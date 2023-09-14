@@ -103,4 +103,3 @@ if ! mv "${dest}" "$1" ; then
   echo "cannot mv ${dest} to $1"
   exit 1
 fi
-
