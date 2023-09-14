@@ -1,0 +1,73 @@
+#!/bin/bash
+
+echo Executing pre-push hook...
+
+if [ ! -z "${GERRIT_PRE_PUSH_EXECUTING+1}" ]; then
+    exit 0
+fi
+
+export GERRIT_PRE_PUSH_EXECUTING=1
+
+# Echoes all arguments, prepending '[gherrit] '
+function log {
+    echo "[gherrit] $@"
+}
+
+# "Internal compiler error" - ie, the script did something
+# that represents a bug.
+function ice {
+    if [ "$#" != 1 ]; then
+        log "Bad arguments to 'ice'; ironic..." >&2
+        exit 1
+    fi
+
+    log "Internal error: $1" >&2
+    exit 1
+}
+
+function fatal {
+    [ "$#" != 1 ] || ice "Wrong number of arguments to 'fatal'"
+    
+    log "Internal error: $1" >&2
+    exit 1
+}
+
+function ref-for-gherrit-id {
+    [ "$#" == 1 ] || ice "Wrong number of arguments to 'ref-for-gherrit-id': $#"
+
+    echo "refs/gherrit/$1"
+}
+
+# Attempts to find the named ref (could be a ref or a commit ID),
+# and attempts to extract a gherrit ID, exiting if either fail.
+function try-get-gherrit-id-for-ref {
+    [ "$#" == 1 ] || ice "Wrong number of arguments to 'try-get-gherrit-id-for-ref': $#"
+
+    COMMIT_REF="$1"
+
+    # This regex will match the literal '^gherrit-pr-id: ' followed
+    # by a PR ID followed by the following (in order):
+    # - 0 or more space characters
+    # - optionally, the pound sign (to start a comment) followed by
+    #   any number of characters
+    # - end of line
+    git rev-list --format=%B --max-count=1 "$COMMIT_REF" |  \
+        grep '^gherrit-pr-id: [a-zA-Z0-9]* *\(#.*\)\?$'  |  \
+        sed -e 's/^gherrit-pr-id: \([a-zA-Z0-9]*\)/\1/'
+
+    # If any of the commands in the preceding pipe fail, then one of
+    # the status codes in `PIPESTATUS` will be non-zero, so this `grep`
+    # will succeed.
+    echo "${PIPESTATUS[@]}" | grep '[1-9]' &>/dev/null && \
+        fatal "Could not find gherrit PR ID in $COMMIT_REF"
+}
+
+# Detect whether we're on main. Pushing directly from
+# main is probably a bad idea.
+#
+# TODO: Make this more robust. E.g., on a detached HEAD,
+# it will happily just print HEAD.
+if [ `git rev-parse --abbrev-ref HEAD` == "main" ]; then
+    echo "Detected 'main' branch; refusing to push..." >&2
+    exit 1
+fi
