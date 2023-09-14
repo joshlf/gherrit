@@ -31,10 +31,10 @@ if test ! -f "$1" ; then
   exit 1
 fi
 
-# Do not create a change id if requested
-if test "false" = "$(git config --bool --get gerrit.createChangeId)" ; then
-  exit 0
-fi
+# # Do not create a change id if requested
+# if test "false" = "$(git config --bool --get gerrit.createChangeId)" ; then
+#   exit 0
+# fi
 
 # Do not create a change id for squash commits.
 if head -n1 "$1" | grep -q '^squash! '; then
@@ -68,7 +68,7 @@ if test -n "${reviewurl}" ; then
   value="${reviewurl%/}/id/I$random"
   pattern=".*/id/I[0-9a-f]\{40\}"
 else
-  token="Change-Id"
+  token="gherrit-pr-id"
   value="I$random"
   pattern=".*"
 fi
