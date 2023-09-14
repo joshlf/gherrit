@@ -86,29 +86,61 @@ function try-get-gh-pr-num-for-gherrit-pr-id {
 # commits between `main` and `main`. There are also no commits between `main`
 # and a `HEAD` which is on but behind `main`.
 #
-# This loop generates a newline-separated list of <commit ID>:<gherrit PR ID>
+# This loop generates a space-separated list of:
+#
+#   <user commit ID>:<new gherrit head commit ID>:<gherrit PR ID>
 #
 # TODO: Currently, if this branch isn't synced to origin/main, the first
 # PR will fail because GH won't be able to treat main as the target branch.
 echo "Pushing the following commits:" >&2
-COMMIT_ID_GHERRIT_PR_ID_PAIRS="$(for COMMIT_ID in $(git log --pretty=format:"%H" --reverse main..); do
+COMMITS=$(for USER_COMMIT_ID in $(git log --pretty=format:"%H" --reverse main..); do
     # TODO: How to detect errors in the subshell created by `$()` and bail?
-    GHERRIT_PR_ID=$(try-get-gherrit-pr-id-for-ref "$COMMIT_ID")
-    
+    GHERRIT_PR_ID=$(try-get-gherrit-pr-id-for-ref "$USER_COMMIT_ID")
+
+    debug "USER_COMMIT_ID: $USER_COMMIT_ID"
+    debug "GHERRIT_PR_ID:  $GHERRIT_PR_ID"
+
+    # TODO: The names here are garbage.
+    NEW_GHERRIT_HEAD_COMMIT_ID=$USER_COMMIT_ID
+    GHERRIT_HEAD_COMMIT_ID=$(git show-ref -s refs/gherrit/$GHERRIT_PR_ID)
+    if [ "$?" == 0 ]; then
+        # We already have an existing history, so we need to add to it.
+        debug "Adding to existing history"
+        TREE=$(git ls-tree --format='%(objectname)' $USER_COMMIT_ID)
+        debug "Using tree: $TREE"
+        NEW_GHERRIT_HEAD_COMMIT_ID=$(git show -s --pretty=format:%B $USER_COMMIT_ID | \
+            git commit-tree $TREE -p $GHERRIT_HEAD_COMMIT_ID)
+        debug "NEW_GHERRIT_HEAD_COMMIT_ID: $NEW_GHERRIT_HEAD_COMMIT_ID"
+    fi
+    debug "NEW_GHERRIT_HEAD_COMMIT_ID: $NEW_GHERRIT_HEAD_COMMIT_ID"
+    git update-ref refs/gherrit/$GHERRIT_PR_ID $NEW_GHERRIT_HEAD_COMMIT_ID
 
     # Format: <short commit hash> <commit title> (gherrit-pr-id: <gherrit PR ID>)
     #
     # TODO: Why isn't `$GHERRIT_PR_ID` being interpreted as a variable here?
     echo "    $(git log -n 1 --pretty='%h %s (gherrit-pr-id: $GHERRIT_PR_ID)' $COMMIT_ID)" >&2
-    echo "$COMMIT_ID:$GHERRIT_PR_ID"
-done)"
+    echo "$USER_COMMIT_ID:$NEW_GHERRIT_HEAD_COMMIT_ID:$GHERRIT_PR_ID"
+done)
+
+# fatal "Bailing early for testing"
 
 # TODO: Make this `lataf` and bail with exit code 0 once we're allowing the push
 # to continue.
-[ -z "$COMMIT_ID_GHERRIT_PR_ID_PAIRS" ] && fatal "Nothing to push; bye!"
+[ -z "$COMMITS" ] && fatal "Nothing to push; bye!"
 
-# Lines are now of the form <commit ID>:refs/heads/<gherrit PR ID>
-GIT_REFSPECS="$(echo "$COMMIT_ID_GHERRIT_PR_ID_PAIRS" | sed -e 's/:/:refs\/heads\//')"
+# Entries are now of the form <new gherrit commit ID>:refs/heads/<gherrit PR ID>
+
+# Entries converted from:
+#
+#   <user commit ID>:<new gherrit head commit ID>:<gherrit PR ID>
+#
+# ...to:
+#
+#   <new gherrit head commit ID>:refs/heads/<gherrit PR ID>
+GIT_REFSPECS="$(echo "$COMMITS" | \
+    sed -e 's/[0-9a-z]*:\([0-9a-z]*\):\([0-9A-Za-z]*\)/\1:refs\/heads\/\2/g')"
+
+# fatal "Bailing with GIT_REFSPECTS: $GIT_REFSPECS"
 
 # Do this here, pushing all commits and associated branch names in one go, to
 # save time compared to doing one commit/branch pair per loop iteration below.
@@ -129,9 +161,10 @@ debug Pushing: $GIT_REFSPECS
 git push --force --quiet origin $GIT_REFSPECS
 
 PARENT_BRANCH_NAME=main
-for COMMIT_ID_GHERRIT_PR_ID in $COMMIT_ID_GHERRIT_PR_ID_PAIRS; do
-    COMMIT_ID="$(echo $COMMIT_ID_GHERRIT_PR_ID | cut -d : -f 1)"
-    GHERRIT_PR_ID="$(echo $COMMIT_ID_GHERRIT_PR_ID | cut -d : -f 2)"
+for COMMIT in $COMMITS; do
+    USER_COMMIT_ID="$(echo $COMMIT | cut -d : -f 1)"
+    # NEW_GHERRIT_HEAD_COMMIT_ID="$(echo $COMMIT | cut -d : -f 2)"
+    GHERRIT_PR_ID="$(echo $COMMIT | cut -d : -f 3)"
 
     debug "Syncing PR for $COMMIT_ID/$GHERRIT_PR_ID"
 
