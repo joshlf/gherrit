@@ -94,6 +94,8 @@ echo "Pushing the following commits:" >&2
 COMMIT_ID_GHERRIT_PR_ID_PAIRS="$(for COMMIT_ID in $(git log --pretty=format:"%H" --reverse main..); do
     # TODO: How to detect errors in the subshell created by `$()` and bail?
     GHERRIT_PR_ID=$(try-get-gherrit-pr-id-for-ref "$COMMIT_ID")
+    
+
     # Format: <short commit hash> <commit title> (gherrit-pr-id: <gherrit PR ID>)
     #
     # TODO: Why isn't `$GHERRIT_PR_ID` being interpreted as a variable here?
