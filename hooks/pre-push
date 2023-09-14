@@ -1,11 +1,7 @@
 #!/bin/bash
 
-echo Executing pre-push hook...
-
-if [ ! -z "${GERRIT_PRE_PUSH_EXECUTING+1}" ]; then
-    exit 0
-fi
-
+# Since we call `git push` from this hook, we need to detect recursion and bail.
+[ -z "${GERRIT_PRE_PUSH_EXECUTING+1}" ] || exit 0
 export GERRIT_PRE_PUSH_EXECUTING=1
 
 # Echoes all arguments, prepending '[gherrit] '.
@@ -32,11 +28,11 @@ function fatal {
     exit 1
 }
 
-function ref-for-gherrit-id {
-    [ "$#" == 1 ] || ice "Wrong number of arguments to 'ref-for-gherrit-id': $#"
+# function ref-for-gherrit-pr-id {
+#     [ "$#" == 1 ] || ice "Wrong number of arguments to 'ref-for-gherrit-pr-id': $#"
 
-    echo "refs/gherrit/$1"
-}
+#     echo "refs/gherrit/$1"
+# }
 
 # Attempts to find the named ref (could be a ref or a commit ID), and attempts
 # to extract a gherrit PR ID, exiting if either fail.
@@ -61,14 +57,59 @@ function try-get-gherrit-pr-id-for-ref {
         fatal "Could not find gherrit PR ID in $COMMIT_REF"
 }
 
+# Output empty string on failure.
+function try-get-gh-pr-num-for-gherrit-pr-id {
+    [ "$#" == 1 ] || ice "Wrong number of arguments to 'try-get-gh-pr-num-for-gherrit-pr-id': $#"
+
+    # `gh pr list` output format:
+    # - Includes the full base branch name (since these are
+    #   cryptographically-high entropy, we don't need to bother parsing a
+    #   particular format - if a gherrit PR ID shows up at all, it'll be the
+    #   branch name)
+    # - The GH PR number is the first character sequence on the line, followed
+    #   by non-numeric characters (in particular, spaces or tabs).
+    gh pr list | grep "$1" | sed -e 's/^\([0-9]*\).*/\1/'
+}
+
 # Iterate over commits between `main` and up to (and including) `HEAD` from
 # oldest to newest. Note that this handles `main` nicely since there are no
 # commits between `main` and `main`. There are also no commits between `main`
 # and a `HEAD` which is on but behind `main`.
 #
 # TODO: How to detect errors in the subshell crated by `$()` and bail?
+PARENT_BRANCH_NAME=main
 for COMMIT_ID in $(git log --pretty=format:"%H" --reverse main..); do
     # TODO: How to detect errors in the subshell created by `$()` and bail?
     GHERRIT_PR_ID=$(try-get-gherrit-pr-id-for-ref "$COMMIT_ID")
-    echo "$GHERRIT_PR_ID"
+
+    # TODO:
+    # - This step causes us to be aware of `origin/$GHERRIT_PR_ID`, which in
+    #   turn means it shows up in `git log` and related commands as one of the
+    #   tags associated with this commit. Can we suppress that somehow?
+    # - This creates a visible branch on GitHub, which clutters the list of
+    #   branches. Can we cause it to remain hidden somehow?
+    # - Don't just assume `origin` is the right remote.
+    git push --force --quiet origin "$COMMIT_ID:refs/heads/$GHERRIT_PR_ID"
+
+    PR_TITLE=$(git log -n 1 --pretty=%s "$COMMIT_ID")
+
+    GH_PR_ID="$(try-get-gh-pr-num-for-gherrit-pr-id $GHERRIT_PR_ID)"
+
+    if [ "$GH_PR_ID" == "" ]; then
+        log "No GitHub PR exists for this change yet; creating one..."
+
+        # TODO: Automatically set the PR name based on the commit message. Maybe
+        # that happens automatically on GH's side and we don't have to do it
+        # ourselves?
+        gh pr create \
+            --base "$PARENT_BRANCH_NAME" \
+            --head "$GHERRIT_PR_ID" \
+            --title "$PR_TITLE" \
+            --body '' || fatal "Failed to create GitHub PR"
+    else
+        gh pr edit "$GH_PR_ID" \
+            --base "$PARENT_BRANCH_NAME" >/dev/null || fatal "Failed to update base branch of GitHub PR"
+    fi
+
+    PARENT_BRANCH_NAME=$GHERRIT_PR_ID
 done
