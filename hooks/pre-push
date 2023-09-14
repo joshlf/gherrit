@@ -161,15 +161,17 @@ debug Pushing: $GIT_REFSPECS
 git push --force --quiet origin $GIT_REFSPECS
 
 PARENT_BRANCH_NAME=main
+GH_PR_IDS_AND_USER_COMMIT_IDS=""
+GH_PR_IDS=""
 for COMMIT in $COMMITS; do
     USER_COMMIT_ID="$(echo $COMMIT | cut -d : -f 1)"
     # NEW_GHERRIT_HEAD_COMMIT_ID="$(echo $COMMIT | cut -d : -f 2)"
     GHERRIT_PR_ID="$(echo $COMMIT | cut -d : -f 3)"
 
-    debug "Syncing PR for $COMMIT_ID/$GHERRIT_PR_ID"
+    debug "Syncing PR for $USER_COMMIT_ID/$GHERRIT_PR_ID"
 
-    PR_TITLE="$(git log -n 1 --pretty=%s $COMMIT_ID)"
-    PR_BODY="$(git log -n 1 --pretty=%b $COMMIT_ID | grep -v '$COMMIT_MSG_GHERRIT_PR_ID_REGEX')"
+    PR_TITLE="$(git log -n 1 --pretty=%s $USER_COMMIT_ID)"
+    PR_BODY="$(git log -n 1 --pretty=%b $USER_COMMIT_ID | grep -v '$COMMIT_MSG_GHERRIT_PR_ID_REGEX')"
     GH_PR_ID="$(try-get-gh-pr-num-for-gherrit-pr-id $GHERRIT_PR_ID)"
 
     debug "Using PR ID  '$GH_PR_ID', PR title '$PR_TITLE', PR body '$PR_BODY'"
@@ -179,19 +181,40 @@ for COMMIT in $COMMITS; do
 
         # NOTE: We don't pipe stdout here because `gh` outputs the PR ID, which
         # the user probably wants to know.
-        gh pr create \
+        GH_PR_ID=$(gh pr create \
             --base "$PARENT_BRANCH_NAME" \
             --head "$GHERRIT_PR_ID" \
             --title "$PR_TITLE" \
-            --body "$PR_BODY" || fatal "Failed to create GitHub PR"
+            --body "$PR_BODY" || fatal "Failed to create GitHub PR")
+        GH_PR_ID="$(echo $GH_PR_ID | rev | cut -d / -f 1 | rev)"
+        GH_PR_IDS_AND_USER_COMMIT_IDS="$GH_PR_IDS_AND_USER_COMMIT_IDS $GH_PR_ID:$USER_COMMIT_ID"
+        GH_PR_IDS="$GH_PR_IDS $GH_PR_ID"
     else
         gh pr edit "$GH_PR_ID" \
             --base "$PARENT_BRANCH_NAME" \
             --title "$PR_TITLE" \
             --body "$PR_BODY" >/dev/null || fatal "Failed to create GitHub PR"
+        GH_PR_IDS_AND_USER_COMMIT_IDS="$GH_PR_IDS_AND_USER_COMMIT_IDS $GH_PR_ID:$USER_COMMIT_ID"
+        GH_PR_IDS="$GH_PR_IDS $GH_PR_ID"
     fi
 
     PARENT_BRANCH_NAME=$GHERRIT_PR_ID
+done
+
+PR_BODY_SECTION_BREAK_MARKDOWN=$(echo -e "\n\n---\n\n")
+GH_PR_IDS_MARKDOWN=$(echo $GH_PR_IDS | tr ' ' '\n' | sed -e 's/\(^.*$\)/- #\1/')
+
+# Now that we know all of the GH PR IDs, we can update each PR description to
+# include a list of all PRs.
+for IDS in $GH_PR_IDS_AND_USER_COMMIT_IDS; do
+    GH_PR_ID="$(echo $IDS | cut -d : -f 1)"
+    USER_COMMIT_ID="$(echo $IDS | cut -d : -f 2)"
+
+    PR_BODY="$(git log -n 1 --pretty=%b $USER_COMMIT_ID | grep -v '$COMMIT_MSG_GHERRIT_PR_ID_REGEX')"
+    # TODO: How to fix the section break and IDs getting smushed together?
+    PR_BODY=$(echo "${PR_BODY}${PR_BODY_SECTION_BREAK_MARKDOWN}${GH_PR_IDS_MARKDOWN}")
+
+    gh pr edit "$GH_PR_ID" --body "$PR_BODY"
 done
 
 # # Iterate over commits between `main` and up to (and including) `HEAD` from
