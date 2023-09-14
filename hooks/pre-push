@@ -1,0 +1,124 @@
+#!/bin/bash
+
+# Since we call `git push` from this hook, we need to detect recursion and bail.
+[ -z "${GERRIT_PRE_PUSH_EXECUTING+1}" ] || exit 0
+export GERRIT_PRE_PUSH_EXECUTING=1
+
+# Echoes all arguments, prepending '[gherrit] '.
+function log {
+    echo "[gherrit] $@"
+}
+
+# "Internal compiler error" - ie, the script did something that represents a
+# bug.
+function ice {
+    if [ "$#" != 1 ]; then
+        log "Bad arguments to 'ice'; ironic..." >&2
+        exit 1
+    fi
+
+    log "Internal error: $1" >&2
+    exit 1
+}
+
+function fatal {
+    [ "$#" == 1 ] || ice "Wrong number of arguments to 'fatal'"
+    
+    log "$1" >&2
+    exit 1
+}
+
+# function ref-for-gherrit-pr-id {
+#     [ "$#" == 1 ] || ice "Wrong number of arguments to 'ref-for-gherrit-pr-id': $#"
+
+#     echo "refs/gherrit/$1"
+# }
+
+# Attempts to find the named ref (could be a ref or a commit ID), and attempts
+# to extract a gherrit PR ID, exiting if either fail.
+function try-get-gherrit-pr-id-for-ref {
+    [ "$#" == 1 ] || ice "Wrong number of arguments to 'try-get-gherrit-pr-id-for-ref': $#"
+
+    COMMIT_REF="$1"
+
+    # This regex will match the literal '^gherrit-pr-id: ' followed by a PR ID
+    # followed by the following (in order):
+    # - 0 or more space characters
+    # - optionally, the pound sign (to start a comment) followed by any number
+    #   of characters
+    # - end of line
+    git rev-list --format=%B --max-count=1 "$COMMIT_REF" |  \
+        grep '^gherrit-pr-id: [a-zA-Z0-9]* *\(#.*\)\?$'  |  \
+        sed -e 's/^gherrit-pr-id: \([a-zA-Z0-9]*\)/\1/'
+
+    # If any of the commands in the preceding pipe fail, then one of the status
+    # codes in `PIPESTATUS` will be non-zero, so this `grep` will succeed.
+    echo "${PIPESTATUS[@]}" | grep '[1-9]' &>/dev/null && \
+        fatal "Could not find gherrit PR ID in $COMMIT_REF"
+}
+
+# Output empty string on failure.
+function try-get-gh-pr-num-for-gherrit-pr-id {
+    [ "$#" == 1 ] || ice "Wrong number of arguments to 'try-get-gh-pr-num-for-gherrit-pr-id': $#"
+
+    # `gh pr list` output format:
+    # - Includes the full base branch name (since these are
+    #   cryptographically-high entropy, we don't need to bother parsing a
+    #   particular format - if a gherrit PR ID shows up at all, it'll be the
+    #   branch name)
+    # - The GH PR number is the first character sequence on the line, followed
+    #   by non-numeric characters (in particular, spaces or tabs).
+    gh pr list | grep "$1" | sed -e 's/^\([0-9]*\).*/\1/'
+}
+
+# Iterate over commits between `main` and up to (and including) `HEAD` from
+# oldest to newest. Note that this handles `main` nicely since there are no
+# commits between `main` and `main`. There are also no commits between `main`
+# and a `HEAD` which is on but behind `main`.
+#
+# TODO: How to detect errors in the subshell crated by `$()` and bail?
+PARENT_BRANCH_NAME=main
+for COMMIT_ID in $(git log --pretty=format:"%H" --reverse main..); do
+    # TODO: How to detect errors in the subshell created by `$()` and bail?
+    GHERRIT_PR_ID=$(try-get-gherrit-pr-id-for-ref "$COMMIT_ID")
+
+    # TODO:
+    # - This step causes us to be aware of `origin/$GHERRIT_PR_ID`, which in
+    #   turn means it shows up in `git log` and related commands as one of the
+    #   tags associated with this commit. Can we suppress that somehow?
+    # - This creates a visible branch on GitHub, which clutters the list of
+    #   branches. Can we cause it to remain hidden somehow?
+    # - Don't just assume `origin` is the right remote.
+    git push --force --quiet origin "$COMMIT_ID:refs/heads/$GHERRIT_PR_ID"
+
+    PR_TITLE=$(git log -n 1 --pretty=%s "$COMMIT_ID")
+
+    GH_PR_ID="$(try-get-gh-pr-num-for-gherrit-pr-id $GHERRIT_PR_ID)"
+
+    if [ "$GH_PR_ID" == "" ]; then
+        log "No GitHub PR exists for this change yet; creating one..."
+
+        # TODO: Automatically set the PR name based on the commit message. Maybe
+        # that happens automatically on GH's side and we don't have to do it
+        # ourselves?
+        gh pr create \
+            --base "$PARENT_BRANCH_NAME" \
+            --head "$GHERRIT_PR_ID" \
+            --title "$PR_TITLE" \
+            --body '' || fatal "Failed to create GitHub PR"
+    else
+        gh pr edit "$GH_PR_ID" \
+            --base "$PARENT_BRANCH_NAME" >/dev/null || fatal "Failed to update base branch of GitHub PR"
+    fi
+
+    PARENT_BRANCH_NAME=$GHERRIT_PR_ID
+done
+
+# TODO: Configure each branch's remote so that it never actually pushes anything
+# up to the server (or at least so that what gets pushed is somehow discarded).
+# If we don't do this, then everything will require a force push since we're
+# amending commits locally. Alternatively, we could just decide that every
+# branch gets pushed. That would have the effect of allowing the top of the PR
+# stack to also have a human-readable branch name.
+log "Instructing Git to 'fail' this push since we've done what we need to do..."
+exit 1
