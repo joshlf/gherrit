@@ -1,30 +1,29 @@
 #!/bin/bash
 
+# Maybe use `gherrit: ` prefix instead to be consistent with Git?
+exec  > >(trap "" INT TERM; sed 's/^/[gherrit] /')
+exec 2> >(trap "" INT TERM; sed 's/^/[gherrit] /' >&2)
+
 # Since we call `git push` from this hook, we need to detect recursion and bail.
 [ -z "${GERRIT_PRE_PUSH_EXECUTING+1}" ] || exit 0
 export GERRIT_PRE_PUSH_EXECUTING=1
-
-# Echoes all arguments, prepending '[gherrit] '.
-function log {
-    echo "[gherrit] $@"
-}
 
 # "Internal compiler error" - ie, the script did something that represents a
 # bug.
 function ice {
     if [ "$#" != 1 ]; then
-        log "Bad arguments to 'ice'; ironic..." >&2
+        echo "Bad arguments to 'ice'; ironic..." >&2
         exit 1
     fi
 
-    log "Internal error: $1" >&2
+    echo"Internal error: $1" >&2
     exit 1
 }
 
 function fatal {
     [ "$#" == 1 ] || ice "Wrong number of arguments to 'fatal'"
     
-    log "$1" >&2
+    echo"$1" >&2
     exit 1
 }
 
@@ -102,9 +101,9 @@ for COMMIT_ID in $(git log --pretty=format:"%H" --reverse main..); do
     GH_PR_ID="$(try-get-gh-pr-num-for-gherrit-pr-id $GHERRIT_PR_ID)"
 
     if [ "$GH_PR_ID" == "" ]; then
-        log "No GitHub PR exists for this change yet; creating one..."
+        echo "No GitHub PR exists for this change yet; creating one..."
 
-        # NOTE: We don't pipe stdout here because it outputs the PR ID, which
+        # NOTE: We don't pipe stdout here because `gh` outputs the PR ID, which
         # the user probably wants to know.
         gh pr create \
             --base "$PARENT_BRANCH_NAME" \
@@ -127,5 +126,5 @@ done
 # amending commits locally. Alternatively, we could just decide that every
 # branch gets pushed. That would have the effect of allowing the top of the PR
 # stack to also have a human-readable branch name.
-log "Instructing Git to 'fail' this push since we've done what we need to do..."
+echo "Instructing Git to 'fail' this push since we've done what we need to do..."
 exit 1
