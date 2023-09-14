@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Maybe use `gherrit: ` prefix instead to be consistent with Git?
+# TODO: Maybe use `gherrit: ` prefix instead to be consistent with Git?
 exec  > >(trap "" INT TERM; sed 's/^/[gherrit] /')
 exec 2> >(trap "" INT TERM; sed 's/^/[gherrit] /' >&2)
 
@@ -9,10 +9,10 @@ exec 2> >(trap "" INT TERM; sed 's/^/[gherrit] /' >&2)
 export GERRIT_PRE_PUSH_EXECUTING=1
 
 # "Internal compiler error" - ie, the script did something that represents a
-# bug.
+# bug. Little rustc joke for ya :)
 function ice {
     if [ "$#" != 1 ]; then
-        echo "Bad arguments to 'ice'; ironic..." >&2
+        echo "Bad arguments to 'ice' ($#); ironic..." >&2
         exit 1
     fi
 
@@ -21,17 +21,25 @@ function ice {
 }
 
 function fatal {
-    [ "$#" == 1 ] || ice "Wrong number of arguments to 'fatal'"
+    [ "$#" == 1 ] || ice "Wrong number of arguments to 'fatal': $#"
     
-    echo"$1" >&2
+    echo "$1" >&2
     exit 1
 }
 
-# function ref-for-gherrit-pr-id {
-#     [ "$#" == 1 ] || ice "Wrong number of arguments to 'ref-for-gherrit-pr-id': $#"
+# The opposite of fatal: Bail early due to success.
+function lataf {
+    [ "$#" == 1 ] || ice "Wrong number of arguments to 'lataf': $#"
+    
+    echo "$1"
+    exit 0
+}
 
-#     echo "refs/gherrit/$1"
-# }
+function debug {
+    [ -z "$GHERRIT_LOG_DEBUG" ] || echo "debug: $@" >&2
+}
+
+COMMIT_MSG_GHERRIT_PR_ID_REGEX='^gherrit-pr-id: [a-zA-Z0-9]* *\(#.*\)\?$'
 
 # Attempts to find the named ref (could be a ref or a commit ID), and attempts
 # to extract a gherrit PR ID, exiting if either fail.
@@ -46,8 +54,8 @@ function try-get-gherrit-pr-id-for-ref {
     # - optionally, the pound sign (to start a comment) followed by any number
     #   of characters
     # - end of line
-    git rev-list --format=%B --max-count=1 "$COMMIT_REF" |  \
-        grep '^gherrit-pr-id: [a-zA-Z0-9]* *\(#.*\)\?$'  |  \
+    git rev-list --format=%B --max-count=1 "$COMMIT_REF" | \
+        grep "$COMMIT_MSG_GHERRIT_PR_ID_REGEX"           | \
         sed -e 's/^gherrit-pr-id: \([a-zA-Z0-9]*\)/\1/'
 
     # If any of the commands in the preceding pipe fail, then one of the status
@@ -57,6 +65,9 @@ function try-get-gherrit-pr-id-for-ref {
 }
 
 # Output empty string on failure.
+#
+# TODO: Maybe instead of doing this check every time, we could store the PR
+# number in local metadata, and then verify it at the same time as updating.
 function try-get-gh-pr-num-for-gherrit-pr-id {
     [ "$#" == 1 ] || ice "Wrong number of arguments to 'try-get-gh-pr-num-for-gherrit-pr-id': $#"
 
@@ -70,35 +81,63 @@ function try-get-gh-pr-num-for-gherrit-pr-id {
     gh pr list | grep "$1" | sed -e 's/^\([0-9]*\).*/\1/'
 }
 
-# Iterate over commits between `main` and up to (and including) `HEAD` from
-# oldest to newest. Note that this handles `main` nicely since there are no
+# This considers all commits between `main` and up to (and including) `HEAD`
+# from oldest to newest. Note that this handles `main` nicely since there are no
 # commits between `main` and `main`. There are also no commits between `main`
 # and a `HEAD` which is on but behind `main`.
 #
-# TODO: How to detect errors in the subshell crated by `$()` and bail?
-PARENT_BRANCH_NAME=main
-for COMMIT_ID in $(git log --pretty=format:"%H" --reverse main..); do
+# This loop generates a newline-separated list of <commit ID>:<gherrit PR ID>
+#
+# TODO: Currently, if this branch isn't synced to origin/main, the first
+# PR will fail because GH won't be able to treat main as the target branch.
+echo "Pushing the following commits:" >&2
+COMMIT_ID_GHERRIT_PR_ID_PAIRS="$(for COMMIT_ID in $(git log --pretty=format:"%H" --reverse main..); do
     # TODO: How to detect errors in the subshell created by `$()` and bail?
     GHERRIT_PR_ID=$(try-get-gherrit-pr-id-for-ref "$COMMIT_ID")
+    # Format: <short commit hash> <commit title> (gherrit-pr-id: <gherrit PR ID>)
+    #
+    # TODO: Why isn't `$GHERRIT_PR_ID` being interpreted as a variable here?
+    echo "    $(git log -n 1 --pretty='%h %s (gherrit-pr-id: $GHERRIT_PR_ID)' $COMMIT_ID)" >&2
+    echo "$COMMIT_ID:$GHERRIT_PR_ID"
+done)"
 
-    # TODO: Log a message describing the commit we're pushing (roughly `git log
-    # -n 1 --oneline`).
+# TODO: Make this `lataf` and bail with exit code 0 once we're allowing the push
+# to continue.
+[ -z "$COMMIT_ID_GHERRIT_PR_ID_PAIRS" ] && fatal "Nothing to push; bye!"
 
-    # TODO:
-    # - This step causes us to be aware of `origin/$GHERRIT_PR_ID`, which in
-    #   turn means it shows up in `git log` and related commands as one of the
-    #   tags associated with this commit. Can we suppress that somehow?
-    # - This creates a visible branch on GitHub, which clutters the list of
-    #   branches. Can we cause it to remain hidden somehow?
-    # - Don't just assume `origin` is the right remote.
-    git push --force --quiet origin "$COMMIT_ID:refs/heads/$GHERRIT_PR_ID"
+# Lines are now of the form <commit ID>:refs/heads/<gherrit PR ID>
+GIT_REFSPECS="$(echo "$COMMIT_ID_GHERRIT_PR_ID_PAIRS" | sed -e 's/:/:refs\/heads\//')"
+
+# Do this here, pushing all commits and associated branch names in one go, to
+# save time compared to doing one commit/branch pair per loop iteration below.
+#
+# It's very important that `$GIT_REFSPECS` is left unquoted here. With quotes,
+# newlines are preserved, and git interprets the whole string as one giant
+# refspec.
+#
+# TODO:
+# - This step causes our local Git to know about the remote branch
+#   `origin/$GHERRIT_PR_ID`, which in turn means it shows up in `git log` and
+#   related commands as one of the refs associated with this commit. Can we
+#   suppress that somehow?
+# - This creates visible branches on GitHub, which clutters the list of
+#   branches. Can we cause them to remain hidden somehow?
+# - Don't just assume `origin` is the right remote.
+debug Pushing: $GIT_REFSPECS
+git push --force --quiet origin $GIT_REFSPECS
+
+PARENT_BRANCH_NAME=main
+for COMMIT_ID_GHERRIT_PR_ID in $COMMIT_ID_GHERRIT_PR_ID_PAIRS; do
+    COMMIT_ID="$(echo $COMMIT_ID_GHERRIT_PR_ID | cut -d : -f 1)"
+    GHERRIT_PR_ID="$(echo $COMMIT_ID_GHERRIT_PR_ID | cut -d : -f 2)"
+
+    debug "Syncing PR for $COMMIT_ID/$GHERRIT_PR_ID"
 
     PR_TITLE="$(git log -n 1 --pretty=%s $COMMIT_ID)"
-
-    # TODO: Filter out `gherrit-pr-id:` line?
-    PR_BODY="$(git log -n 1 --pretty=%b $COMMIT_ID)"
-
+    PR_BODY="$(git log -n 1 --pretty=%b $COMMIT_ID | grep -v '$COMMIT_MSG_GHERRIT_PR_ID_REGEX')"
     GH_PR_ID="$(try-get-gh-pr-num-for-gherrit-pr-id $GHERRIT_PR_ID)"
+
+    debug "Using PR ID  '$GH_PR_ID', PR title '$PR_TITLE', PR body '$PR_BODY'"
 
     if [ "$GH_PR_ID" == "" ]; then
         echo "No GitHub PR exists for this change yet; creating one..."
@@ -119,6 +158,58 @@ for COMMIT_ID in $(git log --pretty=format:"%H" --reverse main..); do
 
     PARENT_BRANCH_NAME=$GHERRIT_PR_ID
 done
+
+# # Iterate over commits between `main` and up to (and including) `HEAD` from
+# # oldest to newest. Note that this handles `main` nicely since there are no
+# # commits between `main` and `main`. There are also no commits between `main`
+# # and a `HEAD` which is on but behind `main`.
+# #
+# # TODO: How to detect errors in the subshell crated by `$()` and bail?
+# PARENT_BRANCH_NAME=main
+# for COMMIT_ID in $(git log --pretty=format:"%H" --reverse main..); do
+#     # TODO: How to detect errors in the subshell created by `$()` and bail?
+#     GHERRIT_PR_ID=$(try-get-gherrit-pr-id-for-ref "$COMMIT_ID")
+
+#     # Format: <short commit hash> <commit title> (gherrit-pr-id: <gherrit PR ID>) 
+#     echo "pushing: $(git log -n 1 --pretty='%h %s (gherrit-pr-id: $GHERRIT_PR_ID)')"
+
+#     # TODO:
+#     # - This step causes us to be aware of `origin/$GHERRIT_PR_ID`, which in
+#     #   turn means it shows up in `git log` and related commands as one of the
+#     #   tags associated with this commit. Can we suppress that somehow?
+#     # - This creates a visible branch on GitHub, which clutters the list of
+#     #   branches. Can we cause it to remain hidden somehow?
+#     # - Don't just assume `origin` is the right remote.
+#     # - Maybe we can just do this push once at the beginning to save network
+#     #   traffic? We'd need to update all refs at once.
+#     git push --force --quiet origin "$COMMIT_ID:refs/heads/$GHERRIT_PR_ID"
+
+#     PR_TITLE="$(git log -n 1 --pretty=%s $COMMIT_ID)"
+
+#     # TODO: Filter out `gherrit-pr-id:` line?
+#     PR_BODY="$(git log -n 1 --pretty=%b $COMMIT_ID | grep -v $COMMIT_MSG_GHERRIT_PR_ID_REGEX)"
+
+#     GH_PR_ID="$(try-get-gh-pr-num-for-gherrit-pr-id $GHERRIT_PR_ID)"
+
+#     if [ "$GH_PR_ID" == "" ]; then
+#         echo "No GitHub PR exists for this change yet; creating one..."
+
+#         # NOTE: We don't pipe stdout here because `gh` outputs the PR ID, which
+#         # the user probably wants to know.
+#         gh pr create \
+#             --base "$PARENT_BRANCH_NAME" \
+#             --head "$GHERRIT_PR_ID" \
+#             --title "$PR_TITLE" \
+#             --body "$PR_BODY" || fatal "Failed to create GitHub PR"
+#     else
+#         gh pr edit "$GH_PR_ID" \
+#             --base "$PARENT_BRANCH_NAME" \
+#             --title "$PR_TITLE" \
+#             --body "$PR_BODY" >/dev/null || fatal "Failed to create GitHub PR"
+#     fi
+
+#     PARENT_BRANCH_NAME=$GHERRIT_PR_ID
+# done
 
 # TODO: Configure each branch's remote so that it never actually pushes anything
 # up to the server (or at least so that what gets pushed is somehow discarded).
