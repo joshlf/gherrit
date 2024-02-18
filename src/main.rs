@@ -30,9 +30,3 @@ fn main() {
 //         println!("{:?}", info);
 //     }
 // }
-
-// fn try_get_gherrit_pr_id_for_ref(spec: &str) -> Result<(), ()> {
-
-// }
-
-// fn try_get_commit_message()
