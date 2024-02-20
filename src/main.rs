@@ -96,12 +96,12 @@ fn main() {
                 println!("{c:?} => {gherrit_id} => {pr_num:?}");
                 let pr_num = if let Some(pr_num) = pr_num {
                     let mut gh_pr_edit = Command::new("gh");
-                    let pr_num = format!("{pr_num}");
+                    let pr_num_str = format!("{pr_num}");
                     gh_pr_edit
                         .args([
                             "pr",
                             "edit",
-                            &pr_num,
+                            &pr_num_str,
                             "--base",
                             &parent_branch,
                             "--title",
