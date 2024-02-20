@@ -1,4 +1,5 @@
 #!/bin/bash
+exit 0
 
 # TODO: Maybe use `gherrit: ` prefix instead to be consistent with Git?
 exec  > >(trap "" INT TERM; sed 's/^/[gherrit] /')
