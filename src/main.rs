@@ -2,12 +2,13 @@
 
 use std::{
     error::Error,
+    ffi::OsStr,
     process::{Command, Stdio},
 };
 
 use gix::{
     refs::{transaction::PreviousValue, Target},
-    Commit, Repository,
+    Repository,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,13 +31,19 @@ fn main() {
         .unwrap();
     commits.reverse();
 
+    let commits = commits
+        .iter()
+        .map(Commit::try_from_gix)
+        .try_collect::<Vec<_>>()
+        .unwrap();
+
     if !KEEP_FULL_HISTORY {
         let commits = commits
             .into_iter()
             .map(|c| -> Result<_, Box<dyn Error>> {
-                let gherrit_id = c.gherrit_pr_id()?;
+                let gherrit_id = c.gherrit_id;
                 let rf = format!("refs/gherrit/{gherrit_id}");
-                let _ = repo.reference(rf, c.id, PreviousValue::Any, "")?;
+                let _ = repo.reference(rf, c.inner.id, PreviousValue::Any, "")?;
                 Ok((c, gherrit_id))
             })
             .try_collect::<Vec<_>>()
@@ -51,16 +58,13 @@ fn main() {
         args.extend(
             commits
                 .iter()
-                .map(|(c, gherrit_id)| format!("{}:refs/heads/{gherrit_id}", c.id())),
+                .map(|(c, gherrit_id)| format!("{}:refs/heads/{gherrit_id}", c.inner.id())),
         );
-        let mut git_push = Command::new("git");
-        git_push.args(args);
+        cmd("git", args).status().unwrap();
 
-        git_push.status().unwrap();
-
-        let mut gh_pr_list = Command::new("gh");
-        gh_pr_list.args(["pr", "list", "--json", "number,headRefName"]);
-        let pr_list = gh_pr_list.output().unwrap();
+        let pr_list = cmd("gh", ["pr", "list", "--json", "number,headRefName"])
+            .output()
+            .unwrap();
 
         #[derive(Serialize, Deserialize, Debug)]
         #[serde(rename_all = "camelCase")]
@@ -73,51 +77,42 @@ fn main() {
 
         println!("{prs:?}");
 
-        let mut parent_branch = "main".to_string();
+        let mut parent_branch = "main";
         let commits = commits
             .into_iter()
             .map(|(c, gherrit_id)| -> Result<_, Box<dyn Error>> {
                 let pr_num = prs.iter().find_map(|pr| {
-                    if pr.head_ref_name == gherrit_id {
+                    if &pr.head_ref_name == gherrit_id {
                         Some(pr.number)
                     } else {
                         None
                     }
                 });
 
-                let message = c.message()?;
-                let title = core::str::from_utf8(message.title)?;
-                // TODO: Strip out `gherrit-pr-id: ...` line.
-                let body = message
-                    .body
-                    .map(|body| core::str::from_utf8(body).unwrap())
-                    .unwrap_or("");
-
-                println!("{c:?} => {gherrit_id} => {pr_num:?}");
                 let pr_num = if let Some(pr_num) = pr_num {
-                    let mut gh_pr_edit = Command::new("gh");
                     let pr_num_str = format!("{pr_num}");
-                    gh_pr_edit
-                        .args([
+                    let mut c = cmd(
+                        "gh",
+                        [
                             "pr",
                             "edit",
                             &pr_num_str,
                             "--base",
                             &parent_branch,
                             "--title",
-                            title,
+                            c.message_title,
                             "--body",
-                            body,
-                        ])
-                        .stdout(Stdio::null());
-                    gh_pr_edit.status()?;
+                            c.message_body,
+                        ],
+                    );
+                    c.stdout(Stdio::null()).status()?;
 
                     pr_num
                 } else {
                     println!("No GitHub PR exists for {gherrit_id}; creating one...");
-                    let mut gh_pr_create = Command::new("gh");
-                    gh_pr_create
-                        .args([
+                    let mut c = cmd(
+                        "gh",
+                        [
                             "pr",
                             "create",
                             "--base",
@@ -125,12 +120,12 @@ fn main() {
                             "--head",
                             &gherrit_id,
                             "--title",
-                            title,
+                            c.message_title,
                             "--body",
-                            body,
-                        ])
-                        .stderr(Stdio::inherit());
-                    let output = gh_pr_create.output()?;
+                            c.message_body,
+                        ],
+                    );
+                    let output = c.stderr(Stdio::inherit()).output()?;
 
                     let output = core::str::from_utf8(&output.stdout)?;
                     let re = regex::Regex::new(
@@ -142,22 +137,25 @@ fn main() {
                     pr_id.as_str().parse()?
                 };
 
-                parent_branch = gherrit_id.clone();
+                parent_branch = gherrit_id;
 
-                let body = body.to_string();
-                Ok((c, gherrit_id, pr_num, body))
+                Ok((c, pr_num))
             })
             .try_collect::<Vec<_>>()
             .unwrap();
 
-        // A markdown bulleted list of links to each PR.
+        // A markdown bulleted list of links to each PR, with the "top" PR (the
+        // furthest from `main`) at the top of the list.
         let gh_pr_ids_markdown = commits
             .iter()
-            .map(|(_, _, pr_num, _)| format!("- #{pr_num}"))
+            .rev()
+            .map(|(_, pr_num)| format!("- #{pr_num}"))
             .intersperse("\n".to_string())
             .collect::<String>();
 
-        for (c, gherrit_id, pr_num, body) in commits {
+        // TODO: These take a long time; run them in parallel.
+        for (c, pr_num) in commits {
+            let body = c.message_body;
             let body = format!("{body}\n\n---\n\n{gh_pr_ids_markdown}");
             let mut gh_pr_edit = Command::new("gh");
             let pr_num = format!("{pr_num}");
@@ -168,9 +166,8 @@ fn main() {
         let commits = commits
             .into_iter()
             .map(|c| -> Result<_, Box<dyn Error>> {
-                let gherrit_id = c.gherrit_pr_id()?;
-                let head_commit = repo.gherrit_head_commit(gherrit_id.clone())?;
-                println!("{c:?} => {gherrit_id} => {head_commit:?}");
+                let gherrit_id = c.gherrit_id;
+                let head_commit = repo.gherrit_head_commit(gherrit_id)?;
                 Ok((c, gherrit_id, head_commit))
             })
             .try_collect::<Vec<_>>()
@@ -189,8 +186,8 @@ fn main() {
                         // (contents, message, parents, etc), then we can
                         // short-circuit and not create a new commit in this
                         // Gherrit PR's history.
-                        let tree = c.tree()?;
-                        let message = core::str::from_utf8(c.message_raw()?)?;
+                        let tree = c.inner.tree()?;
+                        let message = core::str::from_utf8(c.inner.message_raw()?)?;
 
                         // TODO: `head_commit.id()` can panic.
                         let new_head = repo.commit(rf, message, tree.id, [head_commit.id()])?;
@@ -198,8 +195,8 @@ fn main() {
                     } else {
                         // We don't have an existing history, so initialize the
                         // history starting with this commit.
-                        let _ = repo.reference(rf, c.id, PreviousValue::Any, "")?;
-                        Ok((c.id(), gherrit_id))
+                        let _ = repo.reference(rf, c.inner.id, PreviousValue::Any, "")?;
+                        Ok((c.inner.id(), gherrit_id))
                     }
                 },
             )
@@ -212,34 +209,52 @@ fn main() {
     }
 }
 
-type GherritId = String;
-
-trait CommitExt {
-    fn gherrit_pr_id(&self) -> Result<GherritId, Box<dyn Error>>;
+struct Commit<'a> {
+    gherrit_id: &'a str,
+    message_title: &'a str,
+    message_body: &'a str,
+    inner: &'a gix::Commit<'a>,
 }
 
-impl<'repo> CommitExt for Commit<'repo> {
-    fn gherrit_pr_id(&self) -> Result<GherritId, Box<dyn Error>> {
-        let msg = self.message()?;
-        let Some(body) = msg.body else { todo!() };
-        // TODO: Only compile this regex once.
-        let re = regex::bytes::Regex::new(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$").unwrap();
-        // TODO: Return error here instead of unwrapping.
-        let captures = re.captures(&body).unwrap();
-        let gherrit_id = captures.get(1).unwrap();
-        // This can't fail because the regex only matches UTF-8.
-        let gherrit_id = core::str::from_utf8(gherrit_id.as_bytes()).unwrap();
-        Ok(gherrit_id.to_string())
+impl<'a> Commit<'a> {
+    fn try_from_gix(c: &'a gix::Commit) -> Result<Commit<'a>, Box<dyn Error>> {
+        let message = c.message()?;
+        let message_title = core::str::from_utf8(message.title)?;
+        let message_body = message
+            .body
+            .map(|body| core::str::from_utf8(body).unwrap())
+            .unwrap_or("");
+        let gherrit_id = {
+            // TODO: Only compile this regex once.
+            let re = regex::Regex::new(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$").unwrap();
+            // TODO: Return error here instead of unwrapping.
+            let captures = re.captures(&message_body).unwrap();
+            let gherrit_id = captures.get(1).unwrap().as_str();
+            gherrit_id
+        };
+
+        Ok(Commit {
+            gherrit_id,
+            message_title,
+            message_body,
+            inner: c,
+        })
     }
 }
 
 trait RepositoryExt {
-    fn gherrit_head_commit(&self, id: GherritId) -> Result<Option<Target>, Box<dyn Error>>;
+    fn gherrit_head_commit(&self, id: &str) -> Result<Option<Target>, Box<dyn Error>>;
 }
 
 impl RepositoryExt for Repository {
-    fn gherrit_head_commit(&self, id: GherritId) -> Result<Option<Target>, Box<dyn Error>> {
+    fn gherrit_head_commit(&self, id: &str) -> Result<Option<Target>, Box<dyn Error>> {
         let r = self.refs.try_find(&format!("refs/gherrit/{id}"))?;
         Ok(r.map(|r| r.target))
     }
+}
+
+fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Command {
+    let mut c = Command::new(name);
+    c.args(args);
+    c
 }
