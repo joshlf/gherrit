@@ -284,6 +284,7 @@ name = "gherrit"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "rayon",
  "regex",
  "serde",
  "serde_json",
