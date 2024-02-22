@@ -5,12 +5,15 @@ use std::{
     error::Error,
     ffi::OsStr,
     process::{Command, ExitStatus, Stdio},
+    thread,
+    time::Instant,
 };
 
 use gix::{
     refs::{transaction::PreviousValue, Target},
-    Repository,
+    ObjectId, Repository,
 };
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 const KEEP_FULL_HISTORY: bool = false;
@@ -23,6 +26,8 @@ fn main() {
         return;
     }
     env::set_var(VAR_NAME, "1");
+
+    let t0 = Instant::now();
 
     let repo = gix::open(".").unwrap();
     let head = repo.rev_parse_single("HEAD").unwrap();
@@ -40,11 +45,17 @@ fn main() {
         .unwrap();
     commits.reverse();
 
+    let t1 = Instant::now();
+    println!("t0 -> t1: {:?}", t1 - t0);
+
     let commits = commits
         .iter()
         .map(Commit::try_from_gix)
         .try_collect::<Vec<_>>()
         .unwrap();
+
+    let t2 = Instant::now();
+    println!("t1 -> t2: {:?}", t2 - t1);
 
     if !KEEP_FULL_HISTORY {
         let commits = commits
@@ -52,11 +63,14 @@ fn main() {
             .map(|c| -> Result<_, Box<dyn Error>> {
                 let gherrit_id = c.gherrit_id;
                 let rf = format!("refs/gherrit/{gherrit_id}");
-                let _ = repo.reference(rf, c.inner.id, PreviousValue::Any, "")?;
+                let _ = repo.reference(rf, c.id, PreviousValue::Any, "")?;
                 Ok((c, gherrit_id))
             })
             .try_collect::<Vec<_>>()
             .unwrap();
+
+        let t3 = Instant::now();
+        println!("t2 -> t3: {:?}", t3 - t2);
 
         let mut args = vec![
             "push".to_string(),
@@ -67,13 +81,16 @@ fn main() {
         args.extend(
             commits
                 .iter()
-                .map(|(c, gherrit_id)| format!("{}:refs/heads/{gherrit_id}", c.inner.id())),
+                .map(|(c, gherrit_id)| format!("{}:refs/heads/{gherrit_id}", c.id)),
         );
         cmd("git", args).status().unwrap();
 
         let pr_list = cmd("gh", ["pr", "list", "--json", "number,headRefName"])
             .output()
             .unwrap();
+
+        let t4 = Instant::now();
+        println!("t3 -> t4: {:?}", t4 - t3);
 
         #[derive(Serialize, Deserialize, Debug)]
         #[serde(rename_all = "camelCase")]
@@ -83,29 +100,41 @@ fn main() {
         }
 
         let prs: Vec<ListEntry> = serde_json::from_slice(&pr_list.stdout).unwrap();
-        let find_pr_num = |gid| {
-            prs.iter()
-                .find_map(|pr| (pr.head_ref_name == gid).then_some(pr.number))
-        };
 
-        let mut parent_branch = "main";
         let commits = commits
             .into_iter()
-            .map(|(c, gherrit_id)| -> Result<_, Box<dyn Error>> {
-                let pr_num = if let Some(pr_num) = find_pr_num(gherrit_id) {
-                    edit_gh_pr(pr_num, &parent_branch, c.message_title, c.message_body)?;
-                    pr_num
-                } else {
-                    println!("No GitHub PR exists for {gherrit_id}; creating one...");
-                    create_gh_pr(&parent_branch, &gherrit_id, c.message_title, c.message_body)?
-                };
-
-                parent_branch = gherrit_id;
-
-                Ok((c, pr_num))
+            .scan("main", |parent_branch, (c, gherrit_id)| {
+                let parent = *parent_branch;
+                *parent_branch = gherrit_id;
+                Some((c, parent, gherrit_id))
             })
+            .collect::<Vec<_>>();
+
+        let commits = commits
+            .into_par_iter()
+            .map(
+                move |(c, parent_branch, gherrit_id)| -> Result<_, Box<dyn Error + Send + Sync>> {
+                    let pr_num = prs
+                        .iter()
+                        .find_map(|pr| (&pr.head_ref_name == gherrit_id).then_some(pr.number));
+                    let pr_num = if let Some(pr_num) = pr_num {
+                        edit_gh_pr(pr_num, &parent_branch, c.message_title, c.message_body)?;
+                        pr_num
+                    } else {
+                        println!("No GitHub PR exists for {gherrit_id}; creating one...");
+                        create_gh_pr(&parent_branch, &gherrit_id, c.message_title, c.message_body)?
+                    };
+
+                    Ok((c, pr_num))
+                },
+            )
+            .collect::<Vec<_>>()
+            .into_iter()
             .try_collect::<Vec<_>>()
             .unwrap();
+
+        let t5 = Instant::now();
+        println!("t4 -> t5: {:?}", t5 - t4);
 
         // A markdown bulleted list of links to each PR, with the "top" PR (the
         // furthest from `main`) at the top of the list.
@@ -116,71 +145,88 @@ fn main() {
             .intersperse("\n".to_string())
             .collect::<String>();
 
-        // TODO: These take a long time; run them in parallel.
-        for (c, pr_num) in commits {
-            let body = c.message_body;
-            // TODO: Only compile this once.
-            let re = regex::Regex::new(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$").unwrap();
-            let body = re.replace(body, "");
+        thread::scope(|s| -> Result<(), Box<dyn Error>> {
+            let join_handles = commits
+                .into_iter()
+                .map(|(c, pr_num)| {
+                    let gh_pr_ids_markdown = &gh_pr_ids_markdown;
+                    s.spawn(move || -> Result<(), std::io::Error> {
+                        let body = c.message_body;
+                        // TODO: Only compile this once.
+                        let re = regex::Regex::new(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$").unwrap();
+                        let body = re.replace(body, "");
 
-            let body = format!("{body}\n\n---\n\n{gh_pr_ids_markdown}");
-            let mut gh_pr_edit = Command::new("gh");
-            let pr_num = format!("{pr_num}");
-            gh_pr_edit.args(["pr", "edit", &pr_num, "--body", &body]);
-            gh_pr_edit.status().unwrap();
-        }
+                        let body = format!("{body}\n\n---\n\n{gh_pr_ids_markdown}");
+                        let pr_num = format!("{pr_num}");
+                        cmd("gh", ["pr", "edit", &pr_num, "--body", &body]).status()?;
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for handle in join_handles {
+                let _: () = handle.join().unwrap()?;
+            }
+
+            let t6 = Instant::now();
+            println!("t5 -> t6: {:?}", t6 - t5);
+
+            Ok(())
+        })
+        .unwrap();
     } else {
-        let commits = commits
-            .into_iter()
-            .map(|c| -> Result<_, Box<dyn Error>> {
-                let gherrit_id = c.gherrit_id;
-                let head_commit = repo.gherrit_head_commit(gherrit_id)?;
-                Ok((c, gherrit_id, head_commit))
-            })
-            .try_collect::<Vec<_>>()
-            .unwrap();
+        // let commits = commits
+        //     .into_iter()
+        //     .map(|c| -> Result<_, Box<dyn Error>> {
+        //         let gherrit_id = c.gherrit_id;
+        //         let head_commit = repo.gherrit_head_commit(gherrit_id)?;
+        //         Ok((c, gherrit_id, head_commit))
+        //     })
+        //     .try_collect::<Vec<_>>()
+        //     .unwrap();
 
-        let commits = commits
-            .into_iter()
-            .map(
-                |(c, gherrit_id, head_commit)| -> Result<_, Box<dyn Error>> {
-                    let rf = format!("refs/gherrit/{gherrit_id}");
-                    if let Some(head_commit) = head_commit {
-                        // We already have an existing history, so we need to
-                        // add to it.
-                        //
-                        // TODO: If nothing has changed about the commit
-                        // (contents, message, parents, etc), then we can
-                        // short-circuit and not create a new commit in this
-                        // Gherrit PR's history.
-                        let tree = c.inner.tree()?;
-                        let message = core::str::from_utf8(c.inner.message_raw()?)?;
+        // let commits = commits
+        //     .into_iter()
+        //     .map(
+        //         |(c, gherrit_id, head_commit)| -> Result<_, Box<dyn Error>> {
+        //             let rf = format!("refs/gherrit/{gherrit_id}");
+        //             if let Some(head_commit) = head_commit {
+        //                 // We already have an existing history, so we need to
+        //                 // add to it.
+        //                 //
+        //                 // TODO: If nothing has changed about the commit
+        //                 // (contents, message, parents, etc), then we can
+        //                 // short-circuit and not create a new commit in this
+        //                 // Gherrit PR's history.
+        //                 let tree = c.inner.tree()?;
+        //                 let message = core::str::from_utf8(c.inner.message_raw()?)?;
 
-                        // TODO: `head_commit.id()` can panic.
-                        let new_head = repo.commit(rf, message, tree.id, [head_commit.id()])?;
-                        Ok((new_head, gherrit_id))
-                    } else {
-                        // We don't have an existing history, so initialize the
-                        // history starting with this commit.
-                        let _ = repo.reference(rf, c.inner.id, PreviousValue::Any, "")?;
-                        Ok((c.inner.id(), gherrit_id))
-                    }
-                },
-            )
-            .try_collect::<Vec<_>>()
-            .unwrap();
+        //                 // TODO: `head_commit.id()` can panic.
+        //                 let new_head = repo.commit(rf, message, tree.id, [head_commit.id()])?;
+        //                 Ok((new_head, gherrit_id))
+        //             } else {
+        //                 // We don't have an existing history, so initialize the
+        //                 // history starting with this commit.
+        //                 let _ = repo.reference(rf, c.id, PreviousValue::Any, "")?;
+        //                 Ok((c.id, gherrit_id))
+        //             }
+        //         },
+        //     )
+        //     .try_collect::<Vec<_>>()
+        //     .unwrap();
 
-        for (head, gherrit_id) in commits {
-            println!("{head}:refs/heads/{gherrit_id}");
-        }
+        // for (head, gherrit_id) in commits {
+        //     println!("{head}:refs/heads/{gherrit_id}");
+        // }
     }
 }
 
 struct Commit<'a> {
+    id: ObjectId,
     gherrit_id: &'a str,
     message_title: &'a str,
     message_body: &'a str,
-    inner: &'a gix::Commit<'a>,
+    // inner: &'a gix::Commit<'a>,
 }
 
 impl<'a> Commit<'a> {
@@ -201,10 +247,10 @@ impl<'a> Commit<'a> {
         };
 
         Ok(Commit {
+            id: c.id,
             gherrit_id,
             message_title,
             message_body,
-            inner: c,
         })
     }
 }
@@ -231,7 +277,7 @@ fn create_gh_pr(
     head_branch: &str,
     title: &str,
     body: &str,
-) -> Result<usize, Box<dyn Error>> {
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let output = cmd(
         "gh",
         [
@@ -263,7 +309,7 @@ fn edit_gh_pr(
     base_branch: &str,
     title: &str,
     body: &str,
-) -> Result<ExitStatus, Box<dyn Error>> {
+) -> Result<ExitStatus, std::io::Error> {
     let pr_num = format!("{pr_num}");
     let mut c = cmd(
         "gh",
