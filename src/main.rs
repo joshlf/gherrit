@@ -1,9 +1,10 @@
 #![feature(iterator_try_collect, iter_intersperse)]
 
 use std::{
+    env,
     error::Error,
     ffi::OsStr,
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
 };
 
 use gix::{
@@ -15,6 +16,14 @@ use serde::{Deserialize, Serialize};
 const KEEP_FULL_HISTORY: bool = false;
 
 fn main() {
+    // Since we call `git push` from this hook, we need to detect recursion and
+    // bail.
+    const VAR_NAME: &str = "GHERRIT_PRE_PUSH_EXECUTING";
+    if env::var_os(VAR_NAME).is_some() {
+        return;
+    }
+    env::set_var(VAR_NAME, "1");
+
     let repo = gix::open(".").unwrap();
     let head = repo.rev_parse_single("HEAD").unwrap();
     let main = repo.rev_parse_single("main").unwrap();
@@ -74,67 +83,21 @@ fn main() {
         }
 
         let prs: Vec<ListEntry> = serde_json::from_slice(&pr_list.stdout).unwrap();
-
-        println!("{prs:?}");
+        let find_pr_num = |gid| {
+            prs.iter()
+                .find_map(|pr| (pr.head_ref_name == gid).then_some(pr.number))
+        };
 
         let mut parent_branch = "main";
         let commits = commits
             .into_iter()
             .map(|(c, gherrit_id)| -> Result<_, Box<dyn Error>> {
-                let pr_num = prs.iter().find_map(|pr| {
-                    if &pr.head_ref_name == gherrit_id {
-                        Some(pr.number)
-                    } else {
-                        None
-                    }
-                });
-
-                let pr_num = if let Some(pr_num) = pr_num {
-                    let pr_num_str = format!("{pr_num}");
-                    let mut c = cmd(
-                        "gh",
-                        [
-                            "pr",
-                            "edit",
-                            &pr_num_str,
-                            "--base",
-                            &parent_branch,
-                            "--title",
-                            c.message_title,
-                            "--body",
-                            c.message_body,
-                        ],
-                    );
-                    c.stdout(Stdio::null()).status()?;
-
+                let pr_num = if let Some(pr_num) = find_pr_num(gherrit_id) {
+                    edit_gh_pr(pr_num, &parent_branch, c.message_title, c.message_body)?;
                     pr_num
                 } else {
                     println!("No GitHub PR exists for {gherrit_id}; creating one...");
-                    let mut c = cmd(
-                        "gh",
-                        [
-                            "pr",
-                            "create",
-                            "--base",
-                            &parent_branch,
-                            "--head",
-                            &gherrit_id,
-                            "--title",
-                            c.message_title,
-                            "--body",
-                            c.message_body,
-                        ],
-                    );
-                    let output = c.stderr(Stdio::inherit()).output()?;
-
-                    let output = core::str::from_utf8(&output.stdout)?;
-                    let re = regex::Regex::new(
-                        "https://github.com/[a-zA-Z0-9]+/[a-zA-Z0-9]+/pull/([0-9]+)",
-                    )
-                    .unwrap();
-                    let captures = re.captures(&output).unwrap();
-                    let pr_id = captures.get(1).unwrap();
-                    pr_id.as_str().parse()?
+                    create_gh_pr(&parent_branch, &gherrit_id, c.message_title, c.message_body)?
                 };
 
                 parent_branch = gherrit_id;
@@ -156,6 +119,10 @@ fn main() {
         // TODO: These take a long time; run them in parallel.
         for (c, pr_num) in commits {
             let body = c.message_body;
+            // TODO: Only compile this once.
+            let re = regex::Regex::new(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$").unwrap();
+            let body = re.replace(body, "");
+
             let body = format!("{body}\n\n---\n\n{gh_pr_ids_markdown}");
             let mut gh_pr_edit = Command::new("gh");
             let pr_num = format!("{pr_num}");
@@ -257,4 +224,61 @@ fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Comman
     let mut c = Command::new(name);
     c.args(args);
     c
+}
+
+fn create_gh_pr(
+    base_branch: &str,
+    head_branch: &str,
+    title: &str,
+    body: &str,
+) -> Result<usize, Box<dyn Error>> {
+    let output = cmd(
+        "gh",
+        [
+            "pr",
+            "create",
+            "--base",
+            base_branch,
+            "--head",
+            head_branch,
+            "--title",
+            title,
+            "--body",
+            body,
+        ],
+    )
+    .stderr(Stdio::inherit())
+    .output()?;
+
+    let output = core::str::from_utf8(&output.stdout)?;
+    let re =
+        regex::Regex::new("https://github.com/[a-zA-Z0-9]+/[a-zA-Z0-9]+/pull/([0-9]+)").unwrap();
+    let captures = re.captures(&output).unwrap();
+    let pr_id = captures.get(1).unwrap();
+    Ok(pr_id.as_str().parse()?)
+}
+
+fn edit_gh_pr(
+    pr_num: usize,
+    base_branch: &str,
+    title: &str,
+    body: &str,
+) -> Result<ExitStatus, Box<dyn Error>> {
+    let pr_num = format!("{pr_num}");
+    let mut c = cmd(
+        "gh",
+        [
+            "pr",
+            "edit",
+            &pr_num,
+            "--base",
+            base_branch,
+            "--title",
+            title,
+            "--body",
+            body,
+        ],
+    );
+
+    Ok(c.stdout(Stdio::null()).status()?)
 }
