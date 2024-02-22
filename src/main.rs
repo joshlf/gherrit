@@ -10,6 +10,7 @@ use std::{
 };
 
 use gix::{
+    reference::Category,
     refs::{transaction::PreviousValue, Target},
     ObjectId, Repository,
 };
@@ -140,6 +141,21 @@ fn main() {
         let t5 = Instant::now();
         println!("t4 -> t5: {:?}", t5 - t4);
 
+        // Attempt to resolve `HEAD` to a branch name so that we can refer to it
+        // in PR bodies. If we can't, then silently fail and just don't include
+        // that information in PR bodies.
+        let head_branch_markdown = repo
+            .head()
+            .ok()
+            .and_then(|head| head.try_into_referent())
+            .and_then(|head_ref| {
+                let (cat, short_name) = head_ref.inner.name.category_and_short_name()?;
+                (cat == Category::LocalBranch).then(|| {
+                    format!("This PR is on branch [{short_name}](../tree/{short_name}).\n\n")
+                })
+            })
+            .unwrap_or("".to_string());
+
         // A markdown bulleted list of links to each PR, with the "top" PR (the
         // furthest from `main`) at the top of the list.
         let gh_pr_ids_markdown = commits
@@ -149,18 +165,20 @@ fn main() {
             .intersperse("\n".to_string())
             .collect::<String>();
 
+        let gh_pr_body_trailer = format!("{head_branch_markdown}{gh_pr_ids_markdown}");
+
         thread::scope(|s| -> Result<(), Box<dyn Error>> {
             let join_handles = commits
                 .into_iter()
                 .map(|(c, parent_branch, pr_num)| {
-                    let gh_pr_ids_markdown = &gh_pr_ids_markdown;
+                    let gh_pr_body_trailer = &gh_pr_body_trailer;
                     s.spawn(move || -> Result<(), std::io::Error> {
                         let body = c.message_body;
                         // TODO: Only compile this once.
                         let re = regex::Regex::new(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$").unwrap();
                         let body = re.replace(body, "");
 
-                        let body = format!("{body}\n\n---\n\n{gh_pr_ids_markdown}");
+                        let body = format!("{body}\n\n---\n\n{gh_pr_body_trailer}");
                         edit_gh_pr(pr_num, &parent_branch, c.message_title, &body)?;
                         Ok(())
                     })
