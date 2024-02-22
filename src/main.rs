@@ -118,14 +118,18 @@ fn main() {
                         .iter()
                         .find_map(|pr| (&pr.head_ref_name == gherrit_id).then_some(pr.number));
                     let pr_num = if let Some(pr_num) = pr_num {
-                        edit_gh_pr(pr_num, &parent_branch, c.message_title, c.message_body)?;
                         pr_num
                     } else {
                         println!("No GitHub PR exists for {gherrit_id}; creating one...");
+                        // Note that the PR's body will soon be overwritten
+                        // (when we add the Markdown links to other PRs).
+                        // However, setting a reasonable default PR body makes
+                        // sense here in case something crashes between here and
+                        // there.
                         create_gh_pr(&parent_branch, &gherrit_id, c.message_title, c.message_body)?
                     };
 
-                    Ok((c, pr_num))
+                    Ok((c, parent_branch, pr_num))
                 },
             )
             .collect::<Vec<_>>()
@@ -141,14 +145,14 @@ fn main() {
         let gh_pr_ids_markdown = commits
             .iter()
             .rev()
-            .map(|(_, pr_num)| format!("- #{pr_num}"))
+            .map(|(_, _, pr_num)| format!("- #{pr_num}"))
             .intersperse("\n".to_string())
             .collect::<String>();
 
         thread::scope(|s| -> Result<(), Box<dyn Error>> {
             let join_handles = commits
                 .into_iter()
-                .map(|(c, pr_num)| {
+                .map(|(c, parent_branch, pr_num)| {
                     let gh_pr_ids_markdown = &gh_pr_ids_markdown;
                     s.spawn(move || -> Result<(), std::io::Error> {
                         let body = c.message_body;
@@ -157,8 +161,7 @@ fn main() {
                         let body = re.replace(body, "");
 
                         let body = format!("{body}\n\n---\n\n{gh_pr_ids_markdown}");
-                        let pr_num = format!("{pr_num}");
-                        cmd("gh", ["pr", "edit", &pr_num, "--body", &body]).status()?;
+                        edit_gh_pr(pr_num, &parent_branch, c.message_title, &body)?;
                         Ok(())
                     })
                 })
