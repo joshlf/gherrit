@@ -20,6 +20,21 @@ use serde::{Deserialize, Serialize};
 const KEEP_FULL_HISTORY: bool = false;
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    let args: Vec<_> = args.iter().map(|s| s.as_str()).collect();
+    match args.as_slice() {
+        [_, "pre-push"] => pre_push(),
+        [_, "commit-msg"] => unimplemented!(),
+        _ => {
+            eprintln!("Usage:");
+            eprintln!("    {} pre-push", args[0]);
+            eprintln!("    {} commit-msg", args[0]);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn pre_push() {
     // Since we call `git push` from this hook, we need to detect recursion and
     // bail.
     const VAR_NAME: &str = "GHERRIT_PRE_PUSH_EXECUTING";
