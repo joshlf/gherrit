@@ -179,15 +179,15 @@ fn pre_push() {
 
         let gh_pr_body_trailer = format!("{head_branch_markdown}{gh_pr_ids_markdown}");
 
+        let re = regex::Regex::new(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$").unwrap();
         thread::scope(|s| -> Result<(), Box<dyn Error>> {
             let join_handles = commits
                 .into_iter()
                 .map(|(c, parent_branch, pr_num)| {
                     let gh_pr_body_trailer = &gh_pr_body_trailer;
+                    let re = &re; // So we can move it into each closure
                     s.spawn(move || -> Result<(), std::io::Error> {
                         let body = c.message_body;
-                        // TODO: Only compile this once.
-                        let re = regex::Regex::new(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$").unwrap();
                         let body = re.replace(body, "");
 
                         let body = format!("{body}\n\n---\n\n{gh_pr_body_trailer}");
