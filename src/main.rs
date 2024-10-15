@@ -35,14 +35,6 @@ fn main() {
 }
 
 fn pre_push() {
-    // Since we call `git push` from this hook, we need to detect recursion and
-    // bail.
-    const VAR_NAME: &str = "GHERRIT_PRE_PUSH_EXECUTING";
-    if env::var_os(VAR_NAME).is_some() {
-        return;
-    }
-    env::set_var(VAR_NAME, "1");
-
     let t0 = Instant::now();
 
     let repo = gix::open(".").unwrap();
@@ -92,6 +84,7 @@ fn pre_push() {
             "push".to_string(),
             "--force".to_string(),
             "--quiet".to_string(),
+            "--no-verify".to_string(),
             "origin".to_string(),
         ];
         args.extend(
