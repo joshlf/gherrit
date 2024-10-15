@@ -85,6 +85,10 @@ fn pre_push() {
             "--force".to_string(),
             "--quiet".to_string(),
             "--no-verify".to_string(),
+            // This is not strictly necessary, but it's good hygiene - we
+            // probbaly don't want to overwrite the PRs if we haven't first
+            // pulled their current state.
+            "--force-if-includes".to_string(),
             "origin".to_string(),
         ];
         args.extend(
