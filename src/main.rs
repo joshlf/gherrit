@@ -1,5 +1,6 @@
 #![feature(iterator_try_collect, iter_intersperse)]
 
+use core::str;
 use std::{
     env,
     error::Error,
@@ -112,7 +113,21 @@ fn pre_push() {
             number: usize,
         }
 
-        let prs: Vec<ListEntry> = serde_json::from_slice(&pr_list.stdout).unwrap();
+        // TODO: Be more robust: allow whitespace
+        let prs: Vec<ListEntry> = if pr_list.stdout.is_empty() {
+            vec![]
+        } else {
+            match serde_json::from_slice(&pr_list.stdout) {
+                Ok(prs) => prs,
+                Err(err) => {
+                    eprintln!("failed to parse `gh` command output: {err}");
+                    if let Ok(stdout) = str::from_utf8(&pr_list.stdout) {
+                        eprintln!("command output (verbatim):\n{stdout}");
+                    }
+                    std::process::exit(2);
+                }
+            }
+        };
 
         let commits = commits
             .into_iter()
