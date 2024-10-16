@@ -3,6 +3,9 @@ name = "gherrit"
 version = "0.1.0"
 edition = "2021"
 
+[profile.release]
+debug = true
+
 [dependencies]
 gix = "0.58.0"
 rayon = "1.8.1"
