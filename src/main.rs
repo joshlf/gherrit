@@ -154,7 +154,14 @@ fn pre_push() {
                         // However, setting a reasonable default PR body makes
                         // sense here in case something crashes between here and
                         // there.
-                        create_gh_pr(&parent_branch, &gherrit_id, c.message_title, c.message_body)?
+                        let num = create_gh_pr(&parent_branch, &gherrit_id, c.message_title, c.message_body)?;
+                        // TODO: Print the full PR URL. Requires resolving the
+                        // username/organization and repository name. Could also
+                        // capture this from the `gh` command output - we
+                        // already have a regex in `create_gh_pr` to do this in
+                        // order to parse the PR number.
+                        println!("Created PR #{num}");
+                        num
                     };
 
                     Ok((c, parent_branch, pr_num))
