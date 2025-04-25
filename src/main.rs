@@ -95,7 +95,7 @@ fn pre_push() {
         args.extend(
             commits
                 .iter()
-                .map(|(c, gherrit_id)| format!("{}:refs/heads/{gherrit_id}", c.id)),
+                .map(|(c, gherrit_id)| format!("{}:refs/heads/gherrit/{gherrit_id}", c.id)),
         );
         cmd("git", args).status().unwrap();
 
@@ -131,20 +131,21 @@ fn pre_push() {
 
         let commits = commits
             .into_iter()
-            .scan("main", |parent_branch, (c, gherrit_id)| {
-                let parent = *parent_branch;
-                *parent_branch = gherrit_id;
-                Some((c, parent, gherrit_id))
+            .scan("main".to_owned(), |parent_branch, (c, gherrit_id)| {
+                let parent = parent_branch.clone();
+                let branch_name = format!("gherrit/{gherrit_id}");
+                *parent_branch = branch_name.clone();
+                Some((c, parent, gherrit_id, branch_name))
             })
             .collect::<Vec<_>>();
 
         let commits = commits
             .into_par_iter()
             .map(
-                move |(c, parent_branch, gherrit_id)| -> Result<_, Box<dyn Error + Send + Sync>> {
+                move |(c, parent_branch, gherrit_id, branch_name)| -> Result<_, Box<dyn Error + Send + Sync>> {
                     let pr_num = prs
                         .iter()
-                        .find_map(|pr| (&pr.head_ref_name == gherrit_id).then_some(pr.number));
+                        .find_map(|pr| (pr.head_ref_name == branch_name).then_some(pr.number));
                     let pr_num = if let Some(pr_num) = pr_num {
                         pr_num
                     } else {
@@ -154,7 +155,12 @@ fn pre_push() {
                         // However, setting a reasonable default PR body makes
                         // sense here in case something crashes between here and
                         // there.
-                        let num = create_gh_pr(&parent_branch, &gherrit_id, c.message_title, c.message_body)?;
+                        let num = create_gh_pr(
+                            &parent_branch,
+                            &branch_name,
+                            c.message_title,
+                            c.message_body,
+                        )?;
                         // TODO: Print the full PR URL. Requires resolving the
                         // username/organization and repository name. Could also
                         // capture this from the `gh` command output - we
