@@ -1,0 +1,54 @@
+name: Gherrit – Update Stack
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rebase-child:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rebase Child PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGED_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -eo pipefail
+
+          CHILD_PR=$(gh pr list --base "$MERGED_BRANCH" --json number --jq '.[0].number')
+          
+          if [ -z "$CHILD_PR" ]; then
+            echo "No child PRs found for branch: $MERGED_BRANCH"
+            exit 0
+          fi
+          
+          echo "Found child PR: #$CHILD_PR"
+          
+          gh pr checkout "$CHILD_PR"
+          
+          # Change the base to main BEFORE rebasing to avoid phantom diffs.
+          gh pr edit "$CHILD_PR" --base main
+          
+          git config user.name "gherrit-bot"
+          git config user.email ""
+          
+          git fetch origin main
+          if ! git rebase origin/main; then
+            echo "Rebase failed. Please resolve conflicts manually."
+            exit 1
+          fi
+          
+          if ! git push --force-with-lease --force-if-includes; then
+            echo "Push failed."
+            exit 1
+          fi
