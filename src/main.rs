@@ -24,12 +24,123 @@ fn main() {
     match args.as_slice() {
         [_, "pre-push"] => pre_push(),
         [_, "commit-msg"] => unimplemented!(),
+        [_, "manage"] => manage(),
+        [_, "unmanage"] => unmanage(),
+        [_, "post-checkout", prev, new, flag] => post_checkout(prev, new, flag),
         _ => {
             eprintln!("Usage:");
             eprintln!("    {} pre-push", args[0]);
             eprintln!("    {} commit-msg", args[0]);
+            eprintln!("    {} manage", args[0]);
+            eprintln!("    {} unmanage", args[0]);
+            eprintln!("    {} post-checkout <prev> <new> <flag>", args[0]);
             std::process::exit(1);
         }
+    }
+}
+
+fn manage() {
+    let repo = gix::open(".").unwrap();
+    let head_ref = repo.head().unwrap().try_into_referent().unwrap();
+    let branch_name = head_ref.name().shorten();
+
+    cmd(
+        "git",
+        [
+            "config",
+            &format!("branch.{}.gherritState", branch_name),
+            "managed",
+        ],
+    )
+    .status()
+    .unwrap();
+    eprintln!("Branch '{}' is now managed by GHerrit.", branch_name);
+}
+
+fn unmanage() {
+    let repo = gix::open(".").unwrap();
+    let head_ref = repo.head().unwrap().try_into_referent().unwrap();
+    let branch_name = head_ref.name().shorten();
+
+    cmd(
+        "git",
+        [
+            "config",
+            &format!("branch.{}.gherritState", branch_name),
+            "unmanaged",
+        ],
+    )
+    .status()
+    .unwrap();
+    eprintln!("Branch '{}' is now unmanaged by GHerrit.", branch_name);
+}
+
+fn post_checkout(_prev: &str, _new: &str, flag: &str) {
+    // Only run on branch switches (flag=1)
+    if flag != "1" {
+        return;
+    }
+
+    let repo = gix::open(".").unwrap();
+    let head = repo.head().unwrap();
+    let head_ref = head.try_into_referent().unwrap();
+    let branch_name = head_ref.name().shorten();
+
+    // Idempotency check: Bail if the branch management state is already set.
+    let config_output = cmd(
+        "git",
+        ["config", &format!("branch.{}.gherritState", branch_name)],
+    )
+    .output()
+    .unwrap();
+    if config_output.status.success() {
+        return;
+    }
+
+    // Creation detection: Bail if we're just checking out an already-existing branch.
+    let reflog_output = cmd(
+        "git",
+        ["reflog", "show", branch_name.to_string().as_str(), "-n1"],
+    )
+    .output()
+    .unwrap();
+    let reflog_stdout = String::from_utf8_lossy(&reflog_output.stdout);
+    if !reflog_stdout.contains("branch: Created from") {
+        return;
+    }
+
+    let upstream_remote = cmd(
+        "git",
+        ["config", "--get", &format!("branch.{}.remote", branch_name)],
+    )
+    .output()
+    .unwrap();
+
+    let upstream_merge = cmd(
+        "git",
+        ["config", "--get", &format!("branch.{}.merge", branch_name)],
+    )
+    .output()
+    .unwrap();
+
+    let has_upstream = upstream_remote.status.success() && upstream_merge.status.success();
+    let is_origin_main = if has_upstream {
+        let remote = to_trimmed_string_lossy(&upstream_remote.stdout);
+        let merge = to_trimmed_string_lossy(&upstream_merge.stdout);
+        remote == "origin" && merge == "refs/heads/main"
+    } else {
+        false
+    };
+
+    if has_upstream && !is_origin_main {
+        // Condition A: Shared Branch
+        unmanage();
+        eprintln!("[gherrit] Branch initialized as UNMANAGED (Collaboration Mode).");
+    } else {
+        // Condition B: New Stack
+        manage();
+        eprintln!("[gherrit] Branch initialized as MANAGED (Stack Mode).");
+        eprintln!("[gherrit] To opt-out, run: gherrit unmanage");
     }
 }
 
@@ -37,6 +148,39 @@ fn pre_push() {
     let t0 = Instant::now();
 
     let repo = gix::open(".").unwrap();
+    let head = repo.head().unwrap();
+    let head_ref = head.try_into_referent().unwrap();
+    let branch_name = head_ref.name().shorten();
+
+    // Step 1: Resolve State
+    let state = to_trimmed_string_lossy(
+        &cmd(
+            "git",
+            [
+                "config",
+                "--get",
+                &format!("branch.{}.gherritState", branch_name),
+            ],
+        )
+        .output()
+        .unwrap()
+        .stdout,
+    );
+
+    match state.as_str() {
+        "unmanaged" => return, // Allow standard push
+        "managed" => {}        // Proceed
+        _ => {
+            eprintln!(
+                "[gherrit] Error: It is unclear if branch '{}' should be a Stack.",
+                branch_name
+            );
+            eprintln!("[gherrit] Run 'gherrit manage' to sync it as a Stack.");
+            eprintln!("[gherrit] Run 'gherrit unmanage' to push it as a standard Git branch.");
+            std::process::exit(1);
+        }
+    }
+
     let head = repo.rev_parse_single("HEAD").unwrap();
     let main = repo.rev_parse_single("main").unwrap();
     let mut commits = repo
@@ -331,4 +475,8 @@ fn edit_gh_pr(
     );
 
     c.stdout(Stdio::null()).status()
+}
+
+fn to_trimmed_string_lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_string()
 }

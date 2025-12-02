@@ -31,10 +31,14 @@ if test ! -f "$1" ; then
   exit 1
 fi
 
-# # Do not create a change id if requested
-# if test "false" = "$(git config --bool --get gerrit.createChangeId)" ; then
-#   exit 0
-# fi
+BRANCH=$(git symbolic-ref --short HEAD)
+STATE=$(git config branch."$BRANCH".gherritState)
+
+# Strict Mode: Only add trailers if EXPLICITLY managed.
+# If 'unmanaged' OR 'unset', we do nothing.
+if [ "$STATE" != "managed" ]; then
+    exit 0
+fi
 
 # Do not create a change id for squash commits.
 if head -n1 "$1" | grep -q '^squash! '; then
