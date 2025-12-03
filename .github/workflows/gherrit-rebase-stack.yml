@@ -1,4 +1,4 @@
-name: Gherrit Chain Automerge
+name: GHerrit – Rebase Stack
 on:
   pull_request:
     types: [closed]
@@ -8,7 +8,7 @@ permissions:
   pull-requests: write
 
 jobs:
-  cascade:
+  rebase-stack:
     # Only run if the PR was actually merged (not just closed/abandoned)
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
@@ -18,7 +18,7 @@ jobs:
           fetch-depth: 0 # Required for rebasing
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Cascade Rebase & Merge
+      - name: Rebase Stack
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MERGED_PR_BODY: ${{ github.event.pull_request.body }}
