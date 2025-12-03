@@ -15,9 +15,6 @@ use gix::{reference::Category, refs::transaction::PreviousValue, ObjectId};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-static GHERRIT_PR_ID_RE: OnceLock<regex::Regex> = OnceLock::new();
-static GH_PR_URL_RE: OnceLock<regex::Regex> = OnceLock::new();
-
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| {
@@ -95,6 +92,21 @@ macro_rules! cmd {
 
     // Base cases
     (@inner $vec:ident $(,)?) => {};
+}
+
+macro_rules! re {
+    ($name:ident, $re:literal) => {
+        fn $name() -> &'static regex::Regex {
+            re!(@inner $re)
+        }
+    };
+    ($re:literal) => {
+        (|| -> &'static regex::Regex { re!(@inner $re) })()
+    };
+    (@inner $re:literal) => {{
+        static RE: OnceLock<regex::Regex> = OnceLock::new();
+        RE.get_or_init(|| regex::Regex::new($re).unwrap())
+    }};
 }
 
 fn manage() {
@@ -300,10 +312,9 @@ fn pre_push() {
                 return;
             }
             let block = buf.join("\n");
-            static RE: OnceLock<regex::Regex> = OnceLock::new();
-            let re = RE.get_or_init(|| {
-                regex::Regex::new(r"(?m)\n?^remote:\s*\nremote: Create a pull request for '.*' on GitHub by visiting:\s*\nremote:\s*https://github\.com/.*\nremote:\s*$").unwrap()
-            });
+            let re = re!(
+                r"(?m)\n?^remote:\s*\nremote: Create a pull request for '.*' on GitHub by visiting:\s*\nremote:\s*https://github\.com/.*\nremote:\s*$"
+            );
 
             let cleaned = re.replace(&block, "");
             if !cleaned.is_empty() {
@@ -447,9 +458,7 @@ fn pre_push() {
                 let message_body = &c.message_body;
 
                 s.spawn(move || -> Result<(), std::io::Error> {
-                    let re = GHERRIT_PR_ID_RE.get_or_init(|| {
-                        regex::Regex::new(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$").unwrap()
-                    });
+                    let re = gherrit_pr_id_re();
                     let body = re.replace(message_body, "");
 
                     // 3. Generate Metadata JSON
@@ -529,8 +538,7 @@ impl<'a> Commit<'a> {
             .map(|body| core::str::from_utf8(body).unwrap())
             .unwrap_or("");
         let gherrit_id = {
-            let re = GHERRIT_PR_ID_RE
-                .get_or_init(|| regex::Regex::new(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$").unwrap());
+            let re = gherrit_pr_id_re();
             let captures = re
                 .captures(message_body)
                 .ok_or_else(|| format!("Commit {} missing gherrit-pr-id trailer", c.id))?;
@@ -582,9 +590,7 @@ fn create_gh_pr(
     .output()?;
 
     let output = core::str::from_utf8(&output.stdout)?;
-    let re = GH_PR_URL_RE.get_or_init(|| {
-        regex::Regex::new("https://github.com/[a-zA-Z0-9]+/[a-zA-Z0-9]+/pull/([0-9]+)").unwrap()
-    });
+    let re = re!("https://github.com/[a-zA-Z0-9]+/[a-zA-Z0-9]+/pull/([0-9]+)");
     let captures = re.captures(output).unwrap();
     let pr_id = captures.get(1).unwrap();
     let pr_url = output.trim().to_string();
@@ -631,3 +637,5 @@ fn get_current_branch() -> Result<(gix::Repository, String), BranchError> {
     let branch_name = head_ref.name().shorten().to_string();
     Ok((repo, branch_name))
 }
+
+re!(gherrit_pr_id_re, r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$");
