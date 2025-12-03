@@ -2,9 +2,29 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::process::{Command, ExitStatus, Output};
 
+/// Constructs a `std::process::Command`.
+///
+/// # Usage
+///
+/// The first argument must be a string literal representing the command and any initial arguments.
+/// This string is split by whitespace to determine the command name and initial arguments.
+///
+/// Subsequent arguments are treated as individual arguments to the command. They are NOT split
+/// by whitespace, allowing for safe passing of arguments that contain spaces.
+///
+/// # Example
+///
+/// ```rust
+/// // - "git" is the command; "config" is an argument.
+/// // - "branch.{branch_name}.gherritManaged" is a single argument (even if it contains spaces when formatted).
+/// // - `state` is a single argument (even if it contains spaces when formatted).
+/// cmd!("git config", "branch.{branch_name}.gherritManaged", state)
+/// ```
 #[macro_export]
 macro_rules! cmd {
     ($bin:literal $(, $($rest:tt)*)?) => {{
+        // The first argument is a literal, so we can safely split it by whitespace.
+        // This allows `cmd!("git config", ...)` to work as expected.
         let bin_str: &str = $bin;
         let parts: Vec<&str> = bin_str.split_whitespace().collect();
         let (bin, pre_args) = match parts.as_slice() {
