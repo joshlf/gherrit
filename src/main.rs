@@ -83,7 +83,12 @@ fn post_checkout(_prev: &str, _new: &str, flag: &str) {
 
     let repo = gix::open(".").unwrap();
     let head = repo.head().unwrap();
-    let head_ref = head.try_into_referent().unwrap();
+
+    let head_ref = match head.try_into_referent() {
+        Some(referent) => referent,
+        None => return, // We are in detached HEAD (e.g. during rebase); do nothing.
+    };
+
     let branch_name = head_ref.name().shorten();
 
     // Idempotency check: Bail if the branch management state is already set.

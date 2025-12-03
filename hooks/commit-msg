@@ -31,7 +31,24 @@ if test ! -f "$1" ; then
   exit 1
 fi
 
-BRANCH=$(git symbolic-ref --short HEAD)
+BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)
+
+# If detached (empty BRANCH), check if we are in a rebase
+if [ -z "$BRANCH" ]; then
+    GIT_DIR=$(git rev-parse --git-dir)
+    
+    # Check for interactive rebase/merge state
+    if [ -f "$GIT_DIR/rebase-merge/head-name" ]; then
+        BRANCH=$(cat "$GIT_DIR/rebase-merge/head-name")
+    # Check for apply-based rebase state
+    elif [ -f "$GIT_DIR/rebase-apply/head-name" ]; then
+        BRANCH=$(cat "$GIT_DIR/rebase-apply/head-name")
+    fi
+    
+    # Strip the 'refs/heads/' prefix if we found a rebase branch
+    BRANCH=${BRANCH#refs/heads/}
+fi
+
 STATE=$(git config branch."$BRANCH".gherritState)
 
 # Strict Mode: Only add trailers if EXPLICITLY managed.
