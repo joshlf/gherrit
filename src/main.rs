@@ -429,20 +429,48 @@ fn pre_push() {
 
     thread::scope(|s| -> Result<(), Box<dyn Error>> {
         let join_handles = commits
-            .into_iter()
-            .map(|(c, parent_branch, pr_num, pr_url)| {
+            .iter()
+            .enumerate()
+            .map(|(i, (c, parent_branch, pr_num, pr_url))| {
                 let gh_pr_body_trailer = &gh_pr_body_trailer;
+
+                // Determine parent and child IDs, which may be `None` at the
+                // beginning or end of the list.
+                let parent_gherrit_id = (i > 0).then(|| commits[i - 1].0.gherrit_id);
+                let child_gherrit_id = (i < commits.len() - 1).then(|| commits[i + 1].0.gherrit_id);
+
+                let current_gherrit_id = c.gherrit_id;
+                let message_title = &c.message_title;
+                let message_body = &c.message_body;
+
                 s.spawn(move || -> Result<(), std::io::Error> {
-                    let body = c.message_body;
                     let re = GHERRIT_PR_ID_RE.get_or_init(|| {
                         regex::Regex::new(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$").unwrap()
                     });
-                    let body = re.replace(body, "");
+                    let body = re.replace(message_body, "");
 
-                    let body = format!("{body}\n\n---\n\n{gh_pr_body_trailer}");
+                    // 3. Generate Metadata JSON
+                    // We generate a JSON object stored in an HTML comment.
+                    let parent_val = parent_gherrit_id
+                        .map(|s| format!("\"{}\"", s))
+                        .unwrap_or("null".to_string());
+                    let child_val = child_gherrit_id
+                        .map(|s| format!("\"{}\"", s))
+                        .unwrap_or("null".to_string());
+
+                    let meta_json = format!(
+                        r#"{{"id": "{}", "parent": {}, "child": {}}}"#,
+                        current_gherrit_id, parent_val, child_val
+                    );
+                    let meta_footer = format!(
+                        "<!-- WARNING: GHerrit relies on the following metadata to work properly. DO NOT EDIT OR REMOVE. -->\n<!-- gherrit-meta: {meta_json} -->",
+                    );
+
+                    let body = format!("{body}\n\n---\n\n{gh_pr_body_trailer}\n{meta_footer}");
+
                     log::debug!("Updating PR #{} description...", pr_num);
                     log::info!("Updated PR #{}: {}", pr_num, pr_url);
-                    edit_gh_pr(pr_num, parent_branch, c.message_title, &body)?;
+                    edit_gh_pr(*pr_num, parent_branch, message_title, &body)?;
                     Ok(())
                 })
             })
