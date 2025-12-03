@@ -2,6 +2,8 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::process::{Command, ExitStatus, Output};
 
+use gix::bstr::ByteSlice as _;
+
 /// Constructs a `std::process::Command`.
 ///
 /// # Usage
@@ -157,4 +159,22 @@ pub fn get_config_bool(
     key: &str,
 ) -> Result<Option<bool>, gix::config::value::Error> {
     repo.config_snapshot().try_boolean(key).transpose()
+}
+
+pub fn is_newly_created_branch(
+    repo: &gix::Repository,
+    branch_name: &str,
+) -> Result<bool, Box<dyn Error>> {
+    // If this branch was just created (as opposed to having been checked out
+    // from an existing branch), then its earliest reflog entry will have the
+    // message "branch: Created from ...".
+    Ok(repo
+        .find_reference(branch_name)?
+        .log_iter()
+        .rev()?
+        .into_iter()
+        .flatten()
+        .next()
+        .transpose()?
+        .is_some_and(|log| log.message.contains_str("branch: Created from")))
 }
