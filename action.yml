@@ -1,0 +1,55 @@
+name: GHerrit – Rebase Stack
+description: 'Automatically rebase the next PR in a GHerrit stack.'
+inputs:
+  token:
+    description: '`GITHUB_TOKEN` to allow rebase and push'
+    required: true
+  pr_body:
+    description: 'The body/description of the PR that was just merged. Used to extract the child PR ID from the GHerrit metadata.'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        MERGED_PR_BODY: ${{ inputs.pr_body }}
+      run: |
+        # Extract the Child ID from the merged PR's metadata by parsing the
+        # JSON inside the HTML comment.
+        CHILD_ID=$(echo "$MERGED_PR_BODY" | grep -oP '(?<=gherrit-meta: ).*?(?= -->)' | jq -r .child)
+
+        if [ -z "$CHILD_ID" ] || [ "$CHILD_ID" == "null" ]; then
+          echo "Merged PR has no child defined in metadata. Reached top of stack."
+          exit 0
+        fi
+
+        echo "Merged PR indicates next child is ID: $CHILD_ID"
+
+        # Find the PR associated with that ID. Since GHerrit branches are
+        # named exactly after the ID (e.g. refs/heads/G...), we can lookup
+        # the PR by branch name (--head).
+        CHILD_PR=$(gh pr list --head "$CHILD_ID" --json number --jq '.[0].number')
+
+        if [ -z "$CHILD_PR" ]; then
+          echo "Error: Metadata says child is $CHILD_ID, but no open PR exists for branch '$CHILD_ID'."
+          echo "The chain might be broken or the child was deleted."
+          exit 1
+        fi
+
+        echo "Identified Child PR: #$CHILD_PR"
+
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        gh pr checkout "$CHILD_PR"
+        
+        gh pr edit "$CHILD_PR" --base main
+        
+        if ! git rebase origin/main; then
+            echo "::error::Rebase conflict for PR #$CHILD_PR. Manual intervention required."
+            exit 1
+        fi
+        
+        git push --force-with-lease
