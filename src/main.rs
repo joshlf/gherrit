@@ -52,8 +52,8 @@ fn main() {
 }
 
 macro_rules! cmd {
-    ($bin:expr $(, $($rest:tt)*)?) => {{
-        let bin_str = $bin.to_string();
+    ($bin:literal $(, $($rest:tt)*)?) => {{
+        let bin_str: &str = $bin;
         let parts: Vec<&str> = bin_str.split_whitespace().collect();
         let (bin, pre_args) = match parts.as_slice() {
             [bin, args @ ..] => (bin, args),
@@ -72,27 +72,18 @@ macro_rules! cmd {
         cmd(bin, &args)
     }};
 
-    // 1. Parenthesized group: ($(...))
-    (@inner $vec:ident, ($($fmt:tt)+) $(, $($rest:tt)*)?) => {
-        $vec.push(format!($($fmt)+));
-        cmd!(@inner $vec $(, $($rest)*)?);
-    };
-
-    // 2. String literal
+    // String literal (treated as a format string, but not broken apart).
     (@inner $vec:ident, $l:literal $(, $($rest:tt)*)?) => {
-        for s in $l.split_whitespace() {
-            $vec.push(s.to_string());
-        }
+        $vec.push(format!($l));
         cmd!(@inner $vec $(, $($rest)*)?);
     };
 
-    // 3. Expression
+    // Expression (not broken apart).
     (@inner $vec:ident, $e:expr $(, $($rest:tt)*)?) => {
         $vec.push($e.to_string());
         cmd!(@inner $vec $(, $($rest)*)?);
     };
 
-    // Base cases
     (@inner $vec:ident $(,)?) => {};
 }
 
@@ -101,12 +92,7 @@ fn manage() {
     let head_ref = repo.head().unwrap().try_into_referent().unwrap();
     let branch_name = head_ref.name().shorten();
 
-    cmd!(
-        "git config",
-        ("branch.{}.gherritState", branch_name),
-        "managed"
-    )
-    .unwrap_status();
+    cmd!("git config", "branch.{branch_name}.gherritState", "managed").unwrap_status();
     log::info!("Branch '{}' is now managed by GHerrit.", branch_name);
 }
 
@@ -115,12 +101,7 @@ fn unmanage() {
     let head_ref = repo.head().unwrap().try_into_referent().unwrap();
     let branch_name = head_ref.name().shorten();
 
-    cmd!(
-        "git config",
-        ("branch.{}.gherritState", branch_name),
-        "unmanaged"
-    )
-    .unwrap_status();
+    cmd!("git config", "branch.{branch_name}.gherritState", "unmanaged").unwrap_status();
     eprintln!("Branch '{}' is now unmanaged by GHerrit.", branch_name);
 }
 
@@ -141,23 +122,23 @@ fn post_checkout(_prev: &str, _new: &str, flag: &str) {
     let branch_name = head_ref.name().shorten();
 
     // Idempotency check: Bail if the branch management state is already set.
-    let config_output = cmd!("git config", ("branch.{}.gherritState", branch_name)).unwrap_output();
+    let config_output = cmd!("git config", "branch.{branch_name}.gherritState").unwrap_output();
     if config_output.status.success() {
         log::debug!("Branch '{}' is already configured.", branch_name);
         return;
     }
 
     // Creation detection: Bail if we're just checking out an already-existing branch.
-    let reflog_output = cmd!("git reflog show", branch_name, "-n1").unwrap_output();
+    let reflog_output = cmd!("git reflog show {branch_name} -n1").unwrap_output();
     let reflog_stdout = String::from_utf8_lossy(&reflog_output.stdout);
     if !reflog_stdout.contains("branch: Created from") {
         log::debug!("Branch '{}' is not newly created.", branch_name);
         return;
     }
 
-    let upstream_remote = cmd!("git config", ("branch.{}.remote", branch_name)).unwrap_output();
+    let upstream_remote = cmd!("git config", "branch.{branch_name}.remote").unwrap_output();
 
-    let upstream_merge = cmd!("git config", ("branch.{}.merge", branch_name)).unwrap_output();
+    let upstream_merge = cmd!("git config", "branch.{branch_name}.merge").unwrap_output();
 
     let has_upstream = upstream_remote.status.success() && upstream_merge.status.success();
     let is_origin_main = if has_upstream {
@@ -190,7 +171,7 @@ fn pre_push() {
 
     // Step 1: Resolve State
     let state = to_trimmed_string_lossy(
-        &cmd!("git config --get", ("branch.{}.gherritState", branch_name),)
+        &cmd!("git config --get", "branch.{branch_name}.gherritState")
             .unwrap_output()
             .stdout,
     );
@@ -263,8 +244,8 @@ fn pre_push() {
         return;
     }
 
-    let config_key = format!("branch.{}.gherritPrivate", branch_name);
-    let config_output = cmd!("git config --get --bool", &config_key).unwrap_output();
+    let config_output =
+        cmd!("git config --get --bool", "branch.{branch_name}.gherritPrivate").unwrap_output();
 
     let is_private = if config_output.status.success() {
         // If config is set, respect it (true/false)
@@ -522,7 +503,7 @@ fn pre_push() {
             "       To enable pushing this branch to 'origin/{}':",
             branch_name
         );
-        log::info!("       git config {} false", config_key);
+        log::info!("       git config branch.{branch_name}.gherritPrivate false");
         log::info!("-------------------------------------------------------------------------");
 
         // Exit with failure (1) to stop Git from proceeding with the standard push
@@ -624,13 +605,13 @@ fn edit_gh_pr(
     let pr_num = format!("{pr_num}");
     let mut c = cmd!(
         "gh pr edit",
-        &pr_num,
+        pr_num,
         "--base",
         base_branch,
         "--title",
         title,
         "--body",
-        body,
+        body
     );
 
     c.stdout(Stdio::null()).status()
