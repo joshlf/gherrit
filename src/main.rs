@@ -263,6 +263,17 @@ fn pre_push() {
         return;
     }
 
+    let config_key = format!("branch.{}.gherritPrivate", branch_name);
+    let config_output = cmd!("git config --get --bool", &config_key).unwrap_output();
+
+    let is_private = if config_output.status.success() {
+        // If config is set, respect it (true/false)
+        to_trimmed_string_lossy(&config_output.stdout) == "true"
+    } else {
+        // If config is unset, DEFAULT TO TRUE (Private)
+        true
+    };
+
     let mut args = vec![
         "push".to_string(),
         "--quiet".to_string(),
@@ -410,16 +421,20 @@ fn pre_push() {
     // Attempt to resolve `HEAD` to a branch name so that we can refer to it
     // in PR bodies. If we can't, then silently fail and just don't include
     // that information in PR bodies.
-    let head_branch_markdown = repo
-        .head()
-        .ok()
-        .and_then(|head| head.try_into_referent())
-        .and_then(|head_ref| {
-            let (cat, short_name) = head_ref.inner.name.category_and_short_name()?;
-            (cat == Category::LocalBranch)
-                .then(|| format!("This PR is on branch [{short_name}](../tree/{short_name}).\n\n"))
-        })
-        .unwrap_or("".to_string());
+    let head_branch_markdown = if !is_private {
+        repo.head()
+            .ok()
+            .and_then(|head| head.try_into_referent())
+            .and_then(|head_ref| {
+                let (cat, short_name) = head_ref.inner.name.category_and_short_name()?;
+                (cat == Category::LocalBranch).then(|| {
+                    format!("This PR is on branch [{short_name}](../tree/{short_name}).\n\n")
+                })
+            })
+            .unwrap_or("".to_string())
+    } else {
+        "".to_string()
+    };
 
     // A markdown bulleted list of links to each PR, with the "top" PR (the
     // furthest from `main`) at the top of the list.
@@ -495,17 +510,6 @@ fn pre_push() {
         Ok(())
     })
     .unwrap();
-
-    let config_key = format!("branch.{}.gherritPrivate", branch_name);
-    let config_output = cmd!("git config --get --bool", &config_key).unwrap_output();
-
-    let is_private = if config_output.status.success() {
-        // If config is set, respect it (true/false)
-        to_trimmed_string_lossy(&config_output.stdout) == "true"
-    } else {
-        // If config is unset, DEFAULT TO TRUE (Private)
-        true
-    };
 
     if is_private {
         log::info!("-------------------------------------------------------------------------");
