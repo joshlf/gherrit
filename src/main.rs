@@ -274,7 +274,70 @@ fn pre_push() {
     );
 
     log::info!("Pushing {} commits to origin...", commits.len());
-    let status = cmd("git", args).status().unwrap();
+    let mut child = cmd("git", args)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Filter out the "Create a pull request" message from GitHub:
+    //
+    //   remote:
+    //   remote: Create a pull request for 'G7a4e64a53733779e8f32b7258d5083e5b15ea91d' on GitHub by visiting:
+    //   remote:      https://github.com/joshlf/gherrit/pull/new/G7a4e64a53733779e8f32b7258d5083e5b15ea91d
+    //   remote:
+    //
+    // We conservatively match as much of this pattern as possible to avoid false positives
+    // (which would result in us swallowing important errors).
+    {
+        use std::io::{BufRead, BufReader};
+        let stderr = child.stderr.take().unwrap();
+        let reader = BufReader::new(stderr);
+
+        let mut buffer: Vec<String> = Vec::new();
+        for line in reader.lines() {
+            let line = line.unwrap();
+            buffer.push(line);
+
+            // Check if buffer *could* be the start of the pattern
+            let is_prefix = match buffer.len() {
+                1 => buffer[0].trim() == "remote:",
+                2 => {
+                    buffer[0].trim() == "remote:"
+                        && buffer[1].contains("remote: Create a pull request for")
+                }
+                3 => {
+                    buffer[0].trim() == "remote:"
+                        && buffer[1].contains("remote: Create a pull request for")
+                        && buffer[2].contains("https://github.com/")
+                }
+                4 => {
+                    let match_found = buffer[0].trim() == "remote:"
+                        && buffer[1].contains("remote: Create a pull request for")
+                        && buffer[2].contains("https://github.com/")
+                        && buffer[3].trim() == "remote:";
+                    if match_found {
+                        buffer.clear(); // Suppress!
+                        continue;
+                    }
+                    false // Not a match
+                }
+                _ => false,
+            };
+
+            if !is_prefix {
+                for l in buffer.drain(..) {
+                    eprintln!("{}", l);
+                }
+            }
+        }
+        // Flush remaining
+        for l in buffer {
+            eprintln!("{}", l);
+        }
+    }
+
+    let status = child.wait().unwrap();
     if !status.success() {
         log::error!("`git push` failed. You may need to `git pull --rebase`.");
         std::process::exit(1);
