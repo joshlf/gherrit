@@ -76,6 +76,26 @@ impl CommandExt for Command {
     }
 }
 
+pub trait ResultExt<T, E> {
+    fn unwrap_or_exit(self, prefix: &str) -> T;
+}
+
+impl<T, E: std::fmt::Display> ResultExt<T, E> for Result<T, E> {
+    fn unwrap_or_exit(self, prefix: &str) -> T {
+        match self {
+            Ok(t) => t,
+            Err(e) => {
+                if prefix.is_empty() {
+                    log::error!("{}", e);
+                } else {
+                    log::error!("{}: {}", prefix, e);
+                }
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 pub fn to_trimmed_string_lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_string()
 }

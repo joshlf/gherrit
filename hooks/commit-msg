@@ -49,11 +49,11 @@ if [ -z "$BRANCH" ]; then
     BRANCH=${BRANCH#refs/heads/}
 fi
 
-STATE=$(git config branch."$BRANCH".gherritState)
+MANAGED=$(git config --type=bool branch."$BRANCH".gherritManaged)
 
 # Strict Mode: Only add trailers if EXPLICITLY managed.
 # If 'unmanaged' OR 'unset', we do nothing.
-if [ "$STATE" != "managed" ]; then
+if [ "$MANAGED" != "true" ]; then
     exit 0
 fi
 

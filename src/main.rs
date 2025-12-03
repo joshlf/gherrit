@@ -17,7 +17,7 @@ use gix::{reference::Category, refs::transaction::PreviousValue, ObjectId};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::util::CommandExt as _;
+use crate::util::{CommandExt as _, ResultExt as _};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -70,16 +70,12 @@ macro_rules! re {
 fn pre_push() {
     let t0 = Instant::now();
 
-    let (repo, branch_name) = util::get_current_branch().unwrap();
+    let (repo, branch_name) =
+        util::get_current_branch().unwrap_or_exit("Failed to get current branch");
 
     // Step 1: Resolve State
-    let state = match manage::get_state(&repo, &branch_name) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("Failed to parse gherritState: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let state =
+        manage::get_state(&repo, &branch_name).unwrap_or_exit("Failed to parse gherritManaged");
 
     match state {
         Some(manage::State::Unmanaged) => {
