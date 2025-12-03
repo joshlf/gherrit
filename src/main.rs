@@ -258,6 +258,11 @@ fn pre_push() {
     let t3 = Instant::now();
     log::trace!("t2 -> t3: {:?}", t3 - t2);
 
+    if commits.is_empty() {
+        log::info!("No commits to sync.");
+        return;
+    }
+
     let mut args = vec![
         "push".to_string(),
         "--quiet".to_string(),
