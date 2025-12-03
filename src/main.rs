@@ -5,7 +5,7 @@ use std::{
     env,
     error::Error,
     ffi::OsStr,
-    process::{Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus, Output, Stdio},
     sync::OnceLock,
     thread,
     time::Instant,
@@ -39,21 +39,56 @@ fn main() {
     }
 }
 
+macro_rules! cmd {
+    ($bin:expr $(, $($rest:tt)*)?) => {{
+        let bin_str = $bin.to_string();
+        let parts: Vec<&str> = bin_str.split_whitespace().collect();
+        let (bin, pre_args) = match parts.as_slice() {
+            [bin, args @ ..] => (bin, args),
+            [] => panic!("Command cannot be empty"),
+        };
+
+        #[allow(unused_mut)]
+        let mut args: Vec<String> = pre_args.iter().map(|s| s.to_string()).collect();
+        cmd!(@inner args $(, $($rest)*)?);
+        cmd(bin, &args)
+    }};
+
+    // 1. Parenthesized group: ($(...))
+    (@inner $vec:ident, ($($fmt:tt)+) $(, $($rest:tt)*)?) => {
+        $vec.push(format!($($fmt)+));
+        cmd!(@inner $vec $(, $($rest)*)?);
+    };
+
+    // 2. String literal
+    (@inner $vec:ident, $l:literal $(, $($rest:tt)*)?) => {
+        for s in $l.split_whitespace() {
+            $vec.push(s.to_string());
+        }
+        cmd!(@inner $vec $(, $($rest)*)?);
+    };
+
+    // 3. Expression
+    (@inner $vec:ident, $e:expr $(, $($rest:tt)*)?) => {
+        $vec.push($e.to_string());
+        cmd!(@inner $vec $(, $($rest)*)?);
+    };
+
+    // Base cases
+    (@inner $vec:ident $(,)?) => {};
+}
+
 fn manage() {
     let repo = gix::open(".").unwrap();
     let head_ref = repo.head().unwrap().try_into_referent().unwrap();
     let branch_name = head_ref.name().shorten();
 
-    cmd(
-        "git",
-        [
-            "config",
-            &format!("branch.{}.gherritState", branch_name),
-            "managed",
-        ],
+    cmd!(
+        "git config",
+        ("branch.{}.gherritState", branch_name),
+        "managed"
     )
-    .status()
-    .unwrap();
+    .unwrap_status();
     eprintln!("Branch '{}' is now managed by GHerrit.", branch_name);
 }
 
@@ -62,16 +97,12 @@ fn unmanage() {
     let head_ref = repo.head().unwrap().try_into_referent().unwrap();
     let branch_name = head_ref.name().shorten();
 
-    cmd(
-        "git",
-        [
-            "config",
-            &format!("branch.{}.gherritState", branch_name),
-            "unmanaged",
-        ],
+    cmd!(
+        "git config",
+        ("branch.{}.gherritState", branch_name),
+        "unmanaged"
     )
-    .status()
-    .unwrap();
+    .unwrap_status();
     eprintln!("Branch '{}' is now unmanaged by GHerrit.", branch_name);
 }
 
@@ -92,41 +123,21 @@ fn post_checkout(_prev: &str, _new: &str, flag: &str) {
     let branch_name = head_ref.name().shorten();
 
     // Idempotency check: Bail if the branch management state is already set.
-    let config_output = cmd(
-        "git",
-        ["config", &format!("branch.{}.gherritState", branch_name)],
-    )
-    .output()
-    .unwrap();
+    let config_output = cmd!("git config", ("branch.{}.gherritState", branch_name)).unwrap_output();
     if config_output.status.success() {
         return;
     }
 
     // Creation detection: Bail if we're just checking out an already-existing branch.
-    let reflog_output = cmd(
-        "git",
-        ["reflog", "show", branch_name.to_string().as_str(), "-n1"],
-    )
-    .output()
-    .unwrap();
+    let reflog_output = cmd!("git reflog show", branch_name, "-n1").unwrap_output();
     let reflog_stdout = String::from_utf8_lossy(&reflog_output.stdout);
     if !reflog_stdout.contains("branch: Created from") {
         return;
     }
 
-    let upstream_remote = cmd(
-        "git",
-        ["config", "--get", &format!("branch.{}.remote", branch_name)],
-    )
-    .output()
-    .unwrap();
+    let upstream_remote = cmd!("git config", ("branch.{}.remote", branch_name)).unwrap_output();
 
-    let upstream_merge = cmd(
-        "git",
-        ["config", "--get", &format!("branch.{}.merge", branch_name)],
-    )
-    .output()
-    .unwrap();
+    let upstream_merge = cmd!("git config", ("branch.{}.merge", branch_name)).unwrap_output();
 
     let has_upstream = upstream_remote.status.success() && upstream_merge.status.success();
     let is_origin_main = if has_upstream {
@@ -159,17 +170,9 @@ fn pre_push() {
 
     // Step 1: Resolve State
     let state = to_trimmed_string_lossy(
-        &cmd(
-            "git",
-            [
-                "config",
-                "--get",
-                &format!("branch.{}.gherritState", branch_name),
-            ],
-        )
-        .output()
-        .unwrap()
-        .stdout,
+        &cmd!("git config --get", ("branch.{}.gherritState", branch_name),)
+            .unwrap_output()
+            .stdout,
     );
 
     match state.as_str() {
@@ -247,9 +250,7 @@ fn pre_push() {
         std::process::exit(1);
     }
 
-    let pr_list = cmd("gh", ["pr", "list", "--json", "number,headRefName"])
-        .output()
-        .unwrap();
+    let pr_list = cmd!("gh pr list --json number,headRefName").unwrap_output();
 
     let t4 = Instant::now();
     println!("t3 -> t4: {:?}", t4 - t3);
@@ -380,9 +381,7 @@ fn pre_push() {
     .unwrap();
 
     let config_key = format!("branch.{}.gherritPrivate", branch_name);
-    let config_output = cmd("git", ["config", "--get", "--bool", &config_key])
-        .output()
-        .unwrap();
+    let config_output = cmd!("git config --get --bool", &config_key).unwrap_output();
 
     let is_private = if config_output.status.success() {
         // If config is set, respect it (true/false)
@@ -399,12 +398,15 @@ fn pre_push() {
         eprintln!(" [gherrit] NOTE: Standard 'git push' was blocked to keep origin clean.");
         eprintln!("           Your changes are already active on GitHub (via GHerrit refs).");
         eprintln!("");
-        eprintln!("           To enable pushing this branch to 'origin/{}':", branch_name);
+        eprintln!(
+            "           To enable pushing this branch to 'origin/{}':",
+            branch_name
+        );
         eprintln!("           git config {} false", config_key);
         eprintln!("-------------------------------------------------------------------------");
-        
+
         // Exit with failure (1) to stop Git from proceeding with the standard push
-        std::process::exit(1); 
+        std::process::exit(1);
     }
 }
 
@@ -447,26 +449,37 @@ fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Comman
     c
 }
 
+trait CommandExt {
+    fn unwrap_status(self) -> ExitStatus;
+
+    fn unwrap_output(self) -> Output;
+}
+
+impl CommandExt for Command {
+    fn unwrap_status(mut self) -> ExitStatus {
+        self.status().unwrap()
+    }
+
+    fn unwrap_output(mut self) -> Output {
+        self.output().unwrap()
+    }
+}
+
 fn create_gh_pr(
     base_branch: &str,
     head_branch: &str,
     title: &str,
     body: &str,
 ) -> Result<usize, Box<dyn Error + Send + Sync>> {
-    let output = cmd(
-        "gh",
-        [
-            "pr",
-            "create",
-            "--base",
-            base_branch,
-            "--head",
-            head_branch,
-            "--title",
-            title,
-            "--body",
-            body,
-        ],
+    let output = cmd!(
+        "gh pr create --base",
+        base_branch,
+        "--head",
+        head_branch,
+        "--title",
+        title,
+        "--body",
+        body,
     )
     .stderr(Stdio::inherit())
     .output()?;
@@ -487,19 +500,15 @@ fn edit_gh_pr(
     body: &str,
 ) -> Result<ExitStatus, std::io::Error> {
     let pr_num = format!("{pr_num}");
-    let mut c = cmd(
-        "gh",
-        [
-            "pr",
-            "edit",
-            &pr_num,
-            "--base",
-            base_branch,
-            "--title",
-            title,
-            "--body",
-            body,
-        ],
+    let mut c = cmd!(
+        "gh pr edit",
+        &pr_num,
+        "--base",
+        base_branch,
+        "--title",
+        title,
+        "--body",
+        body,
     );
 
     c.stdout(Stdio::null()).status()
