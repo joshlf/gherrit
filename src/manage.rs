@@ -1,18 +1,36 @@
 use crate::cmd;
 use crate::util::{self, BranchError, CommandExt};
+use std::str::FromStr;
+use strum::{Display, EnumString, ParseError};
 
-pub fn manage() {
-    let (_, branch_name) = util::get_current_branch().unwrap();
-
-    cmd!("git config", "branch.{branch_name}.gherritState", "managed").unwrap_status();
-    log::info!("Branch '{}' is now managed by GHerrit.", branch_name);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString)]
+#[strum(serialize_all = "snake_case")]
+pub enum State {
+    Managed,
+    Unmanaged,
 }
 
-pub fn unmanage() {
+pub fn get_state(repo: &gix::Repository, branch_name: &str) -> Result<Option<State>, ParseError> {
+    let snapshot = repo.config_snapshot();
+    let key = format!("branch.{}.gherritState", branch_name);
+    match snapshot.string(key.as_str()) {
+        Some(cow) => {
+            let state_str = util::to_trimmed_string_lossy(cow.as_ref());
+            let state = State::from_str(&state_str)?;
+            Ok(Some(state))
+        }
+        None => Ok(None),
+    }
+}
+
+pub fn set_state(state: State) {
     let (_, branch_name) = util::get_current_branch().unwrap();
 
     cmd!("git config", "branch.{branch_name}.gherritState", "unmanaged").unwrap_status();
-    eprintln!("Branch '{}' is now unmanaged by GHerrit.", branch_name);
+    match state {
+        State::Managed => log::info!("Branch '{}' is now managed by GHerrit.", branch_name),
+        State::Unmanaged => eprintln!("Branch '{}' is now unmanaged by GHerrit.", branch_name),
+    }
 }
 
 pub fn post_checkout(_prev: &str, _new: &str, flag: &str) {
@@ -21,7 +39,7 @@ pub fn post_checkout(_prev: &str, _new: &str, flag: &str) {
         return;
     }
 
-    let (_repo, branch_name) = match util::get_current_branch() {
+    let (repo, branch_name) = match util::get_current_branch() {
         Ok(res) => res,
         Err(BranchError::DetachedHead) => return, // Detached HEAD (e.g. during rebase); do nothing.
         Err(e) => {
@@ -31,10 +49,16 @@ pub fn post_checkout(_prev: &str, _new: &str, flag: &str) {
     };
 
     // Idempotency check: Bail if the branch management state is already set.
-    let config_output = cmd!("git config", "branch.{branch_name}.gherritState").unwrap_output();
-    if config_output.status.success() {
-        log::debug!("Branch '{}' is already configured.", branch_name);
-        return;
+    match get_state(&repo, &branch_name) {
+        Ok(Some(_)) => {
+            log::debug!("Branch '{}' is already configured.", branch_name);
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            log::error!("Failed to parse gherritState: {}", e);
+            return;
+        }
     }
 
     // Creation detection: Bail if we're just checking out an already-existing branch.
@@ -60,11 +84,11 @@ pub fn post_checkout(_prev: &str, _new: &str, flag: &str) {
 
     if has_upstream && !is_origin_main {
         // Condition A: Shared Branch
-        unmanage();
+        set_state(State::Unmanaged);
         log::info!("Branch initialized as UNMANAGED (Collaboration Mode).");
     } else {
         // Condition B: New Stack
-        manage();
+        set_state(State::Managed);
         log::info!("Branch initialized as MANAGED (Stack Mode).");
         log::info!("To opt-out, run: gherrit unmanage");
     }
