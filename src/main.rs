@@ -1,11 +1,13 @@
 #![feature(iterator_try_collect, iter_intersperse)]
 
+mod manage;
+mod util;
+
 use core::str;
 use std::{
     env,
     error::Error,
-    ffi::OsStr,
-    process::{Command, ExitStatus, Output, Stdio},
+    process::{ExitStatus, Stdio},
     sync::OnceLock,
     thread,
     time::Instant,
@@ -14,6 +16,8 @@ use std::{
 use gix::{reference::Category, refs::transaction::PreviousValue, ObjectId};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+
+use crate::util::CommandExt as _;
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -33,9 +37,9 @@ fn main() {
     match args.as_slice() {
         [_, "pre-push"] => pre_push(),
         [_, "commit-msg"] => unimplemented!(),
-        [_, "manage"] => manage(),
-        [_, "unmanage"] => unmanage(),
-        [_, "post-checkout", prev, new, flag] => post_checkout(prev, new, flag),
+        [_, "manage"] => manage::manage(),
+        [_, "unmanage"] => manage::unmanage(),
+        [_, "post-checkout", prev, new, flag] => manage::post_checkout(prev, new, flag),
         _ => {
             eprintln!("Usage:");
             eprintln!("    {} pre-push", args[0]);
@@ -46,42 +50,6 @@ fn main() {
             std::process::exit(1);
         }
     }
-}
-
-macro_rules! cmd {
-    ($bin:literal $(, $($rest:tt)*)?) => {{
-        let bin_str: &str = $bin;
-        let parts: Vec<&str> = bin_str.split_whitespace().collect();
-        let (bin, pre_args) = match parts.as_slice() {
-            [bin, args @ ..] => (bin, args),
-            [] => panic!("Command cannot be empty"),
-        };
-
-        #[allow(unused_mut)]
-        let mut args: Vec<String> = pre_args.iter().map(|s| s.to_string()).collect();
-        cmd!(@inner args $(, $($rest)*)?);
-
-        log::debug!("exec: {} {}", bin, args.iter().map(|s| if s.contains(" ") {
-            format!("'{}'", s)
-        } else {
-            s.clone()
-        }).collect::<Vec<_>>().join(" "));
-        cmd(bin, &args)
-    }};
-
-    // String literal (treated as a format string, but not broken apart).
-    (@inner $vec:ident, $l:literal $(, $($rest:tt)*)?) => {
-        $vec.push(format!($l));
-        cmd!(@inner $vec $(, $($rest)*)?);
-    };
-
-    // Expression (not broken apart).
-    (@inner $vec:ident, $e:expr $(, $($rest:tt)*)?) => {
-        $vec.push($e.to_string());
-        cmd!(@inner $vec $(, $($rest)*)?);
-    };
-
-    (@inner $vec:ident $(,)?) => {};
 }
 
 macro_rules! re {
@@ -99,82 +67,13 @@ macro_rules! re {
     }};
 }
 
-fn manage() {
-    let (_, branch_name) = get_current_branch().unwrap();
-
-    cmd!("git config", "branch.{branch_name}.gherritState", "managed").unwrap_status();
-    log::info!("Branch '{}' is now managed by GHerrit.", branch_name);
-}
-
-fn unmanage() {
-    let (_, branch_name) = get_current_branch().unwrap();
-
-    cmd!("git config", "branch.{branch_name}.gherritState", "unmanaged").unwrap_status();
-    eprintln!("Branch '{}' is now unmanaged by GHerrit.", branch_name);
-}
-
-fn post_checkout(_prev: &str, _new: &str, flag: &str) {
-    // Only run on branch switches (flag=1)
-    if flag != "1" {
-        return;
-    }
-
-    let (_repo, branch_name) = match get_current_branch() {
-        Ok(res) => res,
-        Err(BranchError::DetachedHead) => return, // Detached HEAD (e.g. during rebase); do nothing.
-        Err(e) => {
-            log::error!("Failed to get current branch: {}", e);
-            return;
-        }
-    };
-
-    // Idempotency check: Bail if the branch management state is already set.
-    let config_output = cmd!("git config", "branch.{branch_name}.gherritState").unwrap_output();
-    if config_output.status.success() {
-        log::debug!("Branch '{}' is already configured.", branch_name);
-        return;
-    }
-
-    // Creation detection: Bail if we're just checking out an already-existing branch.
-    let reflog_output = cmd!("git reflog show {branch_name} -n1").unwrap_output();
-    let reflog_stdout = String::from_utf8_lossy(&reflog_output.stdout);
-    if !reflog_stdout.contains("branch: Created from") {
-        log::debug!("Branch '{}' is not newly created.", branch_name);
-        return;
-    }
-
-    let upstream_remote = cmd!("git config", "branch.{branch_name}.remote").unwrap_output();
-
-    let upstream_merge = cmd!("git config", "branch.{branch_name}.merge").unwrap_output();
-
-    let has_upstream = upstream_remote.status.success() && upstream_merge.status.success();
-    let is_origin_main = if has_upstream {
-        let remote = to_trimmed_string_lossy(&upstream_remote.stdout);
-        let merge = to_trimmed_string_lossy(&upstream_merge.stdout);
-        remote == "origin" && merge == "refs/heads/main"
-    } else {
-        false
-    };
-
-    if has_upstream && !is_origin_main {
-        // Condition A: Shared Branch
-        unmanage();
-        log::info!("Branch initialized as UNMANAGED (Collaboration Mode).");
-    } else {
-        // Condition B: New Stack
-        manage();
-        log::info!("Branch initialized as MANAGED (Stack Mode).");
-        log::info!("To opt-out, run: gherrit unmanage");
-    }
-}
-
 fn pre_push() {
     let t0 = Instant::now();
 
-    let (repo, branch_name) = get_current_branch().unwrap();
+    let (repo, branch_name) = util::get_current_branch().unwrap();
 
     // Step 1: Resolve State
-    let state = to_trimmed_string_lossy(
+    let state = util::to_trimmed_string_lossy(
         &cmd!("git config --get", "branch.{branch_name}.gherritState")
             .unwrap_output()
             .stdout,
@@ -253,7 +152,7 @@ fn pre_push() {
 
     let is_private = if config_output.status.success() {
         // If config is set, respect it (true/false)
-        to_trimmed_string_lossy(&config_output.stdout) == "true"
+        util::to_trimmed_string_lossy(&config_output.stdout) == "true"
     } else {
         // If config is unset, DEFAULT TO TRUE (Private)
         true
@@ -275,7 +174,7 @@ fn pre_push() {
     );
 
     log::info!("Pushing {} commits to origin...", commits.len());
-    let mut child = cmd("git", args)
+    let mut child = util::cmd("git", args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
         .spawn()
@@ -545,28 +444,6 @@ impl<'a> Commit<'a> {
     }
 }
 
-fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Command {
-    let mut c = Command::new(name);
-    c.args(args);
-    c
-}
-
-trait CommandExt {
-    fn unwrap_status(self) -> ExitStatus;
-
-    fn unwrap_output(self) -> Output;
-}
-
-impl CommandExt for Command {
-    fn unwrap_status(mut self) -> ExitStatus {
-        self.status().unwrap()
-    }
-
-    fn unwrap_output(mut self) -> Output {
-        self.output().unwrap()
-    }
-}
-
 fn create_gh_pr(
     base_branch: &str,
     head_branch: &str,
@@ -613,35 +490,6 @@ fn edit_gh_pr(
     );
 
     c.stdout(Stdio::null()).status()
-}
-
-fn to_trimmed_string_lossy(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).trim().to_string()
-}
-
-#[derive(Debug)]
-enum BranchError {
-    DetachedHead,
-    Gix(Box<dyn Error>),
-}
-
-impl std::fmt::Display for BranchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BranchError::DetachedHead => write!(f, "Detached HEAD"),
-            BranchError::Gix(e) => write!(f, "Gix error: {}", e),
-        }
-    }
-}
-
-impl Error for BranchError {}
-
-fn get_current_branch() -> Result<(gix::Repository, String), BranchError> {
-    let repo = gix::open(".").map_err(|e| BranchError::Gix(Box::new(e)))?;
-    let head = repo.head().map_err(|e| BranchError::Gix(Box::new(e)))?;
-    let head_ref = head.try_into_referent().ok_or(BranchError::DetachedHead)?;
-    let branch_name = head_ref.name().shorten().to_string();
-    Ok((repo, branch_name))
 }
 
 re!(gherrit_pr_id_re, r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$");
