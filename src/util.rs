@@ -4,49 +4,28 @@ use std::process::{Command, ExitStatus, Output};
 
 #[macro_export]
 macro_rules! cmd {
-    ($bin:literal $(, $($rest:tt)*)?) => {{
-        let bin_str = format!($bin);
+    ($cmd:literal) => {{
+        let bin_str = format!($cmd);
         let parts: Vec<&str> = bin_str.split_whitespace().collect();
-        let (bin, pre_args) = match parts.as_slice() {
+        let (bin, args) = match parts.as_slice() {
             [bin, args @ ..] => (bin, args),
             [] => panic!("Command cannot be empty"),
         };
 
-        #[allow(unused_mut)]
-        let mut args: Vec<String> = pre_args.iter().map(|s| s.to_string()).collect();
-        cmd!(@inner args $(, $($rest)*)?);
-
-        log::debug!("exec: {} {}", bin, args.iter().map(|s| if s.contains(" ") {
-            format!("'{}'", s)
-        } else {
-            s.clone()
-        }).collect::<Vec<_>>().join(" "));
-        $crate::util::cmd(bin, &args)
+        log::debug!(
+            "exec: {} {}",
+            bin,
+            args.iter()
+                .map(|s| if s.contains(" ") {
+                    format!("'{}'", s)
+                } else {
+                    s.to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        $crate::util::cmd(bin, args)
     }};
-
-    // Parenthesized group: ($(...))
-    (@inner $vec:ident, ($($fmt:tt)+) $(, $($rest:tt)*)?) => {
-        $vec.push(format!($($fmt)+));
-        cmd!(@inner $vec $(, $($rest)*)?);
-    };
-
-    // String literal (treated as a format string)
-    (@inner $vec:ident, $l:literal $(, $($rest:tt)*)?) => {
-        let formatted = format!($l);
-        for s in formatted.split_whitespace() {
-            $vec.push(s.to_string());
-        }
-        cmd!(@inner $vec $(, $($rest)*)?);
-    };
-
-    // Expression
-    (@inner $vec:ident, $e:expr $(, $($rest:tt)*)?) => {
-        $vec.push($e.to_string());
-        cmd!(@inner $vec $(, $($rest)*)?);
-    };
-
-    // Base cases
-    (@inner $vec:ident $(,)?) => {};
 }
 
 #[macro_export]
