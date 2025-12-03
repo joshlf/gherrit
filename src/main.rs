@@ -293,7 +293,6 @@ fn pre_push() {
         url: String,
     }
 
-    // TODO: Be more robust: allow whitespace
     let prs: Vec<ListEntry> = if pr_list.stdout.is_empty() {
         vec![]
     } else {
@@ -459,8 +458,9 @@ impl<'a> Commit<'a> {
         let gherrit_id = {
             let re = GHERRIT_PR_ID_RE
                 .get_or_init(|| regex::Regex::new(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$").unwrap());
-            // TODO: Return error here instead of unwrapping.
-            let captures = re.captures(message_body).unwrap();
+            let captures = re
+                .captures(message_body)
+                .ok_or_else(|| format!("Commit {} missing gherrit-pr-id trailer", c.id))?;
             let gherrit_id = captures.get(1).unwrap().as_str();
             gherrit_id
         };
