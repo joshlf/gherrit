@@ -116,9 +116,7 @@ impl<T, E: std::fmt::Display> ResultExt<T, E> for Result<T, E> {
     }
 }
 
-pub fn to_trimmed_string_lossy(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).trim().to_string()
-}
+
 
 #[derive(Debug)]
 pub enum BranchError {
@@ -143,4 +141,22 @@ pub fn get_current_branch() -> Result<(gix::Repository, String), BranchError> {
     let head_ref = head.try_into_referent().ok_or(BranchError::DetachedHead)?;
     let branch_name = head_ref.name().shorten().to_string();
     Ok((repo, branch_name))
+}
+
+pub fn get_config_string(
+    repo: &gix::Repository,
+    key: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let Some(cow) = repo.config_snapshot().string(key) else {
+        return Ok(None);
+    };
+    let s = std::str::from_utf8(cow.as_ref())?;
+    Ok(Some(s.trim().to_string()))
+}
+
+pub fn get_config_bool(
+    repo: &gix::Repository,
+    key: &str,
+) -> Result<Option<bool>, gix::config::value::Error> {
+    repo.config_snapshot().try_boolean(key).transpose()
 }
