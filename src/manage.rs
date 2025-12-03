@@ -1,18 +1,19 @@
 use crate::cmd;
-use crate::util::{self, BranchError, CommandExt};
+use crate::util::{self, BranchError, CommandExt, ResultExt as _};
 use std::str::FromStr;
 use strum::{Display, EnumString, ParseError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString)]
-#[strum(serialize_all = "snake_case")]
 pub enum State {
+    #[strum(serialize = "true")]
     Managed,
+    #[strum(serialize = "false")]
     Unmanaged,
 }
 
 pub fn get_state(repo: &gix::Repository, branch_name: &str) -> Result<Option<State>, ParseError> {
     let snapshot = repo.config_snapshot();
-    let key = format!("branch.{}.gherritState", branch_name);
+    let key = format!("branch.{}.gherritManaged", branch_name);
     match snapshot.string(key.as_str()) {
         Some(cow) => {
             let state_str = util::to_trimmed_string_lossy(cow.as_ref());
@@ -24,9 +25,10 @@ pub fn get_state(repo: &gix::Repository, branch_name: &str) -> Result<Option<Sta
 }
 
 pub fn set_state(state: State) {
-    let (_, branch_name) = util::get_current_branch().unwrap();
+    let (_, branch_name) =
+        util::get_current_branch().unwrap_or_exit("Failed to get current branch");
 
-    cmd!("git config", "branch.{branch_name}.gherritState", "unmanaged").unwrap_status();
+    cmd!("git config", "branch.{branch_name}.gherritManaged", state).unwrap_status();
     match state {
         State::Managed => log::info!("Branch '{}' is now managed by GHerrit.", branch_name),
         State::Unmanaged => eprintln!("Branch '{}' is now unmanaged by GHerrit.", branch_name),
@@ -49,16 +51,12 @@ pub fn post_checkout(_prev: &str, _new: &str, flag: &str) {
     };
 
     // Idempotency check: Bail if the branch management state is already set.
-    match get_state(&repo, &branch_name) {
-        Ok(Some(_)) => {
-            log::debug!("Branch '{}' is already configured.", branch_name);
-            return;
-        }
-        Ok(None) => {}
-        Err(e) => {
-            log::error!("Failed to parse gherritState: {}", e);
-            return;
-        }
+    if get_state(&repo, &branch_name)
+        .unwrap_or_exit("Failed to parse gherritState")
+        .is_some()
+    {
+        log::debug!("Branch '{}' is already configured.", branch_name);
+        return;
     }
 
     // Creation detection: Bail if we're just checking out an already-existing branch.
@@ -70,7 +68,6 @@ pub fn post_checkout(_prev: &str, _new: &str, flag: &str) {
     }
 
     let upstream_remote = cmd!("git config", "branch.{branch_name}.remote").unwrap_output();
-
     let upstream_merge = cmd!("git config", "branch.{branch_name}.merge").unwrap_output();
 
     let has_upstream = upstream_remote.status.success() && upstream_merge.status.success();
