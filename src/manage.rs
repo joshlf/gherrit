@@ -63,9 +63,9 @@ pub fn post_checkout(_prev: &str, _new: &str, flag: &str) {
     }
 
     // Creation detection: Bail if we're just checking out an already-existing branch.
-    let reflog_output = cmd!("git reflog show", branch_name, "-n1").unwrap_output();
-    let reflog_stdout = String::from_utf8_lossy(&reflog_output.stdout);
-    if !reflog_stdout.contains("branch: Created from") {
+    let is_new = util::is_newly_created_branch(&repo, &branch_name)
+        .unwrap_or_exit("Failed to check if branch is new");
+    if !is_new {
         log::debug!("Branch '{}' is not newly created.", branch_name);
         return;
     }
