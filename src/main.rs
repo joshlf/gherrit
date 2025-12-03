@@ -383,6 +383,34 @@ fn pre_push() {
         Ok(())
     })
     .unwrap();
+
+    let config_key = format!("branch.{}.gherritPrivate", branch_name);
+    let config_output = cmd("git", ["config", "--get", "--bool", &config_key])
+        .output()
+        .unwrap();
+
+    let is_private = if config_output.status.success() {
+        // If config is set, respect it (true/false)
+        to_trimmed_string_lossy(&config_output.stdout) == "true"
+    } else {
+        // If config is unset, DEFAULT TO TRUE (Private)
+        true
+    };
+
+    if is_private {
+        eprintln!("-------------------------------------------------------------------------");
+        eprintln!(" [gherrit] Stack successfully synchronized!");
+        eprintln!("");
+        eprintln!(" [gherrit] NOTE: Standard 'git push' was blocked to keep origin clean.");
+        eprintln!("           Your changes are already active on GitHub (via GHerrit refs).");
+        eprintln!("");
+        eprintln!("           To enable pushing this branch to 'origin/{}':", branch_name);
+        eprintln!("           git config {} false", config_key);
+        eprintln!("-------------------------------------------------------------------------");
+        
+        // Exit with failure (1) to stop Git from proceeding with the standard push
+        std::process::exit(1); 
+    }
 }
 
 struct Commit<'a> {
