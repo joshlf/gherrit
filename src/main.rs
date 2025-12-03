@@ -274,7 +274,58 @@ fn pre_push() {
     );
 
     log::info!("Pushing {} commits to origin...", commits.len());
-    let status = cmd("git", args).status().unwrap();
+    let mut child = cmd("git", args)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Filter out the "Create a pull request" message from GitHub:
+    //
+    //   remote:
+    //   remote: Create a pull request for 'G7a4e64a53733779e8f32b7258d5083e5b15ea91d' on GitHub by visiting:
+    //   remote:      https://github.com/joshlf/gherrit/pull/new/G7a4e64a53733779e8f32b7258d5083e5b15ea91d
+    //   remote:
+    //
+    // We use a multi-line regex to match this block specifically.
+    {
+        use std::io::{BufRead, BufReader};
+        let stderr = child.stderr.take().unwrap();
+        let reader = BufReader::new(stderr);
+
+        // Buffer for contiguous "remote:" lines
+        let mut remote_buffer: Vec<String> = Vec::new();
+
+        let flush_buffer = |buf: &mut Vec<String>| {
+            if buf.is_empty() {
+                return;
+            }
+            let block = buf.join("\n");
+            static RE: OnceLock<regex::Regex> = OnceLock::new();
+            let re = RE.get_or_init(|| {
+                regex::Regex::new(r"(?m)\n?^remote:\s*\nremote: Create a pull request for '.*' on GitHub by visiting:\s*\nremote:\s*https://github\.com/.*\nremote:\s*$").unwrap()
+            });
+
+            let cleaned = re.replace(&block, "");
+            if !cleaned.is_empty() {
+                eprintln!("{}", cleaned);
+            }
+            buf.clear();
+        };
+
+        for line in reader.lines() {
+            let line = line.unwrap();
+            if line.trim_start().starts_with("remote:") {
+                remote_buffer.push(line);
+            } else {
+                flush_buffer(&mut remote_buffer);
+                eprintln!("{}", line);
+            }
+        }
+        flush_buffer(&mut remote_buffer);
+    }
+
+    let status = child.wait().unwrap();
     if !status.success() {
         log::error!("`git push` failed. You may need to `git pull --rebase`.");
         std::process::exit(1);
@@ -321,15 +372,13 @@ fn pre_push() {
         .into_par_iter()
         .map(
             move |(c, parent_branch, gherrit_id)| -> Result<_, Box<dyn Error + Send + Sync>> {
-                let pr_info = prs
-                    .iter()
-                    .find(|pr| pr.head_ref_name == gherrit_id);
+                let pr_info = prs.iter().find(|pr| pr.head_ref_name == gherrit_id);
 
                 let (pr_num, pr_url) = if let Some(pr) = pr_info {
                     log::debug!("Found existing PR #{} for {}", pr.number, gherrit_id);
                     (pr.number, pr.url.clone())
                 } else {
-                    log::info!("No GitHub PR exists for {gherrit_id}; creating one...");
+                    log::debug!("No GitHub PR exists for {gherrit_id}; creating one...");
                     // Note that the PR's body will soon be overwritten
                     // (when we add the Markdown links to other PRs).
                     // However, setting a reasonable default PR body makes
@@ -337,7 +386,7 @@ fn pre_push() {
                     // there.
                     let (num, url) =
                         create_gh_pr(parent_branch, gherrit_id, c.message_title, c.message_body)?;
-                    
+
                     log::info!("Created PR #{num}: {url}");
                     (num, url)
                 };
