@@ -25,7 +25,7 @@ jobs:
         run: |
           # Extract the Child ID from the merged PR's metadata by parsing the
           # JSON inside the HTML comment.
-          CHILD_ID=$(echo "$MERGED_PR_BODY" | grep -oP '(?<=gherrit-meta: ).*' | jq -r .child)
+          CHILD_ID=$(echo "$MERGED_PR_BODY" | grep -oP '(?<=gherrit-meta: ).*?(?= -->)' | jq -r .child)
 
           if [ -z "$CHILD_ID" ] || [ "$CHILD_ID" == "null" ]; then
             echo "Merged PR has no child defined in metadata. Reached top of stack."
