@@ -23,10 +23,15 @@ pub fn set_state(state: State) {
     let (_, branch_name) =
         util::get_current_branch().unwrap_or_exit("Failed to get current branch");
 
-    cmd!("git config", "branch.{branch_name}.gherritManaged", match state {
-        State::Managed => "true",
-        State::Unmanaged => "false",
-    }).unwrap_status();
+    cmd!(
+        "git config",
+        "branch.{branch_name}.gherritManaged",
+        match state {
+            State::Managed => "true",
+            State::Unmanaged => "false",
+        }
+    )
+    .unwrap_status();
     match state {
         State::Managed => log::info!("Branch '{}' is now managed by GHerrit.", branch_name),
         State::Unmanaged => log::info!("Branch '{}' is now unmanaged by GHerrit.", branch_name),

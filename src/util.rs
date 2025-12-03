@@ -116,8 +116,6 @@ impl<T, E: std::fmt::Display> ResultExt<T, E> for Result<T, E> {
     }
 }
 
-
-
 #[derive(Debug)]
 pub enum BranchError {
     DetachedHead,
