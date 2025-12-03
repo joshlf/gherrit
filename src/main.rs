@@ -280,7 +280,7 @@ fn pre_push() {
         std::process::exit(1);
     }
 
-    let pr_list = cmd!("gh pr list --json number,headRefName").unwrap_output();
+    let pr_list = cmd!("gh pr list --json number,headRefName,url").unwrap_output();
 
     let t4 = Instant::now();
     log::trace!("t3 -> t4: {:?}", t4 - t3);
@@ -290,6 +290,7 @@ fn pre_push() {
     struct ListEntry {
         head_ref_name: String,
         number: usize,
+        url: String,
     }
 
     // TODO: Be more robust: allow whitespace
@@ -321,12 +322,13 @@ fn pre_push() {
         .into_par_iter()
         .map(
             move |(c, parent_branch, gherrit_id)| -> Result<_, Box<dyn Error + Send + Sync>> {
-                let pr_num = prs
+                let pr_info = prs
                     .iter()
-                    .find_map(|pr| (pr.head_ref_name == gherrit_id).then_some(pr.number));
-                let pr_num = if let Some(pr_num) = pr_num {
-                    log::debug!("Found existing PR #{} for {}", pr_num, gherrit_id);
-                    pr_num
+                    .find(|pr| pr.head_ref_name == gherrit_id);
+
+                let (pr_num, pr_url) = if let Some(pr) = pr_info {
+                    log::debug!("Found existing PR #{} for {}", pr.number, gherrit_id);
+                    (pr.number, pr.url.clone())
                 } else {
                     log::info!("No GitHub PR exists for {gherrit_id}; creating one...");
                     // Note that the PR's body will soon be overwritten
@@ -334,18 +336,14 @@ fn pre_push() {
                     // However, setting a reasonable default PR body makes
                     // sense here in case something crashes between here and
                     // there.
-                    let num =
+                    let (num, url) =
                         create_gh_pr(parent_branch, gherrit_id, c.message_title, c.message_body)?;
-                    // TODO: Print the full PR URL. Requires resolving the
-                    // username/organization and repository name. Could also
-                    // capture this from the `gh` command output - we
-                    // already have a regex in `create_gh_pr` to do this in
-                    // order to parse the PR number.
-                    log::info!("Created PR #{num}");
-                    num
+                    
+                    log::info!("Created PR #{num}: {url}");
+                    (num, url)
                 };
 
-                Ok((c, parent_branch, pr_num))
+                Ok((c, parent_branch, pr_num, pr_url))
             },
         )
         .collect::<Vec<_>>()
@@ -375,7 +373,7 @@ fn pre_push() {
     let gh_pr_ids_markdown = commits
         .iter()
         .rev()
-        .map(|(_, _, pr_num)| format!("- #{pr_num}"))
+        .map(|(_, _, pr_num, _)| format!("- #{pr_num}"))
         .intersperse("\n".to_string())
         .collect::<String>();
 
@@ -384,7 +382,7 @@ fn pre_push() {
     thread::scope(|s| -> Result<(), Box<dyn Error>> {
         let join_handles = commits
             .into_iter()
-            .map(|(c, parent_branch, pr_num)| {
+            .map(|(c, parent_branch, pr_num, pr_url)| {
                 let gh_pr_body_trailer = &gh_pr_body_trailer;
                 s.spawn(move || -> Result<(), std::io::Error> {
                     let body = c.message_body;
@@ -395,6 +393,7 @@ fn pre_push() {
 
                     let body = format!("{body}\n\n---\n\n{gh_pr_body_trailer}");
                     log::debug!("Updating PR #{} description...", pr_num);
+                    log::info!("Updated PR #{}: {}", pr_num, pr_url);
                     edit_gh_pr(pr_num, parent_branch, c.message_title, &body)?;
                     Ok(())
                 })
@@ -502,7 +501,7 @@ fn create_gh_pr(
     head_branch: &str,
     title: &str,
     body: &str,
-) -> Result<usize, Box<dyn Error + Send + Sync>> {
+) -> Result<(usize, String), Box<dyn Error + Send + Sync>> {
     let output = cmd!(
         "gh pr create --base",
         base_branch,
@@ -522,7 +521,8 @@ fn create_gh_pr(
     });
     let captures = re.captures(output).unwrap();
     let pr_id = captures.get(1).unwrap();
-    Ok(pr_id.as_str().parse()?)
+    let pr_url = output.trim().to_string();
+    Ok((pr_id.as_str().parse()?, pr_url))
 }
 
 fn edit_gh_pr(
