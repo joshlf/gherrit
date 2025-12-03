@@ -27,9 +27,40 @@ It allows you to maintain a single local branch containing a stack of commits (e
     cp hooks/commit-msg .git/hooks/commit-msg
     cp hooks/pre-push .git/hooks/pre-push
 
+    ```bash
     # Ensure they are executable
     chmod +x .git/hooks/commit-msg
     chmod +x .git/hooks/pre-push
+    ```
+
+3.  **Setup GitHub Action (Optional but Recommended):**
+    To enable automatic cascading merges (where merging a parent PR automatically rebases its child), add the following workflow to your repository at `.github/workflows/gherrit-rebase-stack.yml`:
+
+    ```yaml
+    name: Rebase Stack
+    on:
+      pull_request:
+        types: [closed]
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    jobs:
+      rebase-stack:
+        if: github.event.pull_request.merged == true
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+            with:
+              fetch-depth: 0
+              token: ${{ secrets.GITHUB_TOKEN }}
+
+          - name: Run Gherrit Cascade
+            uses: joshlf/gherrit@main
+            with:
+              token: ${{ secrets.GITHUB_TOKEN }}
+              pr_body: ${{ github.event.pull_request.body }}
     ```
 
 ## Usage
