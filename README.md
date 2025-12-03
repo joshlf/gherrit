@@ -34,7 +34,7 @@ It allows you to maintain a single local branch containing a stack of commits (e
 
 ## Usage
 
-Once installed, simply work as if you were using Gerrit or a sophisticated stacked-diff tool.
+Once installed, simply work as if you were using Gerrit.
 
 ### 1\. Creating a Stack
 
