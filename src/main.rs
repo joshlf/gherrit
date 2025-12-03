@@ -5,18 +5,39 @@ mod util;
 
 use core::str;
 use std::{
-    env,
     error::Error,
     process::{ExitStatus, Stdio},
     thread,
     time::Instant,
 };
 
+use clap::{Parser, Subcommand};
+
 use gix::{reference::Category, refs::transaction::PreviousValue, ObjectId};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::util::{CommandExt as _, ResultExt as _};
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    PrePush,
+    CommitMsg,
+    Manage,
+    Unmanage,
+    PostCheckout {
+        prev: String,
+        new: String,
+        flag: String,
+    },
+}
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -31,23 +52,14 @@ fn main() {
         })
         .init();
 
-    let args: Vec<String> = env::args().collect();
-    let args: Vec<_> = args.iter().map(|s| s.as_str()).collect();
-    match args.as_slice() {
-        [_, "pre-push"] => pre_push(),
-        [_, "commit-msg"] => unimplemented!(),
-        [_, "manage"] => manage::set_state(manage::State::Managed),
-        [_, "unmanage"] => manage::set_state(manage::State::Unmanaged),
-        [_, "post-checkout", prev, new, flag] => manage::post_checkout(prev, new, flag),
-        _ => {
-            eprintln!("Usage:");
-            eprintln!("    {} pre-push", args[0]);
-            eprintln!("    {} commit-msg", args[0]);
-            eprintln!("    {} manage", args[0]);
-            eprintln!("    {} unmanage", args[0]);
-            eprintln!("    {} post-checkout <prev> <new> <flag>", args[0]);
-            std::process::exit(1);
-        }
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::PrePush => pre_push(),
+        Commands::CommitMsg => unimplemented!(),
+        Commands::Manage => manage::set_state(manage::State::Managed),
+        Commands::Unmanage => manage::set_state(manage::State::Unmanaged),
+        Commands::PostCheckout { prev, new, flag } => manage::post_checkout(&prev, &new, &flag),
     }
 }
 
