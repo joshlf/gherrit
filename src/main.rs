@@ -19,6 +19,18 @@ static GHERRIT_PR_ID_RE: OnceLock<regex::Regex> = OnceLock::new();
 static GH_PR_URL_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format(|buf, record| {
+            use std::io::Write;
+            let level = record.level();
+            if level == log::Level::Info {
+                writeln!(buf, "[gherrit] {}", record.args())
+            } else {
+                writeln!(buf, "[gherrit] [{}] {}", level, record.args())
+            }
+        })
+        .init();
+
     let args: Vec<String> = env::args().collect();
     let args: Vec<_> = args.iter().map(|s| s.as_str()).collect();
     match args.as_slice() {
@@ -51,6 +63,12 @@ macro_rules! cmd {
         #[allow(unused_mut)]
         let mut args: Vec<String> = pre_args.iter().map(|s| s.to_string()).collect();
         cmd!(@inner args $(, $($rest)*)?);
+
+        log::debug!("exec: {} {}", bin, args.iter().map(|s| if s.contains(" ") {
+            format!("'{}'", s)
+        } else {
+            s.clone()
+        }).collect::<Vec<_>>().join(" "));
         cmd(bin, &args)
     }};
 
@@ -89,7 +107,7 @@ fn manage() {
         "managed"
     )
     .unwrap_status();
-    eprintln!("Branch '{}' is now managed by GHerrit.", branch_name);
+    log::info!("Branch '{}' is now managed by GHerrit.", branch_name);
 }
 
 fn unmanage() {
@@ -125,6 +143,7 @@ fn post_checkout(_prev: &str, _new: &str, flag: &str) {
     // Idempotency check: Bail if the branch management state is already set.
     let config_output = cmd!("git config", ("branch.{}.gherritState", branch_name)).unwrap_output();
     if config_output.status.success() {
+        log::debug!("Branch '{}' is already configured.", branch_name);
         return;
     }
 
@@ -132,6 +151,7 @@ fn post_checkout(_prev: &str, _new: &str, flag: &str) {
     let reflog_output = cmd!("git reflog show", branch_name, "-n1").unwrap_output();
     let reflog_stdout = String::from_utf8_lossy(&reflog_output.stdout);
     if !reflog_stdout.contains("branch: Created from") {
+        log::debug!("Branch '{}' is not newly created.", branch_name);
         return;
     }
 
@@ -151,12 +171,12 @@ fn post_checkout(_prev: &str, _new: &str, flag: &str) {
     if has_upstream && !is_origin_main {
         // Condition A: Shared Branch
         unmanage();
-        eprintln!("[gherrit] Branch initialized as UNMANAGED (Collaboration Mode).");
+        log::info!("Branch initialized as UNMANAGED (Collaboration Mode).");
     } else {
         // Condition B: New Stack
         manage();
-        eprintln!("[gherrit] Branch initialized as MANAGED (Stack Mode).");
-        eprintln!("[gherrit] To opt-out, run: gherrit unmanage");
+        log::info!("Branch initialized as MANAGED (Stack Mode).");
+        log::info!("To opt-out, run: gherrit unmanage");
     }
 }
 
@@ -176,15 +196,23 @@ fn pre_push() {
     );
 
     match state.as_str() {
-        "unmanaged" => return, // Allow standard push
-        "managed" => {}        // Proceed
-        _ => {
-            eprintln!(
-                "[gherrit] Error: It is unclear if branch '{}' should be a Stack.",
+        "unmanaged" => {
+            log::info!(
+                "Branch '{}' is UNMANAGED. Allowing standard push.",
                 branch_name
             );
-            eprintln!("[gherrit] Run 'gherrit manage' to sync it as a Stack.");
-            eprintln!("[gherrit] Run 'gherrit unmanage' to push it as a standard Git branch.");
+            return; // Allow standard push
+        }
+        "managed" => {
+            log::info!("Branch '{}' is MANAGED. Syncing stack...", branch_name);
+        } // Proceed
+        _ => {
+            log::error!(
+                "It is unclear if branch '{}' should be a Stack.",
+                branch_name
+            );
+            log::error!("Run 'gherrit manage' to sync it as a Stack.");
+            log::error!("Run 'gherrit unmanage' to push it as a standard Git branch.");
             std::process::exit(1);
         }
     }
@@ -205,7 +233,7 @@ fn pre_push() {
     commits.reverse();
 
     let t1 = Instant::now();
-    println!("t0 -> t1: {:?}", t1 - t0);
+    log::trace!("t0 -> t1: {:?}", t1 - t0);
 
     let commits = commits
         .iter()
@@ -214,7 +242,7 @@ fn pre_push() {
         .unwrap();
 
     let t2 = Instant::now();
-    println!("t1 -> t2: {:?}", t2 - t1);
+    log::trace!("t1 -> t2: {:?}", t2 - t1);
 
     let commits = commits
         .into_iter()
@@ -228,7 +256,7 @@ fn pre_push() {
         .unwrap();
 
     let t3 = Instant::now();
-    println!("t2 -> t3: {:?}", t3 - t2);
+    log::trace!("t2 -> t3: {:?}", t3 - t2);
 
     let mut args = vec![
         "push".to_string(),
@@ -244,16 +272,18 @@ fn pre_push() {
             .iter()
             .map(|(c, gherrit_id)| format!("{}:refs/heads/{gherrit_id}", c.id)),
     );
+
+    log::info!("Pushing {} commits to origin...", commits.len());
     let status = cmd("git", args).status().unwrap();
     if !status.success() {
-        eprintln!("Error: `git push` failed. You may need to `git pull --rebase`.");
+        log::error!("`git push` failed. You may need to `git pull --rebase`.");
         std::process::exit(1);
     }
 
     let pr_list = cmd!("gh pr list --json number,headRefName").unwrap_output();
 
     let t4 = Instant::now();
-    println!("t3 -> t4: {:?}", t4 - t3);
+    log::trace!("t3 -> t4: {:?}", t4 - t3);
 
     #[derive(Serialize, Deserialize, Debug)]
     #[serde(rename_all = "camelCase")]
@@ -269,9 +299,9 @@ fn pre_push() {
         match serde_json::from_slice(&pr_list.stdout) {
             Ok(prs) => prs,
             Err(err) => {
-                eprintln!("failed to parse `gh` command output: {err}");
+                log::error!("failed to parse `gh` command output: {err}");
                 if let Ok(stdout) = str::from_utf8(&pr_list.stdout) {
-                    eprintln!("command output (verbatim):\n{stdout}");
+                    log::error!("command output (verbatim):\n{stdout}");
                 }
                 std::process::exit(2);
             }
@@ -295,9 +325,10 @@ fn pre_push() {
                     .iter()
                     .find_map(|pr| (pr.head_ref_name == gherrit_id).then_some(pr.number));
                 let pr_num = if let Some(pr_num) = pr_num {
+                    log::debug!("Found existing PR #{} for {}", pr_num, gherrit_id);
                     pr_num
                 } else {
-                    println!("No GitHub PR exists for {gherrit_id}; creating one...");
+                    log::info!("No GitHub PR exists for {gherrit_id}; creating one...");
                     // Note that the PR's body will soon be overwritten
                     // (when we add the Markdown links to other PRs).
                     // However, setting a reasonable default PR body makes
@@ -310,7 +341,7 @@ fn pre_push() {
                     // capture this from the `gh` command output - we
                     // already have a regex in `create_gh_pr` to do this in
                     // order to parse the PR number.
-                    println!("Created PR #{num}");
+                    log::info!("Created PR #{num}");
                     num
                 };
 
@@ -323,7 +354,7 @@ fn pre_push() {
         .unwrap();
 
     let t5 = Instant::now();
-    println!("t4 -> t5: {:?}", t5 - t4);
+    log::trace!("t4 -> t5: {:?}", t5 - t4);
 
     // Attempt to resolve `HEAD` to a branch name so that we can refer to it
     // in PR bodies. If we can't, then silently fail and just don't include
@@ -363,6 +394,7 @@ fn pre_push() {
                     let body = re.replace(body, "");
 
                     let body = format!("{body}\n\n---\n\n{gh_pr_body_trailer}");
+                    log::debug!("Updating PR #{} description...", pr_num);
                     edit_gh_pr(pr_num, parent_branch, c.message_title, &body)?;
                     Ok(())
                 })
@@ -374,7 +406,7 @@ fn pre_push() {
         }
 
         let t6 = Instant::now();
-        println!("t5 -> t6: {:?}", t6 - t5);
+        log::trace!("t5 -> t6: {:?}", t6 - t5);
 
         Ok(())
     })
@@ -392,18 +424,18 @@ fn pre_push() {
     };
 
     if is_private {
-        eprintln!("-------------------------------------------------------------------------");
-        eprintln!(" [gherrit] Stack successfully synchronized!");
-        eprintln!("");
-        eprintln!(" [gherrit] NOTE: Standard 'git push' was blocked to keep origin clean.");
-        eprintln!("           Your changes are already active on GitHub (via GHerrit refs).");
-        eprintln!("");
-        eprintln!(
-            "           To enable pushing this branch to 'origin/{}':",
+        log::info!("-------------------------------------------------------------------------");
+        log::info!(" Stack successfully synchronized!");
+        log::info!("");
+        log::info!(" NOTE: Standard 'git push' was blocked to keep origin clean.");
+        log::info!("       Your changes are already active on GitHub (via GHerrit refs).");
+        log::info!("");
+        log::info!(
+            "       To enable pushing this branch to 'origin/{}':",
             branch_name
         );
-        eprintln!("           git config {} false", config_key);
-        eprintln!("-------------------------------------------------------------------------");
+        log::info!("       git config {} false", config_key);
+        log::info!("-------------------------------------------------------------------------");
 
         // Exit with failure (1) to stop Git from proceeding with the standard push
         std::process::exit(1);
