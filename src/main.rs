@@ -8,7 +8,6 @@ use std::{
     env,
     error::Error,
     process::{ExitStatus, Stdio},
-    sync::OnceLock,
     thread,
     time::Instant,
 };
@@ -50,21 +49,6 @@ fn main() {
             std::process::exit(1);
         }
     }
-}
-
-macro_rules! re {
-    ($name:ident, $re:literal) => {
-        fn $name() -> &'static regex::Regex {
-            re!(@inner $re)
-        }
-    };
-    ($re:literal) => {
-        (|| -> &'static regex::Regex { re!(@inner $re) })()
-    };
-    (@inner $re:literal) => {{
-        static RE: OnceLock<regex::Regex> = OnceLock::new();
-        RE.get_or_init(|| regex::Regex::new($re).unwrap())
-    }};
 }
 
 fn pre_push() {
