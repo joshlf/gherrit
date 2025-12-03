@@ -73,7 +73,7 @@ if test -n "${reviewurl}" ; then
   pattern=".*/id/I[0-9a-f]\{40\}"
 else
   token="gherrit-pr-id"
-  value="I$random"
+  value="G$random"
   pattern=".*"
 fi
 
