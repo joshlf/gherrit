@@ -1,25 +1,20 @@
 use crate::cmd;
 use crate::util::{self, BranchError, CommandExt, ResultExt as _};
-use std::str::FromStr;
-use strum::{Display, EnumString, ParseError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    #[strum(serialize = "true")]
     Managed,
-    #[strum(serialize = "false")]
     Unmanaged,
 }
 
-pub fn get_state(repo: &gix::Repository, branch_name: &str) -> Result<Option<State>, ParseError> {
-    let snapshot = repo.config_snapshot();
+pub fn get_state(
+    repo: &gix::Repository,
+    branch_name: &str,
+) -> Result<Option<State>, gix::config::value::Error> {
     let key = format!("branch.{}.gherritManaged", branch_name);
-    match snapshot.string(key.as_str()) {
-        Some(cow) => {
-            let state_str = util::to_trimmed_string_lossy(cow.as_ref());
-            let state = State::from_str(&state_str)?;
-            Ok(Some(state))
-        }
+    match util::get_config_bool(repo, &key)? {
+        Some(true) => Ok(Some(State::Managed)),
+        Some(false) => Ok(Some(State::Unmanaged)),
         None => Ok(None),
     }
 }
@@ -28,10 +23,13 @@ pub fn set_state(state: State) {
     let (_, branch_name) =
         util::get_current_branch().unwrap_or_exit("Failed to get current branch");
 
-    cmd!("git config", "branch.{branch_name}.gherritManaged", state).unwrap_status();
+    cmd!("git config", "branch.{branch_name}.gherritManaged", match state {
+        State::Managed => "true",
+        State::Unmanaged => "false",
+    }).unwrap_status();
     match state {
         State::Managed => log::info!("Branch '{}' is now managed by GHerrit.", branch_name),
-        State::Unmanaged => eprintln!("Branch '{}' is now unmanaged by GHerrit.", branch_name),
+        State::Unmanaged => log::info!("Branch '{}' is now unmanaged by GHerrit.", branch_name),
     }
 }
 
@@ -67,13 +65,15 @@ pub fn post_checkout(_prev: &str, _new: &str, flag: &str) {
         return;
     }
 
-    let upstream_remote = cmd!("git config", "branch.{branch_name}.remote").unwrap_output();
-    let upstream_merge = cmd!("git config", "branch.{branch_name}.merge").unwrap_output();
+    let upstream_remote = util::get_config_string(&repo, &format!("branch.{branch_name}.remote"))
+        .unwrap_or_exit("Failed to read config");
+    let upstream_merge = util::get_config_string(&repo, &format!("branch.{branch_name}.merge"))
+        .unwrap_or_exit("Failed to read config");
 
-    let has_upstream = upstream_remote.status.success() && upstream_merge.status.success();
+    let has_upstream = upstream_remote.is_some() && upstream_merge.is_some();
     let is_origin_main = if has_upstream {
-        let remote = util::to_trimmed_string_lossy(&upstream_remote.stdout);
-        let merge = util::to_trimmed_string_lossy(&upstream_merge.stdout);
+        let remote = upstream_remote.as_deref().unwrap_or("");
+        let merge = upstream_merge.as_deref().unwrap_or("");
         remote == "origin" && merge == "refs/heads/main"
     } else {
         false

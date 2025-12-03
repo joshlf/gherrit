@@ -129,16 +129,9 @@ fn pre_push() {
         return;
     }
 
-    let config_output =
-        cmd!("git config --get --bool", "branch.{branch_name}.gherritPrivate").unwrap_output();
-
-    let is_private = if config_output.status.success() {
-        // If config is set, respect it (true/false)
-        util::to_trimmed_string_lossy(&config_output.stdout) == "true"
-    } else {
-        // If config is unset, DEFAULT TO TRUE (Private)
-        true
-    };
+    let is_private = util::get_config_bool(&repo, &format!("branch.{branch_name}.gherritPrivate"))
+        .unwrap_or_exit("Failed to read config")
+        .unwrap_or(true);
 
     let mut args = vec![
         "push".to_string(),
