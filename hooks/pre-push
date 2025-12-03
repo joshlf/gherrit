@@ -1,4 +1,4 @@
 #!/bin/bash
 
-gherrit pre-push
+gherrit hook pre-push
 exit $?
