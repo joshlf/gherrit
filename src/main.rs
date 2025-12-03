@@ -462,6 +462,10 @@ fn pre_push() {
                         r#"{{"id": "{}", "parent": {}, "child": {}}}"#,
                         current_gherrit_id, parent_val, child_val
                     );
+                    // WARNING: Our "Rebase Stack" GitHub Action relies on the metadata
+                    // footer being formatted exactly as-is. It is sensitive to whitespace
+                    // and newlines. Do not change this format without also updating the
+                    // action.
                     let meta_footer = format!(
                         "<!-- WARNING: GHerrit relies on the following metadata to work properly. DO NOT EDIT OR REMOVE. -->\n<!-- gherrit-meta: {meta_json} -->",
                     );
