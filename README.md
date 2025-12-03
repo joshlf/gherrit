@@ -116,6 +116,22 @@ GHerrit emulates this by rewriting each PR's message with links to other PRs in 
 
 <img width="915" height="317" alt="Screenshot 2025-12-02 at 6 46 15 PM" src="https://github.com/user-attachments/assets/6ee80641-af67-4b37-9f57-797207637bbe" />
 
+#### Cascading Merge Automation
+
+When managing a stack of PRs on GitHub, merging a parent PR (e.g., `feature-A`) into `main` causes a problem for its child PR (`feature-B`). Since `feature-B` was based on the *branch* `feature-A`, and `feature-A` has now been squashed and merged into `main`, GitHub sees the commits in `feature-B` as "new" relative to `main`, even if they are identical to the ones just merged. This often results in "phantom diffs" or merge conflicts.
+
+To solve this, GHerrit implements a **Cascading Merge** system:
+
+1.  **Metadata Injection**: When pushing, GHerrit injects hidden metadata into the PR description (inside an HTML comment) containing the IDs of the parent and child PRs.
+2.  **Automated Rebase**: A GitHub Action (`gherrit-rebase-stack.yml`) triggers whenever a PR is merged. It:
+    *   Reads the metadata to find the *child* PR's ID.
+    *   Finds the child PR by its synthesized branch name (e.g., `G...`)
+    *   Retargets the child PR to base off `main`.
+    *   Rebases the child PR onto the new `main`.
+    *   Force-pushes the updated child PR.
+
+This ensures that as soon as you merge the bottom of the stack, the next PR automatically updates and becomes ready for review/merge, keeping the entire chain healthy without manual intervention.
+
 ### Hybrid Workflow Support
 
 GHerrit is designed to work seamlessly with developers using other, non-GHerrit workflows. In order to accomplish this, GHerrit tracks whether each local branch is "managed" or "unmanaged". By default, branches created locally are managed, while branches created remotely (and checked out locally) are "unmanaged". A branch's management state can be changed with `gherrit manage` or `gherrit unmanage`.
