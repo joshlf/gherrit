@@ -88,18 +88,14 @@ macro_rules! cmd {
 }
 
 fn manage() {
-    let repo = gix::open(".").unwrap();
-    let head_ref = repo.head().unwrap().try_into_referent().unwrap();
-    let branch_name = head_ref.name().shorten();
+    let (_, branch_name) = get_current_branch().unwrap();
 
     cmd!("git config", "branch.{branch_name}.gherritState", "managed").unwrap_status();
     log::info!("Branch '{}' is now managed by GHerrit.", branch_name);
 }
 
 fn unmanage() {
-    let repo = gix::open(".").unwrap();
-    let head_ref = repo.head().unwrap().try_into_referent().unwrap();
-    let branch_name = head_ref.name().shorten();
+    let (_, branch_name) = get_current_branch().unwrap();
 
     cmd!("git config", "branch.{branch_name}.gherritState", "unmanaged").unwrap_status();
     eprintln!("Branch '{}' is now unmanaged by GHerrit.", branch_name);
@@ -111,15 +107,14 @@ fn post_checkout(_prev: &str, _new: &str, flag: &str) {
         return;
     }
 
-    let repo = gix::open(".").unwrap();
-    let head = repo.head().unwrap();
-
-    let head_ref = match head.try_into_referent() {
-        Some(referent) => referent,
-        None => return, // We are in detached HEAD (e.g. during rebase); do nothing.
+    let (_repo, branch_name) = match get_current_branch() {
+        Ok(res) => res,
+        Err(BranchError::DetachedHead) => return, // Detached HEAD (e.g. during rebase); do nothing.
+        Err(e) => {
+            log::error!("Failed to get current branch: {}", e);
+            return;
+        }
     };
-
-    let branch_name = head_ref.name().shorten();
 
     // Idempotency check: Bail if the branch management state is already set.
     let config_output = cmd!("git config", "branch.{branch_name}.gherritState").unwrap_output();
@@ -164,10 +159,7 @@ fn post_checkout(_prev: &str, _new: &str, flag: &str) {
 fn pre_push() {
     let t0 = Instant::now();
 
-    let repo = gix::open(".").unwrap();
-    let head = repo.head().unwrap();
-    let head_ref = head.try_into_referent().unwrap();
-    let branch_name = head_ref.name().shorten();
+    let (repo, branch_name) = get_current_branch().unwrap();
 
     // Step 1: Resolve State
     let state = to_trimmed_string_lossy(
@@ -619,4 +611,29 @@ fn edit_gh_pr(
 
 fn to_trimmed_string_lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+#[derive(Debug)]
+enum BranchError {
+    DetachedHead,
+    Gix(Box<dyn Error>),
+}
+
+impl std::fmt::Display for BranchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BranchError::DetachedHead => write!(f, "Detached HEAD"),
+            BranchError::Gix(e) => write!(f, "Gix error: {}", e),
+        }
+    }
+}
+
+impl Error for BranchError {}
+
+fn get_current_branch() -> Result<(gix::Repository, String), BranchError> {
+    let repo = gix::open(".").map_err(|e| BranchError::Gix(Box::new(e)))?;
+    let head = repo.head().map_err(|e| BranchError::Gix(Box::new(e)))?;
+    let head_ref = head.try_into_referent().ok_or(BranchError::DetachedHead)?;
+    let branch_name = head_ref.name().shorten().to_string();
+    Ok((repo, branch_name))
 }
