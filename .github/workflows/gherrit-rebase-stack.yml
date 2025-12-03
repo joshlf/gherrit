@@ -1,5 +1,4 @@
-name: Gherrit – Update Stack
-
+name: Gherrit Chain Automerge
 on:
   pull_request:
     types: [closed]
@@ -9,46 +8,55 @@ permissions:
   pull-requests: write
 
 jobs:
-  rebase-child:
+  cascade:
+    # Only run if the PR was actually merged (not just closed/abandoned)
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # Required for rebasing
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Rebase Child PR
+      - name: Cascade Rebase & Merge
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MERGED_BRANCH: ${{ github.event.pull_request.head.ref }}
+          MERGED_PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          set -eo pipefail
+          # Extract the Child ID from the merged PR's metadata by parsing the
+          # JSON inside the HTML comment.
+          CHILD_ID=$(echo "$MERGED_PR_BODY" | grep -oP '(?<=gherrit-meta: ).*' | jq -r .child)
 
-          CHILD_PR=$(gh pr list --base "$MERGED_BRANCH" --json number --jq '.[0].number')
-          
-          if [ -z "$CHILD_PR" ]; then
-            echo "No child PRs found for branch: $MERGED_BRANCH"
+          if [ -z "$CHILD_ID" ] || [ "$CHILD_ID" == "null" ]; then
+            echo "Merged PR has no child defined in metadata. Reached top of stack."
             exit 0
           fi
-          
-          echo "Found child PR: #$CHILD_PR"
-          
+
+          echo "Merged PR indicates next child is ID: $CHILD_ID"
+
+          # Find the PR associated with that ID. Since Gherrit branches are
+          # named exactly after the ID (e.g. refs/heads/G...), we can lookup
+          # the PR by branch name (--head).
+          CHILD_PR=$(gh pr list --head "$CHILD_ID" --json number --jq '.[0].number')
+
+          if [ -z "$CHILD_PR" ]; then
+            echo "Error: Metadata says child is $CHILD_ID, but no open PR exists for branch '$CHILD_ID'."
+            echo "The chain might be broken or the child was deleted."
+            exit 1
+          fi
+
+          echo "Identified Child PR: #$CHILD_PR"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           gh pr checkout "$CHILD_PR"
           
-          # Change the base to main BEFORE rebasing to avoid phantom diffs.
           gh pr edit "$CHILD_PR" --base main
           
-          git config user.name "gherrit-bot"
-          git config user.email ""
-          
-          git fetch origin main
           if ! git rebase origin/main; then
-            echo "Rebase failed. Please resolve conflicts manually."
-            exit 1
+             echo "::error::Rebase conflict for PR #$CHILD_PR. Manual intervention required."
+             exit 1
           fi
           
-          if ! git push --force-with-lease --force-if-includes; then
-            echo "Push failed."
-            exit 1
-          fi
+          git push --force-with-lease
