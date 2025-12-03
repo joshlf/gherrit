@@ -37,8 +37,8 @@ fn main() {
     match args.as_slice() {
         [_, "pre-push"] => pre_push(),
         [_, "commit-msg"] => unimplemented!(),
-        [_, "manage"] => manage::manage(),
-        [_, "unmanage"] => manage::unmanage(),
+        [_, "manage"] => manage::set_state(manage::State::Managed),
+        [_, "unmanage"] => manage::set_state(manage::State::Unmanaged),
         [_, "post-checkout", prev, new, flag] => manage::post_checkout(prev, new, flag),
         _ => {
             eprintln!("Usage:");
@@ -73,24 +73,26 @@ fn pre_push() {
     let (repo, branch_name) = util::get_current_branch().unwrap();
 
     // Step 1: Resolve State
-    let state = util::to_trimmed_string_lossy(
-        &cmd!("git config --get", "branch.{branch_name}.gherritState")
-            .unwrap_output()
-            .stdout,
-    );
+    let state = match manage::get_state(&repo, &branch_name) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to parse gherritState: {}", e);
+            std::process::exit(1);
+        }
+    };
 
-    match state.as_str() {
-        "unmanaged" => {
+    match state {
+        Some(manage::State::Unmanaged) => {
             log::info!(
                 "Branch '{}' is UNMANAGED. Allowing standard push.",
                 branch_name
             );
             return; // Allow standard push
         }
-        "managed" => {
+        Some(manage::State::Managed) => {
             log::info!("Branch '{}' is MANAGED. Syncing stack...", branch_name);
         } // Proceed
-        _ => {
+        None => {
             log::error!(
                 "It is unclear if branch '{}' should be a Stack.",
                 branch_name
