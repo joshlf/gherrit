@@ -94,7 +94,7 @@ GHerrit will detect the changes based on the persistent `gherrit-pr-id` in the c
 
 #### `gherrit-pr-id` Trailer and Phantom Branches
 
-Inspired by Gerrit, each commit managed by GHerrit includes a trailer line in its commit message, e.g., `gherrit-pr-id: I847...`.
+Inspired by Gerrit, each commit managed by GHerrit includes a trailer line in its commit message, e.g., `gherrit-pr-id: G847...`.
 
 GitHub identifies PRs by *branch name* (specifically, a PR is a request to merge the contents of one *branch* into another). A branch can contain multiple commits, leading to a one-to-many  relationship between PRs and commits. In the Gerrit style, we want a one-to-one relationship between PRs and commits. However, Git commits do not have stable identifiers – commit hashes change on rebase, on `git commit --amend`, etc. The `gerrit-pr-id` trailer acts as a stable key for the commit that survives rebases and other commit changes.
 
