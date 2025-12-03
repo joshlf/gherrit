@@ -234,11 +234,6 @@ fn pre_push() {
         // Use --force-with-lease to ensure we don't overwrite remote changes
         // that we haven't seen (i.e. if the remote ref has moved since we last fetched).
         "--force-with-lease".to_string(),
-        // Combined with --force-with-lease, --force-if-includes ensures that
-        // we have locally integrated the remote changes we are overwriting.
-        // This prevents overwriting work even if we have fetched the latest refs
-        // but haven't actually merged/rebased them into our local branch.
-        "--force-if-includes".to_string(),
         "origin".to_string(),
     ];
     args.extend(
