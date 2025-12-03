@@ -28,10 +28,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    PrePush,
-    CommitMsg,
+    /// Git hooks integration (internal use only).
+    #[command(subcommand, hide = true)]
+    Hook(HookCommands),
+    /// Configure the current branch to be managed by GHerrit.
     Manage,
+    /// Configure the current branch to be unmanaged by GHerrit.
     Unmanage,
+}
+
+#[derive(Subcommand)]
+enum HookCommands {
+    /// Git pre-push hook.
+    PrePush,
+    /// Git post-checkout hook.
     PostCheckout {
         prev: String,
         new: String,
@@ -55,11 +65,14 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::PrePush => pre_push(),
-        Commands::CommitMsg => unimplemented!(),
+        Commands::Hook(cmd) => match cmd {
+            HookCommands::PrePush => pre_push(),
+            HookCommands::PostCheckout { prev, new, flag } => {
+                manage::post_checkout(&prev, &new, &flag)
+            }
+        },
         Commands::Manage => manage::set_state(manage::State::Managed),
         Commands::Unmanage => manage::set_state(manage::State::Unmanaged),
-        Commands::PostCheckout { prev, new, flag } => manage::post_checkout(&prev, &new, &flag),
     }
 }
 

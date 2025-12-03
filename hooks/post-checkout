@@ -5,4 +5,4 @@
 if [ "$3" != "1" ]; then exit 0; fi
 
 # Delegate to Rust binary
-gherrit post-checkout "$1" "$2" "$3"
+gherrit hook post-checkout "$1" "$2" "$3"
