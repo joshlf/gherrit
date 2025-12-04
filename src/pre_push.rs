@@ -2,7 +2,6 @@ use core::str;
 use std::{
     error::Error,
     process::{ExitStatus, Stdio},
-    thread,
     time::Instant,
 };
 
@@ -369,129 +368,118 @@ fn sync_prs(
 
     let gh_pr_body_trailer = format!("{head_branch_markdown}{gh_pr_ids_markdown}");
 
-    thread::scope(|s| -> Result<(), Box<dyn Error>> {
-        let join_handles = commits
-            .iter()
-            .enumerate()
-            .map(|(i, (c, parent_branch, pr_num, pr_url))| {
-                let gh_pr_body_trailer = &gh_pr_body_trailer;
-                let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
-                let repo_url = &repo_url;
+    commits
+        .par_iter()
+        .enumerate()
+        .try_for_each(|(i, (c, parent_branch, pr_num, pr_url))| -> Result<(), Box<dyn Error + Send + Sync>> {
+            let gh_pr_body_trailer = &gh_pr_body_trailer;
+            let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
+            let repo_url = &repo_url;
 
-                // Determine parent and child IDs, which may be `None` at the
-                // beginning or end of the list.
-                let parent_gherrit_id = (i > 0).then(|| commits[i - 1].0.gherrit_id.clone());
-                let child_gherrit_id = (i < commits.len() - 1).then(|| commits[i + 1].0.gherrit_id.clone());
+            // Determine parent and child IDs, which may be `None` at the
+            // beginning or end of the list.
+            let parent_gherrit_id = (i > 0).then(|| commits[i - 1].0.gherrit_id.clone());
+            let child_gherrit_id = (i < commits.len() - 1).then(|| commits[i + 1].0.gherrit_id.clone());
 
-                let current_gherrit_id = c.gherrit_id.clone();
-                let message_title = c.message_title.clone();
-                let message_body = c.message_body.clone();
+            let current_gherrit_id = c.gherrit_id.clone();
+            let message_title = c.message_title.clone();
+            let message_body = c.message_body.clone();
 
-                s.spawn(move || -> Result<(), std::io::Error> {
-                    let re = gherrit_pr_id_re();
-                    let body = re.replace(&message_body, "");
+            let re = gherrit_pr_id_re();
+            let body = re.replace(&message_body, "");
 
-                    // Generate Patch History Table
-                    let mut history_table = String::new();
-                    if latest_version > 1 && !repo_url.is_empty() {
-                        history_table.push_str(&format!("\n\n**Latest Update:** v{} — [Compare vs v{}]({}/compare/gherrit/{}/v{}..gherrit/{}/v{})\n\n", 
-                            latest_version,
-                            latest_version - 1,
-                            repo_url,
-                            current_gherrit_id, latest_version - 1,
-                            current_gherrit_id, latest_version
-                        ));
+            // Generate Patch History Table
+            let mut history_table = String::new();
+            if latest_version > 1 && !repo_url.is_empty() {
+                history_table.push_str(&format!("\n\n**Latest Update:** v{} — [Compare vs v{}]({}/compare/gherrit/{}/v{}..gherrit/{}/v{})\n\n", 
+                    latest_version,
+                    latest_version - 1,
+                    repo_url,
+                    current_gherrit_id, latest_version - 1,
+                    current_gherrit_id, latest_version
+                ));
 
-                        history_table.push_str("<details>\n<summary><strong>📚 Full Patch History</strong></summary>\n\n");
+                history_table.push_str("<details>\n<summary><strong>📚 Full Patch History</strong></summary>\n\n");
 
-                        history_table.push_str("*Links show the diff between the row version and the column version.*\n\n");
+                history_table.push_str("*Links show the diff between the row version and the column version.*\n\n");
 
-                        // Header
-                        history_table.push_str("| Version | Base |");
-                        for v in 1..latest_version {
-                            history_table.push_str(&format!(" v{} |", v));
-                        }
-                        history_table.push_str("\n| :--- | :--- |");
-                        for _ in 1..latest_version {
-                            history_table.push_str(" :--- |");
-                        }
-                        history_table.push_str("\n");
+                // Header
+                history_table.push_str("| Version | Base |");
+                for v in 1..latest_version {
+                    history_table.push_str(&format!(" v{} |", v));
+                }
+                history_table.push_str("\n| :--- | :--- |");
+                for _ in 1..latest_version {
+                    history_table.push_str(" :--- |");
+                }
+                history_table.push_str("\n");
 
-                        let prefix = if latest_version <= 8 { "vs " } else { "" };
+                let prefix = if latest_version <= 8 { "vs " } else { "" };
 
-                        // Rows
-                        for v_row in (1..=latest_version).rev() {
-                            history_table.push_str(&format!("| v{} |", v_row));
+                // Rows
+                for v_row in (1..=latest_version).rev() {
+                    history_table.push_str(&format!("| v{} |", v_row));
 
-                            // Base column (v0)
-                            // Compare parent_branch..v_row
-                            // Note: parent_branch is the *current* base.
-                            let base_link = format!("[{}Base]({}/compare/{}..gherrit/{}/v{})", 
-                                prefix,
+                    // Base column (v0)
+                    // Compare parent_branch..v_row
+                    // Note: parent_branch is the *current* base.
+                    let base_link = format!("[{}Base]({}/compare/{}..gherrit/{}/v{})", 
+                        prefix,
+                        repo_url,
+                        parent_branch,
+                        current_gherrit_id, v_row
+                    );
+                    history_table.push_str(&format!(" {} |", base_link));
+
+                    // Previous version columns
+                    for v_col in 1..latest_version {
+                        if v_col < v_row {
+                            let link = format!("[{}v{}]({}/compare/gherrit/{}/v{}..gherrit/{}/v{})", 
+                                prefix, v_col,
                                 repo_url,
-                                parent_branch,
+                                current_gherrit_id, v_col,
                                 current_gherrit_id, v_row
                             );
-                            history_table.push_str(&format!(" {} |", base_link));
-
-                            // Previous version columns
-                            for v_col in 1..latest_version {
-                                if v_col < v_row {
-                                    let link = format!("[{}v{}]({}/compare/gherrit/{}/v{}..gherrit/{}/v{})", 
-                                        prefix, v_col,
-                                        repo_url,
-                                        current_gherrit_id, v_col,
-                                        current_gherrit_id, v_row
-                                    );
-                                    history_table.push_str(&format!(" {} |", link));
-                                } else {
-                                    history_table.push_str(" |");
-                                }
-                            }
-                            history_table.push_str("\n");
+                            history_table.push_str(&format!(" {} |", link));
+                        } else {
+                            history_table.push_str(" |");
                         }
-                        history_table.push_str("\n</details>");
                     }
+                    history_table.push_str("\n");
+                }
+                history_table.push_str("\n</details>");
+            }
 
-                    // 3. Generate Metadata JSON
-                    // We generate a JSON object stored in an HTML comment.
-                    let parent_val = parent_gherrit_id
-                        .map(|s| format!("\"{}\"", s))
-                        .unwrap_or("null".to_string());
-                    let child_val = child_gherrit_id
-                        .map(|s| format!("\"{}\"", s))
-                        .unwrap_or("null".to_string());
+            // 3. Generate Metadata JSON
+            // We generate a JSON object stored in an HTML comment.
+            let parent_val = parent_gherrit_id
+                .map(|s| format!("\"{}\"", s))
+                .unwrap_or("null".to_string());
+            let child_val = child_gherrit_id
+                .map(|s| format!("\"{}\"", s))
+                .unwrap_or("null".to_string());
 
-                    let meta_json = format!(
-                        r#"{{"id": "{}", "parent": {}, "child": {}}}"#,
-                        current_gherrit_id, parent_val, child_val
-                    );
-                    // WARNING: Our "Rebase Stack" GitHub Action relies on the metadata
-                    // footer being formatted exactly as-is. It is sensitive to whitespace
-                    // and newlines. Do not change this format without also updating the
-                    // action.
-                    let meta_footer = format!(
-                        "<!-- WARNING: GHerrit relies on the following metadata to work properly. DO NOT EDIT OR REMOVE. -->\n<!-- gherrit-meta: {meta_json} -->",
-                    );
+            let meta_json = format!(
+                r#"{{"id": "{}", "parent": {}, "child": {}}}"#,
+                current_gherrit_id, parent_val, child_val
+            );
+            // WARNING: Our "Rebase Stack" GitHub Action relies on the metadata
+            // footer being formatted exactly as-is. It is sensitive to whitespace
+            // and newlines. Do not change this format without also updating the
+            // action.
+            let meta_footer = format!(
+                "<!-- WARNING: GHerrit relies on the following metadata to work properly. DO NOT EDIT OR REMOVE. -->\n<!-- gherrit-meta: {meta_json} -->",
+            );
 
-                    let warning = "<!-- WARNING: This PR description is automatically generated by GHerrit. Any manual edits will be overwritten on the next push. -->";
-                    let body = format!("{warning}\n\n{body}\n\n---\n\n{gh_pr_body_trailer}\n{history_table}\n{meta_footer}");
+            let warning = "<!-- WARNING: This PR description is automatically generated by GHerrit. Any manual edits will be overwritten on the next push. -->";
+            let body = format!("{warning}\n\n{body}\n\n---\n\n{gh_pr_body_trailer}\n{history_table}\n{meta_footer}");
 
-                    log::debug!("Updating PR #{} description...", pr_num);
-                    log::info!("Updated PR #{}: {}", pr_num, pr_url);
-                    edit_gh_pr(*pr_num, parent_branch, &message_title, &body)?;
-                    Ok(())
-                })
-            })
-            .collect::<Vec<_>>();
-
-        for handle in join_handles {
-            let _: () = handle.join().unwrap()?;
-        }
-
-        Ok(())
-    })
-    .unwrap();
+            log::debug!("Updating PR #{} description...", pr_num);
+            log::info!("Updated PR #{}: {}", pr_num, pr_url);
+            edit_gh_pr(*pr_num, parent_branch, &message_title, &body)?;
+            Ok(())
+        })
+        .unwrap();
 
     if is_private {
         log::info!("-------------------------------------------------------------------------");
