@@ -1,5 +1,3 @@
-#![feature(iterator_try_collect, iter_intersperse)]
-
 mod manage;
 mod pre_push;
 mod util;
