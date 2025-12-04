@@ -48,6 +48,12 @@ fn main() {
         })
         .init();
 
+    // Limit concurrency to avoid hitting GitHub's abuse limits.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(6)
+        .build_global()
+        .unwrap();
+
     let cli = Cli::parse();
 
     match cli.command {
