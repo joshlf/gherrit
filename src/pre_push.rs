@@ -81,13 +81,13 @@ fn collect_commits(repo: &gix::Repository) -> Result<Vec<Commit>, Box<dyn Error>
             res.map_err::<Box<dyn Error>, _>(|e| Box::new(e))
                 .and_then(|info| info.object().map_err::<Box<dyn Error>, _>(|e| Box::new(e)))
         })
-        .try_collect::<Vec<_>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
     commits.reverse();
 
     commits
         .into_iter()
         .map(|c| c.try_into())
-        .try_collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn create_gherrit_refs(
@@ -101,7 +101,7 @@ fn create_gherrit_refs(
             let _ = repo.reference(rf, c.id, PreviousValue::Any, "")?;
             Ok(c)
         })
-        .try_collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn push_to_origin(commits: &[Commit]) -> std::collections::HashMap<String, usize> {
@@ -333,7 +333,7 @@ fn sync_prs(
         )
         .collect::<Vec<_>>()
         .into_iter()
-        .try_collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
     let is_private = is_private_stack(repo, branch_name);
@@ -371,8 +371,8 @@ fn sync_prs(
         .iter()
         .rev()
         .map(|(_, _, pr_num, _)| format!("- #{pr_num}"))
-        .intersperse("\n".to_string())
-        .collect::<String>();
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let gh_pr_body_trailer = format!("{head_branch_markdown}{gh_pr_ids_markdown}");
 
