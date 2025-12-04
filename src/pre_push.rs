@@ -38,9 +38,9 @@ pub fn run() {
         return;
     }
 
-    push_to_origin(&repo, &branch_name, &commits);
+    let latest_versions = push_to_origin(&repo, &branch_name, &commits);
 
-    sync_prs(&repo, &branch_name, commits);
+    sync_prs(&repo, &branch_name, commits, latest_versions);
 }
 
 // TODO: Maybe this should return a Result instead of bailing from inside?
@@ -105,10 +105,20 @@ fn create_gherrit_refs(
         .try_collect::<Vec<_>>()
 }
 
-fn push_to_origin(repo: &gix::Repository, branch_name: &str, commits: &[Commit]) {
+fn push_to_origin(
+    repo: &gix::Repository,
+    branch_name: &str,
+    commits: &[Commit],
+) -> std::collections::HashMap<String, usize> {
     let _is_private = util::get_config_bool(repo, &format!("branch.{branch_name}.gherritPrivate"))
         .unwrap_or_exit("Failed to read config")
         .unwrap_or(true);
+
+    let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
+    let remote_versions = get_remote_versions(&gherrit_ids).unwrap_or_else(|e| {
+        log::warn!("Failed to fetch remote versions: {}", e);
+        std::collections::HashMap::new()
+    });
 
     let mut args = vec![
         "push".to_string(),
@@ -119,13 +129,34 @@ fn push_to_origin(repo: &gix::Repository, branch_name: &str, commits: &[Commit])
         "--force-with-lease".to_string(),
         "origin".to_string(),
     ];
-    args.extend(
-        commits
-            .iter()
-            .map(|c| format!("{}:refs/heads/{}", c.id, c.gherrit_id)),
-    );
 
-    log::info!("Pushing {} commits to origin...", commits.len());
+    let mut next_versions = std::collections::HashMap::new();
+
+    args.extend(commits.iter().flat_map(|c| {
+        let versions = remote_versions.get(&c.gherrit_id).map(|v| v.as_slice()).unwrap_or(&[]);
+        
+        // Find the latest version
+        let latest = versions.iter().max_by_key(|(v, _)| *v);
+        
+        if let Some((ver, sha)) = latest {
+            if *sha == c.id.to_string() {
+                log::info!("Commit {} already tagged as v{}", c.id, ver);
+                next_versions.insert(c.gherrit_id.clone(), *ver);
+                // Still push the branch ref
+                return vec![format!("{}:refs/heads/{}", c.id, c.gherrit_id)];
+            }
+        }
+
+        let next_version = latest.map(|(v, _)| *v).unwrap_or(0) + 1;
+        next_versions.insert(c.gherrit_id.clone(), next_version);
+
+        vec![
+            format!("{}:refs/heads/{}", c.id, c.gherrit_id),
+            format!("{}:refs/tags/gherrit/{}/v{}", c.id, c.gherrit_id, next_version),
+        ]
+    }));
+
+    log::info!("Pushing {} commits and tags to origin...", commits.len());
     let mut child = util::cmd("git", args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
@@ -174,9 +205,59 @@ fn push_to_origin(repo: &gix::Repository, branch_name: &str, commits: &[Commit])
         log::error!("`git push` failed. You may need to `git pull --rebase`.");
         std::process::exit(1);
     }
+
+    next_versions
 }
 
-fn sync_prs(repo: &gix::Repository, branch_name: &str, commits: Vec<Commit>) {
+fn get_remote_versions(
+    gherrit_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<(usize, String)>>, Box<dyn Error>> {
+    if gherrit_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let mut args = vec![
+        "ls-remote".to_string(),
+        "--tags".to_string(),
+        "origin".to_string(),
+    ];
+    for id in gherrit_ids {
+        args.push(format!("refs/tags/gherrit/{}/*", id));
+    }
+
+    let output = util::cmd("git", args).output()?;
+    let output = core::str::from_utf8(&output.stdout)?;
+
+    let mut versions: std::collections::HashMap<String, Vec<(usize, String)>> =
+        std::collections::HashMap::new();
+    let re = re!(r"refs/tags/gherrit/([^/]+)/v(\d+)$");
+
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let sha = parts[0].to_string();
+        let ref_name = parts[1];
+        if let Some(caps) = re.captures(ref_name) {
+            if let (Some(id), Some(ver)) = (caps.get(1), caps.get(2)) {
+                let id = id.as_str().to_string();
+                if let Ok(ver) = ver.as_str().parse::<usize>() {
+                    versions.entry(id).or_default().push((ver, sha));
+                }
+            }
+        }
+    }
+
+    Ok(versions)
+}
+
+fn sync_prs(
+    repo: &gix::Repository,
+    branch_name: &str,
+    commits: Vec<Commit>,
+    latest_versions: std::collections::HashMap<String, usize>,
+) {
     let pr_list = cmd!("gh pr list --json number,headRefName,url").unwrap_output();
 
     #[derive(Serialize, Deserialize, Debug)]
@@ -202,6 +283,12 @@ fn sync_prs(repo: &gix::Repository, branch_name: &str, commits: Vec<Commit>) {
         }
     };
 
+    // Derive base repo URL from the first PR URL found, or default to empty if none.
+    // e.g. https://github.com/owner/repo/pull/123 -> https://github.com/owner/repo
+    let repo_url = prs.first().map(|pr| {
+        pr.url.split("/pull/").next().unwrap_or("")
+    }).unwrap_or("").to_string();
+
     let commits = commits
         .into_iter()
         .scan("main".to_string(), |parent_branch, c| {
@@ -214,7 +301,7 @@ fn sync_prs(repo: &gix::Repository, branch_name: &str, commits: Vec<Commit>) {
     let commits = commits
         .into_par_iter()
         .map(
-            move |(c, parent_branch)| -> Result<_, Box<dyn Error + Send + Sync>> {
+            move |(c, parent_branch, )| -> Result<_, Box<dyn Error + Send + Sync>> {
                 let pr_info = prs.iter().find(|pr| pr.head_ref_name == c.gherrit_id);
 
                 let (pr_num, pr_url) = if let Some(pr) = pr_info {
@@ -280,6 +367,8 @@ fn sync_prs(repo: &gix::Repository, branch_name: &str, commits: Vec<Commit>) {
             .enumerate()
             .map(|(i, (c, parent_branch, pr_num, pr_url))| {
                 let gh_pr_body_trailer = &gh_pr_body_trailer;
+                let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
+                let repo_url = &repo_url;
 
                 // Determine parent and child IDs, which may be `None` at the
                 // beginning or end of the list.
@@ -293,6 +382,91 @@ fn sync_prs(repo: &gix::Repository, branch_name: &str, commits: Vec<Commit>) {
                 s.spawn(move || -> Result<(), std::io::Error> {
                     let re = gherrit_pr_id_re();
                     let body = re.replace(&message_body, "");
+
+                    // Generate Patch History Table
+                    let mut history_table = String::new();
+                    if latest_version > 1 && !repo_url.is_empty() {
+                        history_table.push_str(&format!("\n\n**Latest Update:** v{} — [Compare vs v{}]({}/compare/gherrit/{}/v{}..gherrit/{}/v{})\n\n", 
+                            latest_version, 
+                            latest_version - 1,
+                            repo_url,
+                            current_gherrit_id, latest_version - 1,
+                            current_gherrit_id, latest_version
+                        ));
+                        
+                        history_table.push_str("<details>\n<summary><strong>📚 Full Patch History</strong></summary>\n\n");
+                        
+                        if latest_version > 10 {
+                            history_table.push_str("_(Note: Due to the large number of versions, history is displayed in a simplified format.)_\n\n");
+                            
+                            for v_row in (1..=latest_version).rev() {
+                                history_table.push_str(&format!("<details>\n<summary>v{}</summary>\n\n", v_row));
+                                
+                                // Base link
+                                let base_link = format!("- [vs Base]({}/compare/{}..gherrit/{}/v{})", 
+                                    repo_url,
+                                    parent_branch,
+                                    current_gherrit_id, v_row
+                                );
+                                history_table.push_str(&format!("{}\n", base_link));
+
+                                // Previous versions
+                                for v_col in (1..v_row).rev() {
+                                    let link = format!("- [vs v{}]({}/compare/gherrit/{}/v{}..gherrit/{}/v{})", 
+                                        v_col,
+                                        repo_url,
+                                        current_gherrit_id, v_col,
+                                        current_gherrit_id, v_row
+                                    );
+                                    history_table.push_str(&format!("{}\n", link));
+                                }
+                                history_table.push_str("\n</details>\n");
+                            }
+                        } else {
+                            // Header
+                            history_table.push_str("| Version | Base |");
+                            for v in 1..latest_version {
+                                history_table.push_str(&format!(" v{} |", v));
+                            }
+                            history_table.push_str("\n| :--- | :--- |");
+                            for _ in 1..latest_version {
+                                history_table.push_str(" :--- |");
+                            }
+                            history_table.push_str("\n");
+
+                            // Rows
+                            for v_row in (1..=latest_version).rev() {
+                                history_table.push_str(&format!("| v{} |", v_row));
+                                
+                                // Base column (v0)
+                                // Compare parent_branch..v_row
+                                // Note: parent_branch is the *current* base.
+                                let base_link = format!("[vs Base]({}/compare/{}..gherrit/{}/v{})", 
+                                    repo_url,
+                                    parent_branch,
+                                    current_gherrit_id, v_row
+                                );
+                                history_table.push_str(&format!(" {} |", base_link));
+
+                                // Previous version columns
+                                for v_col in 1..latest_version {
+                                    if v_col < v_row {
+                                        let link = format!("[vs v{}]({}/compare/gherrit/{}/v{}..gherrit/{}/v{})", 
+                                            v_col,
+                                            repo_url,
+                                            current_gherrit_id, v_col,
+                                            current_gherrit_id, v_row
+                                        );
+                                        history_table.push_str(&format!(" {} |", link));
+                                    } else {
+                                        history_table.push_str(" |");
+                                    }
+                                }
+                                history_table.push_str("\n");
+                            }
+                        }
+                        history_table.push_str("\n</details>");
+                    }
 
                     // 3. Generate Metadata JSON
                     // We generate a JSON object stored in an HTML comment.
@@ -316,7 +490,7 @@ fn sync_prs(repo: &gix::Repository, branch_name: &str, commits: Vec<Commit>) {
                     );
 
                     let warning = "<!-- WARNING: This PR description is automatically generated by GHerrit. Any manual edits will be overwritten on the next push. -->";
-                    let body = format!("{warning}\n\n{body}\n\n---\n\n{gh_pr_body_trailer}\n{meta_footer}");
+                    let body = format!("{warning}\n\n{body}\n\n---\n\n{gh_pr_body_trailer}\n{history_table}\n{meta_footer}");
 
                     log::debug!("Updating PR #{} description...", pr_num);
                     log::info!("Updated PR #{}: {}", pr_num, pr_url);
