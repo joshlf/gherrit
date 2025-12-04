@@ -126,6 +126,10 @@ fn push_to_origin(
         // Use --force-with-lease to ensure we don't overwrite remote changes
         // that we haven't seen (i.e. if the remote ref has moved since we last fetched).
         "--force-with-lease".to_string(),
+        // If any push fails, abort the entire push instead of leaving GitHub with refs
+        // that don't correspond to any PR. Mostly commonly, this is caused by
+        // --force-with-lease causing some refs to fail to push.
+        "--atomic".to_string(),
         "origin".to_string(),
     ];
 
