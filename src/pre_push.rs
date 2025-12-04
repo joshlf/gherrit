@@ -288,14 +288,6 @@ fn sync_prs(
         }
     };
 
-    // Derive base repo URL from the first PR URL found, or default to empty if none.
-    // e.g. https://github.com/owner/repo/pull/123 -> https://github.com/owner/repo
-    let repo_url = prs
-        .first()
-        .map(|pr| pr.url.split("/pull/").next().unwrap_or(""))
-        .unwrap_or("")
-        .to_string();
-
     let commits = commits
         .into_iter()
         .scan("main".to_string(), |parent_branch, c| {
@@ -338,6 +330,15 @@ fn sync_prs(
     let is_private = util::get_config_bool(repo, &format!("branch.{branch_name}.gherritPrivate"))
         .unwrap_or_exit("Failed to read config")
         .unwrap_or(true);
+
+    // Derive base repo URL safely from the first commit's PR URL.
+    // Since `commits` is not empty (checked at the start of `run`), and `create_gh_pr`
+    // always returns a valid URL, this is safe.
+    let repo_url = commits
+        .first()
+        .map(|(_, _, _, url)| url.split("/pull/").next().unwrap_or(""))
+        .unwrap_or("")
+        .to_string();
 
     // Attempt to resolve `HEAD` to a branch name so that we can refer to it
     // in PR bodies. If we can't, then silently fail and just don't include
