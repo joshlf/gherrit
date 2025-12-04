@@ -1,6 +1,8 @@
+mod commit_msg;
 mod manage;
 mod pre_push;
 mod util;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -31,6 +33,11 @@ enum HookCommands {
         new: String,
         flag: String,
     },
+    /// Git commit-msg hook.
+    CommitMsg {
+        /// The file containing the commit message.
+        file: String,
+    },
 }
 
 fn main() {
@@ -60,6 +67,7 @@ fn main() {
             HookCommands::PostCheckout { prev, new, flag } => {
                 manage::post_checkout(&prev, &new, &flag)
             }
+            HookCommands::CommitMsg { file } => commit_msg::run(&file),
         },
         Commands::Manage => manage::set_state(manage::State::Managed),
         Commands::Unmanage => manage::set_state(manage::State::Unmanaged),
