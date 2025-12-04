@@ -226,8 +226,21 @@ fn get_remote_versions(
         "--tags".to_string(),
         "origin".to_string(),
     ];
-    for id in gherrit_ids {
-        args.push(format!("refs/tags/gherrit/{}/*", id));
+
+    // Windows command line limit is ~32k chars. Each refspec is ~70 chars.
+    // 50 * 70 = 3500 chars, which is ~10% of the limit, leaving plenty of room
+    // for environment variables and other overhead.
+    const MAX_SPECIFIC_REFSPECS: usize = 50;
+    if gherrit_ids.len() > MAX_SPECIFIC_REFSPECS {
+        // Fallback: Fetch ALL gherrit tags to avoid crashing the shell
+        // with too many arguments.
+        args.push("refs/tags/gherrit/*".to_string());
+    } else {
+        args.extend(
+            gherrit_ids
+                .iter()
+                .map(|id| format!("refs/tags/gherrit/{id}/*")),
+        );
     }
 
     let output = util::cmd("git", args).output()?;
