@@ -69,7 +69,7 @@ macro_rules! re {
         }
     };
     ($re:literal) => {
-        (|| -> &'static regex::Regex { re!(@inner $re) })()
+        re!(@inner $re)
     };
     (@inner $re:literal) => {{
         static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -118,29 +118,62 @@ impl<T, E: std::fmt::Display> ResultExt<T, E> for Result<T, E> {
     }
 }
 
-#[derive(Debug)]
-pub enum BranchError {
-    DetachedHead,
-    Gix(Box<dyn Error>),
+use std::path::PathBuf;
+
+/// Represents the state of the HEAD reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadState {
+    /// HEAD points to a local branch (e.g., `refs/heads/main`).
+    Attached(String),
+    /// HEAD is detached, but we are in the middle of a rebase of this branch.
+    Rebasing(String),
+    /// HEAD is detached and no rebase context was found.
+    Detached,
 }
 
-impl std::fmt::Display for BranchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl HeadState {
+    /// Returns the logical branch name if one exists (Attached or Rebasing).
+    pub fn name(&self) -> Option<&str> {
         match self {
-            BranchError::DetachedHead => write!(f, "Detached HEAD"),
-            BranchError::Gix(e) => write!(f, "Gix error: {}", e),
+            HeadState::Attached(name) | HeadState::Rebasing(name) => Some(name),
+            HeadState::Detached => None,
         }
     }
 }
 
-impl Error for BranchError {}
+/// Determines the current HEAD state.
+pub fn get_current_branch(repo: &gix::Repository) -> Result<HeadState, Box<dyn std::error::Error>> {
+    let head = repo.head()?;
 
-pub fn get_current_branch() -> Result<(gix::Repository, String), BranchError> {
-    let repo = gix::open(".").map_err(|e| BranchError::Gix(Box::new(e)))?;
-    let head = repo.head().map_err(|e| BranchError::Gix(Box::new(e)))?;
-    let head_ref = head.try_into_referent().ok_or(BranchError::DetachedHead)?;
-    let branch_name = head_ref.name().shorten().to_string();
-    Ok((repo, branch_name))
+    // 1. Try standard Attached HEAD
+    if let Some(name) = head.referent_name() {
+        let name = name.shorten().to_string();
+        return Ok(HeadState::Attached(name));
+    }
+
+    // 2. Try Rebase Detection (Rebase-Merge or Rebase-Apply)
+    let git_dir = repo.path();
+
+    let try_read_ref = |path: PathBuf| -> Option<String> {
+        std::fs::read_to_string(path).ok().map(|content| {
+            content
+                .trim()
+                .strip_prefix("refs/heads/")
+                .unwrap_or(content.trim())
+                .to_string()
+        })
+    };
+
+    if let Some(name) = try_read_ref(git_dir.join("rebase-merge/head-name")) {
+        return Ok(HeadState::Rebasing(name));
+    }
+
+    if let Some(name) = try_read_ref(git_dir.join("rebase-apply/head-name")) {
+        return Ok(HeadState::Rebasing(name));
+    }
+
+    // 3. Fallback to Detached
+    Ok(HeadState::Detached)
 }
 
 pub fn get_config_string(
