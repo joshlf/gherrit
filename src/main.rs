@@ -1,6 +1,10 @@
+mod commit_msg;
 mod manage;
 mod pre_push;
 mod util;
+
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -31,6 +35,8 @@ enum HookCommands {
         new: String,
         flag: String,
     },
+    /// Git commit-msg hook.
+    CommitMsg { msg_file: PathBuf },
 }
 
 fn main() {
@@ -60,6 +66,7 @@ fn main() {
             HookCommands::PostCheckout { prev, new, flag } => {
                 manage::post_checkout(&prev, &new, &flag)
             }
+            HookCommands::CommitMsg { msg_file } => commit_msg::run(&msg_file),
         },
         Commands::Manage => manage::set_state(manage::State::Managed),
         Commands::Unmanage => manage::set_state(manage::State::Unmanaged),
