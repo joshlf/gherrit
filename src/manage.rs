@@ -19,43 +19,58 @@ pub fn get_state(
     }
 }
 
+/// Configures the Git branch state for GHerrit management.
+///
+/// Sets/unsets the following config values:
+/// - `branch.<name>.gherritManaged` (boolean): Indicates whether the branch is
+///   managed by GHerrit.
+/// - `branch.<name>.pushRemote` (string): Set to "." when managed, unset when
+///   unmanaged. Causes `git push` to be a no-op by pushing to the local
+///   repository instead of pushing to the remote repository.
+/// - `branch.<name>.remote` (string)/`branch.<name>.merge` (string): Set to
+///   "."/"refs/heads/<branch>" when managed, unset when unmanaged. Satisfies
+///   Git's requirement that an upstream branch be set to suppress "fatal: The
+///   current branch has no upstream branch" errors.
 pub fn set_state(state: State) {
-    let (_, branch_name) =
+    let (repo, branch_name) =
         util::get_current_branch().unwrap_or_exit("Failed to get current branch");
 
-    cmd!(
-        "git config",
-        "branch.{branch_name}.gherritManaged",
-        match state {
-            State::Managed => "true",
-            State::Unmanaged => "false",
-        }
-    )
-    .unwrap_status();
+    let key_managed = format!("branch.{branch_name}.gherritManaged");
+    let key_push_remote = format!("branch.{branch_name}.pushRemote");
+    let key_remote = format!("branch.{branch_name}.remote");
+    let key_merge = format!("branch.{branch_name}.merge");
+    let self_merge_ref = format!("refs/heads/{branch_name}");
+
     match state {
         State::Managed => {
-            // Set pushRemote to "." (current directory).
-            // This makes `git push` a local no-op.
-            // Result:
-            // 1. `pre-push` hook runs and syncs to GitHub (exit 0).
-            // 2. Git pushes to `.` (succeeds instantly with no effect).
-            // 3. User sees success, and `origin/branch` is NOT updated
-            //    (Private).
-            cmd!("git config", "branch.{branch_name}.pushRemote", ".").unwrap_status();
+            cmd!("git config", key_managed, "true").unwrap_status();
+            cmd!("git config", key_push_remote, ".").unwrap_status();
+            cmd!("git config", key_remote, ".").unwrap_status();
+            cmd!("git config", key_merge, &self_merge_ref).unwrap_status();
 
             log::info!("Branch '{branch_name}' is now managed by GHerrit.");
-            log::info!("  - 'git push' is now configured to sync your stack WITHOUT updating 'origin/{branch_name}'");
+            log::info!("  - 'git push' is configured to sync your stack WITHOUT updating 'origin/{branch_name}'.");
             log::info!("  - To allow pushing this branch to origin (making it public), run:");
-            log::info!("    git config --unset branch.{branch_name}.pushRemote");
+            log::info!("    git config branch.{branch_name}.pushRemote origin");
         }
         State::Unmanaged => {
-            // Remove the pushRemote override to restore standard Git behavior.
-            // Use `.unwrap_status()` and ignore errors (in case the config key
-            // doesn't exist).
-            let _ = cmd!("git config --unset", "branch.{branch_name}.pushRemote").unwrap_status();
+            cmd!("git config", key_managed, "false").unwrap_status();
+            cmd!("git config --unset", key_push_remote).unwrap_status();
+
+            let current_remote = util::get_config_string(&repo, &key_remote).unwrap_or(None);
+            let current_merge = util::get_config_string(&repo, &key_merge).unwrap_or(None);
+
+            if current_remote.as_deref() == Some(".")
+                && current_merge.as_deref() == Some(&self_merge_ref)
+            {
+                cmd!("git config --unset", key_remote).unwrap_status();
+                cmd!("git config --unset", key_merge).unwrap_status();
+                log::info!("  - Removed local self-tracking configuration.");
+            }
 
             log::info!("Branch '{branch_name}' is now unmanaged by GHerrit.");
             log::info!("  - Standard 'git push' behavior has been restored.");
+            log::info!("  - Local self-tracking removed. You may need to set a new upstream (e.g., git push -u origin {branch_name}).");
         }
     }
 }
