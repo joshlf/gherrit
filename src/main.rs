@@ -3,6 +3,8 @@ mod manage;
 mod pre_push;
 mod util;
 
+use util::ResultExt as _;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -60,16 +62,17 @@ fn main() {
         .unwrap();
 
     let cli = Cli::parse();
+    let repo = gix::open(".").unwrap_or_exit("Failed to open repo");
 
     match cli.command {
         Commands::Hook(cmd) => match cmd {
-            HookCommands::PrePush => pre_push::run(),
+            HookCommands::PrePush => pre_push::run(&repo),
             HookCommands::PostCheckout { prev, new, flag } => {
-                manage::post_checkout(&prev, &new, &flag)
+                manage::post_checkout(&repo, &prev, &new, &flag)
             }
-            HookCommands::CommitMsg { file } => commit_msg::run(&file),
+            HookCommands::CommitMsg { file } => commit_msg::run(&repo, &file),
         },
-        Commands::Manage => manage::set_state(manage::State::Managed),
-        Commands::Unmanage => manage::set_state(manage::State::Unmanaged),
+        Commands::Manage => manage::set_state(&repo, manage::State::Managed),
+        Commands::Unmanage => manage::set_state(&repo, manage::State::Unmanaged),
     }
 }

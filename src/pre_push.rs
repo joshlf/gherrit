@@ -1,5 +1,6 @@
 use core::str;
 use std::{
+    collections::HashMap,
     error::Error,
     process::{ExitStatus, Stdio},
     time::Instant,
@@ -11,23 +12,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cmd, manage, re,
-    util::{self, CommandExt as _, ResultExt as _},
+    util::{self, CommandExt as _, HeadState, ResultExt as _},
 };
 
-pub fn run() {
+pub fn run(repo: &gix::Repository) {
     let t0 = Instant::now();
 
-    let (repo, branch_name) =
-        util::get_current_branch().unwrap_or_exit("Failed to get current branch");
+    let branch_name = util::get_current_branch(repo).unwrap_or_exit("Failed to get current branch");
+    let branch_name = match branch_name {
+        HeadState::Attached(bn) | HeadState::Rebasing(bn) => bn,
+        HeadState::Detached => {
+            log::error!("Cannot push from detached HEAD");
+            std::process::exit(1);
+        }
+    };
 
-    check_managed_state(&repo, &branch_name);
+    check_managed_state(repo, &branch_name);
 
-    let commits = collect_commits(&repo).unwrap_or_exit("Failed to collect commits");
+    let commits = collect_commits(repo).unwrap_or_exit("Failed to collect commits");
 
     let t1 = Instant::now();
     log::trace!("t0 -> t1: {:?}", t1 - t0);
 
-    let commits = create_gherrit_refs(&repo, commits).unwrap_or_exit("Failed to create refs");
+    let commits = create_gherrit_refs(repo, commits).unwrap_or_exit("Failed to create refs");
 
     let t2 = Instant::now();
     log::trace!("t1 -> t2: {:?}", t2 - t1);
@@ -39,7 +46,7 @@ pub fn run() {
 
     let latest_versions = push_to_origin(&commits);
 
-    sync_prs(&repo, &branch_name, commits, latest_versions);
+    sync_prs(repo, &branch_name, commits, latest_versions);
 }
 
 // TODO: Maybe this should return a Result instead of bailing from inside?
@@ -104,11 +111,11 @@ fn create_gherrit_refs(
         .collect::<Result<Vec<_>, _>>()
 }
 
-fn push_to_origin(commits: &[Commit]) -> std::collections::HashMap<String, usize> {
+fn push_to_origin(commits: &[Commit]) -> HashMap<String, usize> {
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
     let remote_versions = get_remote_versions(&gherrit_ids).unwrap_or_else(|e| {
         log::warn!("Failed to fetch remote versions: {}", e);
-        std::collections::HashMap::new()
+        HashMap::new()
     });
 
     let mut args = vec![
@@ -125,7 +132,7 @@ fn push_to_origin(commits: &[Commit]) -> std::collections::HashMap<String, usize
         "origin".to_string(),
     ];
 
-    let mut next_versions = std::collections::HashMap::new();
+    let mut next_versions = HashMap::new();
 
     args.extend(commits.iter().flat_map(|c| {
         let versions = remote_versions
@@ -210,11 +217,12 @@ fn push_to_origin(commits: &[Commit]) -> std::collections::HashMap<String, usize
     next_versions
 }
 
+#[allow(clippy::type_complexity)]
 fn get_remote_versions(
     gherrit_ids: &[String],
-) -> Result<std::collections::HashMap<String, Vec<(usize, String)>>, Box<dyn Error>> {
+) -> Result<HashMap<String, Vec<(usize, String)>>, Box<dyn Error>> {
     if gherrit_ids.is_empty() {
-        return Ok(std::collections::HashMap::new());
+        return Ok(HashMap::new());
     }
 
     let mut args = vec![
@@ -242,8 +250,7 @@ fn get_remote_versions(
     let output = util::cmd("git", args).output()?;
     let output = core::str::from_utf8(&output.stdout)?;
 
-    let mut versions: std::collections::HashMap<String, Vec<(usize, String)>> =
-        std::collections::HashMap::new();
+    let mut versions: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     let re = re!(r"refs/tags/gherrit/([^/]+)/v(\d+)$");
 
     for line in output.lines() {
@@ -270,7 +277,7 @@ fn sync_prs(
     repo: &gix::Repository,
     branch_name: &str,
     commits: Vec<Commit>,
-    latest_versions: std::collections::HashMap<String, usize>,
+    latest_versions: HashMap<String, usize>,
 ) {
     let pr_list = cmd!("gh pr list --json number,headRefName,url").unwrap_output();
 
@@ -420,7 +427,7 @@ fn sync_prs(
                 for _ in 1..latest_version {
                     history_table.push_str(" :--- |");
                 }
-                history_table.push_str("\n");
+                history_table.push('\n');
 
                 let prefix = if latest_version <= 8 { "vs " } else { "" };
 
@@ -453,7 +460,7 @@ fn sync_prs(
                             history_table.push_str(" |");
                         }
                     }
-                    history_table.push_str("\n");
+                    history_table.push('\n');
                 }
                 history_table.push_str("\n</details>");
             }
