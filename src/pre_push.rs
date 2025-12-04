@@ -37,7 +37,7 @@ pub fn run() {
         return;
     }
 
-    let latest_versions = push_to_origin(&repo, &branch_name, &commits);
+    let latest_versions = push_to_origin(&commits);
 
     sync_prs(&repo, &branch_name, commits, latest_versions);
 }
@@ -104,15 +104,7 @@ fn create_gherrit_refs(
         .try_collect::<Vec<_>>()
 }
 
-fn push_to_origin(
-    repo: &gix::Repository,
-    branch_name: &str,
-    commits: &[Commit],
-) -> std::collections::HashMap<String, usize> {
-    let _is_private = util::get_config_bool(repo, &format!("branch.{branch_name}.gherritPrivate"))
-        .unwrap_or_exit("Failed to read config")
-        .unwrap_or(true);
-
+fn push_to_origin(commits: &[Commit]) -> std::collections::HashMap<String, usize> {
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
     let remote_versions = get_remote_versions(&gherrit_ids).unwrap_or_else(|e| {
         log::warn!("Failed to fetch remote versions: {}", e);
@@ -344,9 +336,7 @@ fn sync_prs(
         .try_collect::<Vec<_>>()
         .unwrap();
 
-    let is_private = util::get_config_bool(repo, &format!("branch.{branch_name}.gherritPrivate"))
-        .unwrap_or_exit("Failed to read config")
-        .unwrap_or(true);
+    let is_private = is_private_stack(repo, branch_name);
 
     // Derive base repo URL safely from the first commit's PR URL.
     // Since `commits` is not empty (checked at the start of `run`), and `create_gh_pr`
@@ -498,24 +488,14 @@ fn sync_prs(
             Ok(())
         })
         .unwrap();
+}
 
-    if is_private {
-        log::info!("-------------------------------------------------------------------------");
-        log::info!(" Stack successfully synchronized!");
-        log::info!("");
-        log::info!(" NOTE: Standard 'git push' was blocked to keep origin clean.");
-        log::info!("       Your changes are already active on GitHub (via GHerrit refs).");
-        log::info!("");
-        log::info!(
-            "       To enable pushing this branch to 'origin/{}':",
-            branch_name
-        );
-        log::info!("       git config branch.{branch_name}.gherritPrivate false");
-        log::info!("-------------------------------------------------------------------------");
-
-        // Exit with failure (1) to stop Git from proceeding with the standard push
-        std::process::exit(1);
-    }
+fn is_private_stack(repo: &gix::Repository, branch: &str) -> bool {
+    // If pushRemote is set to ".", it is a private loopback stack.
+    // If it is unset or anything else (e.g. 'origin'), it is public.
+    util::get_config_string(repo, &format!("branch.{}.pushRemote", branch))
+        .map(|val| val.as_deref() == Some("."))
+        .unwrap_or(false)
 }
 
 struct Commit {
