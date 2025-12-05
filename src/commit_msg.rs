@@ -26,6 +26,7 @@ use crate::{cmd, util};
 use eyre::{bail, Result, WrapErr};
 use owo_colors::OwoColorize;
 
+// See e.g. https://floatingoctothorpe.uk/2017/empty-trees-in-git.html
 const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
