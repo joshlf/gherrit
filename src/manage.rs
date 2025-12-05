@@ -33,7 +33,7 @@ pub fn get_state(repo: &util::Repo, branch_name: &str) -> Result<Option<State>> 
 pub fn set_state(repo: &util::Repo, state: State) -> Result<()> {
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
-        HeadState::Attached(bn) | HeadState::Rebasing(bn) => bn,
+        HeadState::Attached(bn) | HeadState::Pending(bn) => bn,
         HeadState::Detached => {
             bail!("Cannot set state for detached HEAD");
         }
@@ -92,7 +92,7 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) => bn,
-        HeadState::Rebasing(_) | HeadState::Detached => return Ok(()),
+        HeadState::Pending(_) | HeadState::Detached => return Ok(()),
     };
 
     // Idempotency check: Bail if the branch management state is already set.

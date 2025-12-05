@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::process::Command;
 
 use eyre::Result;
-use gix::bstr::ByteSlice as _;
+use gix::{bstr::ByteSlice as _, state::InProgress};
 
 /// Constructs a `std::process::Command`.
 ///
@@ -88,19 +88,21 @@ use std::path::PathBuf;
 /// Represents the state of the HEAD reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadState {
-    /// HEAD points to a local branch (e.g., `refs/heads/main`).
+    /// HEAD points to a local branch (e.g., `refs/heads/main`). We are fully
+    /// "on" this branch.
     Attached(String),
-    /// HEAD is detached, but we are in the middle of a rebase of this branch.
-    Rebasing(String),
-    /// HEAD is detached and no rebase context was found.
+    /// HEAD is detached (e.g. during a rebase), but we know which branch we are
+    /// conceptually working on.
+    Pending(String),
+    /// HEAD is detached and we don't know of any associated branch.
     Detached,
 }
 
 impl HeadState {
-    /// Returns the logical branch name if one exists (Attached or Rebasing).
+    /// Returns the logical branch name if one exists (Attached or Pending).
     pub fn name(&self) -> Option<&str> {
         match self {
-            HeadState::Attached(name) | HeadState::Rebasing(name) => Some(name),
+            HeadState::Attached(name) | HeadState::Pending(name) => Some(name),
             HeadState::Detached => None,
         }
     }
@@ -166,35 +168,36 @@ impl std::ops::Deref for Repo {
 
 /// Determines the current HEAD state.
 fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
-    let head = repo.head()?;
-
-    // 1. Try standard Attached HEAD
-    if let Some(name) = head.referent_name() {
+    if let Some(name) = repo.head()?.referent_name() {
         let name = name.shorten().to_string();
         return Ok(HeadState::Attached(name));
     }
 
-    // 2. Try Rebase Detection (Rebase-Merge or Rebase-Apply)
-    let git_dir = repo.path();
+    // Try to recover the branch name – we only care about states that detach
+    // HEAD but preserve a branch identity. All other states besides these two
+    // are either unreachable (because they're states in which the HEAD is
+    // considered attached, and so we would have already returned above) or
+    // are states in which we don't have any branch name at all.
+    if let Some(InProgress::Rebase) | Some(InProgress::RebaseInteractive) = repo.state() {
+        let git_dir = repo.path();
+        let try_read_ref = |path: PathBuf| -> Option<String> {
+            std::fs::read_to_string(path).ok().map(|content| {
+                content
+                    .trim()
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(content.trim())
+                    .to_string()
+            })
+        };
 
-    let try_read_ref = |path: PathBuf| -> Option<String> {
-        std::fs::read_to_string(path).ok().map(|content| {
-            content
-                .trim()
-                .strip_prefix("refs/heads/")
-                .unwrap_or(content.trim())
-                .to_string()
-        })
-    };
+        if let Some(name) = try_read_ref(git_dir.join("rebase-merge/head-name")) {
+            return Ok(HeadState::Pending(name));
+        }
 
-    if let Some(name) = try_read_ref(git_dir.join("rebase-merge/head-name")) {
-        return Ok(HeadState::Rebasing(name));
+        if let Some(name) = try_read_ref(git_dir.join("rebase-apply/head-name")) {
+            return Ok(HeadState::Pending(name));
+        }
     }
 
-    if let Some(name) = try_read_ref(git_dir.join("rebase-apply/head-name")) {
-        return Ok(HeadState::Rebasing(name));
-    }
-
-    // 3. Fallback to Detached
     Ok(HeadState::Detached)
 }
