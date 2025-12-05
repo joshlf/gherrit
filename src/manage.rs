@@ -1,5 +1,6 @@
 use crate::cmd;
-use crate::util::{self, CommandExt, HeadState, ResultExt as _};
+use crate::util::{self, HeadState};
+use eyre::{bail, Result, WrapErr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -7,10 +8,7 @@ pub enum State {
     Unmanaged,
 }
 
-pub fn get_state(
-    repo: &util::Repo,
-    branch_name: &str,
-) -> Result<Option<State>, gix::config::value::Error> {
+pub fn get_state(repo: &util::Repo, branch_name: &str) -> Result<Option<State>> {
     let key = format!("branch.{}.gherritManaged", branch_name);
     match repo.config_bool(&key)? {
         Some(true) => Ok(Some(State::Managed)),
@@ -31,13 +29,12 @@ pub fn get_state(
 ///   "."/"refs/heads/<branch>" when managed, unset when unmanaged. Satisfies
 ///   Git's requirement that an upstream branch be set to suppress "fatal: The
 ///   current branch has no upstream branch" errors.
-pub fn set_state(repo: &util::Repo, state: State) {
+pub fn set_state(repo: &util::Repo, state: State) -> Result<()> {
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) | HeadState::Rebasing(bn) => bn,
         HeadState::Detached => {
-            log::error!("Cannot set state for detached HEAD");
-            std::process::exit(1);
+            bail!("Cannot set state for detached HEAD");
         }
     };
 
@@ -45,10 +42,10 @@ pub fn set_state(repo: &util::Repo, state: State) {
     let self_merge_ref = format!("refs/heads/{branch_name}");
     match state {
         State::Managed => {
-            cmd!("git config", key("gherritManaged"), "true").unwrap_status();
-            cmd!("git config", key("pushRemote"), ".").unwrap_status();
-            cmd!("git config", key("remote"), ".").unwrap_status();
-            cmd!("git config", key("merge"), &self_merge_ref).unwrap_status();
+            cmd!("git config", key("gherritManaged"), "true").status()?;
+            cmd!("git config", key("pushRemote"), ".").status()?;
+            cmd!("git config", key("remote"), ".").status()?;
+            cmd!("git config", key("merge"), &self_merge_ref).status()?;
 
             log::info!("Branch '{branch_name}' is now managed by GHerrit.");
             log::info!("  - 'git push' is configured to sync your stack WITHOUT updating 'origin/{branch_name}'.");
@@ -56,17 +53,17 @@ pub fn set_state(repo: &util::Repo, state: State) {
             log::info!("    git config {} origin", key("pushRemote"));
         }
         State::Unmanaged => {
-            cmd!("git config", key("gherritManaged"), "false").unwrap_status();
-            cmd!("git config --unset", key("pushRemote")).unwrap_status();
+            cmd!("git config", key("gherritManaged"), "false").status()?;
+            cmd!("git config --unset", key("pushRemote")).status()?;
 
-            let current_remote = repo.config_string(&key("remote")).unwrap_or(None);
-            let current_merge = repo.config_string(&key("merge")).unwrap_or(None);
+            let current_remote = repo.config_string(&key("remote"))?;
+            let current_merge = repo.config_string(&key("merge"))?;
 
             if current_remote.as_deref() == Some(".")
                 && current_merge.as_deref() == Some(&self_merge_ref)
             {
-                cmd!("git config --unset", key("remote")).unwrap_status();
-                cmd!("git config --unset", key("merge")).unwrap_status();
+                cmd!("git config --unset", key("remote")).status()?;
+                cmd!("git config --unset", key("merge")).status()?;
                 log::info!("  - Removed local self-tracking configuration.");
             }
 
@@ -75,44 +72,45 @@ pub fn set_state(repo: &util::Repo, state: State) {
             log::info!("  - Local self-tracking removed. You may need to set a new upstream (e.g., git push -u origin {branch_name}).");
         }
     }
+    Ok(())
 }
 
-pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) {
+pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> Result<()> {
     // Only run on branch switches (flag=1)
     if flag != "1" {
-        return;
+        return Ok(());
     }
 
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) => bn,
-        HeadState::Rebasing(_) | HeadState::Detached => return,
+        HeadState::Rebasing(_) | HeadState::Detached => return Ok(()),
     };
 
     // Idempotency check: Bail if the branch management state is already set.
     if get_state(repo, branch_name)
-        .unwrap_or_exit("Failed to parse gherritState")
+        .wrap_err("Failed to parse gherritState")?
         .is_some()
     {
         log::debug!("Branch '{}' is already configured.", branch_name);
-        return;
+        return Ok(());
     }
 
     // Creation detection: Bail if we're just checking out an already-existing branch.
     let is_new = repo
         .is_newly_created_branch(branch_name)
-        .unwrap_or_exit("Failed to check if branch is new");
+        .wrap_err("Failed to check if branch is new")?;
     if !is_new {
         log::debug!("Branch '{}' is not newly created.", branch_name);
-        return;
+        return Ok(());
     }
 
     let upstream_remote = repo
         .config_string(&format!("branch.{branch_name}.remote"))
-        .unwrap_or_exit("Failed to read config");
+        .wrap_err("Failed to read config")?;
     let upstream_merge = repo
         .config_string(&format!("branch.{branch_name}.merge"))
-        .unwrap_or_exit("Failed to read config");
+        .wrap_err("Failed to read config")?;
 
     let has_upstream = upstream_remote.is_some() && upstream_merge.is_some();
     let is_origin_main = if has_upstream {
@@ -125,12 +123,14 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) {
 
     if has_upstream && !is_origin_main {
         // Condition A: Shared Branch
-        set_state(repo, State::Unmanaged);
+        set_state(repo, State::Unmanaged)?;
         log::info!("Branch initialized as UNMANAGED (Collaboration Mode).");
     } else {
         // Condition B: New Stack
-        set_state(repo, State::Managed);
+        set_state(repo, State::Managed)?;
         log::info!("Branch initialized as MANAGED (Stack Mode).");
         log::info!("To opt-out, run: gherrit unmanage");
     }
+
+    Ok(())
 }
