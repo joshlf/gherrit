@@ -42,7 +42,9 @@ enum HookCommands {
     },
 }
 
-fn main() {
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format({
             use owo_colors::OwoColorize as _;
@@ -77,8 +79,10 @@ fn main() {
         format!("{:#}", e)
             .lines()
             .for_each(|line| log::error!("{}", line));
-        std::process::exit(1);
+        return ExitCode::FAILURE;
     }
+
+    ExitCode::SUCCESS
 }
 
 fn run() -> Result<()> {

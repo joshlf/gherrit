@@ -72,8 +72,8 @@ macro_rules! re {
         re!(@inner $re)
     };
     (@inner $re:literal) => {{
-        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        RE.get_or_init(|| regex::Regex::new($re).unwrap())
+        static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new($re).unwrap());
+        &*RE
     }};
 }
 
