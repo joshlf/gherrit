@@ -12,7 +12,7 @@ pub fn get_state(
     branch_name: &str,
 ) -> Result<Option<State>, gix::config::value::Error> {
     let key = format!("branch.{}.gherritManaged", branch_name);
-    match util::get_config_bool(repo, &key)? {
+    match repo.config_bool(&key)? {
         Some(true) => Ok(Some(State::Managed)),
         Some(false) => Ok(Some(State::Unmanaged)),
         None => Ok(None),
@@ -63,8 +63,8 @@ pub fn set_state(repo: &util::Repo, state: State) {
             cmd!("git config", key_managed, "false").unwrap_status();
             cmd!("git config --unset", key_push_remote).unwrap_status();
 
-            let current_remote = util::get_config_string(repo, &key_remote).unwrap_or(None);
-            let current_merge = util::get_config_string(repo, &key_merge).unwrap_or(None);
+            let current_remote = repo.config_string(&key_remote).unwrap_or(None);
+            let current_merge = repo.config_string(&key_merge).unwrap_or(None);
 
             if current_remote.as_deref() == Some(".")
                 && current_merge.as_deref() == Some(&self_merge_ref)
@@ -111,9 +111,11 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) {
         return;
     }
 
-    let upstream_remote = util::get_config_string(repo, &format!("branch.{branch_name}.remote"))
+    let upstream_remote = repo
+        .config_string(&format!("branch.{branch_name}.remote"))
         .unwrap_or_exit("Failed to read config");
-    let upstream_merge = util::get_config_string(repo, &format!("branch.{branch_name}.merge"))
+    let upstream_merge = repo
+        .config_string(&format!("branch.{branch_name}.merge"))
         .unwrap_or_exit("Failed to read config");
 
     let has_upstream = upstream_remote.is_some() && upstream_merge.is_some();
