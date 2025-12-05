@@ -44,13 +44,27 @@ enum HookCommands {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format(|buf, record| {
-            use std::io::Write;
-            let level = record.level();
-            if level == log::Level::Info {
-                writeln!(buf, "[gherrit] {}", record.args())
-            } else {
-                writeln!(buf, "[gherrit] [{}] {}", level, record.args())
+        .format({
+            use owo_colors::OwoColorize as _;
+            use std::io::Write as _;
+
+            let prefix = "[gherrit]".bold().green().to_string();
+            let level_style_error = " [ERROR]".red().to_string();
+            let level_style_warn = " [WARN]".yellow().to_string();
+            let level_style_info = "".to_string();
+            let level_style_debug = " [DEBUG]".purple().to_string();
+            let level_style_trace = " [TRACE]".dimmed().to_string();
+
+            move |buf, record| {
+                let level_style = match record.level() {
+                    log::Level::Error => &level_style_error,
+                    log::Level::Warn => &level_style_warn,
+                    log::Level::Info => &level_style_info,
+                    log::Level::Debug => &level_style_debug,
+                    log::Level::Trace => &level_style_trace,
+                };
+
+                writeln!(buf, "{prefix}{level_style} {}", record.args())
             }
         })
         .init();
