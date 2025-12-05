@@ -54,13 +54,50 @@ impl TestContext {
     }
 
     pub fn run_git(&self, args: &[&str]) {
-        run_git_cmd(&self.repo_path, args);
+        let mut cmd = assert_cmd::Command::new("git");
+        cmd.current_dir(&self.repo_path);
+        cmd.args(args);
+
+        if !self.is_live {
+            let mut paths = vec![self.dir.path().to_path_buf()];
+            paths.extend(env::split_paths(&env::var_os("PATH").unwrap()));
+            let new_path_str = env::join_paths(paths).unwrap();
+            cmd.env("PATH", new_path_str);
+            cmd.env("SYSTEM_GIT_PATH", &self.system_git);
+        }
+
+        cmd.assert().success();
     }
 
     pub fn read_mock_state(&self) -> MockState {
         let content = fs::read_to_string(self.repo_path.join("mock_state.json"))
             .expect("Failed to read mock_state.json");
         serde_json::from_str(&content).expect("Failed to parse mock state")
+    }
+
+    pub fn install_hooks(&self) {
+        let hooks_dir = self.repo_path.join(".git").join("hooks");
+        fs::create_dir_all(&hooks_dir).expect("Failed to create hooks dir");
+
+        self.install_hook(&hooks_dir, "commit-msg");
+        self.install_hook(&hooks_dir, "pre-push");
+        self.install_hook(&hooks_dir, "post-checkout");
+    }
+
+    fn install_hook(&self, dir: &Path, name: &str) {
+        let file_path = dir.join(name);
+        let bin_path = env!("CARGO_BIN_EXE_gherrit");
+        let script = format!("#!/bin/sh\n{:?} hook {} \"$@\"\n", bin_path, name);
+
+        fs::write(&file_path, script).expect("Failed to write hook script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&file_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&file_path, perms).expect("Failed to set hook permissions");
+        }
     }
 }
 
@@ -88,12 +125,19 @@ pub struct PrEntry {
 
 fn install_mock_binaries(path: &Path) {
     let mock_bin = PathBuf::from(env!("CARGO_BIN_EXE_mock_bin"));
+    let gherrit_bin = PathBuf::from(env!("CARGO_BIN_EXE_gherrit"));
 
-    let git_dest = path.join(if cfg!(windows) { "git.exe" } else { "git" });
-    let gh_dest = path.join(if cfg!(windows) { "gh.exe" } else { "gh" });
+    let git_dst = path.join(if cfg!(windows) { "git.exe" } else { "git" });
+    let gh_dst = path.join(if cfg!(windows) { "gh.exe" } else { "gh" });
+    let gherrit_dst = path.join(if cfg!(windows) {
+        "gherrit.exe"
+    } else {
+        "gherrit"
+    });
 
-    fs::copy(&mock_bin, &git_dest).unwrap();
-    fs::copy(&mock_bin, &gh_dest).unwrap();
+    fs::copy(&mock_bin, &git_dst).unwrap();
+    fs::copy(&mock_bin, &gh_dst).unwrap();
+    fs::copy(&gherrit_bin, &gherrit_dst).unwrap();
 }
 
 fn init_git_repo(path: &Path) {

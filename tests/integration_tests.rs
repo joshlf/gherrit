@@ -24,24 +24,18 @@ fn test_commit_msg_hook() {
 #[test]
 fn test_full_stack_lifecycle_mocked() {
     let ctx = TestContext::init();
+    ctx.install_hooks();
 
     // Setup: Create 'main' and a feature branch
     ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
     ctx.run_git(&["checkout", "-b", "feature-stack"]);
-    ctx.run_git(&[
-        "commit",
-        "--allow-empty",
-        "-m",
-        "Commit A\n\ngherrit-pr-id: G1",
-    ]);
-    ctx.run_git(&[
-        "commit",
-        "--allow-empty",
-        "-m",
-        "Commit B\n\ngherrit-pr-id: G2",
-    ]);
 
+    // Manage the branch properly before making commits so hooks are installed
     ctx.gherrit().args(["manage"]).assert().success();
+
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit A"]);
+
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit B"]);
 
     // Trigger Pre-Push Hook (Simulate 'git push'). We call the hook directly
     // because simulating a real 'git push' that calls the hook recursively is
