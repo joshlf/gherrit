@@ -26,9 +26,6 @@ use crate::{cmd, util};
 use eyre::{bail, Result, WrapErr};
 use owo_colors::OwoColorize;
 
-// See e.g. https://floatingoctothorpe.uk/2017/empty-trees-in-git.html
-const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-
 pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     let msg_path = Path::new(msg_file);
     if !msg_path.exists() {
@@ -70,7 +67,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
         let refhash = repo
             .head_id()
             .map(|h| h.to_string())
-            .unwrap_or_else(|_| EMPTY_TREE_HASH.to_string());
+            .unwrap_or_else(|_| gix::ObjectId::empty_tree(repo.object_hash()).to_string());
 
         format!("{}\n{}\n{}", committer_ident, refhash, msg_content)
     };
