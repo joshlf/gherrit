@@ -25,7 +25,7 @@ pub fn run(repo: &util::Repo) -> Result<()> {
 
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
-        HeadState::Attached(bn) | HeadState::Rebasing(bn) => bn,
+        HeadState::Attached(bn) | HeadState::Pending(bn) => bn,
         HeadState::Detached => {
             bail!("Cannot push from detached HEAD");
         }
