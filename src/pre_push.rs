@@ -109,105 +109,116 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
         HashMap::new()
     });
 
-    let mut args = vec![
-        "push".to_string(),
-        "--quiet".to_string(),
-        "--no-verify".to_string(),
-        // Use --force-with-lease to ensure we don't overwrite remote changes
-        // that we haven't seen (i.e. if the remote ref has moved since we last fetched).
-        "--force-with-lease".to_string(),
-        // If any push fails, abort the entire push instead of leaving GitHub with refs
-        // that don't correspond to any PR. Mostly commonly, this is caused by
-        // --force-with-lease causing some refs to fail to push.
-        "--atomic".to_string(),
-        repo.default_remote_name(),
-    ];
-
     let mut next_versions = HashMap::new();
 
-    args.extend(commits.iter().flat_map(|c| {
-        let versions = remote_versions
-            .get(&c.gherrit_id)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
+    // Windows command line limit is ~32k chars. Each commit generates ~200 chars
+    // of refspecs (1 branch ref + 1 tag ref).
+    // 80 * 200 = 16,000 chars, leaving plenty of headroom.
+    const BATCH_SIZE: usize = 80;
 
-        // Find the latest version
-        let latest = versions.iter().max_by_key(|(v, _)| *v);
+    for chunk in commits.chunks(BATCH_SIZE) {
+        let mut refspecs = Vec::new();
 
-        if let Some((ver, sha)) = latest {
-            if *sha == c.id.to_string() {
-                log::info!(
-                    "Commit {} already tagged as {}",
-                    c.id.yellow(),
-                    format!("v{ver}").bold()
-                );
-                next_versions.insert(c.gherrit_id.clone(), *ver);
-                // Still push the branch ref
-                return vec![format!("{}:refs/heads/{}", c.id, c.gherrit_id)];
+        for c in chunk {
+            let versions = remote_versions
+                .get(&c.gherrit_id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+
+            // Find the latest version
+            let latest = versions.iter().max_by_key(|(v, _)| *v);
+
+            if let Some((ver, sha)) = latest {
+                if *sha == c.id.to_string() {
+                    log::info!(
+                        "Commit {} already tagged as {}",
+                        c.id.yellow(),
+                        format!("v{ver}").bold()
+                    );
+                    next_versions.insert(c.gherrit_id.clone(), *ver);
+                    // Still push the branch ref to ensure the phantom branch is up to date
+                    refspecs.push(format!("{}:refs/heads/{}", c.id, c.gherrit_id));
+                    continue;
+                }
             }
-        }
 
-        let next_version = latest.map(|(v, _)| *v).unwrap_or(0) + 1;
-        next_versions.insert(c.gherrit_id.clone(), next_version);
+            let next_version = latest.map(|(v, _)| *v).unwrap_or(0) + 1;
+            next_versions.insert(c.gherrit_id.clone(), next_version);
 
-        vec![
-            format!("{}:refs/heads/{}", c.id, c.gherrit_id),
-            format!(
+            refspecs.push(format!("{}:refs/heads/{}", c.id, c.gherrit_id));
+            refspecs.push(format!(
                 "{}:refs/tags/gherrit/{}/v{}",
                 c.id, c.gherrit_id, next_version
-            ),
-        ]
-    }));
-
-    log::info!("Pushing {} commits and tags to origin...", commits.len());
-    let mut child = util::cmd("git", args)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::piped())
-        .spawn()
-        .wrap_err("Failed to run `git push`")?;
-
-    // Filter out the "Create a pull request" message from GitHub
-    {
-        use std::io::{BufRead, BufReader};
-        let stderr = child.stderr.take().unwrap();
-        let reader = BufReader::new(stderr);
-
-        // Buffer for contiguous "remote:" lines
-        let mut remote_buffer: Vec<String> = Vec::new();
-
-        let flush_buffer = |buf: &mut Vec<String>| {
-            if buf.is_empty() {
-                return;
-            }
-            let block = buf.join("\n");
-            let re = re!(
-                r"(?m)\n?^remote:\s*\nremote: Create a pull request for '.*' on GitHub by visiting:\s*\nremote:\s*https://github\.com/.*\nremote:\s*$"
-            );
-
-            let cleaned = re.replace(&block, "");
-            if !cleaned.is_empty() {
-                eprintln!("{}", cleaned);
-            }
-            buf.clear();
-        };
-
-        for line in reader.lines() {
-            let line = line.unwrap();
-            if line.trim_start().starts_with("remote:") {
-                remote_buffer.push(line);
-            } else {
-                flush_buffer(&mut remote_buffer);
-                eprintln!("{}", line);
-            }
+            ));
         }
-        flush_buffer(&mut remote_buffer);
-    }
 
-    let status = child.wait().unwrap();
-    if !status.success() {
-        let r = repo.default_remote_name();
-        let b = repo.find_default_branch_on_default_remote();
-        bail!("`git push` failed. You may need to rebase on the latest changes from {r}/{b}.");
+        if refspecs.is_empty() {
+            continue;
+        }
+
+        let mut args = vec![
+            "push".to_string(),
+            "--quiet".to_string(),
+            "--no-verify".to_string(),
+            // Use --force-with-lease to ensure we don't overwrite remote changes
+            // that we haven't seen.
+            "--force-with-lease".to_string(),
+            // If any push in this batch fails, abort this batch.
+            "--atomic".to_string(),
+            repo.default_remote_name(),
+        ];
+        args.extend(refspecs);
+
+        log::info!("Pushing chunk of {} refs on remote...", args.len() - 6); // Subtract flags
+        let mut child = util::cmd("git", args)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .spawn()
+            .wrap_err("Failed to run `git push`")?;
+
+        // Filter out the "Create a pull request" message from GitHub
+        {
+            use std::io::{BufRead, BufReader};
+            let stderr = child.stderr.take().unwrap();
+            let reader = BufReader::new(stderr);
+
+            // Buffer for contiguous "remote:" lines
+            let mut remote_buffer: Vec<String> = Vec::new();
+
+            let flush_buffer = |buf: &mut Vec<String>| {
+                if buf.is_empty() {
+                    return;
+                }
+                let block = buf.join("\n");
+                let re = re!(
+                    r"(?m)\n?^remote:\s*\nremote: Create a pull request for '.*' on GitHub by visiting:\s*\nremote:\s*https://github\.com/.*\nremote:\s*$"
+                );
+
+                let cleaned = re.replace(&block, "");
+                if !cleaned.is_empty() {
+                    eprintln!("{}", cleaned);
+                }
+                buf.clear();
+            };
+
+            for line in reader.lines() {
+                let line = line.unwrap();
+                if line.trim_start().starts_with("remote:") {
+                    remote_buffer.push(line);
+                } else {
+                    flush_buffer(&mut remote_buffer);
+                    eprintln!("{}", line);
+                }
+            }
+            flush_buffer(&mut remote_buffer);
+        }
+
+        let status = child.wait().unwrap();
+        if !status.success() {
+            let r = repo.default_remote_name();
+            let b = repo.find_default_branch_on_default_remote();
+            bail!("`git push` failed. You may need to rebase on the latest changes from {r}/{b}.");
+        }
     }
 
     Ok(next_versions)
@@ -226,10 +237,9 @@ fn get_remote_versions(
 
     // Batch size to avoid overwhelming the shell or server.
     //
-    // Windows command line limit is ~32k chars. Each refspec is ~70 chars.
-    // 50 * 70 = 3500 chars, which is ~10% of the limit, leaving plenty of room
-    // for environment variables and other overhead.
-    const BATCH_SIZE: usize = 50;
+    // Windows command line limit is ~32k chars. Each refspec is ~62 chars.
+    // 250 * 62 = 15,500 chars, which is ~50% of the limit, safe for all OSes.
+    const BATCH_SIZE: usize = 250;
 
     for chunk in gherrit_ids.chunks(BATCH_SIZE) {
         let mut args = vec![
