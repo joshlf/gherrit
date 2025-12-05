@@ -594,8 +594,7 @@ impl<'a> TryFrom<gix::Commit<'a>> for Commit {
             let captures = re
                 .captures(&message_body)
                 .ok_or_else(|| eyre!("Commit {} missing gherrit-pr-id trailer", c.id))?;
-            let gherrit_id = captures.get(1).unwrap().as_str().to_string();
-            gherrit_id
+            captures.get(1).unwrap().as_str().to_string()
         };
 
         Ok(Commit {

@@ -1,0 +1,202 @@
+use serde::{Deserialize, Serialize};
+use std::env;
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::Command;
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct MockState {
+    #[serde(default)]
+    prs: Vec<PrEntry>,
+    #[serde(default)]
+    pushed_refs: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct PrEntry {
+    number: usize,
+    #[serde(rename = "headRefName")]
+    head_ref_name: String,
+    #[serde(rename = "baseRefName")]
+    base_ref_name: String,
+    title: String,
+    body: String,
+    url: String,
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    // Detect identity via filename (handles .exe on Windows)
+    let prog_name = PathBuf::from(&args[0])
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    if prog_name == "git" {
+        handle_git(&args);
+    } else {
+        // Default to gh behavior if named gh or mock-gh
+        handle_gh(&args);
+    }
+}
+
+fn handle_git(args: &[String]) {
+    // Basic heuristic: Intercept "push"
+    if args.contains(&"push".to_string()) {
+        // Parse refspecs (args that look like refs or have colons)
+        let refspecs: Vec<String> = args
+            .iter()
+            .skip(1) // Skip "git"
+            .filter(|arg| arg.starts_with("refs/") || arg.contains(":"))
+            .cloned()
+            .collect();
+
+        update_state(|state| {
+            state.pushed_refs.extend(refspecs);
+        });
+
+        // Pretend push succeeded
+        return;
+    }
+
+    // Pass-through for everything else
+    let real_git = env::var("SYSTEM_GIT_PATH").unwrap_or_else(|_| "git".to_string());
+    let status = Command::new(real_git)
+        .args(&args[1..])
+        .status()
+        .expect("Failed to run real git from mock shim");
+
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+fn handle_gh(args: &[String]) {
+    // args[0] is program name, args[1] is subcommand (e.g., "pr")
+    let subcmd = args.get(1).map(|s| s.as_str());
+    if let Some("pr") = subcmd {
+        match args.get(2).map(|s| s.as_str()) {
+            Some("list") => {
+                let state = read_state();
+                println!("{}", serde_json::to_string(&state.prs).unwrap());
+            }
+            Some("create") => {
+                // Quick-and-dirty arg parsing.
+                let title = extract_arg(args, "--title").unwrap_or("No Title".into());
+                let body = extract_arg(args, "--body").unwrap_or("".into());
+                let head = extract_arg(args, "--head").unwrap_or("?".into());
+                let base = extract_arg(args, "--base").unwrap_or("main".into());
+
+                // Simple ID generation without extra deps
+                let state_read = read_state();
+                let max_id = state_read.prs.iter().map(|p| p.number).max().unwrap_or(100);
+                let num = max_id + 1;
+
+                let url = format!("https://github.com/mock/repo/pull/{}", num);
+
+                let entry = PrEntry {
+                    number: num,
+                    head_ref_name: head,
+                    base_ref_name: base,
+                    title,
+                    body,
+                    url: url.clone(),
+                };
+
+                update_state(|state| state.prs.push(entry));
+                println!("{}", url);
+            }
+            Some("edit") => {
+                // usage: gh pr edit <number> ...
+                if let Some(num_str) = args.get(3) {
+                    if let Ok(num) = num_str.parse::<usize>() {
+                        let title = extract_arg(args, "--title");
+                        let body = extract_arg(args, "--body");
+
+                        update_state(|state| {
+                            if let Some(pr) = state.prs.iter_mut().find(|p| p.number == num) {
+                                if let Some(t) = title {
+                                    pr.title = t;
+                                }
+                                if let Some(b) = body {
+                                    pr.body = b;
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extract_arg(args: &[String], key: &str) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == key {
+            return iter.next().cloned();
+        }
+    }
+    None
+}
+
+fn read_state() -> MockState {
+    if let Ok(content) = fs::read_to_string("mock_state.json") {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        MockState::default()
+    }
+}
+
+fn update_state<F>(f: F)
+where
+    F: FnOnce(&mut MockState),
+{
+    // Use gix::lock for robust file locking to ensure safe concurrent updates.
+    // acquire_to_update_resource creates a lock file (e.g., mock_state.json.lock).
+    // Defaults to failing immediately if locked, so we implement a retry loop.
+
+    let state_path = PathBuf::from("mock_state.json");
+    let mut lock = None;
+    let mut retries = 0;
+
+    while lock.is_none() {
+        match gix::lock::File::acquire_to_update_resource(
+            &state_path,
+            gix::lock::acquire::Fail::Immediately,
+            None,
+        ) {
+            Ok(l) => lock = Some(l),
+            Err(gix::lock::acquire::Error::PermanentlyLocked { .. }) => {
+                // Lock file exists, likely held by another process.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                retries += 1;
+            }
+            Err(e) => panic!("Failed to acquire lock: {e}"),
+        }
+
+        if retries > 500 {
+            panic!("Timed out waiting for lock on mock_state.json");
+        }
+    }
+
+    let mut lock = lock.unwrap();
+
+    // Read current state (if file exists) while holding the lock.
+    let mut state = if state_path.exists() {
+        let content = fs::read_to_string(&state_path).unwrap();
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        MockState::default()
+    };
+
+    f(&mut state);
+
+    // Write the updated state and atomic commit (rename).
+    let new_content = serde_json::to_string(&state).unwrap();
+    lock.with_mut(|out| out.write_all(new_content.as_bytes()))
+        .unwrap();
+
+    lock.commit().unwrap();
+}
