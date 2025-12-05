@@ -23,12 +23,15 @@ use std::path::Path;
 
 use crate::manage;
 use crate::{cmd, util};
-use eyre::{bail, Result, WrapErr};
+use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
 
 pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     let msg_path = Path::new(msg_file);
-    if !msg_path.exists() {
+    if !msg_path
+        .try_exists()
+        .wrap_err("Failed to check file existence")?
+    {
         bail!("File does not exist: {}", msg_path.display().red().bold());
     }
 
