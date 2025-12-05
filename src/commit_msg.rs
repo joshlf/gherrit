@@ -83,28 +83,11 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     .wrap_err("Failed to compute hash")?;
     let random_hash = object_id.to_string();
 
-    // Determine trailer token and value
-    let review_url = repo.config_string("gerrit.reviewUrl")?;
-    let (token, value, regex_pattern) = if let Some(url) = review_url {
-        let url = url.trim_end_matches('/');
-        (
-            "Link",
-            format!("{}/id/I{}", url, random_hash),
-            format!(r"^{}: .*/id/I[0-9a-f]{{40}}$", "Link"),
-        )
-    } else {
-        (
-            "gherrit-pr-id",
-            format!("G{}", random_hash),
-            format!(r"^{}: .*", "gherrit-pr-id"),
-        )
-    };
-
     // Check if trailer exists
     let output = cmd!("git interpret-trailers --parse", msg_file).output()?;
     let trailers = String::from_utf8_lossy(&output.stdout);
 
-    let re = regex::Regex::new(&regex_pattern).expect("Invalid regex");
+    let re = crate::re!(r"^gherrit-pr-id: .*");
     if trailers.lines().any(|line| re.is_match(line)) {
         return Ok(());
     }
@@ -114,7 +97,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     // --if-exists doNothing: prevents duplicates
     cmd!(
         "git interpret-trailers --in-place --where start --if-exists doNothing --trailer",
-        "{token}: {value}",
+        "gherrit-pr-id: G{random_hash}",
         msg_file
     )
     .status()?;
