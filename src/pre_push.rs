@@ -525,7 +525,7 @@ fn sync_prs(
 fn is_private_stack(repo: &util::Repo, branch: &str) -> bool {
     // If pushRemote is set to ".", it is a private loopback stack.
     // If it is unset or anything else (e.g. 'origin'), it is public.
-    util::get_config_string(repo, &format!("branch.{}.pushRemote", branch))
+    repo.config_string(&format!("branch.{}.pushRemote", branch))
         .map(|val| val.as_deref() == Some("."))
         .unwrap_or(false)
 }

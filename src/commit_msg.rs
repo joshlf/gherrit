@@ -85,7 +85,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) {
     let random_hash = object_id.to_string();
 
     // Determine trailer token and value
-    let review_url = util::get_config_string(repo, "gerrit.reviewUrl").unwrap_or(None);
+    let review_url = repo.config_string("gerrit.reviewUrl").unwrap_or(None);
     let (token, value, regex_pattern) = if let Some(url) = review_url {
         let url = url.trim_end_matches('/');
         (
