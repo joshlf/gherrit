@@ -155,6 +155,61 @@ impl Repo {
         // Check if the previous OID is the Null Object ID (0000...)
         Ok(latest_log.is_some_and(|log| log.previous_oid.is_null()))
     }
+
+    pub fn default_remote_name(&self) -> String {
+        self.config_string("gherrit.remote")
+            .unwrap_or_default()
+            .unwrap_or_else(|| "origin".to_string())
+    }
+
+    fn find_default_branches(&self, remote_name: &str) -> Result<Vec<String>> {
+        let mut branches = Vec::new();
+
+        // Try to infer the default branch from the remote HEAD.
+        let remote_head_ref = format!("refs/remotes/{}/HEAD", remote_name);
+        if let Ok(head_ref) = self.inner.find_reference(&remote_head_ref) {
+            let target_name = head_ref
+                .target()
+                .try_name()
+                .map(|n| n.as_bstr().to_string());
+            if let Some(target) = target_name {
+                let prefix = format!("refs/remotes/{}/", remote_name);
+                if let Some(stripped) = target.strip_prefix(&prefix) {
+                    branches.push(stripped.to_string());
+                }
+            }
+        }
+
+        // Check git config
+        if let Some(default_branch) = self.config_string("init.defaultBranch")? {
+            branches.push(default_branch);
+        }
+
+        // Check for common local branch names
+        let locals = ["main", "master", "trunk"]
+            .into_iter()
+            .filter(|b| self.find_reference(&format!("refs/heads/{b}")).is_ok())
+            .map(String::from);
+        branches.extend(locals);
+
+        // Default fallback
+        branches.push("main".to_string());
+
+        Ok(branches)
+    }
+
+    pub fn find_default_branch_on_default_remote(&self) -> Result<String> {
+        let branches = self.find_default_branches(&self.default_remote_name())?;
+        Ok(branches
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "main".to_string()))
+    }
+
+    pub fn is_a_default_branch_on_default_remote(&self, branch_name: &str) -> Result<bool> {
+        let branches = self.find_default_branches(&self.default_remote_name())?;
+        Ok(branches.iter().any(|b| b == branch_name))
+    }
 }
 
 impl std::ops::Deref for Repo {
