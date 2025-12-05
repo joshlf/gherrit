@@ -1,6 +1,7 @@
 use crate::cmd;
 use crate::util::{self, HeadState};
 use eyre::{bail, Result, WrapErr};
+use owo_colors::OwoColorize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -47,7 +48,11 @@ pub fn set_state(repo: &util::Repo, state: State) -> Result<()> {
             cmd!("git config", key("remote"), ".").status()?;
             cmd!("git config", key("merge"), &self_merge_ref).status()?;
 
-            log::info!("Branch '{branch_name}' is now managed by GHerrit.");
+            log::info!(
+                "Branch '{}' is now {} by GHerrit.",
+                branch_name.yellow(),
+                "managed".green()
+            );
             log::info!("  - 'git push' is configured to sync your stack WITHOUT updating 'origin/{branch_name}'.");
             log::info!("  - To allow pushing this branch to origin (making it public), run:");
             log::info!("    git config {} origin", key("pushRemote"));
@@ -64,10 +69,13 @@ pub fn set_state(repo: &util::Repo, state: State) -> Result<()> {
             {
                 cmd!("git config --unset", key("remote")).status()?;
                 cmd!("git config --unset", key("merge")).status()?;
-                log::info!("  - Removed local self-tracking configuration.");
             }
 
-            log::info!("Branch '{branch_name}' is now unmanaged by GHerrit.");
+            log::info!(
+                "Branch '{}' is now {} by GHerrit.",
+                branch_name.yellow(),
+                "unmanaged".red()
+            );
             log::info!("  - Standard 'git push' behavior has been restored.");
             log::info!("  - Local self-tracking removed. You may need to set a new upstream (e.g., git push -u origin {branch_name}).");
         }
@@ -92,7 +100,7 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         .wrap_err("Failed to parse gherritState")?
         .is_some()
     {
-        log::debug!("Branch '{}' is already configured.", branch_name);
+        log::debug!(" Branch '{}' is already configured.", branch_name);
         return Ok(());
     }
 
@@ -101,7 +109,7 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         .is_newly_created_branch(branch_name)
         .wrap_err("Failed to check if branch is new")?;
     if !is_new {
-        log::debug!("Branch '{}' is not newly created.", branch_name);
+        log::debug!(" Branch '{}' is not newly created.", branch_name);
         return Ok(());
     }
 
@@ -124,11 +132,14 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
     if has_upstream && !is_origin_main {
         // Condition A: Shared Branch
         set_state(repo, State::Unmanaged)?;
-        log::info!("Branch initialized as UNMANAGED (Collaboration Mode).");
+        log::info!(
+            "Branch initialized as {}.",
+            "UNMANAGED (Collaboration Mode)".yellow()
+        );
     } else {
         // Condition B: New Stack
         set_state(repo, State::Managed)?;
-        log::info!("Branch initialized as MANAGED (Stack Mode).");
+        log::info!("Branch initialized as {}.", "MANAGED (Stack Mode)".green());
         log::info!("To opt-out, run: gherrit unmanage");
     }
 

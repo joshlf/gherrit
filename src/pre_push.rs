@@ -14,6 +14,7 @@ use crate::{
     util::{self, HeadState},
 };
 use eyre::{bail, eyre, Context, Result};
+use owo_colors::OwoColorize;
 
 pub fn run(repo: &util::Repo) -> Result<()> {
     let t0 = Instant::now();
@@ -136,7 +137,11 @@ fn push_to_origin(commits: &[Commit]) -> Result<HashMap<String, usize>> {
 
         if let Some((ver, sha)) = latest {
             if *sha == c.id.to_string() {
-                log::info!("Commit {} already tagged as v{}", c.id, ver);
+                log::info!(
+                    "Commit {} already tagged as {}",
+                    c.id.yellow(),
+                    format!("v{ver}").bold()
+                );
                 next_versions.insert(c.gherrit_id.clone(), *ver);
                 // Still push the branch ref
                 return vec![format!("{}:refs/heads/{}", c.id, c.gherrit_id)];
@@ -416,7 +421,11 @@ fn sync_prs(
             let pr_info = prs.iter().find(|pr| pr.head_ref_name == c.gherrit_id);
 
             let (pr_num, pr_url) = if let Some(pr) = pr_info {
-                log::debug!("Found existing PR #{} for {}", pr.number, c.gherrit_id);
+                log::debug!(
+                    "Found existing PR #{} for {}",
+                    pr.number.green().bold(),
+                    c.gherrit_id
+                );
                 (pr.number, pr.url.clone())
             } else {
                 log::debug!("No GitHub PR exists for {}; creating one...", c.gherrit_id);
@@ -427,7 +436,11 @@ fn sync_prs(
                     &c.message_body,
                 )?;
 
-                log::info!("Created PR #{num}: {url}");
+                log::info!(
+                    "Created PR #{}: {}",
+                    num.green().bold(),
+                    url.blue().underline()
+                );
                 (num, url)
             };
 
@@ -495,8 +508,12 @@ fn sync_prs(
                 child_gherrit_id.as_deref(),
             );
 
-            log::debug!("Updating PR #{} description...", pr_num);
-            log::info!("Updated PR #{}: {}", pr_num, pr_url);
+            log::debug!("Updating PR #{} description...", pr_num.green().bold());
+            log::info!(
+                "Updated PR #{}: {}",
+                pr_num.green().bold(),
+                pr_url.blue().underline()
+            );
             edit_gh_pr(*pr_num, parent_branch, &c.message_title, &body)?;
             Ok(())
         },
