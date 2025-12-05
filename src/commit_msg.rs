@@ -24,13 +24,14 @@ use std::path::Path;
 use crate::manage;
 use crate::{cmd, util};
 use eyre::{bail, Result, WrapErr};
+use owo_colors::OwoColorize;
 
 const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     let msg_path = Path::new(msg_file);
     if !msg_path.exists() {
-        bail!("File does not exist: {}", msg_path.display());
+        bail!("File does not exist: {}", msg_path.display().red().bold());
     }
 
     // Get current branch (Supporting Rebase)

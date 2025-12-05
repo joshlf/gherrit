@@ -472,6 +472,7 @@ dependencies = [
  "eyre",
  "gix",
  "log",
+ "owo-colors",
  "rayon",
  "regex",
  "serde",
