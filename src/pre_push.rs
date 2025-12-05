@@ -1,7 +1,7 @@
 use core::str;
 use std::{
     collections::{HashMap, HashSet},
-    process::{ExitStatus, Stdio},
+    process::Stdio,
     thread,
     time::Instant,
 };
@@ -241,7 +241,7 @@ fn push_to_origin(commits: &[Commit]) -> Result<HashMap<String, usize>> {
 
     let status = child.wait().unwrap();
     if !status.success() {
-        bail!("`git push` failed. You may need to `git pull --rebase`.");
+        bail!("`git push` failed. You may need to rebase on the latest changes from origin/main.");
     }
 
     Ok(next_versions)
@@ -412,7 +412,8 @@ fn sync_prs(
     commits: Vec<Commit>,
     latest_versions: HashMap<String, usize>,
 ) -> Result<()> {
-    let pr_list = cmd!("gh pr list --json number,headRefName,url").output()?;
+    let pr_list =
+        cmd!("gh pr list --json number,headRefName,url,title,body,baseRefName").output()?;
 
     #[derive(Serialize, Deserialize, Debug)]
     #[serde(rename_all = "camelCase")]
@@ -420,6 +421,9 @@ fn sync_prs(
         head_ref_name: String,
         number: usize,
         url: String,
+        title: String,
+        body: String,
+        base_ref_name: String,
     }
 
     let prs: Vec<ListEntry> = if pr_list.stdout.is_empty() {
@@ -451,13 +455,19 @@ fn sync_prs(
         .map(move |(c, parent_branch)| -> Result<_> {
             let pr_info = prs.iter().find(|pr| pr.head_ref_name == c.gherrit_id);
 
-            let (pr_num, pr_url) = if let Some(pr) = pr_info {
+            let pr_state = if let Some(pr) = pr_info {
                 log::debug!(
                     "Found existing PR #{} for {}",
                     pr.number.green().bold(),
                     c.gherrit_id
                 );
-                (pr.number, pr.url.clone())
+                PrState {
+                    number: pr.number,
+                    url: pr.url.clone(),
+                    title: pr.title.clone(),
+                    body: pr.body.clone(),
+                    base: pr.base_ref_name.clone(),
+                }
             } else {
                 log::debug!("No GitHub PR exists for {}; creating one...", c.gherrit_id);
                 let (num, url) = create_gh_pr(
@@ -472,10 +482,16 @@ fn sync_prs(
                     num.green().bold(),
                     url.blue().underline()
                 );
-                (num, url)
+                PrState {
+                    number: num,
+                    url,
+                    title: c.message_title.clone(),
+                    body: c.message_body.clone(),
+                    base: parent_branch.clone(),
+                }
             };
 
-            Ok((c, parent_branch, pr_num, pr_url))
+            Ok((c, parent_branch, pr_state))
         })
         .collect::<Vec<_>>()
         .into_iter()
@@ -488,7 +504,7 @@ fn sync_prs(
     // always returns a valid URL, this is safe.
     let repo_url = commits
         .first()
-        .map(|(_, _, _, url)| url.split("/pull/").next().unwrap_or(""))
+        .map(|(_, _, pr_state)| pr_state.url.split("/pull/").next().unwrap_or(""))
         .unwrap_or("")
         .to_string();
 
@@ -515,12 +531,12 @@ fn sync_prs(
     let gh_pr_ids_markdown = commits
         .iter()
         .rev()
-        .map(|(_, _, pr_num, _)| format!("- #{pr_num}"))
+        .map(|(_, _, pr_state)| format!("- #{}", pr_state.number))
         .collect::<Vec<_>>()
         .join("\n");
 
     commits.par_iter().enumerate().try_for_each(
-        |(i, (c, parent_branch, pr_num, pr_url))| -> Result<()> {
+        |(i, (c, parent_branch, pr_state))| -> Result<()> {
             let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
 
             // Determine parent and child IDs
@@ -539,13 +555,7 @@ fn sync_prs(
                 child_gherrit_id.as_deref(),
             );
 
-            log::debug!("Updating PR #{} description...", pr_num.green().bold());
-            log::info!(
-                "Updated PR #{}: {}",
-                pr_num.green().bold(),
-                pr_url.blue().underline()
-            );
-            edit_gh_pr(*pr_num, parent_branch, &c.message_title, &body)?;
+            edit_gh_pr(pr_state, parent_branch, &c.message_title, &body)?;
             Ok(())
         },
     )?;
@@ -565,6 +575,15 @@ struct Commit {
     gherrit_id: String,
     message_title: String,
     message_body: String,
+}
+
+#[derive(Debug, Clone)]
+struct PrState {
+    number: usize,
+    url: String,
+    title: String,
+    body: String,
+    base: String,
 }
 
 impl<'a> TryFrom<gix::Commit<'a>> for Commit {
@@ -623,20 +642,40 @@ fn create_gh_pr(
     Ok((pr_id.as_str().parse()?, pr_url))
 }
 
-fn edit_gh_pr(pr_num: usize, base_branch: &str, title: &str, body: &str) -> Result<ExitStatus> {
-    let pr_num = format!("{pr_num}");
-    let mut c = cmd!(
-        "gh pr edit",
-        pr_num,
-        "--base",
-        base_branch,
-        "--title",
-        title,
-        "--body",
-        body
-    );
+fn edit_gh_pr(state: &PrState, new_base: &str, new_title: &str, new_body: &str) -> Result<()> {
+    let pr_num = state.number.to_string();
+    let mut args = vec!["pr", "edit", &pr_num];
+    let mut changed = false;
 
-    Ok(c.stdout(Stdio::null()).status()?)
+    if state.base != new_base {
+        args.push("--base");
+        args.push(new_base);
+        changed = true;
+    }
+
+    if state.title != new_title {
+        args.push("--title");
+        args.push(new_title);
+        changed = true;
+    }
+
+    if state.body.replace("\r\n", "\n").trim() != new_body.replace("\r\n", "\n").trim() {
+        args.push("--body");
+        args.push(new_body);
+        changed = true;
+    }
+
+    let pr_num = state.number.green().bold().to_string();
+    let pr_url = state.url.blue().underline().to_string();
+    if !changed {
+        log::info!("PR #{pr_num} is up to date: {pr_url}");
+    } else {
+        log::debug!("Updating PR #{pr_num}...");
+        util::cmd("gh", args).stdout(Stdio::null()).status()?;
+        log::info!("Updated PR #{pr_num}: {pr_url}");
+    }
+
+    Ok(())
 }
 
 re!(gherrit_pr_id_re, r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$");
