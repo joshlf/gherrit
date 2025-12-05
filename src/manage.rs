@@ -120,16 +120,31 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         .config_string(&format!("branch.{branch_name}.merge"))
         .wrap_err("Failed to read config")?;
 
-    let has_upstream = upstream_remote.is_some() && upstream_merge.is_some();
-    let is_origin_main = if has_upstream {
-        let remote = upstream_remote.as_deref().unwrap_or("");
-        let merge = upstream_merge.as_deref().unwrap_or("");
-        remote == "origin" && merge == "refs/heads/main"
+    let is_default_branch = if let (Some(remote), Some(merge)) =
+        (upstream_remote.as_deref(), upstream_merge.as_deref())
+    {
+        let branch_name = merge.strip_prefix("refs/heads/").unwrap_or(merge);
+        ({
+            // Check if the upstream matches the remote's HEAD (e.g. origin/HEAD
+            // -> origin/main)
+            let expected_target = format!("refs/remotes/{remote}/{branch_name}");
+            let remote_head_ref = format!("refs/remotes/{remote}/HEAD");
+            repo.find_reference(&remote_head_ref)
+                .ok()
+                .and_then(|r| r.target().try_name().map(|n| n.to_string()))
+                .is_some_and(|target| target == expected_target)
+        }) || {
+            // Fallback: Check config or standard conventions
+            let configured_default = repo.config_string("init.defaultBranch").ok().flatten();
+            configured_default.as_deref() == Some(branch_name)
+                || matches!(branch_name, "main" | "master" | "trunk")
+        }
     } else {
         false
     };
 
-    if has_upstream && !is_origin_main {
+    let has_upstream = upstream_remote.is_some() && upstream_merge.is_some();
+    if has_upstream && !is_default_branch {
         // Condition A: Shared Branch
         set_state(repo, State::Unmanaged)?;
         log::info!(
