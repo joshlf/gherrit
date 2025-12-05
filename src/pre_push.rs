@@ -124,8 +124,8 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
 
     let mut next_versions = HashMap::new();
 
-    // Windows command line limit is ~32k chars. Each commit generates ~200 chars
-    // of refspecs (1 branch ref + 1 tag ref).
+    // Windows command line limit is ~32k chars. Each commit generates ~200
+    // chars of refspecs (1 branch ref + 1 tag ref).
     // 80 * 200 = 16,000 chars, leaving plenty of headroom.
     const BATCH_SIZE: usize = 80;
 

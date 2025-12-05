@@ -48,7 +48,10 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Squash check
+    // Skip temporary squash commits (e.g. from `git commit --squash`) to
+    // prevent creating "phantom" PRs for changes destined to be merged away.
+    // These commits are transient and shouldn't be part of the persistent
+    // managed stack.
     let msg_content = fs::read_to_string(msg_path).wrap_err("Failed to read msg file")?;
     if msg_content
         .lines()
