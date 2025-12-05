@@ -22,47 +22,44 @@ use std::fs;
 use std::path::Path;
 
 use crate::manage;
-use crate::{
-    cmd,
-    util::{self, CommandExt as _, ResultExt as _},
-};
+use crate::{cmd, util};
+use eyre::{bail, Result, WrapErr};
 
 const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
-pub fn run(repo: &util::Repo, msg_file: &str) {
+pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     let msg_path = Path::new(msg_file);
     if !msg_path.exists() {
-        log::error!("File does not exist: {}", msg_path.display());
-        std::process::exit(1);
+        bail!("File does not exist: {}", msg_path.display());
     }
 
     // Get current branch (Supporting Rebase)
     let Some(branch_name) = repo.current_branch().name() else {
         log::debug!("Could not determine branch name (detached head?). Skipping.");
-        return;
+        return Ok(());
     };
 
     // Check if managed – bail if unmanaged or if management state is unset.
-    if manage::get_state(repo, branch_name).unwrap_or_exit("Failed to get config")
+    if manage::get_state(repo, branch_name).wrap_err("Failed to get config")?
         != Some(manage::State::Managed)
     {
-        return;
+        return Ok(());
     }
 
     // Squash check
-    let msg_content = fs::read_to_string(msg_path).unwrap_or_exit("Failed to read msg file");
+    let msg_content = fs::read_to_string(msg_path).wrap_err("Failed to read msg file")?;
     if msg_content
         .lines()
         .next()
         .is_some_and(|l| l.starts_with("squash! "))
     {
-        return;
+        return Ok(());
     }
 
     // Calculate Change-ID
     // Construct the input: "Ident\nRefHash\nMsgContent"
     let input_data = {
-        let committer_ident = cmd!("git var GIT_COMMITTER_IDENT").unwrap_output();
+        let committer_ident = cmd!("git var GIT_COMMITTER_IDENT").output()?;
         let committer_ident = String::from_utf8_lossy(committer_ident.stdout.as_slice())
             .trim()
             .to_string();
@@ -81,11 +78,11 @@ pub fn run(repo: &util::Repo, msg_file: &str) {
         gix::object::Kind::Blob,
         input_data.as_bytes(),
     )
-    .unwrap_or_exit("Failed to compute hash");
+    .wrap_err("Failed to compute hash")?;
     let random_hash = object_id.to_string();
 
     // Determine trailer token and value
-    let review_url = repo.config_string("gerrit.reviewUrl").unwrap_or(None);
+    let review_url = repo.config_string("gerrit.reviewUrl")?;
     let (token, value, regex_pattern) = if let Some(url) = review_url {
         let url = url.trim_end_matches('/');
         (
@@ -102,12 +99,12 @@ pub fn run(repo: &util::Repo, msg_file: &str) {
     };
 
     // Check if trailer exists
-    let output = cmd!("git interpret-trailers --parse", msg_file).unwrap_output();
+    let output = cmd!("git interpret-trailers --parse", msg_file).output()?;
     let trailers = String::from_utf8_lossy(&output.stdout);
 
     let re = regex::Regex::new(&regex_pattern).expect("Invalid regex");
     if trailers.lines().any(|line| re.is_match(line)) {
-        return;
+        return Ok(());
     }
 
     // Insert trailer
@@ -118,5 +115,6 @@ pub fn run(repo: &util::Repo, msg_file: &str) {
         "{token}: {value}",
         msg_file
     )
-    .unwrap_status();
+    .status()?;
+    Ok(())
 }

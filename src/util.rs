@@ -1,7 +1,7 @@
-use std::error::Error;
 use std::ffi::OsStr;
-use std::process::{Command, ExitStatus, Output};
+use std::process::Command;
 
+use eyre::Result;
 use gix::bstr::ByteSlice as _;
 
 /// Constructs a `std::process::Command`.
@@ -83,41 +83,6 @@ pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Co
     c
 }
 
-pub trait CommandExt {
-    fn unwrap_status(self) -> ExitStatus;
-    fn unwrap_output(self) -> Output;
-}
-
-impl CommandExt for Command {
-    fn unwrap_status(mut self) -> ExitStatus {
-        self.status().unwrap()
-    }
-
-    fn unwrap_output(mut self) -> Output {
-        self.output().unwrap()
-    }
-}
-
-pub trait ResultExt<T, E> {
-    fn unwrap_or_exit(self, prefix: &str) -> T;
-}
-
-impl<T, E: std::fmt::Display> ResultExt<T, E> for Result<T, E> {
-    fn unwrap_or_exit(self, prefix: &str) -> T {
-        match self {
-            Ok(t) => t,
-            Err(e) => {
-                if prefix.is_empty() {
-                    log::error!("{}", e);
-                } else {
-                    log::error!("{}: {}", prefix, e);
-                }
-                std::process::exit(1);
-            }
-        }
-    }
-}
-
 use std::path::PathBuf;
 
 /// Represents the state of the HEAD reference.
@@ -147,7 +112,7 @@ pub struct Repo {
 }
 
 impl Repo {
-    pub fn open(path: &str) -> Result<Self, Box<dyn Error>> {
+    pub fn open(path: &str) -> Result<Self> {
         let inner = gix::open(path)?;
         let current_branch = get_current_branch(&inner)?;
         Ok(Self {
@@ -160,7 +125,7 @@ impl Repo {
         &self.current_branch
     }
 
-    pub fn config_string(&self, key: &str) -> Result<Option<String>, Box<dyn Error>> {
+    pub fn config_string(&self, key: &str) -> Result<Option<String>> {
         let Some(cow) = self.inner.config_snapshot().string(key) else {
             return Ok(None);
         };
@@ -168,11 +133,11 @@ impl Repo {
         Ok(Some(s.trim().to_string()))
     }
 
-    pub fn config_bool(&self, key: &str) -> Result<Option<bool>, gix::config::value::Error> {
-        self.inner.config_snapshot().try_boolean(key).transpose()
+    pub fn config_bool(&self, key: &str) -> Result<Option<bool>> {
+        Ok(self.inner.config_snapshot().try_boolean(key).transpose()?)
     }
 
-    pub fn is_newly_created_branch(&self, branch_name: &str) -> Result<bool, Box<dyn Error>> {
+    pub fn is_newly_created_branch(&self, branch_name: &str) -> Result<bool> {
         // If this branch was just created (as opposed to having been checked out
         // from an existing branch), then its earliest reflog entry will have the
         // message "branch: Created from ...".
@@ -198,7 +163,7 @@ impl std::ops::Deref for Repo {
 }
 
 /// Determines the current HEAD state.
-fn get_current_branch(repo: &gix::Repository) -> Result<HeadState, Box<dyn std::error::Error>> {
+fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     let head = repo.head()?;
 
     // 1. Try standard Attached HEAD

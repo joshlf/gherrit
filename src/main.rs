@@ -3,7 +3,7 @@ mod manage;
 mod pre_push;
 mod util;
 
-use util::ResultExt as _;
+use eyre::{Result, WrapErr};
 
 use clap::{Parser, Subcommand};
 
@@ -55,6 +55,19 @@ fn main() {
         })
         .init();
 
+    if let Err(e) = color_eyre::install() {
+        log::error!("Failed to install color_eyre: {}", e);
+    }
+
+    if let Err(e) = run() {
+        format!("{:#}", e)
+            .lines()
+            .for_each(|line| log::error!("{}", line));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     // Limit concurrency to avoid hitting GitHub's abuse limits.
     rayon::ThreadPoolBuilder::new()
         .num_threads(6)
@@ -62,17 +75,19 @@ fn main() {
         .unwrap();
 
     let cli = Cli::parse();
-    let repo = util::Repo::open(".").unwrap_or_exit("Failed to open repo");
+    let repo = util::Repo::open(".").wrap_err("Failed to open repo")?;
 
     match cli.command {
         Commands::Hook(cmd) => match cmd {
-            HookCommands::PrePush => pre_push::run(&repo),
+            HookCommands::PrePush => pre_push::run(&repo)?,
             HookCommands::PostCheckout { prev, new, flag } => {
-                manage::post_checkout(&repo, &prev, &new, &flag)
+                manage::post_checkout(&repo, &prev, &new, &flag)?
             }
-            HookCommands::CommitMsg { file } => commit_msg::run(&repo, &file),
+            HookCommands::CommitMsg { file } => commit_msg::run(&repo, &file)?,
         },
-        Commands::Manage => manage::set_state(&repo, manage::State::Managed),
-        Commands::Unmanage => manage::set_state(&repo, manage::State::Unmanaged),
+        Commands::Manage => manage::set_state(&repo, manage::State::Managed)?,
+        Commands::Unmanage => manage::set_state(&repo, manage::State::Unmanaged)?,
     }
+
+    Ok(())
 }
