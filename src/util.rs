@@ -162,7 +162,7 @@ impl Repo {
             .unwrap_or_else(|| "origin".to_string())
     }
 
-    fn find_default_branches(&self, remote_name: &str) -> Result<Vec<String>> {
+    fn find_default_branches(&self, remote_name: &str) -> Vec<String> {
         let mut branches = Vec::new();
 
         // Try to infer the default branch from the remote HEAD.
@@ -181,7 +181,9 @@ impl Repo {
         }
 
         // Check git config
-        if let Some(default_branch) = self.config_string("init.defaultBranch")? {
+        //
+        // Note that we swallow errors (e.g. invalid UTF-8) here.
+        if let Some(default_branch) = self.config_string("init.defaultBranch").ok().flatten() {
             branches.push(default_branch);
         }
 
@@ -195,20 +197,20 @@ impl Repo {
         // Default fallback
         branches.push("main".to_string());
 
-        Ok(branches)
+        branches
     }
 
-    pub fn find_default_branch_on_default_remote(&self) -> Result<String> {
-        let branches = self.find_default_branches(&self.default_remote_name())?;
-        Ok(branches
+    pub fn find_default_branch_on_default_remote(&self) -> String {
+        let branches = self.find_default_branches(&self.default_remote_name());
+        branches
             .first()
             .cloned()
-            .unwrap_or_else(|| "main".to_string()))
+            .unwrap_or_else(|| "main".to_string())
     }
 
-    pub fn is_a_default_branch_on_default_remote(&self, branch_name: &str) -> Result<bool> {
-        let branches = self.find_default_branches(&self.default_remote_name())?;
-        Ok(branches.iter().any(|b| b == branch_name))
+    pub fn is_a_default_branch_on_default_remote(&self, branch_name: &str) -> bool {
+        let branches = self.find_default_branches(&self.default_remote_name());
+        branches.iter().any(|b| b == branch_name)
     }
 }
 
