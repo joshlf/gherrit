@@ -121,15 +121,50 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         .wrap_err("Failed to read config")?;
 
     let has_upstream = upstream_remote.is_some() && upstream_merge.is_some();
-    let is_origin_main = if has_upstream {
+    let is_default_branch = if has_upstream {
         let remote = upstream_remote.as_deref().unwrap_or("");
-        let merge = upstream_merge.as_deref().unwrap_or("");
-        remote == "origin" && merge == "refs/heads/main"
+        let merge = upstream_merge.as_deref().unwrap_or(""); // e.g., "refs/heads/main"
+
+        // 1. Try to resolve 'refs/remotes/{remote}/HEAD' to see what the server thinks is default
+        let remote_head_ref = format!("refs/remotes/{remote}/HEAD");
+
+        let matches_remote_head = repo
+            .find_reference(&remote_head_ref)
+            .ok()
+            .and_then(|head_ref| {
+                head_ref
+                    .target()
+                    .try_name()
+                    .map(|n| n.as_bstr().to_string())
+            })
+            .map(|target_name| {
+                // target_name is likely "refs/remotes/origin/main"
+                // merge is "refs/heads/main"
+                // We construct what 'merge' would look like as a remote ref to compare
+                let merge_short = merge.strip_prefix("refs/heads/").unwrap_or(merge);
+                let expected_remote_ref = format!("refs/remotes/{remote}/{merge_short}");
+                target_name == expected_remote_ref
+            })
+            .unwrap_or(false);
+
+        if matches_remote_head {
+            true
+        } else {
+            // 2. Fallback: Check config or standard names
+            let default_cfg = repo.config_string("init.defaultBranch").unwrap_or(None);
+
+            let short_merge = merge.strip_prefix("refs/heads/").unwrap_or(merge);
+
+            matches!(default_cfg.as_deref(), Some(def) if def == short_merge)
+                || short_merge == "main"
+                || short_merge == "master"
+                || short_merge == "trunk"
+        }
     } else {
         false
     };
 
-    if has_upstream && !is_origin_main {
+    if has_upstream && !is_default_branch {
         // Condition A: Shared Branch
         set_state(repo, State::Unmanaged)?;
         log::info!(
