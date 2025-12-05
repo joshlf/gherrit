@@ -44,22 +44,53 @@ pub fn set_state(repo: &util::Repo, state: State) -> Result<()> {
     match state {
         State::Managed => {
             cmd!("git config", key("gherritManaged"), "true").status()?;
-            cmd!("git config", key("pushRemote"), ".").status()?;
+            cmd!("git config", key("gherritManaged"), "true").status()?;
+
+            let current_push_remote = repo.config_string(&key("pushRemote"))?;
+            let custom_push_remote = match current_push_remote.as_deref() {
+                Some(".") => None, // Already set to "."; nothing to do.
+                Some(remote) => Some(remote),
+                None => {
+                    cmd!("git config", key("pushRemote"), ".").status()?;
+                    None
+                }
+            };
+
             cmd!("git config", key("remote"), ".").status()?;
             cmd!("git config", key("merge"), &self_merge_ref).status()?;
 
+            let branch_name_yellow = branch_name.yellow();
             log::info!(
-                "Branch '{}' is now {} by GHerrit.",
-                branch_name.yellow(),
+                "Branch '{branch_name_yellow}' is now {} by GHerrit.",
                 "managed".green()
             );
-            log::info!("  - 'git push' is configured to sync your stack WITHOUT updating 'origin/{branch_name}'.");
-            log::info!("  - To allow pushing this branch to origin (making it public), run:");
-            log::info!("    git config {} origin", key("pushRemote"));
+            if let Some(remote) = custom_push_remote {
+                let remote_yellow = remote.yellow();
+                log::warn!("Branch '{branch_name_yellow}' has a custom pushRemote '{remote_yellow}'. GHerrit did NOT overwrite it.");
+                log::warn!("  - Running `git push` will push to '{remote_yellow}' in addition to syncing via GHerrit.");
+                log::warn!("  - To configure GHerrit to sync your stack WITHOUT pushing to origin (making it private), run:");
+                log::warn!("    git config {} .", key("pushRemote"));
+                log::warn!("  - To allow pushing this branch to origin (making it public), run:");
+                log::warn!("    git config {} origin", key("pushRemote"));
+            } else {
+                log::info!("  - 'git push' is configured to sync your stack WITHOUT updating 'origin/{branch_name}'.");
+                log::info!("  - To allow pushing this branch to origin (making it public), run:");
+                log::info!("    git config {} origin", key("pushRemote"));
+            }
         }
         State::Unmanaged => {
             cmd!("git config", key("gherritManaged"), "false").status()?;
-            cmd!("git config --unset", key("pushRemote")).status()?;
+            cmd!("git config", key("gherritManaged"), "false").status()?;
+
+            let current_push_remote = repo.config_string(&key("pushRemote"))?;
+            let custom_push_remote = match current_push_remote.as_deref() {
+                Some(".") => {
+                    cmd!("git config", key("pushRemote"), ".").status()?;
+                    None
+                }
+                Some(remote) => Some(remote),
+                None => None, // Already unset; nothing to do.
+            };
 
             let current_remote = repo.config_string(&key("remote"))?;
             let current_merge = repo.config_string(&key("merge"))?;
@@ -71,13 +102,17 @@ pub fn set_state(repo: &util::Repo, state: State) -> Result<()> {
                 cmd!("git config --unset", key("merge")).status()?;
             }
 
+            let branch_name_yellow = branch_name.yellow();
             log::info!(
-                "Branch '{}' is now {} by GHerrit.",
-                branch_name.yellow(),
+                "Branch '{branch_name_yellow}' is now {} by GHerrit.",
                 "unmanaged".red()
             );
             log::info!("  - Standard 'git push' behavior has been restored.");
-            log::info!("  - Local self-tracking removed. You may need to set a new upstream (e.g., git push -u origin {branch_name}).");
+            if let Some(remote) = custom_push_remote {
+                log::warn!("Branch '{branch_name_yellow}' has a custom pushRemote '{remote}'. GHerrit did NOT unset it.");
+            } else {
+                log::info!("  - Local self-tracking removed. You may need to set a new upstream (e.g., git push -u origin {branch_name}).");
+            }
         }
     }
     Ok(())
