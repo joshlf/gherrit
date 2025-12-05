@@ -1,7 +1,6 @@
 use core::str;
 use std::{
     collections::HashMap,
-    error::Error,
     process::{ExitStatus, Stdio},
     time::Instant,
 };
@@ -12,47 +11,46 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cmd, manage, re,
-    util::{self, CommandExt as _, HeadState, ResultExt as _},
+    util::{self, HeadState},
 };
+use eyre::{bail, eyre, Context, Result};
 
-pub fn run(repo: &util::Repo) {
+pub fn run(repo: &util::Repo) -> Result<()> {
     let t0 = Instant::now();
 
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) | HeadState::Rebasing(bn) => bn,
         HeadState::Detached => {
-            log::error!("Cannot push from detached HEAD");
-            std::process::exit(1);
+            bail!("Cannot push from detached HEAD");
         }
     };
 
-    check_managed_state(repo, branch_name);
+    check_managed_state(repo, branch_name)?;
 
-    let commits = collect_commits(repo).unwrap_or_exit("Failed to collect commits");
+    let commits = collect_commits(repo).wrap_err("Failed to collect commits")?;
 
     let t1 = Instant::now();
     log::trace!("t0 -> t1: {:?}", t1 - t0);
 
-    let commits = create_gherrit_refs(repo, commits).unwrap_or_exit("Failed to create refs");
+    let commits = create_gherrit_refs(repo, commits).wrap_err("Failed to create refs")?;
 
     let t2 = Instant::now();
     log::trace!("t1 -> t2: {:?}", t2 - t1);
 
     if commits.is_empty() {
         log::info!("No commits to sync.");
-        return;
+        return Ok(());
     }
 
-    let latest_versions = push_to_origin(&commits);
+    let latest_versions = push_to_origin(&commits)?;
 
-    sync_prs(repo, branch_name, commits, latest_versions);
+    sync_prs(repo, branch_name, commits, latest_versions)
 }
 
 // TODO: Maybe this should return a Result instead of bailing from inside?
-fn check_managed_state(repo: &util::Repo, branch_name: &str) {
-    let state =
-        manage::get_state(repo, branch_name).unwrap_or_exit("Failed to parse gherritManaged");
+fn check_managed_state(repo: &util::Repo, branch_name: &str) -> Result<()> {
+    let state = manage::get_state(repo, branch_name).wrap_err("Failed to parse gherritManaged")?;
 
     match state {
         Some(manage::State::Unmanaged) => {
@@ -60,35 +58,31 @@ fn check_managed_state(repo: &util::Repo, branch_name: &str) {
                 "Branch '{}' is UNMANAGED. Allowing standard push.",
                 branch_name
             );
-            std::process::exit(0); // Allow standard push
+            return Ok(()); // Allow standard push
         }
         Some(manage::State::Managed) => {
             log::info!("Branch '{}' is MANAGED. Syncing stack...", branch_name);
         } // Proceed
         None => {
-            log::error!(
-                "It is unclear if branch '{}' should be a Stack.",
-                branch_name
+            bail!(
+                "It is unclear if branch '{branch_name}' should be a Stack.\n\
+                Run 'gherrit manage' to sync it as a Stack.\n\
+                Run 'gherrit unmanage' to push it as a standard Git branch."
             );
-            log::error!("Run 'gherrit manage' to sync it as a Stack.");
-            log::error!("Run 'gherrit unmanage' to push it as a standard Git branch.");
-            std::process::exit(1);
         }
     }
+    Ok(())
 }
 
-fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>, Box<dyn Error>> {
+fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
     let head = repo.rev_parse_single("HEAD")?;
     let main = repo.rev_parse_single("main")?;
     let mut commits = repo
         .rev_walk([head])
         .all()?
         .take_while(|res| res.as_ref().map(|info| info.id != main).unwrap_or(true))
-        .map(|res| -> Result<_, Box<dyn Error>> {
-            res.map_err::<Box<dyn Error>, _>(|e| Box::new(e))
-                .and_then(|info| info.object().map_err::<Box<dyn Error>, _>(|e| Box::new(e)))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|res| -> Result<_> { Ok(res?.object()?) })
+        .collect::<Result<Vec<_>>>()?;
     commits.reverse();
 
     commits
@@ -97,21 +91,18 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>, Box<dyn Error>> {
         .collect::<Result<Vec<_>, _>>()
 }
 
-fn create_gherrit_refs(
-    repo: &util::Repo,
-    commits: Vec<Commit>,
-) -> Result<Vec<Commit>, Box<dyn Error>> {
+fn create_gherrit_refs(repo: &util::Repo, commits: Vec<Commit>) -> Result<Vec<Commit>> {
     commits
         .into_iter()
-        .map(|c| -> Result<_, Box<dyn Error>> {
+        .map(|c| -> Result<_> {
             let rf = format!("refs/gherrit/{}", c.gherrit_id);
             let _ = repo.reference(rf, c.id, PreviousValue::Any, "")?;
             Ok(c)
         })
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<Result<Vec<_>>>()
 }
 
-fn push_to_origin(commits: &[Commit]) -> HashMap<String, usize> {
+fn push_to_origin(commits: &[Commit]) -> Result<HashMap<String, usize>> {
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
     let remote_versions = get_remote_versions(&gherrit_ids).unwrap_or_else(|e| {
         log::warn!("Failed to fetch remote versions: {}", e);
@@ -169,7 +160,7 @@ fn push_to_origin(commits: &[Commit]) -> HashMap<String, usize> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap();
+        .wrap_err("Failed to run `git push`")?;
 
     // Filter out the "Create a pull request" message from GitHub
     {
@@ -210,17 +201,14 @@ fn push_to_origin(commits: &[Commit]) -> HashMap<String, usize> {
 
     let status = child.wait().unwrap();
     if !status.success() {
-        log::error!("`git push` failed. You may need to `git pull --rebase`.");
-        std::process::exit(1);
+        bail!("`git push` failed. You may need to `git pull --rebase`.");
     }
 
-    next_versions
+    Ok(next_versions)
 }
 
 #[allow(clippy::type_complexity)]
-fn get_remote_versions(
-    gherrit_ids: &[String],
-) -> Result<HashMap<String, Vec<(usize, String)>>, Box<dyn Error>> {
+fn get_remote_versions(gherrit_ids: &[String]) -> Result<HashMap<String, Vec<(usize, String)>>> {
     if gherrit_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -387,8 +375,8 @@ fn sync_prs(
     branch_name: &str,
     commits: Vec<Commit>,
     latest_versions: HashMap<String, usize>,
-) {
-    let pr_list = cmd!("gh pr list --json number,headRefName,url").unwrap_output();
+) -> Result<()> {
+    let pr_list = cmd!("gh pr list --json number,headRefName,url").output()?;
 
     #[derive(Serialize, Deserialize, Debug)]
     #[serde(rename_all = "camelCase")]
@@ -404,11 +392,11 @@ fn sync_prs(
         match serde_json::from_slice(&pr_list.stdout) {
             Ok(prs) => prs,
             Err(err) => {
-                log::error!("failed to parse `gh` command output: {err}");
+                let mut error = format!("failed to parse `gh` command output: {err}");
                 if let Ok(stdout) = str::from_utf8(&pr_list.stdout) {
-                    log::error!("command output (verbatim):\n{stdout}");
+                    error += &format!("\ncommand output (verbatim):\n{stdout}");
                 }
-                std::process::exit(2);
+                bail!(error);
             }
         }
     };
@@ -424,33 +412,30 @@ fn sync_prs(
 
     let commits = commits
         .into_par_iter()
-        .map(
-            move |(c, parent_branch)| -> Result<_, Box<dyn Error + Send + Sync>> {
-                let pr_info = prs.iter().find(|pr| pr.head_ref_name == c.gherrit_id);
+        .map(move |(c, parent_branch)| -> Result<_> {
+            let pr_info = prs.iter().find(|pr| pr.head_ref_name == c.gherrit_id);
 
-                let (pr_num, pr_url) = if let Some(pr) = pr_info {
-                    log::debug!("Found existing PR #{} for {}", pr.number, c.gherrit_id);
-                    (pr.number, pr.url.clone())
-                } else {
-                    log::debug!("No GitHub PR exists for {}; creating one...", c.gherrit_id);
-                    let (num, url) = create_gh_pr(
-                        &parent_branch,
-                        &c.gherrit_id,
-                        &c.message_title,
-                        &c.message_body,
-                    )?;
+            let (pr_num, pr_url) = if let Some(pr) = pr_info {
+                log::debug!("Found existing PR #{} for {}", pr.number, c.gherrit_id);
+                (pr.number, pr.url.clone())
+            } else {
+                log::debug!("No GitHub PR exists for {}; creating one...", c.gherrit_id);
+                let (num, url) = create_gh_pr(
+                    &parent_branch,
+                    &c.gherrit_id,
+                    &c.message_title,
+                    &c.message_body,
+                )?;
 
-                    log::info!("Created PR #{num}: {url}");
-                    (num, url)
-                };
+                log::info!("Created PR #{num}: {url}");
+                (num, url)
+            };
 
-                Ok((c, parent_branch, pr_num, pr_url))
-            },
-        )
+            Ok((c, parent_branch, pr_num, pr_url))
+        })
         .collect::<Vec<_>>()
         .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+        .collect::<Result<Vec<_>>>()?;
 
     let is_private = is_private_stack(repo, branch_name);
 
@@ -490,36 +475,33 @@ fn sync_prs(
         .collect::<Vec<_>>()
         .join("\n");
 
-    commits
-        .par_iter()
-        .enumerate()
-        .try_for_each(
-            |(i, (c, parent_branch, pr_num, pr_url))| -> Result<(), Box<dyn Error + Send + Sync>> {
-                let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
+    commits.par_iter().enumerate().try_for_each(
+        |(i, (c, parent_branch, pr_num, pr_url))| -> Result<()> {
+            let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
 
-                // Determine parent and child IDs
-                let parent_gherrit_id = (i > 0).then(|| commits[i - 1].0.gherrit_id.clone());
-                let child_gherrit_id =
-                    (i < commits.len() - 1).then(|| commits[i + 1].0.gherrit_id.clone());
+            // Determine parent and child IDs
+            let parent_gherrit_id = (i > 0).then(|| commits[i - 1].0.gherrit_id.clone());
+            let child_gherrit_id =
+                (i < commits.len() - 1).then(|| commits[i + 1].0.gherrit_id.clone());
 
-                let body = generate_pr_body(
-                    c,
-                    &repo_url,
-                    &head_branch_markdown,
-                    &gh_pr_ids_markdown,
-                    latest_version,
-                    parent_branch,
-                    parent_gherrit_id.as_deref(),
-                    child_gherrit_id.as_deref(),
-                );
+            let body = generate_pr_body(
+                c,
+                &repo_url,
+                &head_branch_markdown,
+                &gh_pr_ids_markdown,
+                latest_version,
+                parent_branch,
+                parent_gherrit_id.as_deref(),
+                child_gherrit_id.as_deref(),
+            );
 
-                log::debug!("Updating PR #{} description...", pr_num);
-                log::info!("Updated PR #{}: {}", pr_num, pr_url);
-                edit_gh_pr(*pr_num, parent_branch, &c.message_title, &body)?;
-                Ok(())
-            },
-        )
-        .unwrap();
+            log::debug!("Updating PR #{} description...", pr_num);
+            log::info!("Updated PR #{}: {}", pr_num, pr_url);
+            edit_gh_pr(*pr_num, parent_branch, &c.message_title, &body)?;
+            Ok(())
+        },
+    )?;
+    Ok(())
 }
 
 fn is_private_stack(repo: &util::Repo, branch: &str) -> bool {
@@ -538,9 +520,9 @@ struct Commit {
 }
 
 impl<'a> TryFrom<gix::Commit<'a>> for Commit {
-    type Error = Box<dyn Error>;
+    type Error = eyre::Report;
 
-    fn try_from(c: gix::Commit) -> Result<Self, Self::Error> {
+    fn try_from(c: gix::Commit) -> Result<Self> {
         let message = c.message()?;
         let message_title = core::str::from_utf8(message.title)?.to_string();
         let message_body = message
@@ -552,7 +534,7 @@ impl<'a> TryFrom<gix::Commit<'a>> for Commit {
             let re = gherrit_pr_id_re();
             let captures = re
                 .captures(&message_body)
-                .ok_or_else(|| format!("Commit {} missing gherrit-pr-id trailer", c.id))?;
+                .ok_or_else(|| eyre!("Commit {} missing gherrit-pr-id trailer", c.id))?;
             let gherrit_id = captures.get(1).unwrap().as_str().to_string();
             gherrit_id
         };
@@ -571,7 +553,7 @@ fn create_gh_pr(
     head_branch: &str,
     title: &str,
     body: &str,
-) -> Result<(usize, String), Box<dyn Error + Send + Sync>> {
+) -> Result<(usize, String)> {
     let output = cmd!(
         "gh pr create --base",
         base_branch,
@@ -593,12 +575,7 @@ fn create_gh_pr(
     Ok((pr_id.as_str().parse()?, pr_url))
 }
 
-fn edit_gh_pr(
-    pr_num: usize,
-    base_branch: &str,
-    title: &str,
-    body: &str,
-) -> Result<ExitStatus, std::io::Error> {
+fn edit_gh_pr(pr_num: usize, base_branch: &str, title: &str, body: &str) -> Result<ExitStatus> {
     let pr_num = format!("{pr_num}");
     let mut c = cmd!(
         "gh pr edit",
@@ -611,7 +588,7 @@ fn edit_gh_pr(
         body
     );
 
-    c.stdout(Stdio::null()).status()
+    Ok(c.stdout(Stdio::null()).status()?)
 }
 
 re!(gherrit_pr_id_re, r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$");
