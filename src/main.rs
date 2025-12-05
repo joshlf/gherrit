@@ -62,7 +62,7 @@ fn main() {
         .unwrap();
 
     let cli = Cli::parse();
-    let repo = gix::open(".").unwrap_or_exit("Failed to open repo");
+    let repo = util::Repo::open(".").unwrap_or_exit("Failed to open repo");
 
     match cli.command {
         Commands::Hook(cmd) => match cmd {
