@@ -29,7 +29,7 @@ use crate::{
 
 const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
-pub fn run(repo: &gix::Repository, msg_file: &str) {
+pub fn run(repo: &util::Repo, msg_file: &str) {
     let msg_path = Path::new(msg_file);
     if !msg_path.exists() {
         log::error!("File does not exist: {}", msg_path.display());
@@ -37,8 +37,7 @@ pub fn run(repo: &gix::Repository, msg_file: &str) {
     }
 
     // Get current branch (Supporting Rebase)
-    let branch_name = util::get_current_branch(repo).unwrap_or_exit("Failed to get current branch");
-    let Some(branch_name) = branch_name.name() else {
+    let Some(branch_name) = repo.current_branch().name() else {
         log::debug!("Could not determine branch name (detached head?). Skipping.");
         return;
     };

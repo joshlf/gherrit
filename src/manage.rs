@@ -8,7 +8,7 @@ pub enum State {
 }
 
 pub fn get_state(
-    repo: &gix::Repository,
+    repo: &util::Repo,
     branch_name: &str,
 ) -> Result<Option<State>, gix::config::value::Error> {
     let key = format!("branch.{}.gherritManaged", branch_name);
@@ -31,8 +31,8 @@ pub fn get_state(
 ///   "."/"refs/heads/<branch>" when managed, unset when unmanaged. Satisfies
 ///   Git's requirement that an upstream branch be set to suppress "fatal: The
 ///   current branch has no upstream branch" errors.
-pub fn set_state(repo: &gix::Repository, state: State) {
-    let branch_name = util::get_current_branch(repo).unwrap_or_exit("Failed to get current branch");
+pub fn set_state(repo: &util::Repo, state: State) {
+    let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) | HeadState::Rebasing(bn) => bn,
         HeadState::Detached => {
@@ -81,20 +81,20 @@ pub fn set_state(repo: &gix::Repository, state: State) {
     }
 }
 
-pub fn post_checkout(repo: &gix::Repository, _prev: &str, _new: &str, flag: &str) {
+pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) {
     // Only run on branch switches (flag=1)
     if flag != "1" {
         return;
     }
 
-    let branch_name = util::get_current_branch(repo).unwrap_or_exit("Failed to get current branch");
+    let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) => bn,
         HeadState::Rebasing(_) | HeadState::Detached => return,
     };
 
     // Idempotency check: Bail if the branch management state is already set.
-    if get_state(repo, &branch_name)
+    if get_state(repo, branch_name)
         .unwrap_or_exit("Failed to parse gherritState")
         .is_some()
     {
@@ -103,7 +103,8 @@ pub fn post_checkout(repo: &gix::Repository, _prev: &str, _new: &str, flag: &str
     }
 
     // Creation detection: Bail if we're just checking out an already-existing branch.
-    let is_new = util::is_newly_created_branch(repo, &branch_name)
+    let is_new = repo
+        .is_newly_created_branch(branch_name)
         .unwrap_or_exit("Failed to check if branch is new");
     if !is_new {
         log::debug!("Branch '{}' is not newly created.", branch_name);

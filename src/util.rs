@@ -141,6 +141,38 @@ impl HeadState {
     }
 }
 
+pub struct Repo {
+    inner: gix::Repository,
+    current_branch: HeadState,
+}
+
+impl Repo {
+    pub fn open(path: &str) -> Result<Self, Box<dyn Error>> {
+        let inner = gix::open(path)?;
+        let current_branch = get_current_branch(&inner)?;
+        Ok(Self {
+            inner,
+            current_branch,
+        })
+    }
+
+    pub fn current_branch(&self) -> &HeadState {
+        &self.current_branch
+    }
+
+    pub fn is_newly_created_branch(&self, branch_name: &str) -> Result<bool, Box<dyn Error>> {
+        is_newly_created_branch(&self.inner, branch_name)
+    }
+}
+
+impl std::ops::Deref for Repo {
+    type Target = gix::Repository;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 /// Determines the current HEAD state.
 pub fn get_current_branch(repo: &gix::Repository) -> Result<HeadState, Box<dyn std::error::Error>> {
     let head = repo.head()?;

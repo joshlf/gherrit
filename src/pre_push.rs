@@ -15,10 +15,10 @@ use crate::{
     util::{self, CommandExt as _, HeadState, ResultExt as _},
 };
 
-pub fn run(repo: &gix::Repository) {
+pub fn run(repo: &util::Repo) {
     let t0 = Instant::now();
 
-    let branch_name = util::get_current_branch(repo).unwrap_or_exit("Failed to get current branch");
+    let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) | HeadState::Rebasing(bn) => bn,
         HeadState::Detached => {
@@ -27,7 +27,7 @@ pub fn run(repo: &gix::Repository) {
         }
     };
 
-    check_managed_state(repo, &branch_name);
+    check_managed_state(repo, branch_name);
 
     let commits = collect_commits(repo).unwrap_or_exit("Failed to collect commits");
 
@@ -46,11 +46,11 @@ pub fn run(repo: &gix::Repository) {
 
     let latest_versions = push_to_origin(&commits);
 
-    sync_prs(repo, &branch_name, commits, latest_versions);
+    sync_prs(repo, branch_name, commits, latest_versions);
 }
 
 // TODO: Maybe this should return a Result instead of bailing from inside?
-fn check_managed_state(repo: &gix::Repository, branch_name: &str) {
+fn check_managed_state(repo: &util::Repo, branch_name: &str) {
     let state =
         manage::get_state(repo, branch_name).unwrap_or_exit("Failed to parse gherritManaged");
 
@@ -77,7 +77,7 @@ fn check_managed_state(repo: &gix::Repository, branch_name: &str) {
     }
 }
 
-fn collect_commits(repo: &gix::Repository) -> Result<Vec<Commit>, Box<dyn Error>> {
+fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>, Box<dyn Error>> {
     let head = repo.rev_parse_single("HEAD")?;
     let main = repo.rev_parse_single("main")?;
     let mut commits = repo
@@ -98,7 +98,7 @@ fn collect_commits(repo: &gix::Repository) -> Result<Vec<Commit>, Box<dyn Error>
 }
 
 fn create_gherrit_refs(
-    repo: &gix::Repository,
+    repo: &util::Repo,
     commits: Vec<Commit>,
 ) -> Result<Vec<Commit>, Box<dyn Error>> {
     commits
@@ -383,7 +383,7 @@ fn generate_pr_body(
 }
 
 fn sync_prs(
-    repo: &gix::Repository,
+    repo: &util::Repo,
     branch_name: &str,
     commits: Vec<Commit>,
     latest_versions: HashMap<String, usize>,
@@ -522,7 +522,7 @@ fn sync_prs(
         .unwrap();
 }
 
-fn is_private_stack(repo: &gix::Repository, branch: &str) -> bool {
+fn is_private_stack(repo: &util::Repo, branch: &str) -> bool {
     // If pushRemote is set to ".", it is a private loopback stack.
     // If it is unset or anything else (e.g. 'origin'), it is public.
     util::get_config_string(repo, &format!("branch.{}.pushRemote", branch))
