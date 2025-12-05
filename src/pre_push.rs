@@ -1,7 +1,7 @@
 use core::str;
 use std::{collections::HashMap, process::Stdio, time::Instant};
 
-use gix::{reference::Category, refs::transaction::PreviousValue, ObjectId};
+use gix::{ObjectId, reference::Category, refs::transaction::PreviousValue};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +9,7 @@ use crate::{
     cmd, manage, re,
     util::{self, HeadState},
 };
-use eyre::{bail, eyre, Context, Result};
+use eyre::{Context, Result, bail, eyre};
 use owo_colors::OwoColorize;
 
 pub fn run(repo: &util::Repo) -> Result<()> {
