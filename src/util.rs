@@ -1,8 +1,8 @@
 use std::ffi::OsStr;
 use std::process::Command;
 
-use eyre::Result;
-use gix::{bstr::ByteSlice as _, state::InProgress};
+use eyre::{OptionExt, Result};
+use gix::state::InProgress;
 
 /// Constructs a `std::process::Command`.
 ///
@@ -142,19 +142,18 @@ impl Repo {
     }
 
     pub fn is_newly_created_branch(&self, branch_name: &str) -> Result<bool> {
-        // If this branch was just created (as opposed to having been checked out
-        // from an existing branch), then its earliest reflog entry will have the
-        // message "branch: Created from ...".
-        Ok(self
-            .inner
-            .find_reference(branch_name)?
+        let reference = self.inner.find_reference(branch_name)?;
+
+        // Get the most recent reflog entry
+        let latest_log = reference
             .log_iter()
-            .rev()?
-            .into_iter()
-            .flatten()
+            .rev()? // Iterate newest-to-oldest
+            .ok_or_eyre("No reflog entries found")?
             .next()
-            .transpose()?
-            .is_some_and(|log| log.message.contains_str("branch: Created from")))
+            .transpose()?;
+
+        // Check if the previous OID is the Null Object ID (0000...)
+        Ok(latest_log.is_some_and(|log| log.previous_oid.is_null()))
     }
 }
 
