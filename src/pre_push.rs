@@ -40,7 +40,7 @@ pub fn run(repo: &util::Repo) -> Result<()> {
         return Ok(());
     }
 
-    let latest_versions = push_to_origin(&commits)?;
+    let latest_versions = push_to_origin(repo, &commits)?;
 
     sync_prs(repo, branch_name, commits, latest_versions)
 }
@@ -73,19 +73,22 @@ fn check_managed_state(repo: &util::Repo, branch_name: &str) -> Result<()> {
 
 fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
     let head = repo.rev_parse_single("HEAD")?;
-    let main = repo.rev_parse_single("main")?;
+    let default_branch = repo.find_default_branch_on_default_remote()?;
+    let default_ref_spec = format!("refs/heads/{}", default_branch);
+    let default_ref = repo.rev_parse_single(default_ref_spec.as_str())?;
     let mut commits = repo
         .rev_walk([head])
         .all()?
-        .take_while(|res| res.as_ref().map(|info| info.id != main).unwrap_or(true))
+        .take_while(|res| {
+            res.as_ref()
+                .map(|info| info.id != default_ref)
+                .unwrap_or(true)
+        })
         .map(|res| -> Result<_> { Ok(res?.object()?) })
         .collect::<Result<Vec<_>>>()?;
     commits.reverse();
 
-    commits
-        .into_iter()
-        .map(|c| c.try_into())
-        .collect::<Result<Vec<_>, _>>()
+    commits.into_iter().map(|c| c.try_into()).collect()
 }
 
 fn create_gherrit_refs(repo: &util::Repo, commits: Vec<Commit>) -> Result<Vec<Commit>> {
@@ -99,9 +102,9 @@ fn create_gherrit_refs(repo: &util::Repo, commits: Vec<Commit>) -> Result<Vec<Co
         .collect::<Result<Vec<_>>>()
 }
 
-fn push_to_origin(commits: &[Commit]) -> Result<HashMap<String, usize>> {
+fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<String, usize>> {
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
-    let remote_versions = get_remote_versions(&gherrit_ids).unwrap_or_else(|e| {
+    let remote_versions = get_remote_versions(repo, &gherrit_ids).unwrap_or_else(|e| {
         log::warn!("Failed to fetch remote versions: {}", e);
         HashMap::new()
     });
@@ -117,7 +120,7 @@ fn push_to_origin(commits: &[Commit]) -> Result<HashMap<String, usize>> {
         // that don't correspond to any PR. Mostly commonly, this is caused by
         // --force-with-lease causing some refs to fail to push.
         "--atomic".to_string(),
-        "origin".to_string(),
+        repo.default_remote_name(),
     ];
 
     let mut next_versions = HashMap::new();
@@ -202,14 +205,21 @@ fn push_to_origin(commits: &[Commit]) -> Result<HashMap<String, usize>> {
 
     let status = child.wait().unwrap();
     if !status.success() {
-        bail!("`git push` failed. You may need to rebase on the latest changes from origin/main.");
+        let r = repo.default_remote_name();
+        let b = repo
+            .find_default_branch_on_default_remote()
+            .unwrap_or("main".to_string());
+        bail!("`git push` failed. You may need to rebase on the latest changes from {r}/{b}.");
     }
 
     Ok(next_versions)
 }
 
 #[allow(clippy::type_complexity)]
-fn get_remote_versions(gherrit_ids: &[String]) -> Result<HashMap<String, Vec<(usize, String)>>> {
+fn get_remote_versions(
+    repo: &util::Repo,
+    gherrit_ids: &[String],
+) -> Result<HashMap<String, Vec<(usize, String)>>> {
     if gherrit_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -227,7 +237,7 @@ fn get_remote_versions(gherrit_ids: &[String]) -> Result<HashMap<String, Vec<(us
         let mut args = vec![
             "ls-remote".to_string(),
             "--tags".to_string(),
-            "origin".to_string(),
+            repo.default_remote_name(),
         ];
 
         args.extend(chunk.iter().map(|id| format!("refs/tags/gherrit/{id}/*")));

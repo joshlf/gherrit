@@ -41,9 +41,10 @@ pub fn set_state(repo: &util::Repo, state: State) -> Result<()> {
 
     let key = |suffix: &str| format!("branch.{branch_name}.{suffix}");
     let self_merge_ref = format!("refs/heads/{branch_name}");
+    let default_remote = repo.default_remote_name();
+
     match state {
         State::Managed => {
-            cmd!("git config", key("gherritManaged"), "true").status()?;
             cmd!("git config", key("gherritManaged"), "true").status()?;
 
             let current_push_remote = repo.config_string(&key("pushRemote"))?;
@@ -68,24 +69,27 @@ pub fn set_state(repo: &util::Repo, state: State) -> Result<()> {
                 let remote_yellow = remote.yellow();
                 log::warn!("Branch '{branch_name_yellow}' has a custom pushRemote '{remote_yellow}'. GHerrit did NOT overwrite it.");
                 log::warn!("  - Running `git push` will push to '{remote_yellow}' in addition to syncing via GHerrit.");
-                log::warn!("  - To configure GHerrit to sync your stack WITHOUT pushing to origin (making it private), run:");
+                log::warn!("  - To configure GHerrit to sync your stack WITHOUT pushing to {default_remote} (making it private), run:");
                 log::warn!("    git config {} .", key("pushRemote"));
-                log::warn!("  - To allow pushing this branch to origin (making it public), run:");
-                log::warn!("    git config {} origin", key("pushRemote"));
+                log::warn!(
+                    "  - To allow pushing this branch to {default_remote} (making it public), run:"
+                );
+                log::warn!("    git config {} {}", key("pushRemote"), default_remote);
             } else {
-                log::info!("  - 'git push' is configured to sync your stack WITHOUT updating 'origin/{branch_name}'.");
-                log::info!("  - To allow pushing this branch to origin (making it public), run:");
-                log::info!("    git config {} origin", key("pushRemote"));
+                log::info!("  - 'git push' is configured to sync your stack WITHOUT updating '{default_remote}/{branch_name}'.");
+                log::info!(
+                    "  - To allow pushing this branch to {default_remote} (making it public), run:"
+                );
+                log::info!("    git config {} {}", key("pushRemote"), default_remote);
             }
         }
         State::Unmanaged => {
-            cmd!("git config", key("gherritManaged"), "false").status()?;
             cmd!("git config", key("gherritManaged"), "false").status()?;
 
             let current_push_remote = repo.config_string(&key("pushRemote"))?;
             let custom_push_remote = match current_push_remote.as_deref() {
                 Some(".") => {
-                    cmd!("git config", key("pushRemote"), ".").status()?;
+                    cmd!("git config --unset", key("pushRemote")).status()?;
                     None
                 }
                 Some(remote) => Some(remote),
@@ -109,9 +113,10 @@ pub fn set_state(repo: &util::Repo, state: State) -> Result<()> {
             );
             log::info!("  - Standard 'git push' behavior has been restored.");
             if let Some(remote) = custom_push_remote {
-                log::warn!("Branch '{branch_name_yellow}' has a custom pushRemote '{remote}'. GHerrit did NOT unset it.");
+                let remote_yellow = remote.yellow();
+                log::warn!("Branch '{branch_name_yellow}' has a custom pushRemote '{remote_yellow}'. GHerrit did NOT unset it.");
             } else {
-                log::info!("  - Local self-tracking removed. You may need to set a new upstream (e.g., git push -u origin {branch_name}).");
+                log::info!("  - Local self-tracking removed. You may need to set a new upstream (e.g., git push -u {default_remote} {branch_name}).");
             }
         }
     }
@@ -155,25 +160,11 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         .config_string(&format!("branch.{branch_name}.merge"))
         .wrap_err("Failed to read config")?;
 
-    let is_default_branch = if let (Some(remote), Some(merge)) =
+    let is_default_branch = if let (Some(_remote), Some(merge)) =
         (upstream_remote.as_deref(), upstream_merge.as_deref())
     {
         let branch_name = merge.strip_prefix("refs/heads/").unwrap_or(merge);
-        ({
-            // Check if the upstream matches the remote's HEAD (e.g. origin/HEAD
-            // -> origin/main)
-            let expected_target = format!("refs/remotes/{remote}/{branch_name}");
-            let remote_head_ref = format!("refs/remotes/{remote}/HEAD");
-            repo.find_reference(&remote_head_ref)
-                .ok()
-                .and_then(|r| r.target().try_name().map(|n| n.to_string()))
-                .is_some_and(|target| target == expected_target)
-        }) || {
-            // Fallback: Check config or standard conventions
-            let configured_default = repo.config_string("init.defaultBranch").ok().flatten();
-            configured_default.as_deref() == Some(branch_name)
-                || matches!(branch_name, "main" | "master" | "trunk")
-        }
+        repo.is_a_default_branch_on_default_remote(branch_name)?
     } else {
         false
     };
