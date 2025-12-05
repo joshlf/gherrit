@@ -54,9 +54,12 @@ impl TestContext {
     }
 
     pub fn run_git(&self, args: &[&str]) {
+        self.git().args(args).assert().success();
+    }
+
+    pub fn git(&self) -> assert_cmd::Command {
         let mut cmd = assert_cmd::Command::new("git");
         cmd.current_dir(&self.repo_path);
-        cmd.args(args);
 
         if !self.is_live {
             let mut paths = vec![self.dir.path().to_path_buf()];
@@ -66,7 +69,7 @@ impl TestContext {
             cmd.env("SYSTEM_GIT_PATH", &self.system_git);
         }
 
-        cmd.assert().success();
+        cmd
     }
 
     pub fn read_mock_state(&self) -> MockState {
