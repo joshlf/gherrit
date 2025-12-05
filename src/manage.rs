@@ -160,14 +160,13 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         .config_string(&format!("branch.{branch_name}.merge"))
         .wrap_err("Failed to read config")?;
 
-    let is_default_branch = if let (Some(_remote), Some(merge)) =
-        (upstream_remote.as_deref(), upstream_merge.as_deref())
-    {
-        let branch_name = merge.strip_prefix("refs/heads/").unwrap_or(merge);
-        repo.is_a_default_branch_on_default_remote(branch_name)?
-    } else {
-        false
-    };
+    let is_default_branch = upstream_merge
+        .as_deref()
+        .map(|merge| {
+            let branch_name = merge.strip_prefix("refs/heads/").unwrap_or(merge);
+            repo.is_a_default_branch_on_default_remote(branch_name)
+        })
+        .unwrap_or(false);
 
     let has_upstream = upstream_remote.is_some() && upstream_merge.is_some();
     if has_upstream && !is_default_branch {

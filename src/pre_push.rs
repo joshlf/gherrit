@@ -73,7 +73,7 @@ fn check_managed_state(repo: &util::Repo, branch_name: &str) -> Result<()> {
 
 fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
     let head = repo.rev_parse_single("HEAD")?;
-    let default_branch = repo.find_default_branch_on_default_remote()?;
+    let default_branch = repo.find_default_branch_on_default_remote();
     let default_ref_spec = format!("refs/heads/{}", default_branch);
     let default_ref = repo.rev_parse_single(default_ref_spec.as_str())?;
     let mut commits = repo
@@ -206,9 +206,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
     let status = child.wait().unwrap();
     if !status.success() {
         let r = repo.default_remote_name();
-        let b = repo
-            .find_default_branch_on_default_remote()
-            .unwrap_or("main".to_string());
+        let b = repo.find_default_branch_on_default_remote();
         bail!("`git push` failed. You may need to rebase on the latest changes from {r}/{b}.");
     }
 
