@@ -41,36 +41,32 @@ pub fn set_state(repo: &util::Repo, state: State) {
         }
     };
 
-    let key_managed = format!("branch.{branch_name}.gherritManaged");
-    let key_push_remote = format!("branch.{branch_name}.pushRemote");
-    let key_remote = format!("branch.{branch_name}.remote");
-    let key_merge = format!("branch.{branch_name}.merge");
+    let key = |suffix: &str| format!("branch.{branch_name}.{suffix}");
     let self_merge_ref = format!("refs/heads/{branch_name}");
-
     match state {
         State::Managed => {
-            cmd!("git config", key_managed, "true").unwrap_status();
-            cmd!("git config", key_push_remote, ".").unwrap_status();
-            cmd!("git config", key_remote, ".").unwrap_status();
-            cmd!("git config", key_merge, &self_merge_ref).unwrap_status();
+            cmd!("git config", key("gherritManaged"), "true").unwrap_status();
+            cmd!("git config", key("pushRemote"), ".").unwrap_status();
+            cmd!("git config", key("remote"), ".").unwrap_status();
+            cmd!("git config", key("merge"), &self_merge_ref).unwrap_status();
 
             log::info!("Branch '{branch_name}' is now managed by GHerrit.");
             log::info!("  - 'git push' is configured to sync your stack WITHOUT updating 'origin/{branch_name}'.");
             log::info!("  - To allow pushing this branch to origin (making it public), run:");
-            log::info!("    git config branch.{branch_name}.pushRemote origin");
+            log::info!("    git config {} origin", key("pushRemote"));
         }
         State::Unmanaged => {
-            cmd!("git config", key_managed, "false").unwrap_status();
-            cmd!("git config --unset", key_push_remote).unwrap_status();
+            cmd!("git config", key("gherritManaged"), "false").unwrap_status();
+            cmd!("git config --unset", key("pushRemote")).unwrap_status();
 
-            let current_remote = repo.config_string(&key_remote).unwrap_or(None);
-            let current_merge = repo.config_string(&key_merge).unwrap_or(None);
+            let current_remote = repo.config_string(&key("remote")).unwrap_or(None);
+            let current_merge = repo.config_string(&key("merge")).unwrap_or(None);
 
             if current_remote.as_deref() == Some(".")
                 && current_merge.as_deref() == Some(&self_merge_ref)
             {
-                cmd!("git config --unset", key_remote).unwrap_status();
-                cmd!("git config --unset", key_merge).unwrap_status();
+                cmd!("git config --unset", key("remote")).unwrap_status();
+                cmd!("git config --unset", key("merge")).unwrap_status();
                 log::info!("  - Removed local self-tracking configuration.");
             }
 
