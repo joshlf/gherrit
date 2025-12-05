@@ -1,10 +1,5 @@
 use core::str;
-use std::{
-    collections::{HashMap, HashSet},
-    process::Stdio,
-    thread,
-    time::Instant,
-};
+use std::{collections::HashMap, process::Stdio, time::Instant};
 
 use gix::{reference::Category, refs::transaction::PreviousValue, ObjectId};
 use rayon::prelude::*;
@@ -20,9 +15,6 @@ use owo_colors::OwoColorize;
 pub fn run(repo: &util::Repo) -> Result<()> {
     let t0 = Instant::now();
 
-    // We spawn this immediately to hide the latency of the network call.
-    let fetch_handle = thread::spawn(fetch_and_get_merged_ids);
-
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) | HeadState::Pending(bn) => bn,
@@ -33,38 +25,7 @@ pub fn run(repo: &util::Repo) -> Result<()> {
 
     check_managed_state(repo, branch_name)?;
 
-    let mut commits = collect_commits(repo).wrap_err("Failed to collect commits")?;
-
-    // NOTE: This `.unwrap()` just has the effect of propagating any panics from
-    // the background thread.
-    match fetch_handle.join().unwrap() {
-        Ok(merged_ids) => {
-            // Prune commits that are already merged upstream. Unless we get very unlucky
-            // and have a PR merged between the time we start the fetch and the time we
-            // issue the subsequent `git push`, this should ensure that we never push
-            // commits which have already been merged upstream, which would cause the
-            // push to fail.
-            if !merged_ids.is_empty() {
-                let original_count = commits.len();
-                commits.retain(|c| !merged_ids.contains(&c.gherrit_id));
-                let removed = original_count - commits.len();
-                if removed > 0 {
-                    log::info!(
-                        "Skipping {} commit(s) that are already merged upstream.",
-                        removed
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            // If the fetch fails (e.g. no network), we log a warning but proceed
-            // attempting to push everything. Use {:#} to print the error chain.
-            log::warn!(
-                "Background fetch failed: {:#}. Proceeding without pruning.",
-                e
-            );
-        }
-    }
+    let commits = collect_commits(repo).wrap_err("Failed to collect commits")?;
 
     let t1 = Instant::now();
     log::trace!("t0 -> t1: {:?}", t1 - t0);
@@ -679,31 +640,3 @@ fn edit_gh_pr(state: &PrState, new_base: &str, new_title: &str, new_body: &str) 
 }
 
 re!(gherrit_pr_id_re, r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$");
-
-fn fetch_and_get_merged_ids() -> Result<HashSet<String>> {
-    // Fetch origin/main to ensure we have the latest state. We suppress
-    // stdout/stderr to keep the hook output clean.
-    cmd!("git fetch origin main")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .wrap_err("Failed to fetch origin/main")?;
-
-    // Get the list of `gherrit-pr-id`s from commits that are in origin/main but
-    // NOT in the local main.
-    let output = cmd!(
-        "git log main..origin/main --format=%(trailers:key=gherrit-pr-id,valueonly,separator=)"
-    )
-    .output()
-    .wrap_err("Failed to check upstream commits")?;
-
-    let stdout = str::from_utf8(&output.stdout)?;
-
-    let ids: HashSet<String> = stdout
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    Ok(ids)
-}
