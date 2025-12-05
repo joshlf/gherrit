@@ -104,7 +104,7 @@ git push
     view the **diff between versions** (e.g., "Compare v3 vs v2"). This allows
     reviewers to immediately see what changed since their last review.
 
-<img width="915" height="317" alt="Screenshot 2025-12-02 at 6 46 15 PM" src="https://github.com/user-attachments/assets/6ee80641-af67-4b37-9f57-797207637bbe" />
+<img width="918" height="575" alt="Screenshot 2025-12-05 at 1 13 16 PM" src="https://github.com/user-attachments/assets/97d59a3d-0697-4c74-a833-9cc6da2089ee" />
 
 ### 3\. Updating the Stack
 
