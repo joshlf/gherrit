@@ -156,6 +156,12 @@ impl Repo {
         Ok(latest_log.is_some_and(|log| log.previous_oid.is_null()))
     }
 
+    /// Checks if `ancestor` is reachable from `descendant`.
+    pub fn is_ancestor(&self, ancestor: gix::ObjectId, descendant: gix::ObjectId) -> Result<bool> {
+        let merge_base = self.inner.merge_base(ancestor, descendant)?;
+        Ok(merge_base.detach() == ancestor)
+    }
+
     pub fn default_remote_name(&self) -> String {
         self.config_string("gherrit.remote")
             .unwrap_or_default()
