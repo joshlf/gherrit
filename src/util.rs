@@ -65,11 +65,11 @@ macro_rules! cmd {
 macro_rules! re {
     ($name:ident, $re:literal) => {
         fn $name() -> &'static regex::Regex {
-            re!(@inner $re)
+            $crate::re!(@inner $re)
         }
     };
     ($re:literal) => {
-        re!(@inner $re)
+        $crate::re!(@inner $re)
     };
     (@inner $re:literal) => {{
         static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new($re).unwrap());
