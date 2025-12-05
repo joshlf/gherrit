@@ -113,7 +113,9 @@ pub struct Repo {
 
 impl Repo {
     pub fn open(path: &str) -> Result<Self> {
-        let inner = gix::open(path)?;
+        // NOTE: `gix::discover` is used instead of `gix::open` so that
+        // `gherrit` doesn't need to be run from the root of the repository.
+        let inner = gix::discover(path)?;
         let current_branch = get_current_branch(&inner)?;
         Ok(Self {
             inner,
