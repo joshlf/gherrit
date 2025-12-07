@@ -116,6 +116,8 @@ fn run_git_cmd(path: &Path, args: &[&str]) {
 pub struct MockState {
     pub prs: Vec<PrEntry>,
     pub pushed_refs: Vec<String>,
+    #[serde(default)]
+    pub push_count: usize,
 }
 
 #[derive(serde::Deserialize, Debug)]
