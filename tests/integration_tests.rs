@@ -256,3 +256,50 @@ fn test_pre_push_ancestry_check() {
         stderr
     );
 }
+
+#[test]
+fn test_version_increment() {
+    let ctx = TestContext::init();
+    ctx.install_hooks();
+
+    // Setup: Initial commit
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
+    // Create feature branch
+    ctx.run_git(&["checkout", "-b", "feat-versioning"]);
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Feature Commit"]);
+
+    // Manage
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Push 1 (v1)
+    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+
+    if !ctx.is_live {
+        let state = ctx.read_mock_state();
+        let has_v1 = state.pushed_refs.iter().any(|r| r.contains("/v1"));
+        assert!(
+            has_v1,
+            "Expected v1 tag to be pushed. Refs: {:?}",
+            state.pushed_refs
+        );
+    }
+
+    // Amend commit (modifies SHA, keeps Change-ID)
+    ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
+
+    // Push 2 (v2)
+    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+
+    if !ctx.is_live {
+        let state = ctx.read_mock_state();
+        let has_v2 = state.pushed_refs.iter().any(|r| r.contains("/v2"));
+        assert!(
+            has_v2,
+            "Expected v2 tag to be pushed. Refs: {:?}",
+            state.pushed_refs
+        );
+
+        // Bonus: Verify v1 was NOT pushed again or deleted (cleanup might delete it locally)
+        // Mock state tracks what was pushed.
+    }
+}
