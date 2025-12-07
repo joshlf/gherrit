@@ -391,3 +391,49 @@ fn test_pr_body_generation() {
     // That would duplicate version increment test somewhat, but good for body check.
     // Let's assume v1 check is sufficient for metadata structure.
 }
+
+#[test]
+fn test_large_stack_batching() {
+    let ctx = TestContext::init();
+    ctx.install_hooks();
+
+    // Setup: Initial commit on main
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
+
+    // Create feature branch
+    ctx.run_git(&["checkout", "-b", "large-stack"]);
+
+    // Create 85 commits (exceeds batch limit of 80)
+    for i in 1..=85 {
+        ctx.run_git(&["commit", "--allow-empty", "-m", &format!("Commit {}", i)]);
+    }
+
+    // Manage
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Sync - should succeed without error
+    // Using simple pre-push hook invocation.
+    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+
+    if !ctx.is_live {
+        let state = ctx.read_mock_state();
+
+        // Assert: 85 PRs created
+        assert_eq!(state.prs.len(), 85, "Expected 85 PRs created");
+
+        // Assert: 85 refs pushed (actually more, since tags are also pushed)
+        // Check refs/gherrit/<ID>/v1 count.
+        let v1_refs = state
+            .pushed_refs
+            .iter()
+            .filter(|r| !r.starts_with("--"))
+            .filter(|r| r.contains("/v1"))
+            .count();
+        assert_eq!(
+            v1_refs,
+            85,
+            "Expected 85 v1 specific refs pushed. Total pushed: {:?}",
+            state.pushed_refs.len()
+        );
+    }
+}
