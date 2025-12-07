@@ -11,6 +11,8 @@ struct MockState {
     prs: Vec<PrEntry>,
     #[serde(default)]
     pushed_refs: Vec<String>,
+    #[serde(default)]
+    push_count: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -55,6 +57,7 @@ fn handle_git(args: &[String]) {
 
         update_state(|state| {
             state.pushed_refs.extend(refspecs);
+            state.push_count += 1;
         });
 
         // Pretend push succeeded
