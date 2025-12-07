@@ -433,3 +433,32 @@ fn test_large_stack_batching() {
         );
     }
 }
+
+#[test]
+fn test_rebase_detection() {
+    let ctx = TestContext::init();
+    ctx.install_hooks();
+
+    // Setup: Main and feature
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial"]);
+    ctx.run_git(&["checkout", "-b", "feature-rebase"]);
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Feature Work"]);
+
+    // Detach HEAD to simulate rebase state
+    ctx.run_git(&["checkout", "--detach"]);
+
+    // Create rebase-merge state manually
+    let rebase_dir = ctx.repo_path.join(".git/rebase-merge");
+    std::fs::create_dir_all(&rebase_dir).unwrap();
+    std::fs::write(rebase_dir.join("head-name"), "refs/heads/feature-rebase").unwrap();
+
+    // Run manage - should succeed by detecting 'feature-rebase'
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Verify config was applied to 'feature-rebase'
+    ctx.git()
+        .args(["config", "branch.feature-rebase.gherritManaged"])
+        .assert()
+        .success()
+        .stdout("true\n");
+}
