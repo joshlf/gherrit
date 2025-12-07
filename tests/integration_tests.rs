@@ -183,3 +183,45 @@ fn test_post_checkout_hook() {
         .success()
         .stdout("false\n");
 }
+
+#[test]
+fn test_commit_msg_edge_cases() {
+    let ctx = TestContext::init();
+    ctx.install_hooks();
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial"]);
+    // Ensure we are managed so the hook is active
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Scenario A: Squash Commit
+    let squash_msg_file = ctx.repo_path.join("SQUASH_MSG");
+    let squash_content = "squash! some other commit";
+    std::fs::write(&squash_msg_file, squash_content).unwrap();
+
+    ctx.gherrit()
+        .args(["hook", "commit-msg", squash_msg_file.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let content_after = std::fs::read_to_string(&squash_msg_file).unwrap();
+    assert_eq!(
+        content_after, squash_content,
+        "Commit-msg hook should ignore squash commits"
+    );
+
+    // Scenario B: Detached HEAD
+    ctx.run_git(&["checkout", "--detach"]);
+    let detached_msg_file = ctx.repo_path.join("DETACHED_MSG");
+    let detached_content = "feat: detached work";
+    std::fs::write(&detached_msg_file, detached_content).unwrap();
+
+    ctx.gherrit()
+        .args(["hook", "commit-msg", detached_msg_file.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let content_after = std::fs::read_to_string(&detached_msg_file).unwrap();
+    assert_eq!(
+        content_after, detached_content,
+        "Commit-msg hook should ignore detached HEAD"
+    );
+}
