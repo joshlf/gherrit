@@ -1,4 +1,5 @@
 mod commit_msg;
+mod install;
 mod manage;
 mod pre_push;
 mod util;
@@ -23,6 +24,12 @@ enum Commands {
     Manage,
     /// Configure the current branch to be unmanaged by GHerrit.
     Unmanage,
+    /// Install GHerrit Git hooks.
+    Install {
+        /// Overwrite existing hooks not managed by GHerrit
+        #[arg(long, short)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -105,6 +112,7 @@ fn run() -> Result<()> {
         },
         Commands::Manage => manage::set_state(&repo, manage::State::Managed)?,
         Commands::Unmanage => manage::set_state(&repo, manage::State::Unmanaged)?,
+        Commands::Install { force } => install::install(&repo, force)?,
     }
 
     Ok(())
