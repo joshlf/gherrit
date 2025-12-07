@@ -552,3 +552,50 @@ fn test_public_stack_links() {
         );
     }
 }
+
+#[test]
+fn test_install_command_edge_cases() {
+    let ctx = TestContext::init();
+    // Do NOT call install_hooks(); we will test installation manually.
+
+    let hooks_dir = ctx.repo_path.join(".git/hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    let pre_push = hooks_dir.join("pre-push");
+
+    // Scenario A: Conflict
+    std::fs::write(&pre_push, "foo").unwrap();
+
+    ctx.gherrit()
+        .args(["install"])
+        .assert()
+        .failure() // Should fail
+        .stderr(predicates::str::contains("Refusing to overwrite"));
+
+    assert_eq!(std::fs::read_to_string(&pre_push).unwrap(), "foo");
+
+    // Scenario B: Force Overwrite
+    ctx.gherrit()
+        .args(["install", "--force"])
+        .assert()
+        .success();
+
+    let content = std::fs::read_to_string(&pre_push).unwrap();
+    assert!(content.contains("# gherrit-installer: managed"));
+
+    // Scenario C: Idempotency (Safe to run again)
+    ctx.gherrit().args(["install"]).assert().success();
+
+    // Scenario D: Safe Update (Modify but keep sentinel)
+    let modified = content + "\n# Some custom comment";
+    std::fs::write(&pre_push, modified).unwrap();
+
+    ctx.gherrit()
+        .args(["install"]) // Should detect sentinel and update gracefully
+        .assert()
+        .success();
+
+    // Content should be reset to standard shim (losing custom comment, which is expected behavior for managed hooks)
+    let reset_content = std::fs::read_to_string(&pre_push).unwrap();
+    assert!(reset_content.contains("# gherrit-installer: managed"));
+    assert!(!reset_content.contains("# Some custom comment"));
+}
