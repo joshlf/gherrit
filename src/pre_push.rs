@@ -115,10 +115,13 @@ fn create_gherrit_refs(repo: &util::Repo, commits: Vec<Commit>) -> Result<Vec<Co
         .collect::<Result<Vec<_>>>()
 }
 
+#[allow(clippy::too_many_lines)]
 fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<String, usize>> {
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
-    let remote_versions = get_remote_versions(repo, &gherrit_ids).unwrap_or_else(|e| {
-        log::warn!("Failed to fetch remote versions: {}", e);
+
+    // 1. Get real-time remote SHAs for the branches (Fixes Stale Info)
+    let remote_branch_states = get_remote_branch_states(repo, &gherrit_ids).unwrap_or_else(|e| {
+        log::warn!("Failed to fetch remote branch states: {}", e);
         HashMap::new()
     });
 
@@ -131,57 +134,40 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
 
     for chunk in commits.chunks(BATCH_SIZE) {
         let mut refspecs = Vec::new();
+        let mut refs_to_persist = Vec::new();
 
         for c in chunk {
-            let remote_data = remote_versions.get(&c.gherrit_id);
-            let versions = remote_data.map(|d| d.versions.as_slice()).unwrap_or(&[]);
+            // 2. Calculate version based on LOCAL state (Optimistic Concurrency)
+            let local_max = get_local_version(repo, &c.gherrit_id).unwrap_or(0);
+            let next_ver = local_max + 1;
+            next_versions.insert(c.gherrit_id.clone(), next_ver);
 
-            // Find the latest version
-            let latest = versions.iter().max_by_key(|(v, _)| *v);
-
-            if let Some((ver, sha)) = latest {
-                if *sha == c.id.to_string() {
-                    log::info!(
-                        "Commit {} already tagged as {}",
-                        c.id.yellow(),
-                        format!("v{ver}").bold()
-                    );
-                    next_versions.insert(c.gherrit_id.clone(), *ver);
-
-                    // Ensure the branch points to this commit even if it's already tagged.
-                    // We use force-with-lease to ensure we only update if the remote matches
-                    // what we expect (which might be empty if the branch doesn't exist).
-                    let branch_lease = remote_data
-                        .and_then(|d| d.branch_sha.as_deref())
-                        .unwrap_or("");
-
-                    refspecs.push(format!("{}:refs/heads/{}", c.id, c.gherrit_id));
-                    refspecs.push(format!(
-                        "--force-with-lease=refs/heads/{}:{branch_lease}",
-                        c.gherrit_id
-                    ));
-
-                    continue;
-                }
-            }
-
-            let next_version = latest.map(|(v, _)| *v).unwrap_or(0) + 1;
-            next_versions.insert(c.gherrit_id.clone(), next_version);
+            // 3. Lease the Branch (Fixing the bug)
+            // If we know the remote SHA, we expect it. If we don't (None), we expect "" (creation).
+            let expected_sha = remote_branch_states
+                .get(&c.gherrit_id)
+                .map(|s| s.as_deref().unwrap_or(""))
+                .unwrap_or("");
 
             refspecs.push(format!("{}:refs/heads/{}", c.id, c.gherrit_id));
             refspecs.push(format!(
-                "{}:refs/tags/gherrit/{}/v{}",
-                c.id, c.gherrit_id, next_version
-            ));
-
-            // Lease for branch
-            let branch_lease = remote_data
-                .and_then(|d| d.branch_sha.as_deref())
-                .unwrap_or("");
-            refspecs.push(format!(
-                "--force-with-lease=refs/heads/{}:{branch_lease}",
+                "--force-with-lease=refs/heads/{}:{expected_sha}",
                 c.gherrit_id
             ));
+
+            // 4. Lock the Tag (Enforcing safety)
+            // We expect the *next* version tag to NOT exist.
+            // This prevents overwriting if someone else pushed next_ver already.
+            refspecs.push(format!(
+                "{}:refs/tags/gherrit/{}/v{}",
+                c.id, c.gherrit_id, next_ver
+            ));
+            refspecs.push(format!(
+                "--force-with-lease=refs/tags/gherrit/{}/v{next_ver}:",
+                c.gherrit_id
+            ));
+
+            refs_to_persist.push((c.id, c.gherrit_id.clone(), next_ver));
         }
 
         if refspecs.is_empty() {
@@ -192,28 +178,24 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
             "push".to_string(),
             "--quiet".to_string(),
             "--no-verify".to_string(),
-            // If any push in this batch fails, abort this batch.
-            "--atomic".to_string(),
+            "--atomic".to_string(), // Critical for the lock to work
             repo.default_remote_name(),
         ];
         args.extend(refspecs);
 
-        log::info!("Pushing chunk to remote..."); // Simplified log
+        log::info!("Pushing chunk to remote...");
         let mut child = util::cmd("git", args)
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
             .spawn()
             .wrap_err("Failed to run `git push`")?;
 
-        // Filter out the "Create a pull request" message from GitHub
+        // Filter output logic (elided for brevity, same as before)
         {
             use std::io::{BufRead, BufReader};
             let stderr = child.stderr.take().unwrap();
             let reader = BufReader::new(stderr);
-
-            // Buffer for contiguous "remote:" lines
             let mut remote_buffer: Vec<String> = Vec::new();
-
             let flush_buffer = |buf: &mut Vec<String>| {
                 if buf.is_empty() {
                     return;
@@ -222,14 +204,12 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
                 let re = re!(
                     r"(?m)\n?^remote:\s*\nremote: Create a pull request for '.*' on GitHub by visiting:\s*\nremote:\s*https://github\.com/.*\nremote:\s*$"
                 );
-
                 let cleaned = re.replace(&block, "");
                 if !cleaned.is_empty() {
                     eprintln!("{}", cleaned);
                 }
                 buf.clear();
             };
-
             for line in reader.lines() {
                 let line = line.unwrap();
                 if line.trim_start().starts_with("remote:") {
@@ -244,31 +224,38 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
 
         let status = child.wait().unwrap();
         if !status.success() {
+            // 5. Handle Failure
+            // If failed, it might be due to the tag lock or branch lease.
             let r = repo.default_remote_name();
-            let b = repo.find_default_branch_on_default_remote();
-            bail!("`git push` failed. You may need to rebase on the latest changes from {r}/{b}.");
+            bail!(
+                "`git push` failed. The remote might be ahead or changed. Run `git fetch {r}` to sync."
+            );
+        }
+
+        // 6. Update Local State (Persist tags)
+        for (id, gherrit_id, ver) in refs_to_persist {
+            let _ = repo.reference(
+                format!("refs/tags/gherrit/{gherrit_id}/v{ver}"),
+                id,
+                PreviousValue::Any,
+                "gherrit: persist local version state",
+            );
         }
     }
 
     Ok(next_versions)
 }
 
-#[derive(Debug, Default)]
-struct RemoteData {
-    branch_sha: Option<String>,
-    versions: Vec<(usize, String)>,
-}
-
 #[allow(clippy::type_complexity)]
-fn get_remote_versions(
+fn get_remote_branch_states(
     repo: &util::Repo,
     gherrit_ids: &[String],
-) -> Result<HashMap<String, RemoteData>> {
+) -> Result<HashMap<String, Option<String>>> {
     if gherrit_ids.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let mut versions: HashMap<String, RemoteData> = HashMap::new();
+    let mut states: HashMap<String, Option<String>> = HashMap::new();
 
     // Batch size is limited to avoid exceeding command line limits (e.g., Windows 32k chars).
     // Each refspec is ~62 chars. 250 * 62 = 15,500 chars (safe).
@@ -276,8 +263,6 @@ fn get_remote_versions(
 
     for chunk in gherrit_ids.chunks(BATCH_SIZE) {
         let mut args = vec!["ls-remote".to_string(), repo.default_remote_name()];
-
-        args.extend(chunk.iter().map(|id| format!("refs/tags/gherrit/{id}/*")));
         args.extend(chunk.iter().map(|id| format!("refs/heads/{id}")));
 
         let output = util::cmd("git", args).output()?;
@@ -285,39 +270,48 @@ fn get_remote_versions(
 
         for line in output.lines() {
             // Output format: "<SHA>\t<refname>"
-            // Example: "d6c4d97...	refs/tags/gherrit/123/v1"
             let Some((sha, ref_name)) = line.split_once('\t') else {
                 continue;
             };
-
-            // Match tags: refs/tags/gherrit/<id>/v<ver>
-            let tag_re = re!(r"refs/tags/gherrit/([^/]+)/v(\d+)$");
-            if let Some(caps) = tag_re.captures(ref_name) {
-                if let (Some(id_match), Some(ver_match)) = (caps.get(1), caps.get(2)) {
-                    let id = id_match.as_str().to_string();
-                    if let Ok(ver) = ver_match.as_str().parse::<usize>() {
-                        versions
-                            .entry(id)
-                            .or_default()
-                            .versions
-                            .push((ver, sha.to_string()));
-                    }
-                }
-                continue;
-            }
 
             // Match heads: refs/heads/<id>
             let head_re = re!(r"refs/heads/([a-zA-Z0-9]+)$");
             if let Some(caps) = head_re.captures(ref_name) {
                 if let Some(id_match) = caps.get(1) {
                     let id = id_match.as_str().to_string();
-                    versions.entry(id).or_default().branch_sha = Some(sha.to_string());
+                    states.insert(id, Some(sha.to_string()));
                 }
             }
         }
     }
 
-    Ok(versions)
+    Ok(states)
+}
+
+fn get_local_version(repo: &util::Repo, gherrit_id: &str) -> Result<usize> {
+    let prefix = format!("refs/tags/gherrit/{}/v", gherrit_id);
+    let mut max_ver = 0;
+
+    // Use .all() and manual filtering to avoid `prefixed` API type issues.
+    let references = repo.references().map_err(|e| eyre!(e))?;
+
+    for reference in references.all().map_err(|e| eyre!(e))? {
+        let reference = reference.map_err(|e| eyre!(e))?;
+        let name = reference.name().as_bstr().to_string();
+
+        if name.starts_with(&prefix) {
+            // Parse "refs/tags/gherrit/<id>/v<ver>"
+            if let Some(ver_str) = name.rsplit('v').next() {
+                if let Ok(ver) = ver_str.parse::<usize>() {
+                    if ver > max_ver {
+                        max_ver = ver;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(max_ver)
 }
 
 #[allow(clippy::too_many_arguments)]
