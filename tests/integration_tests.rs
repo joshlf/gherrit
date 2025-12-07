@@ -311,3 +311,73 @@ fn test_version_increment() {
         );
     }
 }
+
+#[test]
+fn test_pr_body_generation() {
+    let ctx = TestContext::init();
+    ctx.install_hooks();
+
+    // Setup: Initial commit on main to establish the branch
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
+
+    // Setup: Stack of 3 commits: A -> B -> C
+    // Must be on a feature branch (not main) for gherrit to sync them
+    ctx.run_git(&["checkout", "-b", "feature-stack"]);
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit A"]);
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit B"]);
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit C"]);
+
+    // Ensure we capture the Change-IDs (Gherrit-IDs).
+    // We can verify this implicitly by checking the PR bodies later.
+
+    // Manage
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Sync
+    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+
+    // Verify
+    if !ctx.is_live {
+        let state = ctx.read_mock_state();
+
+        // Find PR for Commit B (should be the middle one, index 1)
+        // mock_bin typically creates PRs in order [A, B, C] or based on commit list.
+        // We know we created 3 PRs.
+        assert_eq!(state.prs.len(), 3, "Expected 3 PRs");
+
+        // The mock bin stores PRs. We need to find the one corresponding to Commit B.
+        // Commit B is the parent of C and child of A.
+        // Let's filter by title
+        let pr_b = state
+            .prs
+            .iter()
+            .find(|pr| pr.title == "Commit B")
+            .expect("PR for Commit B not found");
+
+        let body = &pr_b.body;
+
+        // 1. Verify Metadata JSON
+        // Should contain <!-- gherrit-meta: { ... } -->
+        assert!(
+            body.contains("<!-- gherrit-meta: {"),
+            "Body missing gherrit-meta block"
+        );
+
+        // Verify parent/child keys exist (basic check, since IDs are dynamic)
+        assert!(
+            body.contains(r#""parent": "G"#),
+            "Body missing valid parent field"
+        );
+        assert!(
+            body.contains(r#""child": "G"#),
+            "Body missing valid child field"
+        );
+
+        // 2. Verify Table
+        // For v1, the history table is NOT generated.
+        assert!(
+            !body.contains("| Version |"),
+            "Table should NOT be present for v1"
+        );
+    }
+}
