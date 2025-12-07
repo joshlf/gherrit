@@ -240,6 +240,34 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
                 PreviousValue::Any,
                 "gherrit: persist local version state",
             );
+
+            // [Clean Up Old Versions]
+            // Iterate over all references to find and delete old tags for this specific ID.
+            let prefix = format!("refs/tags/gherrit/{gherrit_id}/");
+
+            // Note: We use manual filtering as established in get_local_version
+            if let Ok(references) = repo.references().map_err(|e| eyre!(e)) {
+                if let Ok(iter) = references.all().map_err(|e| eyre!(e)) {
+                    for reference in iter.filter_map(Result::ok) {
+                        let name = reference.name().as_bstr().to_string();
+
+                        if let Some(suffix) = name.strip_prefix(&prefix) {
+                            if let Some(ver_str) = suffix.strip_prefix("v") {
+                                if let Ok(old_ver) = ver_str.parse::<usize>() {
+                                    // CRITICAL: Only delete if strictly older than the current version.
+                                    if old_ver < ver {
+                                        log::debug!("Cleaning up obsolete tag: {name}");
+                                        // Best effort deletion
+                                        if let Ok(r) = repo.find_reference(&name) {
+                                            let _ = r.delete();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
