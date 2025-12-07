@@ -380,6 +380,38 @@ fn test_pr_body_generation() {
             "Table should NOT be present for v1"
         );
     }
+
+    // 4. Update to v2 to verify the Patch History Table appears
+    ctx.run_git(&["checkout", "feature-stack"]); // Ensure we are on the branch
+
+    // Amend "Commit B" (the middle one)
+    // We need to re-find it. Since we are in a stack, we can just amend HEAD~1
+    // but that's risky if the graph is complex.
+    // Easier: Just amend the tip (Commit C). The table should appear on Commit C's PR too.
+    ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
+
+    // Sync again
+    // ctx.gherrit().args(["hook", "pre-push"]).assert().success(); // Manual assert below for capture
+    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+
+    if !ctx.is_live {
+        let state = ctx.read_mock_state();
+        // Find PR for Commit C (the tip)
+        let pr_c = state
+            .prs
+            .iter()
+            .find(|pr| pr.title == "Commit C")
+            .expect("PR for Commit C not found");
+
+        let body = &pr_c.body;
+
+        // Assert table exists now
+        assert!(
+            body.contains("| Version |"),
+            "Patch History Table should appear for v2"
+        );
+        assert!(body.contains("v1 |"), "Table should reference v1");
+    }
 }
 
 #[test]
@@ -455,4 +487,48 @@ fn test_rebase_detection() {
         .assert()
         .success()
         .stdout("true\n");
+}
+
+#[test]
+fn test_public_stack_links() {
+    let ctx = TestContext::init();
+    ctx.install_hooks();
+
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Init"]);
+    ctx.run_git(&["checkout", "-b", "public-feature"]);
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Public Commit"]);
+
+    // 1. Private Mode (Default)
+    ctx.gherrit().args(["manage"]).assert().success();
+    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+
+    if !ctx.is_live {
+        let state = ctx.read_mock_state();
+        let body = &state.prs[0].body;
+        assert!(
+            !body.contains("This PR is on branch"),
+            "Private stack should NOT link to local branch"
+        );
+    }
+
+    // 2. Public Mode
+    // Manually set pushRemote to origin (simulating a public stack)
+    ctx.run_git(&["config", "branch.public-feature.pushRemote", "origin"]);
+
+    // Force an update so the body regenerates (amend commit)
+    ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
+    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+
+    if !ctx.is_live {
+        let state = ctx.read_mock_state();
+        let body = &state.prs[0].body; // Get the updated body
+        assert!(
+            body.contains("This PR is on branch"),
+            "Public stack SHOULD link to local branch"
+        );
+        assert!(
+            body.contains("[public-feature]"),
+            "Link should mention the branch name"
+        );
+    }
 }
