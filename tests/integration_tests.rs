@@ -225,3 +225,34 @@ fn test_commit_msg_edge_cases() {
         "Commit-msg hook should ignore detached HEAD"
     );
 }
+
+#[test]
+fn test_pre_push_ancestry_check() {
+    let ctx = TestContext::init();
+    ctx.install_hooks();
+
+    // Setup: Create a normal history first (common init)
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Root"]);
+
+    // Create an orphan branch
+    ctx.run_git(&["checkout", "--orphan", "lonely-branch"]);
+    // ctx.run_git(&["rm", "--cached", "-r", "."]); // Index is already empty from empty commit
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Lonely Commit"]);
+
+    // Manage it (this might succeed or fail depending on implementation,
+    // but we care about push failure)
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Trigger pre-push hook
+    // It should fail because it can't find the merge base with 'main'
+    let output = ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
+
+    let output = output.get_output();
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+
+    assert!(
+        stderr.contains("not based on") || stderr.contains("share history"),
+        "Expected ancestry error, got: {}",
+        stderr
+    );
+}
