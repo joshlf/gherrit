@@ -142,7 +142,15 @@ impl Repo {
     }
 
     pub fn is_newly_created_branch(&self, branch_name: &str) -> Result<bool> {
-        let reference = self.inner.find_reference(branch_name)?;
+        let reference = match self.inner.find_reference(branch_name) {
+            Ok(r) => r,
+            // If the branch reference doesn't exist yet, it's an "unborn branch".
+            // This happens, for example, during `git checkout --orphan <name>`:
+            // HEAD points to `refs/heads/<name>`, but the ref itself isn't
+            // created until the first commit. In this case, it is definitionally
+            // a newly created branch.
+            Err(_) => return Ok(true),
+        };
 
         // Get the most recent reflog entry
         let latest_log = reference
@@ -158,8 +166,12 @@ impl Repo {
 
     /// Checks if `ancestor` is reachable from `descendant`.
     pub fn is_ancestor(&self, ancestor: gix::ObjectId, descendant: gix::ObjectId) -> Result<bool> {
-        let merge_base = self.inner.merge_base(ancestor, descendant)?;
-        Ok(merge_base.detach() == ancestor)
+        match self.inner.merge_base(ancestor, descendant) {
+            Ok(merge_base) => Ok(merge_base.detach() == ancestor),
+            // If there is no common ancestor (e.g., an orphan branch), `merge_base`
+            // returns an error. We treat this as "not an ancestor".
+            Err(_) => Ok(false),
+        }
     }
 
     pub fn default_remote_name(&self) -> String {
