@@ -79,28 +79,8 @@ impl TestContext {
     }
 
     pub fn install_hooks(&self) {
-        let hooks_dir = self.repo_path.join(".git").join("hooks");
-        fs::create_dir_all(&hooks_dir).expect("Failed to create hooks dir");
-
-        self.install_hook(&hooks_dir, "commit-msg");
-        self.install_hook(&hooks_dir, "pre-push");
-        self.install_hook(&hooks_dir, "post-checkout");
-    }
-
-    fn install_hook(&self, dir: &Path, name: &str) {
-        let file_path = dir.join(name);
-        let bin_path = env!("CARGO_BIN_EXE_gherrit");
-        let script = format!("#!/bin/sh\n{:?} hook {} \"$@\"\n", bin_path, name);
-
-        fs::write(&file_path, script).expect("Failed to write hook script");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&file_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&file_path, perms).expect("Failed to set hook permissions");
-        }
+        // Use the new install command
+        self.gherrit().args(["install"]).assert().success();
     }
 }
 

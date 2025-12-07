@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::process::Command;
 
 use eyre::{OptionExt, Result};
+use gix::bstr::ByteSlice;
 use gix::state::InProgress;
 
 /// Constructs a `std::process::Command`.
@@ -139,6 +140,24 @@ impl Repo {
 
     pub fn config_bool(&self, key: &str) -> Result<Option<bool>> {
         Ok(self.inner.config_snapshot().try_boolean(key).transpose()?)
+    }
+
+    pub fn config_path(&self, key: &str) -> Result<Option<PathBuf>> {
+        let snapshot = self.inner.config_snapshot();
+        let Some(path_val) = snapshot.path(key) else {
+            return Ok(None);
+        };
+
+        let bstr: &gix::bstr::BStr = path_val.as_ref();
+        let raw_path = bstr.to_path()?.to_path_buf();
+
+        // Resolve relative paths against the workdir (or gitdir for bare repos)
+        if raw_path.is_absolute() {
+            Ok(Some(raw_path))
+        } else {
+            let root = self.workdir().unwrap_or(self.path());
+            Ok(Some(root.join(raw_path)))
+        }
     }
 
     pub fn is_newly_created_branch(&self, branch_name: &str) -> Result<bool> {
