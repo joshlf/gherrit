@@ -142,7 +142,10 @@ impl Repo {
     }
 
     pub fn is_newly_created_branch(&self, branch_name: &str) -> Result<bool> {
-        let reference = self.inner.find_reference(branch_name)?;
+        let reference = match self.inner.find_reference(branch_name) {
+            Ok(r) => r,
+            Err(_) => return Ok(true),
+        };
 
         // Get the most recent reflog entry
         let latest_log = reference
@@ -158,8 +161,10 @@ impl Repo {
 
     /// Checks if `ancestor` is reachable from `descendant`.
     pub fn is_ancestor(&self, ancestor: gix::ObjectId, descendant: gix::ObjectId) -> Result<bool> {
-        let merge_base = self.inner.merge_base(ancestor, descendant)?;
-        Ok(merge_base.detach() == ancestor)
+        match self.inner.merge_base(ancestor, descendant) {
+            Ok(merge_base) => Ok(merge_base.detach() == ancestor),
+            Err(_) => Ok(false),
+        }
     }
 
     pub fn default_remote_name(&self) -> String {
