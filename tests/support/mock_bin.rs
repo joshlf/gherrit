@@ -87,29 +87,45 @@ fn handle_gh(args: &[String]) {
                 let head = extract_arg(args, "--head").unwrap_or("?".into());
                 let base = extract_arg(args, "--base").unwrap_or("main".into());
 
-                // Simple ID generation without extra deps
-                let state_read = read_state();
-                let max_id = state_read.prs.iter().map(|p| p.number).max().unwrap_or(100);
-                let num = max_id + 1;
+                let mut url = String::new();
 
-                let url = format!("https://github.com/mock/repo/pull/{}", num);
+                update_state(|state| {
+                    let max_id = state.prs.iter().map(|p| p.number).max().unwrap_or(100);
+                    let num = max_id + 1;
+                    let u = format!("https://github.com/mock/repo/pull/{}", num);
+                    url = u.clone();
 
-                let entry = PrEntry {
-                    number: num,
-                    head_ref_name: head,
-                    base_ref_name: base,
-                    title,
-                    body,
-                    url: url.clone(),
-                };
+                    let entry = PrEntry {
+                        number: num,
+                        head_ref_name: head,
+                        base_ref_name: base,
+                        title,
+                        body,
+                        url: u,
+                    };
+                    state.prs.push(entry);
+                });
 
-                update_state(|state| state.prs.push(entry));
                 println!("{}", url);
             }
             Some("edit") => {
                 // usage: gh pr edit <number> ...
-                if let Some(num_str) = args.get(3) {
-                    if let Ok(num) = num_str.parse::<usize>() {
+                if let Some(id_or_url) = args.get(3) {
+                    eprintln!("MOCK_BIN: edit requested for {}", id_or_url);
+                    let target_number = if let Ok(num) = id_or_url.parse::<usize>() {
+                        Some(num)
+                    } else {
+                        let s = read_state();
+                        let found = s.prs.iter().find(|p| p.url == *id_or_url).map(|p| p.number);
+                        eprintln!(
+                            "MOCK_BIN: URL lookup result: {:?} (URLs in state: {:?})",
+                            found,
+                            s.prs.iter().map(|p| &p.url).collect::<Vec<_>>()
+                        );
+                        found
+                    };
+
+                    if let Some(num) = target_number {
                         let title = extract_arg(args, "--title");
                         let body = extract_arg(args, "--body");
 

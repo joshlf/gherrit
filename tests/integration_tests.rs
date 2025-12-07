@@ -303,3 +303,91 @@ fn test_version_increment() {
         // Mock state tracks what was pushed.
     }
 }
+
+#[test]
+fn test_pr_body_generation() {
+    let ctx = TestContext::init();
+    ctx.install_hooks();
+
+    // Setup: Initial commit on main to establish the branch
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
+
+    // Setup: Stack of 3 commits: A -> B -> C
+    // Must be on a feature branch (not main) for gherrit to sync them
+    ctx.run_git(&["checkout", "-b", "feature-stack"]);
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit A"]);
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit B"]);
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit C"]);
+
+    // Ensure we capture the Change-IDs (Gherrit-IDs)
+    // We can't easily get them from git log here without parsing, but we can infer them from the PR body later.
+    // Actually, we can just check the middle PR has *some* parent and *some* child.
+
+    // Manage
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Sync
+    let assert = ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+    let output = assert.get_output();
+    println!(
+        "GHERRIT STDERR:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify
+    if !ctx.is_live {
+        let state = ctx.read_mock_state();
+
+        // Find PR for Commit B (should be the middle one, index 1)
+        // mock_bin typically creates PRs in order [A, B, C] or based on commit list.
+        // We know we created 3 PRs.
+        assert_eq!(state.prs.len(), 3, "Expected 3 PRs");
+
+        // The mock bin stores PRs. We need to find the one corresponding to Commit B.
+        // Commit B is the parent of C and child of A.
+        // Let's filter by title
+        let pr_b = state
+            .prs
+            .iter()
+            .find(|pr| pr.title == "Commit B")
+            .expect("PR for Commit B not found");
+
+        let body = &pr_b.body;
+
+        println!("DEBUG: PR Body for Commit B:\n{}", body);
+
+        // 1. Verify Metadata JSON
+        // Should contain <!-- gherrit-meta: { ... } -->
+        assert!(
+            body.contains("<!-- gherrit-meta: {"),
+            "Body missing gherrit-meta block"
+        );
+
+        // Verify parent/child keys exist (basic check, since IDs are dynamic)
+        assert!(
+            body.contains(r#""parent": "G"#),
+            "Body missing valid parent field"
+        );
+        assert!(
+            body.contains(r#""child": "G"#),
+            "Body missing valid child field"
+        );
+
+        // 2. Verify Table (even if v1, standard template might include it or not,
+        // code says: if latest_version > 1 it shows history. Here v=1.
+        // Actually, for v1, the history table is NOT generated in the code I reviewed earlier.
+        // Let's check: src/pre_push.rs: `if latest_version > 1 ...`.
+        // So we won't see the table yet.
+
+        // Let's force a v2 to see the table?
+        // Or just verify the absence of table for v1 and presence of metadata.
+        assert!(
+            !body.contains("| Version |"),
+            "Table should NOT be present for v1"
+        );
+    }
+
+    // Now let's amend B to create v2 and verify table appears?
+    // That would duplicate version increment test somewhat, but good for body check.
+    // Let's assume v1 check is sufficient for metadata structure.
+}
