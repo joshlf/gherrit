@@ -133,10 +133,8 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
         let mut refspecs = Vec::new();
 
         for c in chunk {
-            let versions = remote_versions
-                .get(&c.gherrit_id)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
+            let remote_data = remote_versions.get(&c.gherrit_id);
+            let versions = remote_data.map(|d| d.versions.as_slice()).unwrap_or(&[]);
 
             // Find the latest version
             let latest = versions.iter().max_by_key(|(v, _)| *v);
@@ -149,8 +147,20 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
                         format!("v{ver}").bold()
                     );
                     next_versions.insert(c.gherrit_id.clone(), *ver);
-                    // Still push the branch ref to ensure the phantom branch is up to date
+
+                    // Ensure the branch points to this commit even if it's already tagged.
+                    // We use force-with-lease to ensure we only update if the remote matches
+                    // what we expect (which might be empty if the branch doesn't exist).
+                    let branch_lease = remote_data
+                        .and_then(|d| d.branch_sha.as_deref())
+                        .unwrap_or("");
+
                     refspecs.push(format!("{}:refs/heads/{}", c.id, c.gherrit_id));
+                    refspecs.push(format!(
+                        "--force-with-lease=refs/heads/{}:{branch_lease}",
+                        c.gherrit_id
+                    ));
+
                     continue;
                 }
             }
@@ -163,6 +173,15 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
                 "{}:refs/tags/gherrit/{}/v{}",
                 c.id, c.gherrit_id, next_version
             ));
+
+            // Lease for branch
+            let branch_lease = remote_data
+                .and_then(|d| d.branch_sha.as_deref())
+                .unwrap_or("");
+            refspecs.push(format!(
+                "--force-with-lease=refs/heads/{}:{branch_lease}",
+                c.gherrit_id
+            ));
         }
 
         if refspecs.is_empty() {
@@ -173,16 +192,13 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
             "push".to_string(),
             "--quiet".to_string(),
             "--no-verify".to_string(),
-            // Use --force-with-lease to ensure we don't overwrite remote changes
-            // that we haven't seen.
-            "--force-with-lease".to_string(),
             // If any push in this batch fails, abort this batch.
             "--atomic".to_string(),
             repo.default_remote_name(),
         ];
         args.extend(refspecs);
 
-        log::info!("Pushing chunk of {} refs on remote...", args.len() - 6); // Subtract flags
+        log::info!("Pushing chunk to remote..."); // Simplified log
         let mut child = util::cmd("git", args)
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
@@ -237,50 +253,65 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
     Ok(next_versions)
 }
 
+#[derive(Debug, Default)]
+struct RemoteData {
+    branch_sha: Option<String>,
+    versions: Vec<(usize, String)>,
+}
+
 #[allow(clippy::type_complexity)]
 fn get_remote_versions(
     repo: &util::Repo,
     gherrit_ids: &[String],
-) -> Result<HashMap<String, Vec<(usize, String)>>> {
+) -> Result<HashMap<String, RemoteData>> {
     if gherrit_ids.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let mut versions: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut versions: HashMap<String, RemoteData> = HashMap::new();
 
-    // Batch size to avoid overwhelming the shell or server.
-    //
-    // Windows command line limit is ~32k chars. Each refspec is ~62 chars.
-    // 250 * 62 = 15,500 chars, which is ~50% of the limit, safe for all OSes.
+    // Batch size is limited to avoid exceeding command line limits (e.g., Windows 32k chars).
+    // Each refspec is ~62 chars. 250 * 62 = 15,500 chars (safe).
     const BATCH_SIZE: usize = 250;
 
     for chunk in gherrit_ids.chunks(BATCH_SIZE) {
-        let mut args = vec![
-            "ls-remote".to_string(),
-            "--tags".to_string(),
-            repo.default_remote_name(),
-        ];
+        let mut args = vec!["ls-remote".to_string(), repo.default_remote_name()];
 
         args.extend(chunk.iter().map(|id| format!("refs/tags/gherrit/{id}/*")));
+        args.extend(chunk.iter().map(|id| format!("refs/heads/{id}")));
 
         let output = util::cmd("git", args).output()?;
         let output = core::str::from_utf8(&output.stdout)?;
 
         for line in output.lines() {
-            // git ls-remote output format: "<SHA>\t<refname>"
+            // Output format: "<SHA>\t<refname>"
             // Example: "d6c4d97...	refs/tags/gherrit/123/v1"
             let Some((sha, ref_name)) = line.split_once('\t') else {
                 continue;
             };
 
-            // Regex for parsing: matches refs/tags/gherrit/<id>/v<ver>
-            let re = re!(r"refs/tags/gherrit/([^/]+)/v(\d+)$");
-            if let Some(caps) = re.captures(ref_name) {
+            // Match tags: refs/tags/gherrit/<id>/v<ver>
+            let tag_re = re!(r"refs/tags/gherrit/([^/]+)/v(\d+)$");
+            if let Some(caps) = tag_re.captures(ref_name) {
                 if let (Some(id_match), Some(ver_match)) = (caps.get(1), caps.get(2)) {
                     let id = id_match.as_str().to_string();
                     if let Ok(ver) = ver_match.as_str().parse::<usize>() {
-                        versions.entry(id).or_default().push((ver, sha.to_string()));
+                        versions
+                            .entry(id)
+                            .or_default()
+                            .versions
+                            .push((ver, sha.to_string()));
                     }
+                }
+                continue;
+            }
+
+            // Match heads: refs/heads/<id>
+            let head_re = re!(r"refs/heads/([a-zA-Z0-9]+)$");
+            if let Some(caps) = head_re.captures(ref_name) {
+                if let Some(id_match) = caps.get(1) {
+                    let id = id_match.as_str().to_string();
+                    versions.entry(id).or_default().branch_sha = Some(sha.to_string());
                 }
             }
         }
