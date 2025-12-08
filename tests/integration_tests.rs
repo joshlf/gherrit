@@ -631,3 +631,100 @@ fn test_install_configuration_and_security() {
         "Should install to external path with --allow-global"
     );
 }
+
+#[test]
+fn test_manage_detached_head() {
+    let ctx = TestContext::init();
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Init"]);
+
+    // Enter detached HEAD state
+    ctx.run_git(&["checkout", "--detach"]);
+
+    // Attempt to manage; should fail with specific error
+    ctx.gherrit()
+        .args(["manage"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "Cannot set state for detached HEAD",
+        ));
+}
+
+#[test]
+fn test_unmanage_cleanup_logic() {
+    let ctx = TestContext::init();
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Init"]);
+    ctx.run_git(&["checkout", "-b", "feature-cleanup"]);
+
+    // Manually configure the state to exact values that trigger the deep cleanup logic
+    ctx.run_git(&["config", "branch.feature-cleanup.gherritManaged", "true"]);
+    ctx.run_git(&["config", "branch.feature-cleanup.pushRemote", "."]);
+    ctx.run_git(&["config", "branch.feature-cleanup.remote", "."]);
+    ctx.run_git(&[
+        "config",
+        "branch.feature-cleanup.merge",
+        "refs/heads/feature-cleanup",
+    ]);
+
+    // Run unmanage
+    ctx.gherrit().args(["unmanage"]).assert().success();
+
+    // Verify cleanup: remote and merge keys should be removed
+    ctx.git()
+        .args(["config", "branch.feature-cleanup.remote"])
+        .assert()
+        .failure();
+    ctx.git()
+        .args(["config", "branch.feature-cleanup.merge"])
+        .assert()
+        .failure();
+    // gherritManaged should be false
+    ctx.git()
+        .args(["config", "branch.feature-cleanup.gherritManaged"])
+        .assert()
+        .success()
+        .stdout("false\n");
+}
+
+#[test]
+fn test_pre_push_failure() {
+    let ctx = TestContext::init_and_install_hooks();
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Init"]);
+
+    ctx.run_git(&["checkout", "-b", "feature-fail"]);
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Work to push"]);
+
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Configure an invalid remote to trigger `git push` failure
+    ctx.run_git(&["remote", "add", "broken-remote", "/path/to/nowhere"]);
+    ctx.run_git(&["config", "gherrit.remote", "broken-remote"]);
+
+    ctx.gherrit()
+        .args(["hook", "pre-push"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("`git push` failed"));
+}
+
+#[test]
+#[cfg(unix)]
+fn test_install_read_only_fs() {
+    use std::os::unix::fs::PermissionsExt;
+    let ctx = TestContext::init();
+    let hooks_dir = ctx.repo_path.join(".git/hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+
+    // Mark hooks directory read-only
+    let mut perms = std::fs::metadata(&hooks_dir).unwrap().permissions();
+    perms.set_mode(0o555); // Read/Execute only (no write)
+    std::fs::set_permissions(&hooks_dir, perms).unwrap();
+
+    // Attempt installation, verifying failure due to permission denied
+    ctx.gherrit().args(["install"]).assert().failure();
+
+    // Cleanup: Restore permissions so TempDir cleanup doesn't panic
+    let mut perms = std::fs::metadata(&hooks_dir).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hooks_dir, perms).unwrap();
+}
