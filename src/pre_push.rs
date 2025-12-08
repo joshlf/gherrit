@@ -42,7 +42,11 @@ pub fn run(repo: &util::Repo) -> Result<()> {
 
     let latest_versions = push_to_origin(repo, &commits)?;
 
-    sync_prs(repo, branch_name, commits, latest_versions)
+    let base_branch = repo
+        .config_string(&format!("branch.{}.gherritBase", branch_name))?
+        .unwrap_or_else(|| repo.default_branch());
+
+    sync_prs(repo, branch_name, commits, latest_versions, &base_branch)
 }
 
 // Check if the branch is managed by GHerrit.
@@ -73,30 +77,35 @@ fn check_managed_state(repo: &util::Repo, branch_name: &str) -> Result<()> {
 
 fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
     let head = repo.rev_parse_single("HEAD")?;
-    let default_branch = repo.find_default_branch_on_default_remote();
-    let default_ref_spec = format!("refs/heads/{}", default_branch);
-    let default_ref = repo.rev_parse_single(default_ref_spec.as_str())?;
+    let branch_name = repo.current_branch().name().unwrap_or("current branch");
 
-    // Verify ancestry to safely determine if we can walk back to default_ref
-    // without traversing the entire history (e.g. if the branch is orphaned).
-    if !repo.is_ancestor(default_ref.detach(), head.detach())? {
-        let branch_name = repo.current_branch().name().unwrap_or("current branch");
+    // Retrieve configured base branch or default to "main"
+    let base_branch = repo
+        .config_string(&format!("branch.{}.gherritBase", branch_name))?
+        .unwrap_or_else(|| repo.default_branch());
+
+    // Resolve the ref for the base branch (e.g. refs/heads/main, refs/heads/develop)
+    // Note: We assume it's a local head for simplicity in determining the stop point.
+    // If it's pure remote, we might need more logic, but "main" usually exists locally.
+    let base_ref_spec = format!("refs/heads/{}", base_branch);
+    let base_ref = repo
+        .rev_parse_single(base_ref_spec.as_str())
+        .wrap_err_with(|| format!("Failed to find base branch '{}'", base_branch))?;
+
+    // Verify ancestry to safely determine if we can walk back to base_ref
+    if !repo.is_ancestor(base_ref.detach(), head.detach())? {
         bail!(
             "The branch '{}' is not based on '{}'.\n\
-             GHerrit only supports stacked branches that share history with the default branch.",
+             GHerrit only supports stacked branches that share history with the base branch.",
             branch_name,
-            default_branch
+            base_branch
         );
     }
 
     let mut commits = repo
         .rev_walk([head])
         .all()?
-        .take_while(|res| {
-            res.as_ref()
-                .map(|info| info.id != default_ref)
-                .unwrap_or(true)
-        })
+        .take_while(|res| res.as_ref().map(|info| info.id != base_ref).unwrap_or(true))
         .map(|res| -> Result<_> { Ok(res?.object()?) })
         .collect::<Result<Vec<_>>>()?;
     commits.reverse();
@@ -434,13 +443,14 @@ fn sync_prs(
     branch_name: &str,
     commits: Vec<Commit>,
     latest_versions: HashMap<String, usize>,
+    base_branch: &str,
 ) -> Result<()> {
     let pr_list =
         cmd!("gh pr list --json number,headRefName,url,title,body,baseRefName").output()?;
 
     #[derive(Serialize, Deserialize, Debug)]
     #[serde(rename_all = "camelCase")]
-    struct ListEntry {
+    struct Pr {
         head_ref_name: String,
         number: usize,
         url: String,
@@ -449,29 +459,18 @@ fn sync_prs(
         base_ref_name: String,
     }
 
-    let prs: Vec<ListEntry> = if pr_list.stdout.is_empty() {
-        vec![]
-    } else {
-        match serde_json::from_slice(&pr_list.stdout) {
-            Ok(prs) => prs,
-            Err(err) => {
-                let mut error = format!("failed to parse `gh` command output: {err}");
-                if let Ok(stdout) = str::from_utf8(&pr_list.stdout) {
-                    error += &format!("\ncommand output (verbatim):\n{stdout}");
-                }
-                bail!(error);
-            }
-        }
-    };
+    let prs: Vec<Pr> = serde_json::from_slice(&pr_list.stdout).wrap_err("Failed to parse PRs")?;
 
-    let commits = commits
+    // 2. Map commits to PRs (create or update)
+    //    We iterate from oldest to newest
+    let commits: Vec<_> = commits
         .into_iter()
-        .scan("main".to_string(), |parent_branch, c| {
+        .scan(base_branch.to_string(), |parent_branch, c| {
             let parent = parent_branch.clone();
             *parent_branch = c.gherrit_id.clone();
-            Some((c, parent))
+            Some((c, parent)) // (Commit, ParentBranch)
         })
-        .collect::<Vec<_>>();
+        .collect();
 
     let commits = commits
         .into_par_iter()
@@ -523,17 +522,13 @@ fn sync_prs(
     let is_private = is_private_stack(repo, branch_name);
 
     // Derive base repo URL safely from the first commit's PR URL.
-    // Since `commits` is not empty (checked at the start of `run`), and
-    // `create_gh_pr` always returns a valid URL, this is safe.
     let repo_url = commits
         .first()
         .map(|(_, _, pr_state)| pr_state.url.split("/pull/").next().unwrap_or(""))
         .unwrap_or("")
         .to_string();
 
-    // Attempt to resolve `HEAD` to a branch name so that we can refer to it
-    // in PR bodies. If we can't, then silently fail and just don't include
-    // that information in PR bodies.
+    // Attempt to resolve `HEAD` to a branch name
     let head_branch_markdown = if !is_private {
         repo.head()
             .ok()
@@ -549,8 +544,7 @@ fn sync_prs(
         "".to_string()
     };
 
-    // A markdown bulleted list of links to each PR, with the "top" PR (the
-    // furthest from `main`) at the top of the list.
+    // A markdown bulleted list of links to each PR.
     let gh_pr_ids_markdown = commits
         .iter()
         .rev()

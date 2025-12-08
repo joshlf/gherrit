@@ -728,3 +728,182 @@ fn test_install_read_only_fs() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&hooks_dir, perms).unwrap();
 }
+
+#[test]
+fn test_recursive_base_detection() {
+    let ctx = TestContext::init_and_install_hooks();
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Init"]);
+
+    // 1. Setup: Checkout feature-A from main
+    //    Git < 2.3XX or mostly defaults don't set upstream on matching local branch names automatically
+    //    without configuration. Ensure it's tracked so GHerrit treats it as valid.
+    ctx.run_git(&["checkout", "-b", "feature-A"]);
+    ctx.run_git(&["config", "branch.feature-A.remote", "."]);
+    ctx.run_git(&["config", "branch.feature-A.merge", "refs/heads/main"]);
+
+    // We must trigger post-checkout logic manually because we configured it AFTER the checkout hook ran.
+    // Or just run "gherrit manage" explicitly.
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Verify feature-A automatically picked up "main" as base
+    ctx.git()
+        .args(["config", "branch.feature-A.gherritBase"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("main"));
+
+    // 2. Recursion: Checkout feature-B from feature-A
+    ctx.run_git(&["checkout", "-b", "feature-B"]);
+    ctx.run_git(&["config", "branch.feature-B.remote", "."]);
+    ctx.run_git(&["config", "branch.feature-B.merge", "refs/heads/feature-A"]);
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    //    Should inherit "main" from feature-A
+    ctx.git()
+        .args(["config", "branch.feature-B.gherritBase"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("main"));
+
+    // 3. Manual Override:
+    ctx.run_git(&["checkout", "main"]); // Switch back to clear state
+    ctx.run_git(&["checkout", "-b", "hotfix-1"]);
+    ctx.run_git(&["config", "branch.hotfix-1.remote", "."]);
+    ctx.run_git(&["config", "branch.hotfix-1.merge", "refs/heads/main"]);
+    ctx.gherrit().args(["manage"]).assert().success(); // Initialize
+
+    // Manual override
+    ctx.run_git(&["config", "branch.hotfix-1.gherritBase", "production"]);
+
+    //    Checkout hotfix-1-patch from hotfix-1
+    ctx.run_git(&["checkout", "-b", "hotfix-1-patch"]);
+    ctx.run_git(&["config", "branch.hotfix-1-patch.remote", "."]);
+    ctx.run_git(&[
+        "config",
+        "branch.hotfix-1-patch.merge",
+        "refs/heads/hotfix-1",
+    ]);
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    //    Should inherit "production"
+    ctx.git()
+        .args(["config", "branch.hotfix-1-patch.gherritBase"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("production"));
+
+    // 4. Remote Edge Case
+    ctx.run_git(&["checkout", "-b", "feature-dev"]);
+    // Simulate what `git checkout -b feature-dev origin/develop` does config-wise:
+    ctx.run_git(&["config", "branch.feature-dev.remote", "origin"]);
+    ctx.run_git(&["config", "branch.feature-dev.merge", "refs/heads/develop"]);
+
+    // Manually trigger manage logic
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Now it should detect "develop" as base.
+    ctx.git()
+        .args(["config", "branch.feature-dev.gherritBase"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("develop"));
+}
+
+#[test]
+fn test_base_detection_with_slashes() {
+    let ctx = TestContext::init_and_install_hooks();
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Init"]);
+
+    // 1. Level 1 (Slash Branch)
+    // Checkout group/feature from main.
+    // Ensure tracking is setup so GHerrit detects upstream.
+    ctx.run_git(&["checkout", "-b", "group/feature"]);
+    ctx.run_git(&["config", "branch.group/feature.remote", "."]);
+    ctx.run_git(&["config", "branch.group/feature.merge", "refs/heads/main"]);
+
+    // Manage
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Assert base is main
+    ctx.git()
+        .args(["config", "branch.group/feature.gherritBase"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("main"));
+
+    // 2. Level 2 (Deep Nesting)
+    // Checkout group/sub-feature from group/feature.
+    ctx.run_git(&["checkout", "-b", "group/sub-feature"]);
+    ctx.run_git(&["config", "branch.group/sub-feature.remote", "."]);
+    ctx.run_git(&[
+        "config",
+        "branch.group/sub-feature.merge",
+        "refs/heads/group/feature",
+    ]);
+
+    // Manage
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Assert base is main (inherited from group/feature -> main)
+    ctx.git()
+        .args(["config", "branch.group/sub-feature.gherritBase"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("main"));
+
+    // 3. Remote Edge Case
+    // Mock remote structure
+    ctx.run_git(&[
+        "config",
+        "remote.my-remote.url",
+        "https://example.com/repo.git",
+    ]);
+    ctx.run_git(&[
+        "config",
+        "remote.my-remote.fetch",
+        "+refs/heads/*:refs/remotes/my-remote/*",
+    ]);
+
+    // Create a mock remote ref to track
+    ctx.run_git(&["update-ref", "refs/remotes/my-remote/release/2.0", "HEAD"]);
+
+    // Checkout hotfix-2 tracking my-remote/release/2.0
+    ctx.run_git(&["checkout", "-b", "hotfix-2"]);
+    ctx.run_git(&["config", "branch.hotfix-2.remote", "my-remote"]);
+    ctx.run_git(&["config", "branch.hotfix-2.merge", "refs/heads/release/2.0"]);
+    // (Note: refs/heads/release/2.0 is the name ON REMOTE, which maps to refs/remotes/my-remote/release/2.0 locally)
+
+    // Manage
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Assert base is release/2.0
+    // Logic: Remote upstream -> Use stripped name "release/2.0".
+    ctx.git()
+        .args(["config", "branch.hotfix-2.gherritBase"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("release/2.0"));
+}
+
+#[test]
+fn test_regression_custom_default_branch() {
+    // An earlier version of the code introduced in the commit which introduces
+    // this test hardcoded "main" as the default base branch if not configured
+    // (even while the base branch was correctly tracked elsewhere in the
+    // GHerrit codebase).
+    let ctx = TestContext::init_and_install_hooks();
+
+    // Override harness to use "trunk" explicitly
+    ctx.run_git(&["branch", "-m", "trunk"]);
+    ctx.run_git(&["config", "init.defaultBranch", "trunk"]);
+
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
+    ctx.run_git(&["checkout", "-b", "feature-trunk"]);
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Feature Commit"]);
+
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // Trigger pre-push. If logic is buggy, it looks for "main" default and
+    // fails/panics. If fixed, it detects "trunk" from config.
+    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+}
