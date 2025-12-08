@@ -44,7 +44,7 @@ macro_rules! cmd {
         } else {
             s.clone()
         }).collect::<Vec<_>>().join(" "));
-        util::cmd(bin, &args)
+        $crate::util::cmd(bin, &args)
     }};
 
     // String literal (treated as a format string, but not broken apart).
@@ -294,4 +294,19 @@ fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     }
 
     Ok(HeadState::Detached)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[should_panic(expected = "Command cannot be empty")]
+    fn test_cmd_macro_empty_panic() {
+        cmd!("");
+    }
+
+    #[test]
+    #[should_panic(expected = "Command cannot be empty")]
+    fn test_cmd_macro_whitespace_panic() {
+        cmd!("   ");
+    }
 }

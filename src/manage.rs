@@ -20,7 +20,7 @@ pub fn get_state(repo: &util::Repo, branch_name: &str) -> Result<Option<State>> 
 
 /// Configures the Git branch state for GHerrit management.
 ///
-/// Sets/unsets the following config values:
+/// Updates the following config values:
 /// - `branch.<name>.gherritManaged` (boolean): Indicates whether the branch is
 ///   managed by GHerrit.
 /// - `branch.<name>.pushRemote` (string): Set to "." when managed, unset when
@@ -147,7 +147,7 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         HeadState::Pending(_) | HeadState::Detached => return Ok(()),
     };
 
-    // Idempotency check: Bail if the branch management state is already set.
+    // Idempotency check: Return early if the branch management state is already set.
     if get_state(repo, branch_name)
         .wrap_err("Failed to parse gherritState")?
         .is_some()
@@ -156,7 +156,7 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         return Ok(());
     }
 
-    // Creation detection: Bail if we're just checking out an already-existing branch.
+    // Creation detection: Return early if we're just checking out an already-existing branch.
     let is_new = repo
         .is_newly_created_branch(branch_name)
         .wrap_err("Failed to check if branch is new")?;
