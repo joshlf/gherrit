@@ -44,9 +44,40 @@ fn main() {
     }
 }
 
+const FAKE_SHA: &str = "abc1234567890abcdef1234567890abcdef12";
+
 fn handle_git(args: &[String]) {
-    // Basic heuristic: Intercept "push"
+    // Intercept "ls-remote" to verify parsing logic in src/pre_push.rs
+    if args.contains(&"ls-remote".to_string()) {
+        let state = read_state();
+        // Simulate output format: "<SHA>\t<Ref>"
+        // Iterate over pushed_refs from the mock state to simulate a remote.
+        for pushed_ref in &state.pushed_refs {
+            // Check whether the reference appears to be a branch ref (refs/heads/...).
+            if pushed_ref.contains(":refs/heads/") {
+                // pushed_ref format in tests is often "local_sha:refs/heads/G..."
+                let parts: Vec<&str> = pushed_ref.split(':').collect();
+                if parts.len() == 2 {
+                    let ref_name = parts[1];
+                    // Print a fake SHA and the ref name, separated by tab.
+                    println!("{}\t{}", FAKE_SHA, ref_name);
+                }
+            } else if pushed_ref.starts_with("refs/heads/") {
+                // Handle case where it might just be the ref name
+                println!("{}\t{}", FAKE_SHA, pushed_ref);
+            }
+        }
+        // Exit successfully after printing
+        return;
+    }
+
+    // Intercept "push"
     if args.contains(&"push".to_string()) {
+        if args.contains(&"broken-remote".to_string()) {
+            eprintln!("fatal: 'broken-remote' does not appear to be a git repository");
+            std::process::exit(1);
+        }
+
         // Parse refspecs (args that look like refs or have colons)
         let refspecs: Vec<String> = args
             .iter()
@@ -60,7 +91,14 @@ fn handle_git(args: &[String]) {
             state.push_count += 1;
         });
 
-        // Pretend push succeeded
+        // Simulate GitHub output to cover src/pre_push.rs:206-215
+        // This output must match the regex in pre_push.rs.
+        eprintln!("remote: ");
+        eprintln!("remote: Create a pull request for 'feature' on GitHub by visiting:");
+        eprintln!("remote:      https://github.com/mock/repo/pull/new/feature");
+        eprintln!("remote: ");
+
+        // Simulate successful push.
         return;
     }
 
@@ -84,7 +122,7 @@ fn handle_gh(args: &[String]) {
                 println!("{}", serde_json::to_string(&state.prs).unwrap());
             }
             Some("create") => {
-                // Quick-and-dirty arg parsing.
+                // Parse arguments.
                 let title = extract_arg(args, "--title").unwrap_or("No Title".into());
                 let body = extract_arg(args, "--body").unwrap_or("".into());
                 let head = extract_arg(args, "--head").unwrap_or("?".into());
