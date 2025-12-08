@@ -570,3 +570,64 @@ fn test_install_command_edge_cases() {
     assert!(reset_content.contains("# gherrit-installer: managed"));
     assert!(!reset_content.contains("# Some custom comment"));
 }
+
+#[test]
+fn test_install_configuration_and_security() {
+    let ctx = TestContext::init();
+
+    // Scenario A: Automatic Directory Creation (Default Path)
+    // -------------------------------------------------------
+    // Ensure .git/hooks does not exist (git init might create it depending on version/templates)
+    let default_hooks = ctx.repo_path.join(".git/hooks");
+    if default_hooks.exists() {
+        std::fs::remove_dir_all(&default_hooks).unwrap();
+    }
+
+    ctx.gherrit().args(["install"]).assert().success();
+    assert!(
+        default_hooks.join("pre-push").exists(),
+        "Should create directory and install hook"
+    );
+
+    // Scenario B: Custom core.hooksPath (Internal)
+    // --------------------------------------------
+    let custom_internal = ctx.repo_path.join(".githooks");
+    ctx.run_git(&["config", "core.hooksPath", ".githooks"]);
+
+    ctx.gherrit().args(["install"]).assert().success();
+    assert!(
+        custom_internal.join("pre-push").exists(),
+        "Should respect core.hooksPath within repo"
+    );
+
+    // Scenario C: Custom core.hooksPath (External/Global) - Security Block
+    // --------------------------------------------------------------------
+    let external_dir = tempfile::TempDir::new().unwrap();
+    let ext_path = external_dir.path().to_str().unwrap();
+
+    // We must use absolute path for git config to ensure gherrit sees it as external
+    ctx.run_git(&["config", "core.hooksPath", ext_path]);
+
+    ctx.gherrit()
+        .args(["install"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("external/global hooks path"));
+
+    assert!(
+        !external_dir.path().join("pre-push").exists(),
+        "Should NOT install to external path without flag"
+    );
+
+    // Scenario D: Custom core.hooksPath (External) - Allow Global
+    // -----------------------------------------------------------
+    ctx.gherrit()
+        .args(["install", "--allow-global"])
+        .assert()
+        .success();
+
+    assert!(
+        external_dir.path().join("pre-push").exists(),
+        "Should install to external path with --allow-global"
+    );
+}

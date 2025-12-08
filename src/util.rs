@@ -155,7 +155,8 @@ impl Repo {
         if raw_path.is_absolute() {
             Ok(Some(raw_path))
         } else {
-            let root = self.workdir().unwrap_or(self.path());
+            // Use `.canonicalize` to guarantee an absolute path.
+            let root = self.workdir().unwrap_or(self.path()).canonicalize()?;
             Ok(Some(root.join(raw_path)))
         }
     }
