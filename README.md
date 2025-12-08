@@ -165,6 +165,18 @@ entire evolution of a PR. These version tags can be used to diff any two
 versions of a PR – this is how GHerrit generates the **Patch History Table** in
 the PR description.
 
+#### Optimistic Concurrency Control
+
+GHerrit enforces optimistic locking to prevent race conditions when multiple
+users update the same stack. When pushing a new version tag (e.g., `v2`),
+GHerrit uses the atomic push option:
+`--force-with-lease=refs/tags/gherrit/<id>/v<ver>:`.
+
+The trailing colon (`:`) tells Git to ensure the ref does **not** already exist
+on the remote. If another user has already pushed `v2` in the interim, the
+assertion fails, the push is rejected, and the user is forced to fetch and
+rebase, preserving the integrity of the patch history.
+
 #### `pre-push` Hook
 
 GHerrit synchronizes changes with GitHub in a `pre-push` hook. This allows
@@ -173,12 +185,24 @@ like (hypothetically) `gherrit sync`.
 
 ##### "Loopback" Interception Strategy
 
-By default, GHerrit configures Git so that `git push` will *only* synchronize
-via the GHerrit `pre-push` hook, and will *not* push the "real" local branch to
-the remote. This is accomplished by setting the managed branch's `pushRemote`
-to `.`, which represents the local file system. After the `pre-push` hook runs,
-Git will push the "real" local branch to this remote (ie, to the local repo),
-which is a no-op.
+By default, GHerrit configures managed branches to treat the local repository as
+its own upstream. It sets:
+
+*   `branch.<name>.pushRemote = .`
+*   `branch.<name>.remote = .`
+*   `branch.<name>.merge = refs/heads/<name>`
+
+This configuration has two benefits:
+
+1.  **Interception:** On `git push`, once GHerrit's `pre-push` hook returns
+    (after synchronizing the stack to GitHub), Git will always complete the
+    push. Other than causing `git push` to fail with a user-visible error,
+    there is no way to for the `pre-push` hook to prevent the push from
+    completing. Setting `pushRemote = .` ensures that, when the push is
+    performed, it targets the local repository, which is a no-op.
+2.  **UX:** This configuration satisfies Git's upstream requirements, allowing
+    users to run `git push` immediately after branch creation without seeing
+    "fatal: The current branch has no upstream branch" errors.
 
 #### PR Rewriting
 
