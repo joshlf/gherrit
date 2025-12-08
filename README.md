@@ -18,21 +18,15 @@ synchronizes them to GitHub as a chain of dependent Pull Requests.
 1.  **Install the Binary:**
 
     ```bash
-    cargo install --path .
+    cargo install --git https://github.com/joshlf/gherrit
     ```
 
-2.  **Configure Hooks:**
-    GHerrit relies on Git hooks to intercept commits and pushes. In the repository you wish to manage:
+2.  **Install Hooks:**
+    GHerrit relies on Git hooks to intercept branch creation, commits, and
+    pushes. In the repository you wish to manage:
 
     ```bash
-    # Copy hooks to your .git directory
-    cp hooks/commit-msg .git/hooks/commit-msg
-    cp hooks/pre-push .git/hooks/pre-push
-
-    ```bash
-    # Ensure they are executable
-    chmod +x .git/hooks/commit-msg
-    chmod +x .git/hooks/pre-push
+    gherrit install
     ```
 
 3.  **Setup GitHub Action (Optional but Recommended):**
