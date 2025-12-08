@@ -90,6 +90,8 @@ pub fn set_state(repo: &util::Repo, state: State) -> Result<()> {
                 );
                 log::info!("    git config {} {}", key("pushRemote"), default_remote);
             }
+            // Ensure base branch is configured for proper stacking
+            detect_and_configure_base(repo, branch_name)?;
         }
         State::Unmanaged => {
             cmd!("git config", key("gherritManaged"), "false").status()?;
@@ -175,8 +177,8 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
     let is_default_branch = upstream_merge
         .as_deref()
         .map(|merge| {
-            let branch_name = merge.strip_prefix("refs/heads/").unwrap_or(merge);
-            repo.is_a_default_branch_on_default_remote(branch_name)
+            let upstream_name = merge.strip_prefix("refs/heads/").unwrap_or(merge);
+            repo.is_a_default_branch_on_default_remote(upstream_name)
         })
         .unwrap_or(false);
 
@@ -195,5 +197,71 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         log::info!("To opt-out, run: gherrit unmanage");
     }
 
+    // --- Smart Base Detection ---
+    detect_and_configure_base(repo, branch_name)?;
+
+    Ok(())
+}
+
+fn detect_and_configure_base(repo: &util::Repo, branch_name: &str) -> Result<()> {
+    log::debug!("Starting smart base detection for branch '{}'", branch_name);
+
+    let upstream_merge = repo.config_string(&format!("branch.{branch_name}.merge"))?;
+    let upstream_remote = repo.config_string(&format!("branch.{branch_name}.remote"))?;
+
+    log::debug!(
+        "upstream_merge={:?}, upstream_remote={:?}",
+        upstream_merge,
+        upstream_remote
+    );
+
+    let upstream_short_name = upstream_merge.as_deref().map(|merge| {
+        merge
+            .strip_prefix("refs/heads/")
+            .unwrap_or(merge)
+            .to_string()
+    });
+
+    log::debug!("upstream_short_name={:?}", upstream_short_name);
+
+    if let Some(upstream) = upstream_short_name {
+        // Validation: If upstream == branch_name, we are self-tracking.
+        // In this case, we cannot use the upstream as the base, because it creates a cycle.
+        // We skip persistence, allowing GHerrit to default to "main" (or unconfigured behavior).
+        if upstream == branch_name {
+            log::debug!(
+                "Branch '{}' is self-tracking. Skipping base persistence to default to 'main'.",
+                branch_name
+            );
+            return Ok(());
+        }
+
+        let base = if upstream_remote.as_deref() == Some(".") {
+            // Case: Local Upstream
+            // Check config for *its* base for inheritance.
+            let upstream_base_key = format!("branch.{}.gherritBase", upstream);
+            let upstream_base = repo.config_string(&upstream_base_key)?;
+
+            // If key exists, inherit. Else, use the upstream name itself.
+            upstream_base.unwrap_or(upstream.clone())
+        } else {
+            // Case: Remote Upstream (e.g. origin/feature/login)
+            // We can't check config for remote branch. Default to the upstream name.
+            // Note: `upstream` here is already stripped of refs/heads/
+            upstream.clone()
+        };
+
+        // 4. Persist
+        let key = format!("branch.{branch_name}.gherritBase");
+        cmd!("git config", key, &base).status()?;
+
+        log::info!("GHerrit detected the base branch as: '{}'", base.blue());
+        log::info!(
+            "(If this is incorrect, run: git config branch.{branch_name}.gherritBase <branch>)"
+        );
+    } else {
+        // Fallback if no upstream is configured yet
+        log::debug!("No upstream configured, skipping base persistence.");
+    }
     Ok(())
 }

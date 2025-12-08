@@ -200,6 +200,13 @@ impl Repo {
             .unwrap_or_else(|| "origin".to_string())
     }
 
+    pub fn default_branch(&self) -> String {
+        self.find_default_branches(&self.default_remote_name())
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "main".to_string())
+    }
+
     fn find_default_branches(&self, remote_name: &str) -> Vec<String> {
         let mut branches = Vec::new();
 
@@ -236,14 +243,6 @@ impl Repo {
         branches.push("main".to_string());
 
         branches
-    }
-
-    pub fn find_default_branch_on_default_remote(&self) -> String {
-        let branches = self.find_default_branches(&self.default_remote_name());
-        branches
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "main".to_string())
     }
 
     pub fn is_a_default_branch_on_default_remote(&self, branch_name: &str) -> bool {
