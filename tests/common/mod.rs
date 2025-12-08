@@ -35,6 +35,12 @@ impl TestContext {
         }
     }
 
+    pub fn init_and_install_hooks() -> Self {
+        let ctx = Self::init();
+        ctx.install_hooks();
+        ctx
+    }
+
     pub fn gherrit(&self) -> assert_cmd::Command {
         let bin_path = env!("CARGO_BIN_EXE_gherrit");
         let mut cmd = assert_cmd::Command::new(bin_path);

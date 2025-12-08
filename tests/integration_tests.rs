@@ -23,8 +23,7 @@ fn test_commit_msg_hook() {
 
 #[test]
 fn test_full_stack_lifecycle_mocked() {
-    let ctx = TestContext::init();
-    ctx.install_hooks();
+    let ctx = TestContext::init_and_install_hooks();
 
     // Setup: Create 'main' and a feature branch
     ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
@@ -58,8 +57,7 @@ fn test_full_stack_lifecycle_mocked() {
 
 #[test]
 fn test_branch_management() {
-    let ctx = TestContext::init();
-    ctx.install_hooks();
+    let ctx = TestContext::init_and_install_hooks();
 
     // Create a branch to manage
     ctx.run_git(&["checkout", "-b", "feature-A"]);
@@ -125,8 +123,7 @@ fn test_branch_management() {
 
 #[test]
 fn test_post_checkout_hook() {
-    let ctx = TestContext::init();
-    ctx.install_hooks();
+    let ctx = TestContext::init_and_install_hooks();
 
     // Scenario A: New Feature Branch (Stack Mode)
     // -------------------------------------------
@@ -186,8 +183,7 @@ fn test_post_checkout_hook() {
 
 #[test]
 fn test_commit_msg_edge_cases() {
-    let ctx = TestContext::init();
-    ctx.install_hooks();
+    let ctx = TestContext::init_and_install_hooks();
     ctx.run_git(&["commit", "--allow-empty", "-m", "Initial"]);
     // Ensure we are managed so the hook is active
     ctx.gherrit().args(["manage"]).assert().success();
@@ -228,8 +224,7 @@ fn test_commit_msg_edge_cases() {
 
 #[test]
 fn test_pre_push_ancestry_check() {
-    let ctx = TestContext::init();
-    ctx.install_hooks();
+    let ctx = TestContext::init_and_install_hooks();
 
     // Setup: Create a normal history first (common init)
     ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Root"]);
@@ -259,8 +254,7 @@ fn test_pre_push_ancestry_check() {
 
 #[test]
 fn test_version_increment() {
-    let ctx = TestContext::init();
-    ctx.install_hooks();
+    let ctx = TestContext::init_and_install_hooks();
 
     // Setup: Initial commit
     ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
@@ -314,8 +308,7 @@ fn test_version_increment() {
 
 #[test]
 fn test_pr_body_generation() {
-    let ctx = TestContext::init();
-    ctx.install_hooks();
+    let ctx = TestContext::init_and_install_hooks();
 
     // Setup: Initial commit on main to establish the branch
     ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
@@ -412,8 +405,7 @@ fn test_pr_body_generation() {
 
 #[test]
 fn test_large_stack_batching() {
-    let ctx = TestContext::init();
-    ctx.install_hooks();
+    let ctx = TestContext::init_and_install_hooks();
 
     // Setup: Initial commit on main
     ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
@@ -464,8 +456,7 @@ fn test_large_stack_batching() {
 
 #[test]
 fn test_rebase_detection() {
-    let ctx = TestContext::init();
-    ctx.install_hooks();
+    let ctx = TestContext::init_and_install_hooks();
 
     // Setup: Main and feature
     ctx.run_git(&["commit", "--allow-empty", "-m", "Initial"]);
@@ -493,8 +484,7 @@ fn test_rebase_detection() {
 
 #[test]
 fn test_public_stack_links() {
-    let ctx = TestContext::init();
-    ctx.install_hooks();
+    let ctx = TestContext::init_and_install_hooks();
 
     ctx.run_git(&["commit", "--allow-empty", "-m", "Init"]);
     ctx.run_git(&["checkout", "-b", "public-feature"]);
@@ -538,7 +528,6 @@ fn test_public_stack_links() {
 #[test]
 fn test_install_command_edge_cases() {
     let ctx = TestContext::init();
-    // Do NOT call install_hooks(); we will test installation manually.
 
     let hooks_dir = ctx.repo_path.join(".git/hooks");
     std::fs::create_dir_all(&hooks_dir).unwrap();
