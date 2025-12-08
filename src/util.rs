@@ -238,14 +238,6 @@ impl Repo {
         branches
     }
 
-    pub fn find_default_branch_on_default_remote(&self) -> String {
-        let branches = self.find_default_branches(&self.default_remote_name());
-        branches
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "main".to_string())
-    }
-
     pub fn is_a_default_branch_on_default_remote(&self, branch_name: &str) -> bool {
         let branches = self.find_default_branches(&self.default_remote_name());
         branches.iter().any(|b| b == branch_name)
