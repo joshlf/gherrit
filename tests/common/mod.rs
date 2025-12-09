@@ -227,3 +227,155 @@ static SYSTEM_GIT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
     let path = stdout.lines().next().expect("No git path found").trim();
     PathBuf::from(path)
 });
+
+/// The state of a stack of commits, using `git log` as the source of truth.
+pub struct StackVerifier<'a> {
+    ctx: &'a TestContext,
+    commits: Vec<CommitInfo>,
+}
+
+#[derive(Debug)]
+struct CommitInfo {
+    oid: String,
+    title: String,
+    body: String,
+    g_id: String,
+}
+
+impl<'a> StackVerifier<'a> {
+    /// Uses `git log` to construct a verifier.
+    pub fn from_git_log(ctx: &'a TestContext) -> Self {
+        // Fetch history in reverse order (oldest -> newest). Format:
+        //
+        //   OID\0Title\0Trailer\0Body\0
+        //
+        // We use null byte delimiters to handle newlines safeley.
+        let output = ctx
+            .git()
+            .args([
+                "log",
+                "--format=%H%x00%s%x00%(trailers:key=gherrit-pr-id,valueonly,separator=)%x00%b%x00",
+                "--reverse",
+            ])
+            .output()
+            .expect("Failed to get git log");
+
+        let stdout = String::from_utf8(output.stdout).expect("Invalid UTF-8");
+
+        // Split by null byte.
+        //
+        // Each record has 4 fields + 1 record separator (effectively).
+        // The last split element will be empty if string ends with \0.
+        let parts: Vec<&str> = stdout.split_terminator('\0').collect();
+
+        let commits: Vec<CommitInfo> = parts
+            .chunks_exact(4)
+            .filter_map(|chunk| {
+                let [oid, title, g_id, body] = chunk else {
+                    return None;
+                };
+
+                let g_id = g_id.trim().to_string();
+                if g_id.is_empty() {
+                    return None;
+                }
+
+                Some(CommitInfo {
+                    oid: oid.trim().to_string(),
+                    title: title.to_string(),
+                    body: body.to_string(),
+                    g_id,
+                })
+            })
+            .collect();
+
+        Self { ctx, commits }
+    }
+
+    pub fn verify_pushed_refs(&self, version: usize) {
+        let state = self.ctx.read_mock_state();
+        for commit in &self.commits {
+            // Check for expected phantom branch ref
+            let expected_branch_ref = format!("{}:refs/heads/{}", commit.oid, commit.g_id);
+            assert!(
+                state.pushed_refs.contains(&expected_branch_ref),
+                "Missing expected branch ref: {}",
+                expected_branch_ref
+            );
+
+            // Check for expected version tag ref
+            let expected_tag_ref = format!(
+                "{}:refs/tags/gherrit/{}/v{}",
+                commit.oid, commit.g_id, version
+            );
+            assert!(
+                state.pushed_refs.contains(&expected_tag_ref),
+                "Missing expected tag ref: {}",
+                expected_tag_ref
+            );
+        }
+    }
+
+    pub fn verify_pr_bodies(&self) {
+        let state = self.ctx.read_mock_state();
+        for (i, commit) in self.commits.iter().enumerate() {
+            // Find PR by title
+            let pr = state
+                .prs
+                .iter()
+                .find(|pr| pr.title == commit.title)
+                .unwrap_or_else(|| panic!("PR not found for commit: {}", commit.title));
+
+            // Verify body content
+            //
+            // `git log --format=%b` includes trailers, but `gherrit` explicitly strips the
+            // internal `gherrit-pr-id` trailer before generating the PR body. We match that
+            // behavior here to ensure strict equality for the rest of the content.
+            let expected_body = commit
+                .body
+                .lines()
+                .filter(|l| !l.starts_with("gherrit-pr-id:"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let expected_body = expected_body.trim();
+
+            assert!(
+                pr.body.contains(expected_body),
+                "PR body for '{}' (ID: {}) missing commit message body.\nExpected content: {}\nActual Body:\n{}",
+                commit.title,
+                commit.g_id,
+                expected_body,
+                pr.body
+            );
+
+            // Construct expected JSON
+            let parent = if i > 0 {
+                format!("\"{}\"", self.commits[i - 1].g_id)
+            } else {
+                "null".to_string()
+            };
+
+            let child = if i < self.commits.len() - 1 {
+                format!("\"{}\"", self.commits[i + 1].g_id)
+            } else {
+                "null".to_string()
+            };
+
+            // Use strict JSON formatting
+            // Note: In verify logic, we want to ensure the metadata block is present and correct.
+            let expected_json = format!(
+                r#"{{"id": "{}", "parent": {}, "child": {}}}"#,
+                commit.g_id, parent, child
+            );
+
+            assert!(
+                pr.body.contains(&expected_json),
+                "PR body for '{}' (ID: {}) missing expected JSON metadata.\nExpected: {}\nActual Body:\n{}",
+                commit.title,
+                commit.g_id,
+                expected_json,
+                pr.body
+            );
+        }
+    }
+}

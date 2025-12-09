@@ -1,5 +1,5 @@
 mod common;
-use common::TestContext;
+use common::{StackVerifier, TestContext};
 
 #[test]
 fn test_commit_msg_hook() {
@@ -48,15 +48,9 @@ fn test_full_stack_lifecycle_mocked() {
 
     // Verify Side Effects (Mock Only)
     if !ctx.is_live {
-        let state = ctx.read_mock_state();
-        assert_eq!(state.prs.len(), 2, "Expected 2 PRs created");
-        // Verify we pushed phantom branches or tags. The mock intercepts 'git
-        // push origin <refspec>...'. GHerrit pushes refspecs like
-        // 'refs/heads/G...:refs/heads/G...' or tags.
-        assert!(
-            !state.pushed_refs.is_empty(),
-            "Expected some refs to be pushed"
-        );
+        let verifier = StackVerifier::from_git_log(&ctx);
+        verifier.verify_pr_bodies();
+        verifier.verify_pushed_refs(1);
     }
 }
 
@@ -401,47 +395,9 @@ fn test_pr_body_generation() {
 
     // Verify
     if !ctx.is_live {
-        let state = ctx.read_mock_state();
-
-        // Find PR for Commit B (should be the middle one, index 1)
-        // mock_bin typically creates PRs in order [A, B, C] or based on commit list.
-        // We know we created 3 PRs.
-        assert_eq!(state.prs.len(), 3, "Expected 3 PRs");
-
-        // The mock bin stores PRs. We need to find the one corresponding to Commit B.
-        // Commit B is the parent of C and child of A.
-        // Let's filter by title
-        let pr_b = state
-            .prs
-            .iter()
-            .find(|pr| pr.title == "Commit B")
-            .expect("PR for Commit B not found");
-
-        let body = &pr_b.body;
-
-        // 1. Verify Metadata JSON
-        // Should contain <!-- gherrit-meta: { ... } -->
-        assert!(
-            body.contains("<!-- gherrit-meta: {"),
-            "Body missing gherrit-meta block"
-        );
-
-        // Verify parent/child keys exist (basic check, since IDs are dynamic)
-        assert!(
-            body.contains(r#""parent": "G"#),
-            "Body missing valid parent field"
-        );
-        assert!(
-            body.contains(r#""child": "G"#),
-            "Body missing valid child field"
-        );
-
-        // 2. Verify Table
-        // For v1, the history table is NOT generated.
-        assert!(
-            !body.contains("| Version |"),
-            "Table should NOT be present for v1"
-        );
+        let verifier = StackVerifier::from_git_log(&ctx);
+        verifier.verify_pr_bodies();
+        verifier.verify_pushed_refs(1);
     }
 
     // 4. Update to v2 to verify the Patch History Table appears
@@ -454,6 +410,10 @@ fn test_pr_body_generation() {
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
     if !ctx.is_live {
+        let verifier = StackVerifier::from_git_log(&ctx);
+        verifier.verify_pr_bodies();
+        verifier.verify_pushed_refs(2);
+
         let state = ctx.read_mock_state();
         // Find PR for Commit C (the tip)
         let pr_c = state
@@ -496,26 +456,13 @@ fn test_large_stack_batching() {
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
     if !ctx.is_live {
+        let verifier = StackVerifier::from_git_log(&ctx);
+        // Expect 85 PRs with correct parent/child chains
+        verifier.verify_pr_bodies();
+        // Expect 85 v1 refs (proving all commits were synced)
+        verifier.verify_pushed_refs(1);
+
         let state = ctx.read_mock_state();
-
-        // Assert: 85 PRs created
-        assert_eq!(state.prs.len(), 85, "Expected 85 PRs created");
-
-        // Assert: 85 refs pushed (actually more, since tags are also pushed)
-        // Check refs/gherrit/<ID>/v1 count.
-        let v1_refs = state
-            .pushed_refs
-            .iter()
-            .filter(|r| !r.starts_with("--"))
-            .filter(|r| r.contains("/v1"))
-            .count();
-        assert_eq!(
-            v1_refs,
-            85,
-            "Expected 85 v1 specific refs pushed. Total pushed: {:?}",
-            state.pushed_refs.len()
-        );
-
         // Assert: Push was split into 2 batches (80 + 5)
         assert_eq!(
             state.push_count, 2,
