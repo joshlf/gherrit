@@ -25,7 +25,7 @@ fn test_commit_msg_hook() {
 fn test_full_stack_lifecycle_mocked() {
     let ctx = TestContext::init_and_install_hooks();
 
-    // Setup: Create 'main' and a feature branch
+    // Setup: Create 'main' (or root) and a feature branch
     ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
     ctx.run_git(&["checkout", "-b", "feature-stack"]);
 
@@ -155,7 +155,7 @@ fn test_post_checkout_hook() {
     // ------------------------------------------------
     // Setup a fake remote tracking branch
     // We switch back to main first to create a fresh branch from
-    ctx.run_git(&["checkout", "main"]);
+    ctx.run_git(&["checkout", &ctx.main_branch_name()]);
 
     // Create the remote ref 'refs/remotes/origin/collab-feature' pointing to HEAD
     ctx.run_git(&["update-ref", "refs/remotes/origin/collab-feature", "HEAD"]);
@@ -809,7 +809,11 @@ fn test_recursive_base_detection() {
     //    without configuration. Ensure it's tracked so GHerrit treats it as valid.
     ctx.run_git(&["checkout", "-b", "feature-A"]);
     ctx.run_git(&["config", "branch.feature-A.remote", "."]);
-    ctx.run_git(&["config", "branch.feature-A.merge", "refs/heads/main"]);
+    ctx.run_git(&[
+        "config",
+        "branch.feature-A.merge",
+        &format!("refs/heads/{}", ctx.main_branch_name()),
+    ]);
 
     // We must trigger post-checkout logic manually because we configured it AFTER the checkout hook ran.
     // Or just run "gherrit manage" explicitly.
@@ -820,7 +824,7 @@ fn test_recursive_base_detection() {
         .args(["config", "branch.feature-A.gherritBase"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("main"));
+        .stdout(predicates::str::contains(ctx.main_branch_name()));
 
     // 2. Recursion: Checkout feature-B from feature-A
     ctx.run_git(&["checkout", "-b", "feature-B"]);
@@ -833,13 +837,17 @@ fn test_recursive_base_detection() {
         .args(["config", "branch.feature-B.gherritBase"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("main"));
+        .stdout(predicates::str::contains(ctx.main_branch_name()));
 
     // 3. Manual Override:
-    ctx.run_git(&["checkout", "main"]); // Switch back to clear state
+    ctx.run_git(&["checkout", &ctx.main_branch_name()]); // Switch back to clear state
     ctx.run_git(&["checkout", "-b", "hotfix-1"]);
     ctx.run_git(&["config", "branch.hotfix-1.remote", "."]);
-    ctx.run_git(&["config", "branch.hotfix-1.merge", "refs/heads/main"]);
+    ctx.run_git(&[
+        "config",
+        "branch.hotfix-1.merge",
+        &format!("refs/heads/{}", ctx.main_branch_name()),
+    ]);
     ctx.gherrit().args(["manage"]).assert().success(); // Initialize
 
     // Manual override
@@ -889,7 +897,11 @@ fn test_base_detection_with_slashes() {
     // Ensure tracking is setup so GHerrit detects upstream.
     ctx.run_git(&["checkout", "-b", "group/feature"]);
     ctx.run_git(&["config", "branch.group/feature.remote", "."]);
-    ctx.run_git(&["config", "branch.group/feature.merge", "refs/heads/main"]);
+    ctx.run_git(&[
+        "config",
+        "branch.group/feature.merge",
+        &format!("refs/heads/{}", ctx.main_branch_name()),
+    ]);
 
     // Manage
     ctx.gherrit().args(["manage"]).assert().success();
@@ -899,7 +911,7 @@ fn test_base_detection_with_slashes() {
         .args(["config", "branch.group/feature.gherritBase"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("main"));
+        .stdout(predicates::str::contains(ctx.main_branch_name()));
 
     // 2. Level 2 (Deep Nesting)
     // Checkout group/sub-feature from group/feature.
@@ -919,7 +931,7 @@ fn test_base_detection_with_slashes() {
         .args(["config", "branch.group/sub-feature.gherritBase"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("main"));
+        .stdout(predicates::str::contains(ctx.main_branch_name()));
 
     // 3. Remote Edge Case
     // Mock remote structure
