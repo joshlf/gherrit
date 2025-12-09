@@ -31,12 +31,15 @@ impl Default for MockState {
     }
 }
 
+const DEFAULT_OWNER: &str = "owner";
+const DEFAULT_REPO: &str = "repo";
+
 fn default_owner() -> String {
-    "mock".to_string()
+    DEFAULT_OWNER.to_string()
 }
 
 fn default_repo() -> String {
-    "repo".to_string()
+    DEFAULT_REPO.to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -79,19 +82,19 @@ fn handle_git(args: &[String]) {
             .cloned()
             .collect();
 
-        update_state(|state| {
+        let (repo_owner, repo_name) = update_state(|state| {
             state.pushed_refs.extend(refspecs);
             state.push_count += 1;
+            (state.repo_owner.clone(), state.repo_name.clone())
         });
 
         // Simulate GitHub output which is filtered by `pre-push` hook.
         // This output must match the regex in pre_push.rs.
-        let state = read_state();
         eprintln!("remote: ");
         eprintln!("remote: Create a pull request for 'feature' on GitHub by visiting:");
         eprintln!(
             "remote:      https://github.com/{}/{}/pull/new/feature",
-            state.repo_owner, state.repo_name
+            repo_owner, repo_name
         );
         eprintln!("remote: ");
     }

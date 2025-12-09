@@ -2,19 +2,20 @@ mod common;
 use common::TestContext;
 
 #[test]
-fn test_crash_on_special_characters_in_repo_url() {
+fn test_special_characters_in_repo_url() {
+    // Regression test for #180
     let scenarios = vec![
-        // 1. User with Hyphen
+        // 1. User with hyphen
         ("user-name", "repo-normal"),
-        // 2. User with Underscore (Technically invalid on GitHub, but tests parser robustness)
+        // 2. User with underscore (technically invalid on GitHub, but tests parser robustness)
         ("user_name", "repo-normal"),
-        // 3. User with Period (Technically invalid on GitHub, but tests parser robustness)
+        // 3. User with period (technically invalid on GitHub, but tests parser robustness)
         ("user.name", "repo-normal"),
-        // 4. Repo with Hyphen
+        // 4. Repo with hyphen
         ("user", "repo-name"),
-        // 5. Repo with Underscore
+        // 5. Repo with underscore
         ("user", "repo_name"),
-        // 6. Repo with Period
+        // 6. Repo with period
         ("user", "repo.name"),
     ];
 
