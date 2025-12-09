@@ -60,7 +60,7 @@ fn handle_git(args: &[String]) {
             state.push_count += 1;
         });
 
-        // Simulate GitHub output to cover src/pre_push.rs:206-215
+        // Simulate GitHub output which is filtered by `pre-push` hook.
         // This output must match the regex in pre_push.rs.
         eprintln!("remote: ");
         eprintln!("remote: Create a pull request for 'feature' on GitHub by visiting:");
@@ -68,7 +68,7 @@ fn handle_git(args: &[String]) {
         eprintln!("remote: ");
     }
 
-    // Pass-through for everything else (and push)
+    // Pass through to real `git` command
     let real_git = env::var("SYSTEM_GIT_PATH").unwrap_or_else(|_| "git".to_string());
     let status = Command::new(real_git)
         .args(&args[1..])
