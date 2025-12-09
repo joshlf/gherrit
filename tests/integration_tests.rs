@@ -155,9 +155,6 @@ fn test_post_checkout_hook() {
     // Create the remote ref 'refs/remotes/origin/collab-feature' pointing to HEAD
     ctx.run_git(&["update-ref", "refs/remotes/origin/collab-feature", "HEAD"]);
 
-    // Define 'origin' remote so --track works
-    ctx.run_git(&["remote", "add", "origin", "."]);
-
     // Checkout tracking branch atomically so config is set when hook runs
     ctx.run_git(&[
         "checkout",
