@@ -46,7 +46,11 @@ pub fn run(repo: &util::Repo) -> Result<()> {
         .config_string(&format!("branch.{}.gherritBase", branch_name))?
         .unwrap_or_else(|| "main".to_string());
 
-    sync_prs(repo, branch_name, commits, latest_versions, &base_branch)
+    let count = commits.len();
+    sync_prs(repo, branch_name, commits, latest_versions, &base_branch)?;
+
+    log::info!("Successfully synced {} commits.", count);
+    Ok(())
 }
 
 // Check if the branch is managed by GHerrit.

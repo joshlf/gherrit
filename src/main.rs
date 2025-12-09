@@ -15,7 +15,7 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Git hooks integration (internal use only).
     #[command(subcommand, hide = true)]
@@ -35,7 +35,7 @@ enum Commands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum HookCommands {
     /// Git pre-push hook.
     PrePush,
@@ -103,6 +103,7 @@ fn run() -> Result<()> {
         .unwrap();
 
     let cli = Cli::parse();
+    log::debug!("Executing command: {:?}", cli.command);
     let repo = util::Repo::open(".").wrap_err("Failed to open repo")?;
 
     match cli.command {
