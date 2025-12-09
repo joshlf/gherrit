@@ -20,7 +20,7 @@ fn test_special_characters_in_repo_url() {
     ];
 
     for (user, repo) in scenarios {
-        println!("Testing scenario: {}/{}", user, repo);
+        println!("Testing scenario: {user}/{repo}");
         let ctx = TestContext::init_with_repo(user, repo);
         ctx.install_hooks();
 

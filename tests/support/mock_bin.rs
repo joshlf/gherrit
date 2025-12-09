@@ -89,10 +89,7 @@ fn handle_git(args: &[String]) {
         // This output must match the regex in pre_push.rs.
         eprintln!("remote: ");
         eprintln!("remote: Create a pull request for 'feature' on GitHub by visiting:");
-        eprintln!(
-            "remote:      https://github.com/{}/{}/pull/new/feature",
-            repo_owner, repo_name
-        );
+        eprintln!("remote:      https://github.com/{repo_owner}/{repo_name}/pull/new/feature");
         eprintln!("remote: ");
     }
 
@@ -126,8 +123,8 @@ fn handle_gh(args: &[String]) {
                     let max_id = state.prs.iter().map(|p| p.number).max().unwrap_or(100);
                     let num = max_id + 1;
                     let u = format!(
-                        "https://github.com/{}/{}/pull/{}",
-                        state.repo_owner, state.repo_name, num
+                        "https://github.com/{}/{}/pull/{num}",
+                        state.repo_owner, state.repo_name
                     );
 
                     let entry = PrEntry {
