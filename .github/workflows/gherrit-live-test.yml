@@ -1,0 +1,45 @@
+name: Live Mode E2E Tests
+
+on:
+  merge_group:
+  workflow_dispatch:
+
+jobs:
+  live-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate Run ID
+        id: run-id
+        run: echo "id=$(date +%s)-${{ github.run_id }}" >> $GITHUB_OUTPUT
+
+      - name: Create Ephemeral Repository
+        id: create-repo
+        env:
+          # Requires a PAT with 'repo' scope stored in secrets
+          GH_TOKEN: ${{ secrets.GHERRIT_BOT_TOKEN }} 
+        run: |
+          REPO_NAME="gherrit-test-${{ steps.run-id.outputs.id }}"
+          # Create private repo in the organization/user context of the token
+          gh repo create $REPO_NAME --private --confirm
+          # Output the clone URL
+          echo "url=$(gh repo view $REPO_NAME --json url -q .url).git" >> $GITHUB_OUTPUT
+          echo "name=$REPO_NAME" >> $GITHUB_OUTPUT
+
+      - name: Run Tests (Live Mode)
+        env:
+          GHERRIT_TEST_REMOTE_URL: ${{ steps.create-repo.outputs.url }}
+          GH_TOKEN: ${{ secrets.GHERRIT_BOT_TOKEN }}
+          # Ensure cargo uses the gh binary available in environment
+        run: cargo test --test integration_tests -- --nocapture
+
+      - name: Delete Ephemeral Repository
+        if: always() # Run even if tests fail
+        env:
+          GH_TOKEN: ${{ secrets.GHERRIT_BOT_TOKEN }}
+        run: |
+          gh repo delete ${{ steps.create-repo.outputs.name }} --yes

@@ -10,6 +10,7 @@ pub struct TestContext {
     pub repo_path: PathBuf,
     pub is_live: bool,
     pub system_git: PathBuf,
+    pub namespace: String,
 }
 
 impl TestContext {
@@ -17,13 +18,28 @@ impl TestContext {
     pub fn init() -> Self {
         let dir = TempDir::new().unwrap();
         let repo_path = dir.path().to_path_buf();
-        let is_live = env::var("GHERRIT_LIVE_TEST").is_ok();
+        let is_live = env::var("GHERRIT_TEST_REMOTE_URL").is_ok();
 
         // Resolve system git before we mess with PATH.
         let system_git = SYSTEM_GIT.clone();
 
+        // Generate unique namespace
+        let id: u64 = rand::random();
+        let namespace = format!("test-{}", id);
+        let root_branch = format!("{}/main", namespace);
+
         init_git_repo(&repo_path);
-        if !is_live {
+
+        // Configure namespaced trunk
+        run_git_cmd(&repo_path, &["branch", "-m", &root_branch]);
+        run_git_cmd(&repo_path, &["config", "init.defaultBranch", &root_branch]);
+
+        if is_live {
+            let remote_url = env::var("GHERRIT_TEST_REMOTE_URL").unwrap();
+            run_git_cmd(&repo_path, &["remote", "add", "origin", &remote_url]);
+            // We need to push the root branch to seed the remote
+            run_git_cmd(&repo_path, &["push", "-u", "origin", &root_branch]);
+        } else {
             install_mock_binaries(dir.path());
         }
 
@@ -32,7 +48,12 @@ impl TestContext {
             repo_path,
             is_live,
             system_git,
+            namespace,
         }
+    }
+
+    pub fn main_branch_name(&self) -> String {
+        format!("{}/main", self.namespace)
     }
 
     pub fn init_and_install_hooks() -> Self {
