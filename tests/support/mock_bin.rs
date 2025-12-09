@@ -31,15 +31,12 @@ impl Default for MockState {
     }
 }
 
-const DEFAULT_OWNER: &str = "owner";
-const DEFAULT_REPO: &str = "repo";
-
 fn default_owner() -> String {
-    DEFAULT_OWNER.to_string()
+    "owner".to_string()
 }
 
 fn default_repo() -> String {
-    DEFAULT_REPO.to_string()
+    "repo".to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

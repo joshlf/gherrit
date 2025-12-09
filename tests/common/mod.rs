@@ -15,7 +15,7 @@ pub struct TestContext {
 impl TestContext {
     /// Allocates a new temporary directory and initializes a git repository in it.
     pub fn init() -> Self {
-        Self::init_with_repo("mock", "repo")
+        Self::init_with_repo("owner", "repo")
     }
 
     pub fn init_with_repo(owner: &str, name: &str) -> Self {
