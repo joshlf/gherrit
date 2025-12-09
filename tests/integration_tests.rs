@@ -313,14 +313,14 @@ fn test_version_increment() {
 fn test_optimistic_locking_conflict() {
     let ctx = TestContext::init_and_install_hooks();
 
-    // 1. Initial setup
+    // Initial setup
     ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
     ctx.run_git(&["checkout", "-b", "feature-conflict"]);
     ctx.run_git(&["commit", "--allow-empty", "-m", "Commit V1"]);
 
     ctx.gherrit().args(["manage"]).assert().success();
 
-    // 2. Push V1
+    // Push V1
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
     // Retrieve the gherrit_id from local refs
@@ -337,9 +337,9 @@ fn test_optimistic_locking_conflict() {
         .strip_prefix("gherrit/")
         .expect("Invalid ref format");
 
-    // 3. Simulate race condition: Create v2 tag on REMOTE manually
-    // The next version should be v2 (since v1 exists).
-    // Note: In bare repo, we can create refs directly.
+    // Simulate race condition: Create v2 tag on REMOTE manually. The next
+    // version should be v2 (since v1 exists). Note that in a bare repo, we can
+    // create refs directly.
     let tag_name = format!("gherrit/{}/v2", gherrit_id);
 
     // Create tag pointing to the branch we just pushed
@@ -348,9 +348,10 @@ fn test_optimistic_locking_conflict() {
         .assert()
         .success();
 
-    // 4. Create local commit for V2 (modify to ensure new hash)
-    // Note: We change the message to guarantee a different SHA even if running quickly.
-    // We MUST preserve the Change-ID to simulate an update to the SAME stack.
+    // Create local commit for V2 (modify to ensure new hash).
+    // Note: We change the message to guarantee a different SHA even if running
+    // quickly. We MUST preserve the Change-ID to simulate an update to the SAME
+    // stack.
     let new_msg = format!("Commit V1 (Amended)\n\ngherrit-pr-id: {}", gherrit_id);
     ctx.run_git(&[
         "commit",
@@ -360,13 +361,18 @@ fn test_optimistic_locking_conflict() {
         &new_msg,
     ]);
 
-    // 5. Attempt push - should fail due to atomic lock
+    // Attempt push - should fail due to atomic lock
     let output = ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
 
     let stderr = std::str::from_utf8(&output.get_output().stderr).unwrap();
     assert!(
         stderr.contains("`git push` failed"),
         "Expected push failure due to lock, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("stale info") || stderr.contains("atomic push failed"),
+        "Expected atomic push failure (stale info), got: {}",
         stderr
     );
 }
