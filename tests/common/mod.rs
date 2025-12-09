@@ -143,7 +143,6 @@ fn init_git_bare_repo(path: &Path) {
 
 fn init_git_repo(path: &Path, remote_path: &Path) {
     run_git_cmd(path, &["init"]);
-    // Override global core.hooksPath which might be set (e.g. /dev/null)
     run_git_cmd(path, &["config", "core.hooksPath", ".git/hooks"]);
     // Must config user identity for commits to work
     run_git_cmd(path, &["config", "user.email", "test@example.com"]);
