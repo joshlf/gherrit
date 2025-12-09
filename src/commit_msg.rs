@@ -78,13 +78,35 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
         format!("{}\n{}\n{}", committer_ident, refhash, msg_content)
     };
 
-    let object_id = gix::diff::object::compute_hash(
-        repo.object_hash(),
-        gix::object::Kind::Blob,
-        input_data.as_bytes(),
-    )
-    .wrap_err("Failed to compute hash")?;
-    let random_hash = object_id.to_string();
+    // Compute a hash of the object data and a random salt. Combined,
+    // this minimizes the likelihood of collisions.
+    let hash = {
+        let object_id = gix::diff::object::compute_hash(
+            repo.object_hash(),
+            gix::object::Kind::Blob,
+            input_data.as_bytes(),
+        )
+        .wrap_err("Failed to compute hash")?;
+
+        // Initialize the hash with the salt.
+        let mut hash: [u8; 20] = rand::random();
+
+        // Mix in the object hash using a simple XOR. This isn't
+        // cryptographically secure, but it's good enough for our purposes –
+        // namely, it ensures that the resulting `hash` has entropy from both
+        // the salt and the object hash.
+        for (r, &d) in hash.iter_mut().zip(object_id.as_bytes().iter().cycle()) {
+            *r ^= d;
+        }
+        hash
+    };
+
+    // Poor man's hex encoding
+    let mut hash_str = String::with_capacity(hash.len() * 2);
+    for b in hash {
+        use std::fmt::Write as _;
+        write!(&mut hash_str, "{:02x}", b).unwrap();
+    }
 
     // Check if trailer exists
     let output = cmd!("git interpret-trailers --parse", msg_file).checked_output()?;
@@ -100,7 +122,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     // --if-exists doNothing: prevents duplicates
     cmd!(
         "git interpret-trailers --in-place --where start --if-exists doNothing --trailer",
-        "gherrit-pr-id: G{random_hash}",
+        "gherrit-pr-id: G{hash_str}",
         msg_file
     )
     .success()?;
