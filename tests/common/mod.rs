@@ -16,13 +16,18 @@ impl TestContext {
     /// Allocates a new temporary directory and initializes a git repository in it.
     pub fn init() -> Self {
         let dir = TempDir::new().unwrap();
-        let repo_path = dir.path().to_path_buf();
+        let repo_path = dir.path().join("local");
+        fs::create_dir(&repo_path).unwrap();
+
+        let remote_path = dir.path().join("remote.git");
+        init_git_bare_repo(&remote_path);
+
         let is_live = env::var("GHERRIT_LIVE_TEST").is_ok();
 
         // Resolve system git before we mess with PATH.
         let system_git = SYSTEM_GIT.clone();
 
-        init_git_repo(&repo_path);
+        init_git_repo(&repo_path, &remote_path);
         if !is_live {
             install_mock_binaries(dir.path());
         }
@@ -131,13 +136,25 @@ fn install_mock_binaries(path: &Path) {
     fs::copy(&gherrit_bin, &gherrit_dst).unwrap();
 }
 
-fn init_git_repo(path: &Path) {
+fn init_git_bare_repo(path: &Path) {
+    fs::create_dir(path).unwrap();
+    run_git_cmd(path, &["init", "--bare"]);
+}
+
+fn init_git_repo(path: &Path, remote_path: &Path) {
     run_git_cmd(path, &["init"]);
+    // Override global core.hooksPath which might be set (e.g. /dev/null)
+    run_git_cmd(path, &["config", "core.hooksPath", ".git/hooks"]);
     // Must config user identity for commits to work
     run_git_cmd(path, &["config", "user.email", "test@example.com"]);
     run_git_cmd(path, &["config", "user.name", "Test User"]);
     // Ensure default branch is main
     run_git_cmd(path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    // Add origin remote
+    run_git_cmd(
+        path,
+        &["remote", "add", "origin", remote_path.to_str().unwrap()],
+    );
 }
 
 static SYSTEM_GIT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
