@@ -155,9 +155,6 @@ fn test_post_checkout_hook() {
     // Create the remote ref 'refs/remotes/origin/collab-feature' pointing to HEAD
     ctx.run_git(&["update-ref", "refs/remotes/origin/collab-feature", "HEAD"]);
 
-    // Define 'origin' remote so --track works
-    ctx.run_git(&["remote", "add", "origin", "."]);
-
     // Checkout tracking branch atomically so config is set when hook runs
     ctx.run_git(&[
         "checkout",
@@ -303,7 +300,75 @@ fn test_version_increment() {
             "v1 tag should NOT be pushed again in the second push. New pushes: {:?}",
             new_pushes
         );
+
+        // Verify that tags actually exist on the remote
+        let output = ctx.remote_git().args(["tag", "-l"]).output().unwrap();
+        let tags = std::str::from_utf8(&output.stdout).unwrap();
+        assert!(tags.contains("/v1"), "Remote should contain v1 tag");
+        assert!(tags.contains("/v2"), "Remote should contain v2 tag");
     }
+}
+
+#[test]
+fn test_optimistic_locking_conflict() {
+    let ctx = TestContext::init_and_install_hooks();
+
+    // 1. Initial setup
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
+    ctx.run_git(&["checkout", "-b", "feature-conflict"]);
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit V1"]);
+
+    ctx.gherrit().args(["manage"]).assert().success();
+
+    // 2. Push V1
+    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+
+    // Retrieve the gherrit_id from local refs
+    let output = ctx
+        .git()
+        .args(["for-each-ref", "--format=%(refname:short)", "refs/gherrit/"])
+        .output()
+        .unwrap();
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let gherrit_id = stdout
+        .lines()
+        .next()
+        .expect("No gherrit ref found")
+        .strip_prefix("gherrit/")
+        .expect("Invalid ref format");
+
+    // 3. Simulate race condition: Create v2 tag on REMOTE manually
+    // The next version should be v2 (since v1 exists).
+    // Note: In bare repo, we can create refs directly.
+    let tag_name = format!("gherrit/{}/v2", gherrit_id);
+
+    // Create tag pointing to the branch we just pushed
+    ctx.remote_git()
+        .args(["tag", &tag_name, &format!("refs/heads/{}", gherrit_id)])
+        .assert()
+        .success();
+
+    // 4. Create local commit for V2 (modify to ensure new hash)
+    // Note: We change the message to guarantee a different SHA even if running quickly.
+    // We MUST preserve the Change-ID to simulate an update to the SAME stack.
+    let new_msg = format!("Commit V1 (Amended)\n\ngherrit-pr-id: {}", gherrit_id);
+    ctx.run_git(&[
+        "commit",
+        "--amend",
+        "--allow-empty",
+        "-m",
+        &new_msg,
+    ]);
+
+    // 5. Attempt push - should fail due to atomic lock
+    let output = ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
+
+    let stderr = std::str::from_utf8(&output.get_output().stderr).unwrap();
+    assert!(
+        stderr.contains("`git push` failed"),
+        "Expected push failure due to lock, got: {}",
+        stderr
+    );
 }
 
 #[test]
