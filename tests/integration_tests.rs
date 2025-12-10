@@ -39,7 +39,12 @@ fn test_full_stack_lifecycle_mocked() {
     // Trigger Pre-Push Hook (Simulate 'git push'). We call the hook directly
     // because simulating a real 'git push' that calls the hook recursively is
     // complex in a test env.
-    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+    // Verify valid sync
+    ctx.gherrit()
+        .args(["hook", "pre-push"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("Successfully synced 2 commits"));
 
     // Verify Side Effects (Mock Only)
     if !ctx.is_live {
