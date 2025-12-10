@@ -12,6 +12,7 @@ pub struct TestContext {
     pub system_git: PathBuf,
 }
 
+#[allow(dead_code)]
 impl TestContext {
     /// Allocates a new temporary directory and initializes a git repository in it.
     pub fn init() -> Self {
@@ -130,7 +131,7 @@ pub struct MockState {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub struct PrEntry {
     pub number: usize,
     pub title: String,
