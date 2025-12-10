@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  validate:
+    name: Validate and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get Rust Version
+        id: rust-version
+        # Parse Cargo.toml to get the rust-version. We use sed to avoid dependency
+        # on the runner's cargo version (which might not support edition 2024).
+        run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-version.outputs.version }}
+          components: clippy, rustfmt
+
+      - name: Cache intermediate build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Formatting
+        run: cargo fmt -- --check
+
+      - name: Clippy (Library & Binaries)
+        run: cargo clippy
+
+      - name: Clippy (Tests)
+        run: cargo clippy --tests
+
+      - name: Run Tests
+        run: cargo test
+
+      - name: Check for TODO comments
+        run: |
+          set -eo pipefail
+
+          # Install in the background so it runs in parallel with `curl`.
+          sudo apt-get install -y ripgrep &
+
+          # Fetch the check_todo.sh script from the google/zerocopy repository
+          curl -sL https://raw.githubusercontent.com/google/zerocopy/main/ci/check_todo.sh -o check_todo.sh
+          chmod +x check_todo.sh
+
+          # Wait for the background installation to finish
+          wait
+
+          ./check_todo.sh .
