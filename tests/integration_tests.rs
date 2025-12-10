@@ -353,13 +353,7 @@ fn test_optimistic_locking_conflict() {
     // quickly. We MUST preserve the Change-ID to simulate an update to the SAME
     // stack.
     let new_msg = format!("Commit V1 (Amended)\n\ngherrit-pr-id: {}", gherrit_id);
-    ctx.run_git(&[
-        "commit",
-        "--amend",
-        "--allow-empty",
-        "-m",
-        &new_msg,
-    ]);
+    ctx.run_git(&["commit", "--amend", "--allow-empty", "-m", &new_msg]);
 
     // Attempt push - should fail due to atomic lock
     let output = ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
