@@ -609,7 +609,7 @@ struct PrState {
     base: String,
 }
 
-impl<'a> TryFrom<gix::Commit<'a>> for Commit {
+impl TryFrom<gix::Commit<'_>> for Commit {
     type Error = eyre::Report;
 
     fn try_from(c: gix::Commit) -> Result<Self> {
