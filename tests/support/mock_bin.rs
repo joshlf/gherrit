@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug)]
 struct MockState {
     #[serde(default)]
     prs: Vec<PrEntry>,
@@ -13,6 +13,30 @@ struct MockState {
     pushed_refs: Vec<String>,
     #[serde(default)]
     push_count: usize,
+    #[serde(default = "default_owner")]
+    repo_owner: String,
+    #[serde(default = "default_repo")]
+    repo_name: String,
+}
+
+impl Default for MockState {
+    fn default() -> Self {
+        Self {
+            prs: vec![],
+            pushed_refs: vec![],
+            push_count: 0,
+            repo_owner: default_owner(),
+            repo_name: default_repo(),
+        }
+    }
+}
+
+fn default_owner() -> String {
+    "owner".to_string()
+}
+
+fn default_repo() -> String {
+    "repo".to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -55,16 +79,17 @@ fn handle_git(args: &[String]) {
             .cloned()
             .collect();
 
-        update_state(|state| {
+        let (repo_owner, repo_name) = update_state(|state| {
             state.pushed_refs.extend(refspecs);
             state.push_count += 1;
+            (state.repo_owner.clone(), state.repo_name.clone())
         });
 
         // Simulate GitHub output which is filtered by `pre-push` hook.
         // This output must match the regex in pre_push.rs.
         eprintln!("remote: ");
         eprintln!("remote: Create a pull request for 'feature' on GitHub by visiting:");
-        eprintln!("remote:      https://github.com/mock/repo/pull/new/feature");
+        eprintln!("remote:      https://github.com/{repo_owner}/{repo_name}/pull/new/feature");
         eprintln!("remote: ");
     }
 
@@ -97,7 +122,10 @@ fn handle_gh(args: &[String]) {
                 let url = update_state(|state| {
                     let max_id = state.prs.iter().map(|p| p.number).max().unwrap_or(100);
                     let num = max_id + 1;
-                    let u = format!("https://github.com/mock/repo/pull/{}", num);
+                    let u = format!(
+                        "https://github.com/{}/{}/pull/{num}",
+                        state.repo_owner, state.repo_name
+                    );
 
                     let entry = PrEntry {
                         number: num,
