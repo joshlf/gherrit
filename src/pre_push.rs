@@ -657,7 +657,7 @@ fn create_gh_pr(
     .output()?;
 
     let output = core::str::from_utf8(&output.stdout)?;
-    let re = re!("https://github.com/[a-zA-Z0-9]+/[a-zA-Z0-9]+/pull/([0-9]+)");
+    let re = re!(r"https://github.com/[a-zA-Z0-9\-_\.]+/[a-zA-Z0-9\-_\.]+/pull/([0-9]+)");
     let captures = re.captures(output).unwrap();
     let pr_id = captures.get(1).unwrap();
     let pr_url = output.trim().to_string();

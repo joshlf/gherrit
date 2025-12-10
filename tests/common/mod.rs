@@ -13,9 +13,14 @@ pub struct TestContext {
     pub system_git: PathBuf,
 }
 
+#[allow(dead_code)]
 impl TestContext {
     /// Allocates a new temporary directory and initializes a git repository in it.
     pub fn init() -> Self {
+        Self::init_with_repo("owner", "repo")
+    }
+
+    pub fn init_with_repo(owner: &str, name: &str) -> Self {
         let dir = TempDir::new().unwrap();
         let repo_path = dir.path().join("local");
         fs::create_dir(&repo_path).unwrap();
@@ -31,6 +36,14 @@ impl TestContext {
         init_git_repo(&repo_path, &remote_path);
         if !is_live {
             install_mock_binaries(dir.path());
+            // Create initial mock state with custom repo
+            let state = MockState {
+                repo_owner: owner.to_string(),
+                repo_name: name.to_string(),
+                ..Default::default()
+            };
+            let state_json = serde_json::to_string(&state).unwrap();
+            fs::write(repo_path.join("mock_state.json"), state_json).unwrap();
         }
 
         Self {
@@ -120,16 +133,22 @@ fn run_git_cmd(path: &Path, args: &[&str]) {
         .success();
 }
 
-#[derive(serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 pub struct MockState {
+    #[serde(default)]
     pub prs: Vec<PrEntry>,
+    #[serde(default)]
     pub pushed_refs: Vec<String>,
     #[serde(default)]
     pub push_count: usize,
+    #[serde(default)]
+    pub repo_owner: String,
+    #[serde(default)]
+    pub repo_name: String,
 }
 
-#[derive(serde::Deserialize, Debug)]
-#[expect(dead_code)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct PrEntry {
     pub number: usize,
     pub title: String,
