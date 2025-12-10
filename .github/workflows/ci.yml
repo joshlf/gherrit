@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get Rust Version
+        id: rust-version
+        # Parse Cargo.toml to get the rust-version. We use sed to avoid dependency
+        # on the runner's cargo version (which might not support edition 2024).
+        run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-version.outputs.version }}
+          components: clippy, rustfmt
+
+      - name: Check Formatting
+        run: cargo fmt -- --check
+
+      - name: Clippy (Library & Binaries)
+        # Deny warnings to ensure the codebase remains clean
+        run: cargo clippy -- -D warnings
+
+      - name: Clippy (Tests)
+        # Ensure tests are also linted
+        run: cargo clippy --tests -- -D warnings
+
+      - name: Run Tests
+        # Integration tests will use the internal mock_bin, so 'gh' auth is not required here.
+        run: cargo test
+
+      - name: Check for TODO comments
+        run: |
+          # Fetch the check_todo.sh script from the google/zerocopy repository
+          curl -sL https://raw.githubusercontent.com/google/zerocopy/main/ci/check_todo.sh -o check_todo.sh
+          chmod +x check_todo.sh
+          
+          # Run the script on the current directory
+          ./check_todo.sh .
