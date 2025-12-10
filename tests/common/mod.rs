@@ -8,6 +8,7 @@ use tempfile::TempDir;
 pub struct TestContext {
     pub dir: TempDir,
     pub repo_path: PathBuf,
+    pub remote_path: PathBuf,
     pub is_live: bool,
     pub system_git: PathBuf,
 }
@@ -48,6 +49,7 @@ impl TestContext {
         Self {
             dir,
             repo_path,
+            remote_path,
             is_live,
             system_git,
         }
@@ -69,6 +71,21 @@ impl TestContext {
             let mut paths = vec![self.dir.path().to_path_buf()];
             paths.extend(env::split_paths(&env::var_os("PATH").unwrap()));
 
+            let new_path_str = env::join_paths(paths).unwrap();
+            cmd.env("PATH", new_path_str);
+            cmd.env("SYSTEM_GIT_PATH", &self.system_git);
+        }
+
+        cmd
+    }
+
+    pub fn remote_git(&self) -> assert_cmd::Command {
+        let mut cmd = assert_cmd::Command::new("git");
+        cmd.current_dir(&self.remote_path);
+
+        if !self.is_live {
+            let mut paths = vec![self.dir.path().to_path_buf()];
+            paths.extend(env::split_paths(&env::var_os("PATH").unwrap()));
             let new_path_str = env::join_paths(paths).unwrap();
             cmd.env("PATH", new_path_str);
             cmd.env("SYSTEM_GIT_PATH", &self.system_git);
