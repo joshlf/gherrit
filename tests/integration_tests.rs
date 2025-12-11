@@ -26,15 +26,15 @@ fn test_full_stack_lifecycle_mocked() {
     let ctx = TestContext::init_and_install_hooks();
 
     // Setup: Create 'main' and a feature branch
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
-    ctx.run_git(&["checkout", "-b", "feature-stack"]);
+    ctx.commit("Initial commit");
+    ctx.checkout_new("feature-stack");
 
     // Manage the branch properly before making commits so hooks are installed
     ctx.gherrit().args(["manage"]).assert().success();
 
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit A"]);
+    ctx.commit("Commit A");
 
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit B"]);
+    ctx.commit("Commit B");
 
     // Trigger Pre-Push Hook (Simulate 'git push'). We call the hook directly
     // because simulating a real 'git push' that calls the hook recursively is
@@ -60,7 +60,7 @@ fn test_branch_management() {
     let ctx = TestContext::init_and_install_hooks();
 
     // Create a branch to manage
-    ctx.run_git(&["checkout", "-b", "feature-A"]);
+    ctx.checkout_new("feature-A");
 
     // Scenario A: Custom Push Remote Preservation
     ctx.run_git(&["config", "branch.feature-A.pushRemote", "origin"]);
@@ -128,9 +128,9 @@ fn test_post_checkout_hook() {
     // Scenario A: New Feature Branch (Stack Mode)
     // -------------------------------------------
     // Must have a commit so HEAD is valid
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
+    ctx.commit("Initial commit");
 
-    ctx.run_git(&["checkout", "-b", "feature-stack"]);
+    ctx.checkout_new("feature-stack");
 
     // Manually invoke the hook (Simulation of git calling it)
     // args: prev_sha new_sha flag(1=branch checkout)
@@ -181,7 +181,7 @@ fn test_post_checkout_hook() {
 #[test]
 fn test_commit_msg_edge_cases() {
     let ctx = TestContext::init_and_install_hooks();
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial"]);
+    ctx.commit("Initial");
     // Ensure we are managed so the hook is active
     ctx.gherrit().args(["manage"]).assert().success();
 
@@ -224,12 +224,12 @@ fn test_pre_push_ancestry_check() {
     let ctx = TestContext::init_and_install_hooks();
 
     // Setup: Create a normal history first (common init)
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Root"]);
+    ctx.commit("Initial Root");
 
     // Create an orphan branch
     ctx.run_git(&["checkout", "--orphan", "lonely-branch"]);
     // ctx.run_git(&["rm", "--cached", "-r", "."]); // Index is already empty from empty commit
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Lonely Commit"]);
+    ctx.commit("Lonely Commit");
 
     // Manage it (this might succeed or fail depending on implementation,
     // but we care about push failure)
@@ -254,10 +254,10 @@ fn test_version_increment() {
     let ctx = TestContext::init_and_install_hooks();
 
     // Setup: Initial commit
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
+    ctx.commit("Initial commit");
     // Create feature branch
-    ctx.run_git(&["checkout", "-b", "feat-versioning"]);
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Feature Commit"]);
+    ctx.checkout_new("feat-versioning");
+    ctx.commit("Feature Commit");
 
     // Manage
     ctx.gherrit().args(["manage"]).assert().success();
@@ -314,9 +314,9 @@ fn test_optimistic_locking_conflict() {
     let ctx = TestContext::init_and_install_hooks();
 
     // Initial setup
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
-    ctx.run_git(&["checkout", "-b", "feature-conflict"]);
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit V1"]);
+    ctx.commit("Initial commit");
+    ctx.checkout_new("feature-conflict");
+    ctx.commit("Commit V1");
 
     ctx.gherrit().args(["manage"]).assert().success();
 
@@ -376,14 +376,14 @@ fn test_pr_body_generation() {
     let ctx = TestContext::init_and_install_hooks();
 
     // Setup: Initial commit on main to establish the branch
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
+    ctx.commit("Initial commit");
 
     // Setup: Stack of 3 commits: A -> B -> C
     // Must be on a feature branch (not main) for gherrit to sync them
-    ctx.run_git(&["checkout", "-b", "feature-stack"]);
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit A"]);
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit B"]);
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit C"]);
+    ctx.checkout_new("feature-stack");
+    ctx.commit("Commit A");
+    ctx.commit("Commit B");
+    ctx.commit("Commit C");
 
     // Ensure we capture the Change-IDs (Gherrit-IDs).
     // We can verify this implicitly by checking the PR bodies later.
@@ -473,14 +473,14 @@ fn test_large_stack_batching() {
     let ctx = TestContext::init_and_install_hooks();
 
     // Setup: Initial commit on main
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
+    ctx.commit("Initial commit");
 
     // Create feature branch
-    ctx.run_git(&["checkout", "-b", "large-stack"]);
+    ctx.checkout_new("large-stack");
 
     // Create 85 commits (exceeds batch limit of 80)
     for i in 1..=85 {
-        ctx.run_git(&["commit", "--allow-empty", "-m", &format!("Commit {}", i)]);
+        ctx.commit(&format!("Commit {}", i));
     }
 
     // Manage
@@ -524,9 +524,9 @@ fn test_rebase_detection() {
     let ctx = TestContext::init_and_install_hooks();
 
     // Setup: Main and feature
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial"]);
-    ctx.run_git(&["checkout", "-b", "feature-rebase"]);
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Feature Work"]);
+    ctx.commit("Initial");
+    ctx.checkout_new("feature-rebase");
+    ctx.commit("Feature Work");
 
     // Detach HEAD to simulate rebase state
     ctx.run_git(&["checkout", "--detach"]);
@@ -551,9 +551,9 @@ fn test_rebase_detection() {
 fn test_public_stack_links() {
     let ctx = TestContext::init_and_install_hooks();
 
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Init"]);
-    ctx.run_git(&["checkout", "-b", "public-feature"]);
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Public Commit"]);
+    ctx.commit("Init");
+    ctx.checkout_new("public-feature");
+    ctx.commit("Public Commit");
 
     // 1. Private Mode (Default)
     ctx.gherrit().args(["manage"]).assert().success();
@@ -700,7 +700,7 @@ fn test_install_configuration_and_security() {
 #[test]
 fn test_manage_detached_head() {
     let ctx = TestContext::init();
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Init"]);
+    ctx.commit("Init");
 
     // Enter detached HEAD state
     ctx.run_git(&["checkout", "--detach"]);
@@ -718,8 +718,8 @@ fn test_manage_detached_head() {
 #[test]
 fn test_unmanage_cleanup_logic() {
     let ctx = TestContext::init();
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Init"]);
-    ctx.run_git(&["checkout", "-b", "feature-cleanup"]);
+    ctx.commit("Init");
+    ctx.checkout_new("feature-cleanup");
 
     // Manually configure the state to exact values that trigger the deep cleanup logic
     ctx.run_git(&["config", "branch.feature-cleanup.gherritManaged", "true"]);
@@ -754,10 +754,10 @@ fn test_unmanage_cleanup_logic() {
 #[test]
 fn test_pre_push_failure() {
     let ctx = TestContext::init_and_install_hooks();
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Init"]);
+    ctx.commit("Init");
 
-    ctx.run_git(&["checkout", "-b", "feature-fail"]);
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Work to push"]);
+    ctx.checkout_new("feature-fail");
+    ctx.commit("Work to push");
 
     ctx.gherrit().args(["manage"]).assert().success();
 

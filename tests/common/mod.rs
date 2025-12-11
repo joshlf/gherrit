@@ -123,6 +123,16 @@ impl TestContext {
         // Use the new install command
         self.gherrit().args(["install"]).assert().success();
     }
+
+    pub fn commit(&self, msg: &str) {
+        self.run_git(&["commit", "--allow-empty", "-m", msg]);
+    }
+
+    pub fn checkout_new(&self, branch_name: &str) {
+        self.run_git(&["checkout", "-b", branch_name]);
+    }
+
+
 }
 
 fn run_git_cmd(path: &Path, args: &[&str]) {
