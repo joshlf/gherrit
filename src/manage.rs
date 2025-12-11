@@ -62,16 +62,16 @@ pub fn set_state(repo: &util::Repo, state: State) -> Result<()> {
 
             let branch_name_yellow = branch_name.yellow();
             log::info!(
-                "Branch '{branch_name_yellow}' is now {} by GHerrit.",
+                "Branch {branch_name_yellow} is now {} by GHerrit.",
                 "managed".green()
             );
             if let Some(remote) = custom_push_remote {
                 let remote_yellow = remote.yellow();
                 log::warn!(
-                    "Branch '{branch_name_yellow}' has a custom pushRemote '{remote_yellow}'. GHerrit did NOT overwrite it."
+                    "Branch {branch_name_yellow} has a custom pushRemote {remote_yellow}. GHerrit did NOT overwrite it."
                 );
                 log::warn!(
-                    "  - Running `git push` will push to '{remote_yellow}' in addition to syncing via GHerrit."
+                    "  - Running `git push` will push to {remote_yellow} in addition to syncing via GHerrit."
                 );
                 log::warn!(
                     "  - To configure GHerrit to sync your stack WITHOUT pushing to {default_remote} (making it private), run:"
@@ -181,17 +181,16 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         .unwrap_or(false);
 
     let has_upstream = upstream_remote.is_some() && upstream_merge.is_some();
+    let branch_name_yellow = branch_name.yellow();
     if has_upstream && !is_default_branch {
         // Condition A: Shared Branch
+        log::info!("Detected {branch_name_yellow} as a shared branch.");
         set_state(repo, State::Unmanaged)?;
-        log::info!(
-            "Branch initialized as {}.",
-            "UNMANAGED (Collaboration Mode)".yellow()
-        );
+        log::info!("To have GHerrit manage this branch, run: gherrit manage");
     } else {
         // Condition B: New Stack
+        log::info!("Detected {branch_name_yellow} as a new branch.");
         set_state(repo, State::Managed)?;
-        log::info!("Branch initialized as {}.", "MANAGED (Stack Mode)".green());
         log::info!("To opt-out, run: gherrit unmanage");
     }
 
