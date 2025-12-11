@@ -172,7 +172,7 @@ fn install_mock_binaries(path: &Path) {
     fs::copy(&gherrit_bin, &gherrit_dst).unwrap();
 }
 
-fn init_git_bare_repo(path: &Path) {
+pub fn init_git_bare_repo(path: &Path) {
     fs::create_dir(path).unwrap();
     run_git_cmd(path, &["init", "--bare"]);
 }
