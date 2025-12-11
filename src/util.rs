@@ -138,10 +138,6 @@ impl Repo {
         Ok(Some(s.trim().to_string()))
     }
 
-    pub fn config_bool(&self, key: &str) -> Result<Option<bool>> {
-        Ok(self.inner.config_snapshot().try_boolean(key).transpose()?)
-    }
-
     pub fn config_path(&self, key: &str) -> Result<Option<PathBuf>> {
         let snapshot = self.inner.config_snapshot();
         let Some(path_val) = snapshot.path(key) else {
