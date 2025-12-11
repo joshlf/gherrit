@@ -189,7 +189,7 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         log::info!("To have GHerrit manage this branch, run: gherrit manage");
     } else {
         // Condition B: New Stack
-        log::info!("Detected {branch_name_yellow} as a new branch");
+        log::info!("Detected {branch_name_yellow} as a new branch.");
         set_state(repo, State::Managed)?;
         log::info!("To opt-out, run: gherrit unmanage");
     }
