@@ -281,6 +281,8 @@ fn init_git_repo(path: &Path, remote_path: &Path) {
     run_git_cmd(path, &["config", "user.name", "Test User"]);
     // Ensure default branch is main
     run_git_cmd(path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    // Explicitly unmanage main to satisfy strict config checks
+    run_git_cmd(path, &["config", "branch.main.gherritManaged", "false"]);
     // Add origin remote
     run_git_cmd(
         path,
