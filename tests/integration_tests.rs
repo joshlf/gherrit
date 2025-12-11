@@ -743,6 +743,13 @@ fn test_pre_push_failure() {
 #[cfg(unix)]
 fn test_install_read_only_fs() {
     use std::os::unix::fs::PermissionsExt as _;
+
+    // Skip if running as root, as root ignores permissions. This can arise in
+    // practice when developing inside a container.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
     let ctx = testutil::test_context_minimal!().build();
     let hooks_dir = ctx.repo_path.join(".git/hooks");
     std::fs::create_dir_all(&hooks_dir).unwrap();
