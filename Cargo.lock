@@ -509,6 +509,7 @@ dependencies = [
  "eyre",
  "fastrand",
  "gix",
+ "libc",
  "log",
  "owo-colors",
  "predicates",
