@@ -793,3 +793,41 @@ fn test_install_read_only_fs() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&hooks_dir, perms).unwrap();
 }
+
+#[test]
+fn test_pre_push_fixup_detection() {
+    let ctx = TestContext::init_and_install_hooks();
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial"]);
+
+    for prefix in ["fixup", "squash", "amend"] {
+        // Create a new branch for each prefix test to ensure clean state.
+        let branch_name = format!("feature-check-{prefix}");
+        ctx.run_git(&["checkout", "-b", &branch_name, "main"]);
+
+        // Normal commit
+        ctx.run_git(&["commit", "--allow-empty", "-m", "Work in progress"]);
+
+        // Prefix commit
+        ctx.run_git(&[
+            "commit",
+            "--allow-empty",
+            "-m",
+            &format!("{prefix}! Work in progress"),
+        ]);
+
+        // Trigger pre-push hook, which should fail because of prefix.
+        let output = ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
+
+        let output = output.get_output();
+        let stderr = std::str::from_utf8(&output.stderr).unwrap();
+
+        assert!(
+            stderr.contains("Stack contains pending fixup/squash/amend commits"),
+            "Expected prefix error for '{prefix}!', got: {stderr}",
+        );
+        assert!(
+            stderr.contains("git rebase -i --autosquash"),
+            "Expected autosquash suggestion for '{prefix}!', got: {stderr}",
+        );
+    }
+}
