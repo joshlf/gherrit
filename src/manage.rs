@@ -1,137 +1,216 @@
-use crate::cmd;
-use crate::util::{self, HeadState};
 use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
 
+use crate::cmd;
+use crate::util::{self, CommandExt as _, HeadState};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    Managed,
     Unmanaged,
+    Private,
+    Public,
 }
 
-pub fn get_state(repo: &util::Repo, branch_name: &str) -> Result<Option<State>> {
-    let key = format!("branch.{}.gherritManaged", branch_name);
-    match repo.config_bool(&key)? {
-        Some(true) => Ok(Some(State::Managed)),
-        Some(false) => Ok(Some(State::Unmanaged)),
-        None => Ok(None),
+impl State {
+    const UNMANAGED: &str = "false";
+    const PRIVATE: &str = "managedPrivate";
+    const PUBLIC: &str = "managedPublic";
+
+    pub fn read_from(repo: &util::Repo, branch_name: &str) -> Result<Option<State>> {
+        let key = format!("branch.{}.gherritManaged", branch_name);
+        match repo.config_string(&key)?.as_deref() {
+            Some(State::PUBLIC) => Ok(Some(State::Public)),
+            Some(State::PRIVATE) => Ok(Some(State::Private)),
+            Some(State::UNMANAGED) => Ok(Some(State::Unmanaged)),
+            None => Ok(None),
+            Some(unknown) => bail!(
+                "Invalid gherritManaged value: {}. Expected {}, {}, or {}.",
+                unknown.yellow(),
+                State::PUBLIC.yellow(),
+                State::PRIVATE.yellow(),
+                State::UNMANAGED.yellow()
+            ),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BranchConfig {
+    push_remote: Option<String>,
+    remote: Option<String>,
+    merge: Option<String>,
+}
+
+impl BranchConfig {
+    fn expected(state: Option<State>, branch_name: &str, default_remote: &str) -> BranchConfig {
+        let self_merge_ref = format!("refs/heads/{branch_name}");
+        BranchConfig {
+            push_remote: match state {
+                Some(State::Unmanaged) | None => None,
+                Some(State::Private) => Some(".".to_string()),
+                Some(State::Public) => Some(default_remote.to_string()),
+            },
+            remote: match state {
+                Some(State::Unmanaged) | None => None,
+                Some(State::Private | State::Public) => Some(".".to_string()),
+            },
+            merge: match state {
+                Some(State::Unmanaged) | None => None,
+                Some(State::Private | State::Public) => Some(self_merge_ref),
+            },
+        }
+    }
+
+    fn read_from(repo: &util::Repo, branch_name: &str) -> Result<BranchConfig> {
+        let key = |suffix: &str| format!("branch.{branch_name}.{suffix}");
+        Ok(BranchConfig {
+            push_remote: repo.config_string(&key("pushRemote"))?,
+            remote: repo.config_string(&key("remote"))?,
+            merge: repo.config_string(&key("merge"))?,
+        })
     }
 }
 
 /// Configures the Git branch state for GHerrit management.
-///
-/// Sets/unsets the following config values:
-/// - `branch.<name>.gherritManaged` (boolean): Indicates whether the branch is
-///   managed by GHerrit.
-/// - `branch.<name>.pushRemote` (string): Set to "." when managed, unset when
-///   unmanaged. Causes `git push` to be a no-op by pushing to the local
-///   repository instead of pushing to the remote repository.
-/// - `branch.<name>.remote` (string)/`branch.<name>.merge` (string): Set to
-///   "."/"refs/heads/<branch>" when managed, unset when unmanaged. Satisfies
-///   Git's requirement that an upstream branch be set to suppress "fatal: The
-///   current branch has no upstream branch" errors.
-pub fn set_state(repo: &util::Repo, state: State) -> Result<()> {
-    let branch_name = repo.current_branch();
-    let branch_name = match branch_name {
-        HeadState::Attached(bn) | HeadState::Pending(bn) => bn,
-        HeadState::Detached => {
-            bail!("Cannot set state for detached HEAD");
+pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()> {
+    use State::*;
+
+    // Step 1: Determine Old Context and Expectation
+    let (branch_name, old_state) = repo.read_current_branch_and_state()?;
+    let default_remote = repo.default_remote_name();
+
+    let key = |suffix: &str| format!("branch.{branch_name}.{suffix}");
+    match (old_state, new_state) {
+        (Some(Unmanaged), Unmanaged) => {
+            log::debug!(
+                "Branch {} is already in the desired state ({new_state:?}).",
+                branch_name.yellow(),
+            );
+            return Ok(());
+        }
+        // This transition just has the effect of clarifying the user's intent
+        // to unmanage the branch. It doesn't change the state, and so we leave
+        // configuration values unchanged. Any configuration values that are set
+        // represent custom configuration (since GHerrit doesn't set any values
+        // in the unmanaged state), and will be detected if the user ever
+        // attempts to transition to a managed state.
+        (None, Unmanaged) => {}
+        // This transition will clobber (when transitioning to a managed state)
+        // or delete (when transitioning to an unmanaged state) any custom
+        // configuration values that the user has set. We include `X -> X`
+        // transitions here (where `X = Private | Public`) because the user may
+        // perform `gherrit manage --force` in order to *keep* the current
+        // management state but forceably clobber any custom configuration
+        // values.
+        //
+        // Note a subtlety: This check will reject configuration values that are
+        // unexpected for the *current* state but are correct for the *new*
+        // state. This may seem surprising, but it is important: If we allowed
+        // this transition, GHerrit would effectively "adopt" ownership of the
+        // user's custom configuration values since it would go from them being
+        // *unexpected* to *expected*. Thus, on any *subsequent* transition,
+        // GHerrit would think it owned them, and would clobber them as it saw
+        // fit.
+        (Some(Unmanaged) | None, Private | Public)
+        | (Some(Private), Unmanaged | Public | Private)
+        | (Some(Public), Unmanaged | Private | Public) => {
+            let current_config = BranchConfig::read_from(repo, &branch_name)?;
+            let expected_old_config =
+                BranchConfig::expected(old_state, &branch_name, &default_remote);
+            if current_config != expected_old_config {
+                // FIXME(#219): Add the ability to save the user's custom
+                // configuration so it can be restored during a subsequent
+                // `gherrit unmanage`.
+                log::warn!(
+                    "Configuration drift detected for branch {}.",
+                    branch_name.yellow()
+                );
+                let (article, state) = match old_state {
+                    Some(State::Unmanaged) | None => ("an", "unmanaged"),
+                    Some(State::Private) => ("a", "private"),
+                    Some(State::Public) => ("a", "public"),
+                };
+                log::warn!(
+                    "The current git configuration does not match the expected state for {article} {} branch.",
+                    state.yellow(),
+                );
+
+                let check_diff =
+                    |key: &str, current: &Option<String>, expected: &Option<String>| {
+                        if current != expected {
+                            let curr_s = current.as_deref().unwrap_or("<unset>");
+                            let exp_s = expected.as_deref().unwrap_or("<unset>");
+                            log::warn!(
+                                "  - {key}: current='{}', expected='{}'",
+                                curr_s.yellow(),
+                                exp_s.yellow()
+                            );
+                        }
+                    };
+
+                let (c, e) = (&current_config, expected_old_config);
+                check_diff("pushRemote", &c.push_remote, &e.push_remote);
+                check_diff("remote", &c.remote, &e.remote);
+                check_diff("merge", &c.merge, &e.merge);
+
+                if force {
+                    log::warn!("Overwriting manual changes (--force).");
+                } else {
+                    log::warn!("Use --force to overwrite manual changes.");
+                    return Ok(());
+                }
+            }
+
+            let apply_config =
+                |k: String, old: Option<String>, new: Option<String>| -> Result<()> {
+                    match (old, new) {
+                        (old, Some(new)) => {
+                            if old.as_ref() != Some(&new) {
+                                cmd!("git config", k, new).success()
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        (Some(_), None) => cmd!("git config --unset", k).success(),
+                        (None, None) => Ok(()),
+                    }
+                };
+
+            let new_config = BranchConfig::expected(Some(new_state), &branch_name, &default_remote);
+            let (c, n) = (current_config, new_config);
+            apply_config(key("pushRemote"), c.push_remote, n.push_remote)?;
+            apply_config(key("remote"), c.remote, n.remote)?;
+            apply_config(key("merge"), c.merge, n.merge)?;
         }
     };
 
-    let key = |suffix: &str| format!("branch.{branch_name}.{suffix}");
-    let self_merge_ref = format!("refs/heads/{branch_name}");
-    let default_remote = repo.default_remote_name();
+    // Step 3: Apply New State
+    let state_val = match new_state {
+        State::Unmanaged => State::UNMANAGED,
+        State::Private => State::PRIVATE,
+        State::Public => State::PUBLIC,
+    };
+    cmd!("git config", key("gherritManaged"), state_val).success()?;
 
-    match state {
-        State::Managed => {
-            cmd!("git config", key("gherritManaged"), "true").status()?;
-
-            let current_push_remote = repo.config_string(&key("pushRemote"))?;
-            let custom_push_remote = match current_push_remote.as_deref() {
-                Some(".") => None, // Already set to "."; nothing to do.
-                Some(remote) => Some(remote),
-                None => {
-                    cmd!("git config", key("pushRemote"), ".").status()?;
-                    None
-                }
-            };
-
-            cmd!("git config", key("remote"), ".").status()?;
-            cmd!("git config", key("merge"), &self_merge_ref).status()?;
-
-            let branch_name_yellow = branch_name.yellow();
-            log::info!(
-                "Branch {branch_name_yellow} is now {} by GHerrit.",
-                "managed".green()
-            );
-            if let Some(remote) = custom_push_remote {
-                let remote_yellow = remote.yellow();
-                log::warn!(
-                    "Branch {branch_name_yellow} has a custom pushRemote {remote_yellow}. GHerrit did NOT overwrite it."
-                );
-                log::warn!(
-                    "  - Running `git push` will push to {remote_yellow} in addition to syncing via GHerrit."
-                );
-                log::warn!(
-                    "  - To configure GHerrit to sync your stack WITHOUT pushing to {default_remote} (making it private), run:"
-                );
-                log::warn!("    git config {} .", key("pushRemote"));
-                log::warn!(
-                    "  - To allow pushing this branch to {default_remote} (making it public), run:"
-                );
-                log::warn!("    git config {} {}", key("pushRemote"), default_remote);
-            } else {
-                log::info!(
-                    "  - 'git push' is configured to sync your stack WITHOUT updating '{default_remote}/{branch_name}'."
-                );
-                log::info!(
-                    "  - To allow pushing this branch to {default_remote} (making it public), run:"
-                );
-                log::info!("    git config {} {}", key("pushRemote"), default_remote);
-            }
-        }
+    let branch_name_y = branch_name.yellow();
+    match new_state {
         State::Unmanaged => {
-            cmd!("git config", key("gherritManaged"), "false").status()?;
-
-            let current_push_remote = repo.config_string(&key("pushRemote"))?;
-            let custom_push_remote = match current_push_remote.as_deref() {
-                Some(".") => {
-                    cmd!("git config --unset", key("pushRemote")).status()?;
-                    None
-                }
-                Some(remote) => Some(remote),
-                None => None, // Already unset; nothing to do.
-            };
-
-            let current_remote = repo.config_string(&key("remote"))?;
-            let current_merge = repo.config_string(&key("merge"))?;
-
-            if current_remote.as_deref() == Some(".")
-                && current_merge.as_deref() == Some(&self_merge_ref)
-            {
-                cmd!("git config --unset", key("remote")).status()?;
-                cmd!("git config --unset", key("merge")).status()?;
-            }
-
-            let branch_name_yellow = branch_name.yellow();
-            log::info!(
-                "Branch '{branch_name_yellow}' is now {} by GHerrit.",
-                "unmanaged".red()
-            );
-            log::info!("  - Standard 'git push' behavior has been restored.");
-            if let Some(remote) = custom_push_remote {
-                let remote_yellow = remote.yellow();
-                log::warn!(
-                    "Branch '{branch_name_yellow}' has a custom pushRemote '{remote_yellow}'. GHerrit did NOT unset it."
-                );
-            } else {
-                log::info!(
-                    "  - Local self-tracking removed. You may need to set a new upstream (e.g., git push -u {default_remote} {branch_name})."
-                );
-            }
+            let unmanaged_r = "unmanaged".red();
+            log::info!("Branch {branch_name_y} is now {unmanaged_r} by GHerrit.");
+        }
+        #[rustfmt::skip]
+        State::Private => {
+            let managed_g = "managed".green();
+            log::info!("Branch {branch_name_y} is now {managed_g} by GHerrit in private mode.");
+            log::info!("  - 'git push' will sync PRs only, but will not push {branch_name_y} itself.");
+        }
+        State::Public => {
+            let managed_g = "managed".green();
+            log::info!("Branch {branch_name_y} is now {managed_g} by GHerrit in public mode.");
+            log::info!("  - 'git push' will sync PRs and will also push {branch_name_y} itself.");
         }
     }
+
     Ok(())
 }
 
@@ -147,12 +226,20 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         HeadState::Pending(_) | HeadState::Detached => return Ok(()),
     };
 
-    // Idempotency check: Bail if the branch management state is already set.
-    if get_state(repo, branch_name)
-        .wrap_err("Failed to parse gherritState")?
-        .is_some()
-    {
-        log::debug!(" Branch '{}' is already configured.", branch_name);
+    // Idempotency check: Bail if the branch management state is explicitly managed.
+    let current_state =
+        State::read_from(repo, branch_name).wrap_err("Failed to parse gherritState")?;
+    let state_str = match current_state {
+        Some(State::Unmanaged) | None => None,
+        Some(State::Private) => Some("private"),
+        Some(State::Public) => Some("public"),
+    };
+    if let Some(state) = state_str {
+        log::debug!(
+            "Branch {} is already configured as {} by GHerrit.",
+            branch_name.yellow(),
+            state.yellow()
+        );
         return Ok(());
     }
 
@@ -185,12 +272,12 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
     if has_upstream && !is_default_branch {
         // Condition A: Shared Branch
         log::info!("Detected {branch_name_yellow} as a shared branch.");
-        set_state(repo, State::Unmanaged)?;
+        set_state(repo, State::Unmanaged, false)?;
         log::info!("To have GHerrit manage this branch, run: gherrit manage");
     } else {
         // Condition B: New Stack
         log::info!("Detected {branch_name_yellow} as a new branch.");
-        set_state(repo, State::Managed)?;
+        set_state(repo, State::Private, false)?;
         log::info!("To opt-out, run: gherrit unmanage");
     }
 

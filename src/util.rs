@@ -1,9 +1,11 @@
 use std::ffi::OsStr;
 use std::process::Command;
 
-use eyre::{OptionExt, Result};
+use eyre::{OptionExt, Result, bail};
 use gix::bstr::ByteSlice;
 use gix::state::InProgress;
+
+use crate::manage::State;
 
 /// Constructs a `std::process::Command`.
 ///
@@ -138,10 +140,6 @@ impl Repo {
         Ok(Some(s.trim().to_string()))
     }
 
-    pub fn config_bool(&self, key: &str) -> Result<Option<bool>> {
-        Ok(self.inner.config_snapshot().try_boolean(key).transpose()?)
-    }
-
     pub fn config_path(&self, key: &str) -> Result<Option<PathBuf>> {
         let snapshot = self.inner.config_snapshot();
         let Some(path_val) = snapshot.path(key) else {
@@ -250,6 +248,34 @@ impl Repo {
         let branches = self.find_default_branches(&self.default_remote_name());
         branches.iter().any(|b| b == branch_name)
     }
+
+    // Check whether the branch is managed by GHerrit.
+    pub fn is_managed(&self, branch_name: &str) -> Result<bool> {
+        match State::read_from(self, branch_name)? {
+            Some(State::Unmanaged) => Ok(false),
+            Some(State::Private | State::Public) => Ok(true),
+            None => {
+                bail!(
+                    "It is unclear whether branch '{branch_name}' should be managed by GHerrit.\n\
+                    Run 'gherrit manage' to sync it as a GHerrit stack.\n\
+                    Run 'gherrit unmanage' to push it as a standard Git branch."
+                );
+            }
+        }
+    }
+
+    pub fn read_current_branch_and_state(&self) -> Result<(String, Option<State>)> {
+        let branch_name = self.current_branch();
+        let branch_name = match branch_name {
+            HeadState::Attached(bn) | HeadState::Pending(bn) => bn,
+            HeadState::Detached => {
+                bail!("Cannot get management state in detached HEAD");
+            }
+        };
+
+        let state = State::read_from(self, branch_name)?;
+        Ok((branch_name.clone(), state))
+    }
 }
 
 impl std::ops::Deref for Repo {
@@ -294,6 +320,20 @@ fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     }
 
     Ok(HeadState::Detached)
+}
+
+pub trait CommandExt {
+    fn success(&mut self) -> Result<()>;
+}
+
+impl CommandExt for Command {
+    fn success(&mut self) -> Result<()> {
+        let status = self.status()?;
+        if !status.success() {
+            bail!("Command failed with status: {}", status);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
