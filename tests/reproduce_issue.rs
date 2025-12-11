@@ -1,6 +1,3 @@
-mod common;
-use common::TestContext;
-
 #[test]
 fn test_special_characters_in_repo_url() {
     // Regression test for #180
@@ -21,12 +18,9 @@ fn test_special_characters_in_repo_url() {
 
     for (user, repo) in scenarios {
         println!("Testing scenario: {user}/{repo}");
-        let ctx = TestContext::init_with_repo(user, repo);
-        ctx.install_hooks();
+        let ctx = testutil::test_context!().owner(user).name(repo).build();
 
-        // Setup a commit
-        ctx.run_git(&["commit", "--allow-empty", "-m", "Initial Commit"]);
-        ctx.run_git(&["checkout", "-b", "feature-stack"]);
+        ctx.checkout_new("feature-stack");
 
         // Manage must happen before commit to ensure the commit-msg hook adds the trailer
         ctx.gherrit().args(["manage"]).assert().success();
