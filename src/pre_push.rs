@@ -6,7 +6,9 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    cmd, manage, re,
+    cmd,
+    manage::{self, State},
+    re,
     util::{self, HeadState},
 };
 use eyre::{Context, Result, bail, eyre};
@@ -47,26 +49,19 @@ pub fn run(repo: &util::Repo) -> Result<()> {
 
 // Check if the branch is managed by GHerrit.
 fn check_managed_state(repo: &util::Repo, branch_name: &str) -> Result<()> {
-    let state = manage::get_state(repo, branch_name).wrap_err("Failed to parse gherritManaged")?;
+    let state = State::read_from(repo, branch_name).wrap_err("Failed to parse gherritManaged")?;
 
     match state {
-        Some(manage::State::Unmanaged) => {
+        State::Unmanaged => {
             log::info!(
                 "Branch '{}' is UNMANAGED. Allowing standard push.",
                 branch_name
             );
             return Ok(()); // Allow standard push
         }
-        Some(manage::State::Managed) => {
+        manage::State::Private | manage::State::Public => {
             log::info!("Branch '{}' is MANAGED. Syncing stack...", branch_name);
         } // Proceed
-        None => {
-            bail!(
-                "It is unclear if branch '{branch_name}' should be a Stack.\n\
-                Run 'gherrit manage' to sync it as a Stack.\n\
-                Run 'gherrit unmanage' to push it as a standard Git branch."
-            );
-        }
     }
     Ok(())
 }
