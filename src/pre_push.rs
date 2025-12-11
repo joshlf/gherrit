@@ -101,7 +101,30 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
         .collect::<Result<Vec<_>>>()?;
     commits.reverse();
 
-    commits.into_iter().map(|c| c.try_into()).collect()
+    let remote = repo.default_remote_name();
+    commits
+        .into_iter()
+        .map(|c| -> Result<Commit> {
+            let msg = c.message()?;
+            let title = core::str::from_utf8(msg.title)?;
+
+            if ["fixup!", "squash!", "amend!"]
+                .iter()
+                .any(|p| title.starts_with(p))
+            {
+                // TODO: Make sure this outputs exactly what we want (and maybe figure
+                // out a way to make the expected error output in tests more human-readable
+                // to the code reviewer).
+                bail!(
+                    "Stack contains pending fixup/squash/amend commits.\n\
+                    Please squash your history before syncing:\n\
+                        git rebase -i --autosquash {remote}/{default_branch}",
+                );
+            }
+
+            c.try_into()
+        })
+        .collect()
 }
 
 fn create_gherrit_refs(repo: &util::Repo, commits: Vec<Commit>) -> Result<Vec<Commit>> {
