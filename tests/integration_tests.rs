@@ -120,7 +120,7 @@ fn test_branch_management() {
 fn test_post_checkout_hook() {
     let ctx = testutil::test_context!().build();
 
-    // Scenario A: New Feature Branch (Stack Mode)
+    // Scenario A: New Feature Branch
 
     ctx.checkout_new("feature-stack");
 
@@ -138,7 +138,7 @@ fn test_post_checkout_hook() {
         .success()
         .stdout("true\n");
 
-    // Scenario B: Existing Branch (Collaboration Mode)
+    // Scenario B: Existing Branch
     // ------------------------------------------------
     // Setup a fake remote tracking branch. We switch back to main first to
     // create a fresh branch from.
