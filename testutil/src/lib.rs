@@ -5,22 +5,93 @@ use std::process::Command;
 use std::sync::LazyLock;
 use tempfile::TempDir;
 
-pub struct TestContext {
-    pub dir: TempDir,
-    pub repo_path: PathBuf,
-    pub remote_path: PathBuf,
-    pub is_live: bool,
-    pub system_git: PathBuf,
+#[macro_export]
+macro_rules! test_context {
+    () => {
+        $crate::TestContextBuilder::new()
+            .binaries(
+                assert_cmd::cargo::cargo_bin!("gherrit"),
+                assert_cmd::cargo::cargo_bin!("mock_bin"),
+            )
+    };
 }
 
-#[allow(dead_code)]
-impl TestContext {
-    /// Allocates a new temporary directory and initializes a git repository in it.
-    pub fn init() -> Self {
-        Self::init_with_repo("owner", "repo")
+#[macro_export]
+macro_rules! test_context_minimal {
+    () => {
+        $crate::TestContextBuilder::new_minimal()
+            .binaries(
+                assert_cmd::cargo::cargo_bin!("gherrit"),
+                assert_cmd::cargo::cargo_bin!("mock_bin"),
+            )
+    };
+}
+
+pub struct TestContextBuilder {
+    owner: String,
+    name: String,
+    install_hooks: bool,
+    initial_commit: bool,
+    gherrit_bin: Option<PathBuf>,
+    mock_bin: Option<PathBuf>,
+}
+
+impl Default for TestContextBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TestContextBuilder {
+    pub fn new() -> Self {
+        Self {
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+            install_hooks: true,
+            initial_commit: true,
+            gherrit_bin: None,
+            mock_bin: None,
+        }
     }
 
-    pub fn init_with_repo(owner: &str, name: &str) -> Self {
+    pub fn new_minimal() -> Self {
+        Self {
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+            install_hooks: false,
+            initial_commit: false,
+            gherrit_bin: None,
+            mock_bin: None,
+        }
+    }
+
+    pub fn binaries(&mut self, gherrit: impl Into<PathBuf>, mock: impl Into<PathBuf>) -> &mut Self {
+        self.gherrit_bin = Some(gherrit.into());
+        self.mock_bin = Some(mock.into());
+        self
+    }
+
+    pub fn owner(&mut self, owner: &str) -> &mut Self {
+        self.owner = owner.to_string();
+        self
+    }
+
+    pub fn name(&mut self, name: &str) -> &mut Self {
+        self.name = name.to_string();
+        self
+    }
+
+    pub fn install_hooks(&mut self, install_hooks: bool) -> &mut Self {
+        self.install_hooks = install_hooks;
+        self
+    }
+
+    pub fn initial_commit(&mut self, initial_commit: bool) -> &mut Self {
+        self.initial_commit = initial_commit;
+        self
+    }
+
+    pub fn build(&self) -> TestContext {
         let dir = TempDir::new().unwrap();
         let repo_path = dir.path().join("local");
         fs::create_dir(&repo_path).unwrap();
@@ -34,36 +105,56 @@ impl TestContext {
         let system_git = SYSTEM_GIT.clone();
 
         init_git_repo(&repo_path, &remote_path);
+
+        let gherrit_bin = self.gherrit_bin.clone().expect("gherrit binary path must be set");
+        let mock_bin = self.mock_bin.clone().expect("mock binary path must be set");
+
+        let ctx = TestContext {
+            dir,
+            repo_path,
+            remote_path: remote_path.clone(),
+            is_live,
+            system_git: system_git.clone(),
+            gherrit_bin_path: gherrit_bin.clone(),
+        };
+
         if !is_live {
-            install_mock_binaries(dir.path());
+            install_mock_binaries(ctx.dir.path(), &mock_bin, &gherrit_bin);
             // Create initial mock state with custom repo
             let state = MockState {
-                repo_owner: owner.to_string(),
-                repo_name: name.to_string(),
+                repo_owner: self.owner.clone(),
+                repo_name: self.name.clone(),
                 ..Default::default()
             };
             let state_json = serde_json::to_string(&state).unwrap();
-            fs::write(repo_path.join("mock_state.json"), state_json).unwrap();
+            fs::write(ctx.repo_path.join("mock_state.json"), state_json).unwrap();
         }
 
-        Self {
-            dir,
-            repo_path,
-            remote_path,
-            is_live,
-            system_git,
+        if self.install_hooks {
+            ctx.install_hooks();
         }
-    }
 
-    pub fn init_and_install_hooks() -> Self {
-        let ctx = Self::init();
-        ctx.install_hooks();
+        if self.initial_commit {
+            ctx.commit("Initial commit");
+        }
+
         ctx
     }
+}
 
+pub struct TestContext {
+    pub dir: TempDir,
+    pub repo_path: PathBuf,
+    pub remote_path: PathBuf,
+    pub is_live: bool,
+    pub system_git: PathBuf,
+    pub gherrit_bin_path: PathBuf,
+}
+
+impl TestContext {
     pub fn gherrit(&self) -> assert_cmd::Command {
-        let bin_path = env!("CARGO_BIN_EXE_gherrit");
-        let mut cmd = assert_cmd::Command::new(bin_path);
+        // Use injected binary path
+        let mut cmd = assert_cmd::Command::new(&self.gherrit_bin_path);
         cmd.current_dir(&self.repo_path);
 
         if !self.is_live {
@@ -123,6 +214,14 @@ impl TestContext {
         // Use the new install command
         self.gherrit().args(["install"]).assert().success();
     }
+
+    pub fn commit(&self, msg: &str) {
+        self.run_git(&["commit", "--allow-empty", "-m", msg]);
+    }
+
+    pub fn checkout_new(&self, branch_name: &str) {
+        self.run_git(&["checkout", "-b", branch_name]);
+    }
 }
 
 fn run_git_cmd(path: &Path, args: &[&str]) {
@@ -148,17 +247,13 @@ pub struct MockState {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct PrEntry {
     pub number: usize,
     pub title: String,
     pub body: String,
 }
 
-fn install_mock_binaries(path: &Path) {
-    let mock_bin = PathBuf::from(env!("CARGO_BIN_EXE_mock_bin"));
-    let gherrit_bin = PathBuf::from(env!("CARGO_BIN_EXE_gherrit"));
-
+pub fn install_mock_binaries(path: &Path, mock_bin: &Path, gherrit_bin: &Path) {
     let git_dst = path.join(if cfg!(windows) { "git.exe" } else { "git" });
     let gh_dst = path.join(if cfg!(windows) { "gh.exe" } else { "gh" });
     let gherrit_dst = path.join(if cfg!(windows) {
@@ -167,9 +262,9 @@ fn install_mock_binaries(path: &Path) {
         "gherrit"
     });
 
-    fs::copy(&mock_bin, &git_dst).unwrap();
-    fs::copy(&mock_bin, &gh_dst).unwrap();
-    fs::copy(&gherrit_bin, &gherrit_dst).unwrap();
+    fs::copy(mock_bin, &git_dst).unwrap();
+    fs::copy(mock_bin, &gh_dst).unwrap();
+    fs::copy(gherrit_bin, &gherrit_dst).unwrap();
 }
 
 pub fn init_git_bare_repo(path: &Path) {
@@ -206,3 +301,9 @@ static SYSTEM_GIT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
     let path = stdout.lines().next().expect("No git path found").trim();
     PathBuf::from(path)
 });
+
+// Initialize on first access if needed, though OnceLock typically needs manual init or GetOrInit
+// LazyLock is unstable or new? 
+// gherrit is rust-version 1.85, so LazyLock is stable (Added in 1.80). 
+// But test_utils/Cargo.toml might not have set rust-version, defaulting to edition 2021.
+// Let's stick to LazyLock if I see it used before. Yes, it was used before.

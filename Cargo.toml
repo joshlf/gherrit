@@ -27,8 +27,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 predicates = "3.1"
 fastrand = "2.0"
+testutil = { path = "testutil" }
 
 [[bin]]
 name = "mock_bin"
 path = "tests/support/mock_bin.rs"
 test = false
+
+[workspace]
+members = ["testutil"]
