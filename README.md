@@ -1,5 +1,7 @@
 # GHerrit
 
+> **Note:** GHerrit is currently in alpha. You're welcome to use it, but please be aware that we may make breaking changes.
+
 **GHerrit** is a tool that brings a **Gerrit-style "Stacked Diffs" workflow** to GitHub.
 
 It allows you to maintain a single local branch containing a stack of commits
@@ -133,6 +135,8 @@ git config branch.<your-branch>.pushRemote origin
 ```
 
 ## Design & Architecture
+
+*If you only intend to **use** GHerrit, and don't care about its internals, then you can stop reading now.*
 
 ### Core Architecture
 
