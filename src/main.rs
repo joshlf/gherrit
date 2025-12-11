@@ -21,9 +21,25 @@ enum Commands {
     #[command(subcommand, hide = true)]
     Hook(HookCommands),
     /// Configure the current branch to be managed by GHerrit.
-    Manage,
+    Manage {
+        /// Force the configuration update, overwriting any manual changes.
+        #[arg(long, short)]
+        force: bool,
+
+        /// Configure the branch to be public (`git push` syncs PRs *and* pushes the branch itself).
+        #[arg(long, group = "visibility")]
+        public: bool,
+
+        /// Configure the branch to be private (`git push` syncs PRs *only*; does not push the branch itself).
+        #[arg(long, group = "visibility")]
+        private: bool,
+    },
     /// Configure the current branch to be unmanaged by GHerrit.
-    Unmanage,
+    Unmanage {
+        /// Force the configuration update, overwriting any manual changes.
+        #[arg(long, short)]
+        force: bool,
+    },
     /// Install GHerrit Git hooks.
     Install {
         /// Overwrite existing hooks not managed by GHerrit
@@ -113,8 +129,31 @@ fn run() -> Result<()> {
             }
             HookCommands::CommitMsg { file } => commit_msg::run(&repo, &file)?,
         },
-        Commands::Manage => manage::set_state(&repo, manage::State::Managed)?,
-        Commands::Unmanage => manage::set_state(&repo, manage::State::Unmanaged)?,
+        Commands::Manage {
+            force,
+            public,
+            private,
+        } => {
+            let branch_name = match repo.current_branch().name() {
+                Some(name) => name,
+                None => eyre::bail!("Cannot manage detached HEAD"),
+            };
+
+            let target_state = if public {
+                manage::State::Public
+            } else if private {
+                manage::State::Private
+            } else {
+                // If no flag provided, preserve current state (enforcing config) or default to Private.
+                match manage::get_state(&repo, branch_name)? {
+                    manage::State::Public => manage::State::Public,
+                    manage::State::Private => manage::State::Private,
+                    manage::State::Unmanaged => manage::State::Private,
+                }
+            };
+            manage::set_state(&repo, target_state, force)?
+        }
+        Commands::Unmanage { force } => manage::set_state(&repo, manage::State::Unmanaged, force)?,
         Commands::Install {
             force,
             allow_global,
