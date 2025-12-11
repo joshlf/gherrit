@@ -1,3 +1,8 @@
+// TODO: Review changes to this file.
+
+const MANAGED_PRIVATE: &str = "managedPrivate";
+const MANAGED_PUBLIC: &str = "managedPublic";
+
 #[test]
 fn test_commit_msg_hook() {
     let ctx = testutil::test_context_minimal!().build();
@@ -57,24 +62,33 @@ fn test_branch_management() {
     // Create a branch to manage
     ctx.checkout_new("feature-A");
 
-    // Scenario A: Custom Push Remote Preservation
+    // Scenario A: Custom Push Remote Preservation (Overwritten by Declarative Model)
     ctx.run_git(&["config", "branch.feature-A.pushRemote", "origin"]);
 
-    ctx.gherrit().args(["manage"]).assert().success();
+    // Attempt manage - should fail (drift)
+    ctx.gherrit().args(["manage"]).assert().success(); // Logs warning, no change
+    // Assert still unmanaged (missing key)
+    ctx.git()
+        .args(["config", "branch.feature-A.gherritManaged"])
+        .assert()
+        .failure();
+
+    // Manage with FORCE - should overwrite
+    ctx.gherrit().args(["manage", "--force"]).assert().success();
 
     // Assert managed
     ctx.git()
         .args(["config", "branch.feature-A.gherritManaged"])
         .assert()
         .success()
-        .stdout("true\n");
+        .stdout(format!("{}\n", MANAGED_PRIVATE));
 
-    // Assert pushRemote preserved
+    // Assert pushRemote updated to loopback (Private default)
     ctx.git()
         .args(["config", "branch.feature-A.pushRemote"])
         .assert()
         .success()
-        .stdout("origin\n");
+        .stdout(".\n");
 
     // Assert other keys set
     ctx.git()
@@ -108,12 +122,16 @@ fn test_branch_management() {
         .assert()
         .failure();
 
-    // Assert pushRemote preserved
+    // Assert pushRemote unset (Config cleanup)
+    // Note: get_expected_config(Unmanaged) returns None for pushRemote,
+    // so set_state will UNSET it if it matches value relative to state?
+    // No, set_state logic:
+    // Unmanaged -> expected None. apply_config calls `cmd!("git config --unset", ...)` if None.
+    // So pushRemote should be unset.
     ctx.git()
         .args(["config", "branch.feature-A.pushRemote"])
         .assert()
-        .success()
-        .stdout("origin\n");
+        .failure();
 }
 
 #[test]
@@ -124,19 +142,14 @@ fn test_post_checkout_hook() {
 
     ctx.checkout_new("feature-stack");
 
-    // Manually invoke the hook (Simulation of git calling it)
-    // args: prev_sha new_sha flag(1=branch checkout)
-    ctx.gherrit()
-        .args(["hook", "post-checkout", "HEAD", "HEAD", "1"])
-        .assert()
-        .success();
+    // Implicit hook run via checkout
 
     // Assert managed = true
     ctx.git()
         .args(["config", "branch.feature-stack.gherritManaged"])
         .assert()
         .success()
-        .stdout("true\n");
+        .stdout(format!("{}\n", MANAGED_PRIVATE));
 
     // Scenario B: Existing Branch
     // ------------------------------------------------
@@ -148,6 +161,7 @@ fn test_post_checkout_hook() {
     ctx.run_git(&["update-ref", "refs/remotes/origin/collab-feature", "HEAD"]);
 
     // Checkout tracking branch atomically so config is set when hook runs
+    // This implicitly runs post-checkout hook.
     ctx.run_git(&[
         "checkout",
         "-b",
@@ -156,11 +170,8 @@ fn test_post_checkout_hook() {
         "origin/collab-feature",
     ]);
 
-    // Manually invoke hook
-    ctx.gherrit()
-        .args(["hook", "post-checkout", "HEAD", "HEAD", "1"])
-        .assert()
-        .success();
+    // Debug: Print config
+    // ctx.run_git(&["config", "--list"]);
 
     // Assert managed = false
     ctx.git()
@@ -510,7 +521,7 @@ fn test_rebase_detection() {
         .args(["config", "branch.feature-rebase.gherritManaged"])
         .assert()
         .success()
-        .stdout("true\n");
+        .stdout(format!("{}\n", MANAGED_PRIVATE));
 }
 
 #[test]
@@ -677,6 +688,31 @@ fn test_manage_detached_head() {
         .args(["manage"])
         .assert()
         .failure()
+        .stderr(predicates::str::contains("Cannot manage detached HEAD"));
+
+    // Attempt manage --public
+    ctx.gherrit()
+        .args(["manage", "--public"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "Cannot set state for detached HEAD",
+        ));
+
+    // Attempt manage --private
+    ctx.gherrit()
+        .args(["manage", "--private"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "Cannot set state for detached HEAD",
+        ));
+
+    // Attempt unmanage
+    ctx.gherrit()
+        .args(["unmanage"])
+        .assert()
+        .failure()
         .stderr(predicates::str::contains(
             "Cannot set state for detached HEAD",
         ));
@@ -689,7 +725,11 @@ fn test_unmanage_cleanup_logic() {
     ctx.checkout_new("feature-cleanup");
 
     // Manually configure the state to exact values that trigger the deep cleanup logic
-    ctx.run_git(&["config", "branch.feature-cleanup.gherritManaged", "true"]);
+    ctx.run_git(&[
+        "config",
+        "branch.feature-cleanup.gherritManaged",
+        MANAGED_PRIVATE,
+    ]);
     ctx.run_git(&["config", "branch.feature-cleanup.pushRemote", "."]);
     ctx.run_git(&["config", "branch.feature-cleanup.remote", "."]);
     ctx.run_git(&[
@@ -766,4 +806,130 @@ fn test_install_read_only_fs() {
     let mut perms = std::fs::metadata(&hooks_dir).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&hooks_dir, perms).unwrap();
+}
+
+#[test]
+fn test_manage_drift_detection() {
+    let ctx = testutil::test_context_minimal!().build();
+    ctx.checkout_new("drift-feature");
+
+    // 1. Initialize managed private branch
+    ctx.gherrit()
+        .args(["manage", "--private"])
+        .assert()
+        .success();
+
+    // 2. Manually sabotage
+    ctx.run_git(&["config", "branch.drift-feature.pushRemote", "origin"]);
+
+    // 3. Attempt Switch to Public (without force)
+    // The command should exit with 0 but log a warning and NOT apply changes.
+    let output = ctx
+        .gherrit()
+        .args(["manage", "--public"])
+        .assert()
+        .success();
+
+    let stderr = std::str::from_utf8(&output.get_output().stderr).unwrap();
+    assert!(stderr.contains("Configuration drift detected"));
+    assert!(stderr.contains("- pushRemote: current='origin', expected='.'"));
+
+    // Assert state matches OLD state (Private)
+    ctx.git()
+        .args(["config", "branch.drift-feature.gherritManaged"])
+        .assert()
+        .stdout(format!("{}\n", MANAGED_PRIVATE));
+
+    // 4. Force Switch
+    ctx.gherrit()
+        .args(["manage", "--public", "--force"])
+        .assert()
+        .success();
+
+    // Assert Success
+    ctx.git()
+        .args(["config", "branch.drift-feature.gherritManaged"])
+        .assert()
+        .stdout(format!("{}\n", MANAGED_PUBLIC));
+
+    // Check pushRemote is now origin
+    ctx.git()
+        .args(["config", "branch.drift-feature.pushRemote"])
+        .assert()
+        .stdout("origin\n");
+}
+
+#[test]
+fn test_manage_toggle_visibility() {
+    let ctx = testutil::test_context_minimal!().build();
+    ctx.checkout_new("visibility-feature");
+
+    // 1. Private
+    ctx.gherrit()
+        .args(["manage", "--private"])
+        .assert()
+        .success();
+    ctx.git()
+        .args(["config", "branch.visibility-feature.pushRemote"])
+        .assert()
+        .stdout(".\n");
+
+    // 2. Public
+    ctx.gherrit()
+        .args(["manage", "--public"])
+        .assert()
+        .success();
+    ctx.git()
+        .args(["config", "branch.visibility-feature.pushRemote"])
+        .assert()
+        .stdout("origin\n");
+
+    // 3. Private again
+    ctx.gherrit()
+        .args(["manage", "--private"])
+        .assert()
+        .success();
+    ctx.git()
+        .args(["config", "branch.visibility-feature.pushRemote"])
+        .assert()
+        .stdout(".\n");
+}
+
+#[test]
+fn test_manage_mutually_exclusive_flags() {
+    let ctx = testutil::test_context_minimal!().build();
+    ctx.checkout_new("conflict-feature");
+
+    // Attempt to set both flags
+    let assert = ctx
+        .gherrit()
+        .args(["manage", "--public", "--private"])
+        .assert()
+        .failure();
+
+    // Verify error message from clap
+    let output = assert.get_output();
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(stderr.contains("the argument '--public' cannot be used with '--private'"));
+}
+
+#[test]
+fn test_manage_invalid_config() {
+    let ctx = testutil::test_context_minimal!().build();
+    ctx.checkout_new("invalid-config-feature");
+
+    // Manually set invalid config
+    ctx.run_git(&[
+        "config",
+        "branch.invalid-config-feature.gherritManaged",
+        "bad-value",
+    ]);
+
+    // Attempt to manage; should fail
+    let assert = ctx.gherrit().args(["manage"]).assert().failure();
+
+    let output = assert.get_output();
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(stderr.contains("Invalid gherritManaged value"));
+    assert!(stderr.contains("bad-value"));
 }

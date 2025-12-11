@@ -21,7 +21,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::manage;
+use crate::manage::State;
 use crate::{cmd, util};
 use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
@@ -41,11 +41,10 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
         return Ok(());
     };
 
-    // Check if managed – bail if unmanaged or if management state is unset.
-    if manage::get_state(repo, branch_name).wrap_err("Failed to get config")?
-        != Some(manage::State::Managed)
-    {
-        return Ok(());
+    // Check if managed – bail if unmanaged.
+    match State::read_from(repo, branch_name).wrap_err("Failed to get config")? {
+        State::Unmanaged => return Ok(()),
+        State::Private | State::Public => {} // Proceed
     }
 
     // Skip temporary squash commits (e.g. from `git commit --squash`) to
