@@ -1,6 +1,6 @@
 # GHerrit
 
-*GHerrit is currently in alpha. You're welcome to use it, but we may make breaking changes.*
+> **Note:** GHerrit is currently in alpha. You're welcome to use it, but please be aware that we may make breaking changes.
 
 **GHerrit** is a tool that brings a **Gerrit-style "Stacked Diffs" workflow** to GitHub.
 
