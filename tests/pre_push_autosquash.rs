@@ -3,8 +3,6 @@
 // from pushing unfinished work to the remote, maintaining a clean commit
 // history.
 
-mod common;
-use common::TestContext;
 use predicates::prelude::*;
 
 // Helper to assert the specific error message format
@@ -30,26 +28,19 @@ fn test_autosquash_prefixes() {
     // ensures that even if a user creates these commits manually or via other
     // tools, GHerrit will catch them before they reach the remote.
 
-    let ctx = TestContext::init_and_install_hooks();
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial"]);
+    let ctx = testutil::test_context!().build();
 
     let prefixes = ["fixup!", "squash!", "amend!"];
-
     for prefix in prefixes {
         // Create a new branch for each prefix test to ensure clean state
         let branch_name = format!("feature-{}", prefix.replace("!", ""));
         ctx.run_git(&["checkout", "-b", &branch_name, "main"]);
 
         // Normal commit
-        ctx.run_git(&["commit", "--allow-empty", "-m", "Work in progress"]);
+        ctx.commit("Work in progress");
 
         // Prefix commit
-        ctx.run_git(&[
-            "commit",
-            "--allow-empty",
-            "-m",
-            &format!("{} Work in progress", prefix),
-        ]);
+        ctx.commit(&format!("{} Work in progress", prefix));
 
         let output = ctx.gherrit().args(["hook", "pre-push"]).assert();
         assert_autosquash_error(output, "origin", "main");
@@ -68,19 +59,17 @@ fn test_buried_autosquash_commit() {
     //
     // Even though HEAD (Commit C) is clean, the push includes Commit B, so it
     // must fail.
-    let ctx = TestContext::init_and_install_hooks();
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial"]);
-
-    ctx.run_git(&["checkout", "-b", "feature-buried"]);
+    let ctx = testutil::test_context!().build();
+    ctx.checkout_new("feature-buried");
 
     // 1. Commit A
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit A"]);
+    ctx.commit("Commit A");
 
     // 2. Commit B (Dirty)
-    ctx.run_git(&["commit", "--allow-empty", "-m", "fixup! Commit A"]);
+    ctx.commit("fixup! Commit A");
 
     // 3. Commit C (Normal)
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit C"]);
+    ctx.commit("Commit C");
 
     let output = ctx.gherrit().args(["hook", "pre-push"]).assert();
     assert_autosquash_error(output, "origin", "main");
@@ -96,15 +85,14 @@ fn test_precedence_over_trailer_check() {
     // definition temporary/incomplete, so it doesn't matter if it has a valid
     // ID or not.
 
-    let ctx = TestContext::init_and_install_hooks();
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial"]);
-    ctx.run_git(&["checkout", "-b", "feature-precedence"]);
+    let ctx = testutil::test_context!().build();
+    ctx.checkout_new("feature-precedence");
 
     // Create a fixup commit that ALSO has a valid trailer. Normally, a trailer
     // makes a commit valid for Gherrit. But 'fixup!' should still block it
     // because it's considered "work in progress/to be squashed".
     let msg = "fixup! Some feature\n\ngherrit-pr-id: G12345";
-    ctx.run_git(&["commit", "--allow-empty", "-m", msg]);
+    ctx.commit(msg);
 
     let output = ctx.gherrit().args(["hook", "pre-push"]).assert();
 
@@ -130,7 +118,7 @@ fn test_dynamic_remote_and_branch_suggestion() {
     //
     //   git rebase -i --autosquash upstream/master
 
-    let ctx = TestContext::init();
+    let ctx = testutil::test_context_minimal!().build();
 
     // Configure default branch to be 'master' to test dynamic branch name
     // detection.
@@ -150,7 +138,7 @@ fn test_dynamic_remote_and_branch_suggestion() {
     // generation just calls `default_remote_name`. However, `gherrit` manages
     // `origin` by default. We need to tell it to use `upstream`.
     let upstream_path = ctx.dir.path().join("upstream.git");
-    common::init_git_bare_repo(&upstream_path);
+    testutil::init_git_bare_repo(&upstream_path);
     ctx.run_git(&["remote", "add", "upstream", upstream_path.to_str().unwrap()]);
 
     // Configure gherrit to use upstream
@@ -159,11 +147,11 @@ fn test_dynamic_remote_and_branch_suggestion() {
     // Install hooks manually since we didn't use init_and_install_hooks
     ctx.install_hooks();
 
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial"]);
-    ctx.run_git(&["checkout", "-b", "feature-dynamic"]);
+    ctx.commit("Initial commit");
+    ctx.checkout_new("feature-dynamic");
 
     // Create fixup
-    ctx.run_git(&["commit", "--allow-empty", "-m", "fixup! Work"]);
+    ctx.commit("fixup! Work");
 
     let output = ctx.gherrit().args(["hook", "pre-push"]).assert();
 
@@ -174,14 +162,13 @@ fn test_dynamic_remote_and_branch_suggestion() {
 fn test_valid_stack_passes() {
     // Control group test: standard, valid commits should pass without issues.
 
-    let ctx = TestContext::init_and_install_hooks();
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Initial"]);
-    ctx.run_git(&["checkout", "-b", "feature-valid"]);
+    let ctx = testutil::test_context!().build();
+    ctx.checkout_new("feature-valid");
 
     // Stack of 3 normal commits
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit A"]);
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit B"]);
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Commit C"]);
+    ctx.commit("Commit A");
+    ctx.commit("Commit B");
+    ctx.commit("Commit C");
 
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 }
