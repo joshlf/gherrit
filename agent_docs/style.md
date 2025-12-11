@@ -2,6 +2,18 @@
 
 This document covers code style and formatting guidelines for the project.
 
+## Format Strings
+
+Always prefer inline format string arguments over out-of-line arguments:
+
+```rust
+// BAD
+println!("Hello, {}!", world);
+
+// GOOD
+println!("Hello, {world}!");
+```
+
 ## Formatting
 
 Maintain consistent formatting by using `cargo fmt`.
