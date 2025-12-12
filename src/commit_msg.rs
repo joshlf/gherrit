@@ -21,7 +21,10 @@
 use std::fs;
 use std::path::Path;
 
-use crate::{cmd, util};
+use crate::{
+    cmd,
+    util::{self, CommandExt as _},
+};
 use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
 
@@ -100,6 +103,6 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
         "gherrit-pr-id: G{random_hash}",
         msg_file
     )
-    .status()?;
+    .success()?;
     Ok(())
 }

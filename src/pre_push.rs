@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cmd, re,
-    util::{self, HeadState},
+    util::{self, CommandExt as _, HeadState},
 };
 use eyre::{Context, Result, bail, eyre};
 use owo_colors::OwoColorize;
@@ -700,7 +700,7 @@ fn edit_gh_pr(state: &PrState, new_base: &str, new_title: &str, new_body: &str) 
         log::info!("PR #{pr_num} is up to date: {pr_url}");
     } else {
         log::debug!("Updating PR #{pr_num}...");
-        util::cmd("gh", args).stdout(Stdio::null()).status()?;
+        util::cmd("gh", args).stdout(Stdio::null()).success()?;
         log::info!("Updated PR #{pr_num}: {pr_url}");
     }
 

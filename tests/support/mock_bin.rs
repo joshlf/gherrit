@@ -143,6 +143,10 @@ fn handle_gh(args: &[String]) {
             }
             Some("edit") => {
                 // usage: gh pr edit <number> ...
+                if env::var("FAIL_GH_EDIT").is_ok() {
+                    eprintln!("Simulated failure for gh pr edit");
+                    std::process::exit(1);
+                }
                 if let Some(id_or_url) = args.get(3) {
                     let target_number = if let Ok(num) = id_or_url.parse::<usize>() {
                         Some(num)
