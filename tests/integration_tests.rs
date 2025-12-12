@@ -937,7 +937,6 @@ fn test_post_checkout_drift_detection() {
     let ctx = testutil::test_context!().build();
 
     // Condition A: Shared Branch Drift (Unmanaged vs Upstream Config)
-    // HEAD Logic: None -> Unmanaged is silent. No warning.
     ctx.run_git(&["checkout", "main"]);
     ctx.run_git(&["update-ref", "refs/remotes/origin/drift-shared", "HEAD"]);
 
