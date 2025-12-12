@@ -21,7 +21,6 @@
 use std::fs;
 use std::path::Path;
 
-use crate::manage::State;
 use crate::{cmd, util};
 use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
@@ -35,16 +34,15 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
         bail!("File does not exist: {}", msg_path.display().red().bold());
     }
 
-    // Get current branch (Supporting Rebase)
+    // Get current branch (supporting rebase)
     let Some(branch_name) = repo.current_branch().name() else {
         log::debug!("Could not determine branch name (detached head?). Skipping.");
         return Ok(());
     };
 
-    // Check if managed – bail if unmanaged.
-    match State::read_from(repo, branch_name).wrap_err("Failed to get config")? {
-        State::Unmanaged => return Ok(()),
-        State::Private | State::Public => {} // Proceed
+    if !repo.is_managed(branch_name)? {
+        log::warn!("Branch {} is not managed. Skipping.", branch_name.yellow());
+        return Ok(());
     }
 
     // Skip temporary squash commits (e.g. from `git commit --squash`) to
