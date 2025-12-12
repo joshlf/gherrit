@@ -68,7 +68,19 @@ fn main() {
     }
 }
 
+fn try_simulate_failure(command: &str, args: &[String]) {
+    let Some(subcommand) = args.get(1) else {
+        return;
+    };
+    if env::var("MOCK_BIN_FAIL_CMD").is_ok_and(|t| t == format!("{}:{}", command, subcommand)) {
+        eprintln!("Simulated failure for {} {}", command, subcommand);
+        std::process::exit(1);
+    }
+}
+
 fn handle_git(args: &[String]) {
+    try_simulate_failure("git", args);
+
     // Spy on "push" but pass through to real git
     if args.contains(&"push".to_string()) {
         // Parse refspecs (args that look like refs or have colons)
@@ -104,6 +116,8 @@ fn handle_git(args: &[String]) {
 }
 
 fn handle_gh(args: &[String]) {
+    try_simulate_failure("gh", &args[1..]);
+
     // args[0] is program name, args[1] is subcommand (e.g., "pr")
     let subcmd = args.get(1).map(|s| s.as_str());
     if let Some("pr") = subcmd {

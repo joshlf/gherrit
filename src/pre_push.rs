@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cmd, re,
-    util::{self, HeadState},
+    util::{self, CommandExt as _, HeadState},
 };
 use eyre::{Context, Result, bail, eyre};
 use owo_colors::OwoColorize;
@@ -279,7 +279,7 @@ fn get_remote_branch_states(
         let mut args = vec!["ls-remote".to_string(), repo.default_remote_name()];
         args.extend(chunk.iter().map(|id| format!("refs/heads/{id}")));
 
-        let output = util::cmd("git", args).output()?;
+        let output = util::cmd("git", args).checked_output()?;
         let output = core::str::from_utf8(&output.stdout)?;
 
         for line in output.lines() {
@@ -443,7 +443,7 @@ fn sync_prs(
     latest_versions: HashMap<String, usize>,
 ) -> Result<()> {
     let pr_list =
-        cmd!("gh pr list --json number,headRefName,url,title,body,baseRefName").output()?;
+        cmd!("gh pr list --json number,headRefName,url,title,body,baseRefName").checked_output()?;
 
     #[derive(Serialize, Deserialize, Debug)]
     #[serde(rename_all = "camelCase")]
@@ -661,7 +661,7 @@ fn create_gh_pr(
         body,
     )
     .stderr(Stdio::inherit())
-    .output()?;
+    .checked_output()?;
 
     let output = core::str::from_utf8(&output.stdout)?;
     let re = re!(r"https://github.com/[a-zA-Z0-9\-_\.]+/[a-zA-Z0-9\-_\.]+/pull/([0-9]+)");
@@ -700,7 +700,7 @@ fn edit_gh_pr(state: &PrState, new_base: &str, new_title: &str, new_body: &str) 
         log::info!("PR #{pr_num} is up to date: {pr_url}");
     } else {
         log::debug!("Updating PR #{pr_num}...");
-        util::cmd("gh", args).stdout(Stdio::null()).status()?;
+        util::cmd("gh", args).stdout(Stdio::null()).success()?;
         log::info!("Updated PR #{pr_num}: {pr_url}");
     }
 

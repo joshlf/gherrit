@@ -324,6 +324,7 @@ fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
 
 pub trait CommandExt {
     fn success(&mut self) -> Result<()>;
+    fn checked_output(&mut self) -> Result<std::process::Output>;
 }
 
 impl CommandExt for Command {
@@ -333,6 +334,18 @@ impl CommandExt for Command {
             bail!("Command failed with status: {}", status);
         }
         Ok(())
+    }
+
+    fn checked_output(&mut self) -> Result<std::process::Output> {
+        let output = self.output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "Command {self:?} failed with status: {}. Stderr: {stderr}",
+                output.status,
+            );
+        }
+        Ok(output)
     }
 }
 

@@ -21,7 +21,10 @@
 use std::fs;
 use std::path::Path;
 
-use crate::{cmd, util};
+use crate::{
+    cmd,
+    util::{self, CommandExt as _},
+};
 use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
 
@@ -61,7 +64,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     // Calculate Change-ID
     // Construct the input: "Ident\nRefHash\nMsgContent"
     let input_data = {
-        let committer_ident = cmd!("git var GIT_COMMITTER_IDENT").output()?;
+        let committer_ident = cmd!("git var GIT_COMMITTER_IDENT").checked_output()?;
         let committer_ident = String::from_utf8_lossy(committer_ident.stdout.as_slice())
             .trim()
             .to_string();
@@ -84,7 +87,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     let random_hash = object_id.to_string();
 
     // Check if trailer exists
-    let output = cmd!("git interpret-trailers --parse", msg_file).output()?;
+    let output = cmd!("git interpret-trailers --parse", msg_file).checked_output()?;
     let trailers = String::from_utf8_lossy(&output.stdout);
 
     let re = crate::re!(r"^gherrit-pr-id: .*");
@@ -100,6 +103,6 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
         "gherrit-pr-id: G{random_hash}",
         msg_file
     )
-    .status()?;
+    .success()?;
     Ok(())
 }
