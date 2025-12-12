@@ -72,6 +72,8 @@ impl BranchConfig {
 
 /// Configures the Git branch state for GHerrit management.
 pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()> {
+    use State::*;
+
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) | HeadState::Pending(bn) => bn,
@@ -84,56 +86,98 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
 
     // Step 1: Determine Old Context and Expectation
     let old_state = State::read_from(repo, branch_name)?;
-    let expected_old_config = BranchConfig::expected(old_state, branch_name, &default_remote);
 
-    // Step 2: Check for Drift
-    let current_config = BranchConfig::read_from(repo, branch_name)?;
-    if current_config != expected_old_config {
-        log::warn!(
-            "Configuration drift detected for branch {}.",
-            branch_name.yellow()
-        );
-        let (article, state) = match old_state {
-            Some(State::Unmanaged) | None => ("an", "unmanaged"),
-            Some(State::Private) => ("a", "private"),
-            Some(State::Public) => ("a", "public"),
-        };
-        log::warn!(
-            "The current git configuration does not match the expected state for {article} {} branch.",
-            state.yellow(),
-        );
-
-        let check_diff = |key: &str, current: &Option<String>, expected: &Option<String>| {
-            if current != expected {
-                let curr_s = current.as_deref().unwrap_or("<unset>");
-                let exp_s = expected.as_deref().unwrap_or("<unset>");
-                log::warn!(
-                    "  - {key}: current='{}', expected='{}'",
-                    curr_s.yellow(),
-                    exp_s.yellow()
-                );
-            }
-        };
-
-        check_diff(
-            "pushRemote",
-            &current_config.push_remote,
-            &expected_old_config.push_remote,
-        );
-        check_diff(
-            "remote",
-            &current_config.remote,
-            &expected_old_config.remote,
-        );
-        check_diff("merge", &current_config.merge, &expected_old_config.merge);
-
-        if force {
-            log::warn!("Overwriting manual changes (--force).");
-        } else {
-            log::warn!("Use --force to overwrite manual changes.");
+    let current_config = match (old_state, new_state) {
+        (Some(Unmanaged), Unmanaged) => {
+            log::debug!(
+                "Branch {} is already in the desired state ({new_state:?}).",
+                branch_name.yellow(),
+            );
             return Ok(());
         }
-    }
+        // This transition just has the effect of clarifying the user's intent
+        // to unmanage the branch. It doesn't change the state, and so we leave
+        // configuration values unchanged. Any configuration values that are set
+        // represent custom configuration (since GHerrit doesn't set any values
+        // in the unmanaged state), and will be detected if the user ever
+        // attempts to transition to a managed state.
+        (None, Unmanaged) => BranchConfig::read_from(repo, branch_name)?,
+        // This transition will clobber (when transitioning to a managed state)
+        // or delete (when transitioning to an unmanaged state) any custom
+        // configuration values that the user has set. We include `X -> X`
+        // transitions here (where `X = Private | Public`) because the user may
+        // perform `gherrit manage --force` in order to *keep* the current
+        // management state but forceably clobber any custom configuration
+        // values.
+        //
+        // Note a subtlety: This check will reject configuration values that are
+        // unexpected for the *current* state but are correct for the *new*
+        // state. This may seem surprising, but it is important: If we allowed
+        // this transition, GHerrit would effectively "adopt" ownership of the
+        // user's custom configuration values since it would go from them being
+        // *unexpected* to *expected*. Thus, on any *subsequent* transition,
+        // GHerrit would think it owned them, and would clobber them as it saw
+        // fit.
+        (Some(Unmanaged) | None, Private | Public)
+        | (Some(Private), Unmanaged | Public | Private)
+        | (Some(Public), Unmanaged | Private | Public) => {
+            let current_config = BranchConfig::read_from(repo, branch_name)?;
+            let expected_old_config =
+                BranchConfig::expected(old_state, branch_name, &default_remote);
+            if current_config != expected_old_config {
+                // FIXME(#219): Add the ability to save the user's custom
+                // configuration so it can be restored during a subsequent
+                // `gherrit unmanage`.
+                log::warn!(
+                    "Configuration drift detected for branch {}.",
+                    branch_name.yellow()
+                );
+                let (article, state) = match old_state {
+                    Some(State::Unmanaged) | None => ("an", "unmanaged"),
+                    Some(State::Private) => ("a", "private"),
+                    Some(State::Public) => ("a", "public"),
+                };
+                log::warn!(
+                    "The current git configuration does not match the expected state for {article} {} branch.",
+                    state.yellow(),
+                );
+
+                let check_diff =
+                    |key: &str, current: &Option<String>, expected: &Option<String>| {
+                        if current != expected {
+                            let curr_s = current.as_deref().unwrap_or("<unset>");
+                            let exp_s = expected.as_deref().unwrap_or("<unset>");
+                            log::warn!(
+                                "  - {key}: current='{}', expected='{}'",
+                                curr_s.yellow(),
+                                exp_s.yellow()
+                            );
+                        }
+                    };
+
+                check_diff(
+                    "pushRemote",
+                    &current_config.push_remote,
+                    &expected_old_config.push_remote,
+                );
+                check_diff(
+                    "remote",
+                    &current_config.remote,
+                    &expected_old_config.remote,
+                );
+                check_diff("merge", &current_config.merge, &expected_old_config.merge);
+
+                if force {
+                    log::warn!("Overwriting manual changes (--force).");
+                } else {
+                    log::warn!("Use --force to overwrite manual changes.");
+                    return Ok(());
+                }
+            }
+
+            current_config
+        }
+    };
 
     // Step 3: Apply New State
     let key = |suffix: &str| format!("branch.{branch_name}.{suffix}");
@@ -144,23 +188,29 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
     };
     cmd!("git config", key("gherritManaged"), state_val).status()?;
 
-    let new_config = BranchConfig::expected(Some(new_state), branch_name, &default_remote);
-
-    let apply_config = |k: String, v: Option<String>| -> Result<()> {
-        if let Some(val) = v {
-            cmd!("git config", k, val).status()?;
-        } else {
-            // Only unset if it is currently set to avoid error
-            if repo.config_string(&k)?.is_some() {
-                cmd!("git config --unset", k).status()?;
+    let apply_config = |k: String, old: Option<String>, new: Option<String>| -> Result<()> {
+        use crate::util::CommandExt as _;
+        match (old, new) {
+            (old, Some(new)) => {
+                if old.as_ref() != Some(&new) {
+                    cmd!("git config", k, new).success()
+                } else {
+                    Ok(())
+                }
             }
+            (Some(_), None) => cmd!("git config --unset", k).success(),
+            (None, None) => Ok(()),
         }
-        Ok(())
     };
 
-    apply_config(key("pushRemote"), new_config.push_remote)?;
-    apply_config(key("remote"), new_config.remote)?;
-    apply_config(key("merge"), new_config.merge)?;
+    let new_config = BranchConfig::expected(Some(new_state), branch_name, &default_remote);
+    apply_config(
+        key("pushRemote"),
+        current_config.push_remote,
+        new_config.push_remote,
+    )?;
+    apply_config(key("remote"), current_config.remote, new_config.remote)?;
+    apply_config(key("merge"), current_config.merge, new_config.merge)?;
 
     let branch_name_yellow = branch_name.yellow();
     match new_state {

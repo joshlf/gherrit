@@ -175,7 +175,8 @@ fn test_post_checkout_hook() {
     ctx.git()
         .args(["config", "branch.collab-feature.gherritManaged"])
         .assert()
-        .failure();
+        .success()
+        .stdout("false\n");
 }
 
 #[test]
@@ -936,6 +937,7 @@ fn test_post_checkout_drift_detection() {
     let ctx = testutil::test_context!().build();
 
     // Condition A: Shared Branch Drift (Unmanaged vs Upstream Config)
+    // HEAD Logic: None -> Unmanaged is silent. No warning.
     ctx.run_git(&["checkout", "main"]);
     ctx.run_git(&["update-ref", "refs/remotes/origin/drift-shared", "HEAD"]);
 
@@ -953,10 +955,9 @@ fn test_post_checkout_drift_detection() {
         .success();
     let stderr = std::str::from_utf8(&assert.get_output().stderr).unwrap();
     assert!(
-        stderr.contains("Configuration drift detected"),
-        "Expected drift warning for shared branch"
+        !stderr.contains("Configuration drift detected"),
+        "Expected NO drift warning for shared branch (silent unmanage)"
     );
-    assert!(stderr.contains("- remote: current='origin', expected='<unset>'"));
 
     // Condition B: New Stack Drift (Private vs Pre-existing Config)
     ctx.run_git(&["checkout", "main"]);

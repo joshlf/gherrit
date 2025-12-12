@@ -309,6 +309,25 @@ fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     Ok(HeadState::Detached)
 }
 
+pub trait CommandExt {
+    fn success(&mut self) -> Result<()>;
+}
+
+impl CommandExt for Command {
+    fn success(&mut self) -> Result<()> {
+        self.status()
+            .map(|s| {
+                if s.success() {
+                    Ok(())
+                } else {
+                    Err(eyre::eyre!("Command failed with status: {}", s))
+                }
+            })
+            .map_err(Into::into)
+            .flatten()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
