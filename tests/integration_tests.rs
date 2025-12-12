@@ -1,5 +1,3 @@
-// TODO: Review changes to this file.
-
 const MANAGED_PRIVATE: &str = "managedPrivate";
 const MANAGED_PUBLIC: &str = "managedPublic";
 
@@ -933,7 +931,6 @@ fn test_manage_invalid_config() {
     assert!(stderr.contains("bad-value"));
 }
 
-// TODO: Hmmmm, some of this seems not like the behavior we want...
 #[test]
 fn test_post_checkout_drift_detection() {
     let ctx = testutil::test_context!().build();
@@ -959,7 +956,6 @@ fn test_post_checkout_drift_detection() {
         stderr.contains("Configuration drift detected"),
         "Expected drift warning for shared branch"
     );
-    // TODO: Shouldn't we cleanly handle this case?
     assert!(stderr.contains("- remote: current='origin', expected='<unset>'"));
 
     // Condition B: New Stack Drift (Private vs Pre-existing Config)

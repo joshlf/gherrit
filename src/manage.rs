@@ -15,14 +15,13 @@ impl State {
     const PRIVATE: &str = "managedPrivate";
     const PUBLIC: &str = "managedPublic";
 
-    // TODO: Have this return `Result<Option<State>>`
-    pub fn read_from(repo: &util::Repo, branch_name: &str) -> Result<State> {
+    pub fn read_from(repo: &util::Repo, branch_name: &str) -> Result<Option<State>> {
         let key = format!("branch.{}.gherritManaged", branch_name);
         match repo.config_string(&key)?.as_deref() {
-            Some(State::PUBLIC) => Ok(State::Public),
-            Some(State::PRIVATE) => Ok(State::Private),
-            // TODO: For `None`, return `Ok(None)`
-            Some(State::UNMANAGED) | None => Ok(State::Unmanaged),
+            Some(State::PUBLIC) => Ok(Some(State::Public)),
+            Some(State::PRIVATE) => Ok(Some(State::Private)),
+            Some(State::UNMANAGED) => Ok(Some(State::Unmanaged)),
+            None => Ok(None),
             Some(unknown) => bail!(
                 "Invalid gherritManaged value: {}. Expected {}, {}, or {}.",
                 unknown.yellow(),
@@ -42,22 +41,21 @@ struct BranchConfig {
 }
 
 impl BranchConfig {
-    fn expected(state: State, branch_name: &str, default_remote: &str) -> BranchConfig {
+    fn expected(state: Option<State>, branch_name: &str, default_remote: &str) -> BranchConfig {
         let self_merge_ref = format!("refs/heads/{branch_name}");
-
         BranchConfig {
             push_remote: match state {
-                State::Unmanaged => None,
-                State::Private => Some(".".to_string()),
-                State::Public => Some(default_remote.to_string()),
+                Some(State::Unmanaged) | None => None,
+                Some(State::Private) => Some(".".to_string()),
+                Some(State::Public) => Some(default_remote.to_string()),
             },
             remote: match state {
-                State::Unmanaged => None,
-                State::Private | State::Public => Some(".".to_string()),
+                Some(State::Unmanaged) | None => None,
+                Some(State::Private | State::Public) => Some(".".to_string()),
             },
             merge: match state {
-                State::Unmanaged => None,
-                State::Private | State::Public => Some(self_merge_ref),
+                Some(State::Unmanaged) | None => None,
+                Some(State::Private | State::Public) => Some(self_merge_ref),
             },
         }
     }
@@ -96,9 +94,9 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
             branch_name.yellow()
         );
         let (article, state) = match old_state {
-            State::Unmanaged => ("an", "unmanaged"),
-            State::Private => ("a", "private"),
-            State::Public => ("a", "public"),
+            Some(State::Unmanaged) | None => ("an", "unmanaged"),
+            Some(State::Private) => ("a", "private"),
+            Some(State::Public) => ("a", "public"),
         };
         log::warn!(
             "The current git configuration does not match the expected state for {article} {} branch.",
@@ -146,7 +144,7 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
     };
     cmd!("git config", key("gherritManaged"), state_val).status()?;
 
-    let new_config = BranchConfig::expected(new_state, branch_name, &default_remote);
+    let new_config = BranchConfig::expected(Some(new_state), branch_name, &default_remote);
 
     let apply_config = |k: String, v: Option<String>| -> Result<()> {
         if let Some(val) = v {
@@ -211,9 +209,9 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
     let current_state =
         State::read_from(repo, branch_name).wrap_err("Failed to parse gherritState")?;
     let state_str = match current_state {
-        State::Unmanaged => None,
-        State::Private => Some("private"),
-        State::Public => Some("public"),
+        Some(State::Unmanaged) | None => None,
+        Some(State::Private) => Some("private"),
+        Some(State::Public) => Some("public"),
     };
     if let Some(state) = state_str {
         log::debug!(

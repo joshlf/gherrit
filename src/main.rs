@@ -147,9 +147,9 @@ fn run() -> Result<()> {
 
                 // If no flag provided, preserve current state (enforcing config) or default to private.
                 match State::read_from(&repo, branch_name)? {
-                    State::Public => State::Public,
-                    State::Private => State::Private,
-                    State::Unmanaged => State::Private,
+                    Some(State::Public) => State::Public,
+                    Some(State::Private) => State::Private,
+                    Some(State::Unmanaged) | None => State::Private,
                 }
             };
             manage::set_state(&repo, target_state, force)?
