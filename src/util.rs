@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::process::Command;
 
-use eyre::{OptionExt, Result, bail};
+use eyre::{OptionExt, Result, WrapErr, bail};
 use gix::bstr::ByteSlice;
 use gix::state::InProgress;
 
@@ -351,6 +351,8 @@ impl CommandExt for Command {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     #[should_panic(expected = "Command cannot be empty")]
     fn test_cmd_macro_empty_panic() {
@@ -362,4 +364,77 @@ mod tests {
     fn test_cmd_macro_whitespace_panic() {
         cmd!("   ");
     }
+
+    #[test]
+    fn test_get_repo_owner_name() {
+        assert_eq!(
+            get_repo_owner_name("https://github.com/owner/repo.git").unwrap(),
+            ("owner".to_string(), "repo".to_string())
+        );
+        assert_eq!(
+            get_repo_owner_name("https://github.com/owner/repo").unwrap(),
+            ("owner".to_string(), "repo".to_string())
+        );
+        assert_eq!(
+            get_repo_owner_name("git@github.com:owner/repo.git").unwrap(),
+            ("owner".to_string(), "repo".to_string())
+        );
+        assert_eq!(
+            get_repo_owner_name("git@github.com:owner/repo").unwrap(),
+            ("owner".to_string(), "repo".to_string())
+        );
+    }
+}
+
+pub fn get_github_token() -> Result<String> {
+    // Priority 1: GITHUB_TOKEN env var
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        return Ok(token);
+    }
+
+    // Priority 2: gh auth token
+    let output = Command::new("gh")
+        .arg("auth")
+        .arg("token")
+        .output()
+        .wrap_err("Failed to run `gh auth token`")?;
+
+    if output.status.success() {
+        let token = String::from_utf8(output.stdout)?.trim().to_string();
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+
+    bail!(
+        "Could not find GitHub token. Please set GITHUB_TOKEN environment variable or login via `gh auth login`."
+    )
+}
+
+pub fn get_repo_owner_name(remote_url: &str) -> Result<(String, String)> {
+    // Supports:
+    // https://github.com/owner/repo.git
+    // git@github.com:owner/repo.git
+
+    let parts: Vec<&str> = if remote_url.starts_with("https://") {
+        remote_url
+            .trim_start_matches("https://github.com/")
+            .trim_end_matches(".git")
+            .split('/')
+            .collect()
+    } else if remote_url.starts_with("git@") {
+        remote_url
+            .trim_start_matches("git@github.com:")
+            .trim_end_matches(".git")
+            .split('/')
+            .collect()
+    } else {
+        bail!("Unsupported remote URL format: {}", remote_url);
+    };
+
+    if parts.len() != 2 {
+        bail!("Could not parse owner and repo from URL: {}", remote_url);
+    }
+
+    Ok((parts[0].to_string(), parts[1].to_string()))
 }
