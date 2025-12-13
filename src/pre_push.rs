@@ -1,18 +1,19 @@
 use core::str;
 use std::{collections::HashMap, process::Stdio, time::Instant};
 
+use color_eyre::eyre::{Context, Result, bail, eyre};
 use gix::{ObjectId, reference::Category, refs::transaction::PreviousValue};
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use itertools::Itertools;
+use octocrab::Octocrab;
+use owo_colors::OwoColorize;
+use serde_json::json;
 
 use crate::{
-    cmd, re,
-    util::{self, CommandExt as _, HeadState},
+    re,
+    util::{self, CommandExt as _, HeadState, Remote},
 };
-use eyre::{Context, Result, bail, eyre};
-use owo_colors::OwoColorize;
 
-pub fn run(repo: &util::Repo) -> Result<()> {
+pub async fn run(repo: &util::Repo) -> Result<()> {
     let t0 = Instant::now();
 
     let branch_name = repo.current_branch();
@@ -53,8 +54,22 @@ pub fn run(repo: &util::Repo) -> Result<()> {
     }
 
     let latest_versions = push_to_origin(repo, &commits)?;
+    let token = util::get_github_token()?;
+    let mut builder = Octocrab::builder().personal_token(token);
 
-    sync_prs(repo, branch_name, commits, latest_versions)
+    // NOTE: It would be very dangerous to support this in production, as an
+    // attacker could use it to steal a user's GitHub API token. Thus, we only
+    // support it in testing.
+    if util::__TESTING
+        && let Ok(api_url) = std::env::var("GHERRIT_GITHUB_API_URL")
+    {
+        log::warn!("Using custom GitHub API URL: {}", api_url);
+        builder = builder.base_uri(api_url)?;
+    }
+
+    let octocrab = builder.build()?;
+
+    sync_prs(repo, &octocrab, branch_name, commits, latest_versions).await
 }
 
 fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
@@ -436,40 +451,37 @@ fn generate_pr_body(
     )
 }
 
-fn sync_prs(
+/// Syncs the local stack of commits with GitHub Pull Requests.
+///
+/// This function:
+/// 1. Finds existing PRs or creates new ones for new commits.
+/// 2. Updates PR metadata (title, body, base branch) to match the local stack.
+/// 3. Updates are queued and executed in batches to optimize performance.
+async fn sync_prs(
     repo: &util::Repo,
+    octocrab: &Octocrab,
     branch_name: &str,
     commits: Vec<Commit>,
     latest_versions: HashMap<String, usize>,
 ) -> Result<()> {
-    let pr_list =
-        cmd!("gh pr list --json number,headRefName,url,title,body,baseRefName").checked_output()?;
+    let remote = repo.default_remote()?;
 
-    #[derive(Serialize, Deserialize, Debug)]
-    #[serde(rename_all = "camelCase")]
-    struct ListEntry {
-        head_ref_name: String,
-        number: usize,
-        url: String,
-        title: String,
-        body: String,
-        base_ref_name: String,
-    }
+    // FIXME: Filter so that we only fetch PRs which correspond to commits in
+    // this stack.
+    let prs_page = octocrab
+        .pulls(&remote.owner, &remote.repo_name)
+        .list()
+        .state(octocrab::params::State::Open)
+        .per_page(100)
+        .send()
+        .await?;
 
-    let prs: Vec<ListEntry> = if pr_list.stdout.is_empty() {
-        vec![]
-    } else {
-        match serde_json::from_slice(&pr_list.stdout) {
-            Ok(prs) => prs,
-            Err(err) => {
-                let mut error = format!("failed to parse `gh` command output: {err}");
-                if let Ok(stdout) = str::from_utf8(&pr_list.stdout) {
-                    error += &format!("\ncommand output (verbatim):\n{stdout}");
-                }
-                bail!(error);
-            }
-        }
-    };
+    // FIXME: Consider processing pages in parallel if it provides a performance
+    // benefit.
+    let prs = octocrab
+        .all_pages(prs_page)
+        .await
+        .wrap_err("Failed to fetch open PRs")?;
 
     let commits = commits
         .into_iter()
@@ -480,67 +492,115 @@ fn sync_prs(
         })
         .collect::<Vec<_>>();
 
-    let commits = commits
-        .into_par_iter()
-        .map(move |(c, parent_branch)| -> Result<_> {
-            let pr_info = prs.iter().find(|pr| pr.head_ref_name == c.gherrit_id);
+    #[derive(Debug, Clone)]
+    struct PrState {
+        number: u64,
+        node_id: String,
 
-            let pr_state = if let Some(pr) = pr_info {
+        // NOTE: We store the title, body, and base branch in two cases:
+        // - For existing PRs, we store them based on the current state.
+        // - For new PRs, we store them based on their initial state that we
+        //   create them in.
+        //
+        // This allows us to avoid unnecessary updates by only updating PRs when
+        // their state has changed. Created PRs are probably guaranteed to need
+        // updating after creation, but it's simpler to unify the logic so we
+        // don't need to special-case them.
+        title: Option<String>,
+        body: Option<String>,
+        base_branch: String,
+    }
+
+    enum PrResolution {
+        Existing(PrState),
+        ToCreate(BatchCreate),
+    }
+
+    // 1. Identify existing PRs or queue for creation
+    let resolutions: Vec<_> = commits
+        .iter()
+        .map(|(c, parent_branch)| {
+            let pr_info = prs.iter().find(|pr| pr.head.ref_field == c.gherrit_id);
+
+            if let Some(pr) = pr_info {
                 log::debug!(
                     "Found existing PR #{} for {}",
                     pr.number.green().bold(),
                     c.gherrit_id
                 );
-                PrState {
+                Ok(PrResolution::Existing(PrState {
                     number: pr.number,
-                    url: pr.url.clone(),
+                    node_id: pr
+                        .node_id
+                        .clone()
+                        .ok_or_else(|| eyre!("Missing GraphQL node ID for PR #{}", pr.number))?,
                     title: pr.title.clone(),
                     body: pr.body.clone(),
-                    base: pr.base_ref_name.clone(),
-                }
+                    base_branch: pr.base.ref_field.clone(),
+                }))
             } else {
-                log::debug!("No GitHub PR exists for {}; creating one...", c.gherrit_id);
-                let (num, url) = create_gh_pr(
-                    &parent_branch,
-                    &c.gherrit_id,
-                    &c.message_title,
-                    &c.message_body,
-                )?;
-
-                log::info!(
-                    "Created PR #{}: {}",
-                    num.green().bold(),
-                    url.blue().underline()
+                log::debug!(
+                    "No GitHub PR exists for {}; queuing creation...",
+                    c.gherrit_id
                 );
-                PrState {
-                    number: num,
-                    url,
+                Ok(PrResolution::ToCreate(BatchCreate {
                     title: c.message_title.clone(),
                     body: c.message_body.clone(),
-                    base: parent_branch.clone(),
-                }
-            };
-
-            Ok((c, parent_branch, pr_state))
+                    base_branch: parent_branch.clone(),
+                    head_branch: c.gherrit_id.clone(),
+                }))
+            }
         })
-        .collect::<Vec<_>>()
-        .into_iter()
         .collect::<Result<Vec<_>>>()?;
 
+    // 2. Batch create missing PRs
+    let creations = resolutions.iter().filter_map(|r| match r {
+        PrResolution::ToCreate(c) => Some(c),
+        _ => None,
+    });
+    let num_creations = creations.clone().count();
+    let new_prs = if num_creations > 0 {
+        log::info!("Creating {num_creations} PRs...");
+        let repo_id = fetch_repo_id(octocrab, &remote).await?;
+        let created = batch_create_prs(octocrab, &repo_id, creations.cloned()).await?;
+        assert_eq!(created.len(), num_creations);
+        log::info!("Created {num_creations} PRs.");
+        created
+    } else {
+        HashMap::new()
+    };
+
+    // 3. Resolve final PR states
+    let mut commit_pr_states = Vec::new();
+
+    // We zip commits with resolutions. Since resolutions were built in order,
+    // they match perfectly.
+    for ((c, parent_branch), resolution) in commits.iter().zip(resolutions) {
+        let pr_state = match resolution {
+            PrResolution::Existing(state) => state,
+            PrResolution::ToCreate(create) => {
+                if let Some((number, url, node_id)) = new_prs.get(&create.head_branch) {
+                    log::info!(
+                        "Created PR #{}: {}",
+                        number.green().bold(),
+                        url.blue().underline()
+                    );
+                    PrState {
+                        number: *number,
+                        node_id: node_id.clone(),
+                        title: Some(create.title),
+                        body: Some(create.body),
+                        base_branch: create.base_branch,
+                    }
+                } else {
+                    bail!("Failed to resolve created PR for {}", create.head_branch);
+                }
+            }
+        };
+        commit_pr_states.push((c, parent_branch, pr_state));
+    }
+
     let is_private = is_private_stack(repo, branch_name);
-
-    // Derive base repo URL safely from the first commit's PR URL.
-    // Since `commits` is not empty (checked at the start of `run`), and
-    // `create_gh_pr` always returns a valid URL, this is safe.
-    let repo_url = commits
-        .first()
-        .map(|(_, _, pr_state)| pr_state.url.split("/pull/").next().unwrap_or(""))
-        .unwrap_or("")
-        .to_string();
-
-    // Attempt to resolve `HEAD` to a branch name so that we can refer to it
-    // in PR bodies. If we can't, then silently fail and just don't include
-    // that information in PR bodies.
     let head_branch_markdown = if !is_private {
         repo.head()
             .ok()
@@ -556,27 +616,26 @@ fn sync_prs(
         "".to_string()
     };
 
-    // A markdown bulleted list of links to each PR, with the "top" PR (the
-    // furthest from `main`) at the top of the list.
-    let gh_pr_ids_markdown = commits
+    let gh_pr_ids_markdown = commit_pr_states
         .iter()
         .rev()
         .map(|(_, _, pr_state)| format!("- #{}", pr_state.number))
         .collect::<Vec<_>>()
         .join("\n");
 
-    commits.par_iter().enumerate().try_for_each(
-        |(i, (c, parent_branch, pr_state))| -> Result<()> {
+    let updates: Vec<BatchUpdate> = commit_pr_states
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (c, parent_branch, pr_state))| {
             let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
 
-            // Determine parent and child IDs
-            let parent_gherrit_id = (i > 0).then(|| commits[i - 1].0.gherrit_id.clone());
-            let child_gherrit_id =
-                (i < commits.len() - 1).then(|| commits[i + 1].0.gherrit_id.clone());
+            let parent_gherrit_id = (i > 0).then(|| commit_pr_states[i - 1].0.gherrit_id.clone());
+            let child_gherrit_id = (i < commit_pr_states.len() - 1)
+                .then(|| commit_pr_states[i + 1].0.gherrit_id.clone());
 
             let body = generate_pr_body(
                 c,
-                &repo_url,
+                &remote.pr_url(pr_state.number),
                 &head_branch_markdown,
                 &gh_pr_ids_markdown,
                 latest_version,
@@ -585,10 +644,51 @@ fn sync_prs(
                 child_gherrit_id.as_deref(),
             );
 
-            edit_gh_pr(pr_state, parent_branch, &c.message_title, &body)?;
-            Ok(())
-        },
-    )?;
+            let pr_num = pr_state.number.green().bold().to_string();
+            let pr_url = remote
+                .pr_url(pr_state.number)
+                .blue()
+                .underline()
+                .to_string();
+
+            let mut changed = false;
+            if pr_state.base_branch != parent_branch.as_str() {
+                changed = true;
+            }
+            if pr_state.title != Some(c.message_title.clone()) {
+                changed = true;
+            }
+            if pr_state
+                .body
+                .as_ref()
+                .map(|b| b.replace("\r\n", "\n").trim() != body.replace("\r\n", "\n").trim())
+                .unwrap_or(true)
+            {
+                changed = true;
+            }
+
+            if changed {
+                log::debug!("Queuing update for PR #{}", pr_num);
+                log::info!("Queued update for PR #{}: {}", pr_num, pr_url);
+                Some(BatchUpdate {
+                    node_id: pr_state.node_id.clone(),
+                    title: c.message_title.clone(),
+                    body: body.clone(),
+                    base_branch: parent_branch.to_string(),
+                })
+            } else {
+                log::info!("PR #{} is up to date: {}", pr_num, pr_url);
+                None
+            }
+        })
+        .collect();
+
+    if !updates.is_empty() {
+        log::info!("Updating batch of {} PRs...", updates.len());
+        batch_update_prs(octocrab, updates).await?;
+        log::info!("Batch update complete.");
+    }
+
     Ok(())
 }
 
@@ -605,15 +705,6 @@ struct Commit {
     gherrit_id: String,
     message_title: String,
     message_body: String,
-}
-
-#[derive(Debug, Clone)]
-struct PrState {
-    number: usize,
-    url: String,
-    title: String,
-    body: String,
-    base: String,
 }
 
 impl TryFrom<gix::Commit<'_>> for Commit {
@@ -644,67 +735,182 @@ impl TryFrom<gix::Commit<'_>> for Commit {
     }
 }
 
-fn create_gh_pr(
-    base_branch: &str,
-    head_branch: &str,
-    title: &str,
-    body: &str,
-) -> Result<(usize, String)> {
-    let output = cmd!(
-        "gh pr create --base",
-        base_branch,
-        "--head",
-        head_branch,
-        "--title",
-        title,
-        "--body",
-        body,
-    )
-    .stderr(Stdio::inherit())
-    .checked_output()?;
+re!(gherrit_pr_id_re, r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$");
 
-    let output = core::str::from_utf8(&output.stdout)?;
-    let re = re!(r"https://github.com/[a-zA-Z0-9\-_\.]+/[a-zA-Z0-9\-_\.]+/pull/([0-9]+)");
-    let captures = re.captures(output).unwrap();
-    let pr_id = captures.get(1).unwrap();
-    let pr_url = output.trim().to_string();
-    Ok((pr_id.as_str().parse()?, pr_url))
+/// A request to update an existing PR in a batch.
+struct BatchUpdate {
+    /// The global Node ID of the Pull Request (required for GraphQL mutations).
+    node_id: String,
+    title: String,
+    body: String,
+    base_branch: String,
 }
 
-fn edit_gh_pr(state: &PrState, new_base: &str, new_title: &str, new_body: &str) -> Result<()> {
-    let pr_num = state.number.to_string();
-    let mut args = vec!["pr", "edit", &pr_num];
-    let mut changed = false;
+/// A request to create a new PR in a batch.
+#[derive(Clone)]
+struct BatchCreate {
+    title: String,
+    body: String,
+    base_branch: String,
+    head_branch: String,
+}
 
-    if state.base != new_base {
-        args.push("--base");
-        args.push(new_base);
-        changed = true;
+/// Fetches the global Repository Node ID for the given owner and repo.
+///
+/// This ID (e.g., "R_kgDOL...") is required for creating PRs via the GraphQL
+/// API, as the `createPullRequest` mutation accepts a `repositoryId` argument,
+/// not owner/name.
+async fn fetch_repo_id(octocrab: &Octocrab, remote: &Remote) -> Result<String> {
+    // NOTE: It's important that we pass `remote.*` as GraphQL variables, not
+    // using string interpolation, as the variables are escaped. Using string
+    // interpolation would risk injection attacks.
+    let query = r#"query RepositoryID($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }"#;
+    let query_body = json!({
+        "query": query,
+        "variables": {
+            "owner": remote.owner,
+            "name": remote.repo_name,
+        }
+    });
+    let response: serde_json::Value = octocrab
+        .graphql(&query_body)
+        .await
+        .wrap_err("Failed to fetch repository ID")?;
+
+    if let Some(errors) = response.get("errors") {
+        log::error!("GraphQL errors: {}", errors);
+        bail!("Failed to fetch repository ID: {:?}", errors);
     }
 
-    if state.title != new_title {
-        args.push("--title");
-        args.push(new_title);
-        changed = true;
-    }
+    let id = response
+        .get("data")
+        .and_then(|d| d.get("repository"))
+        .and_then(|r| r.get("id"))
+        .and_then(|id| id.as_str())
+        .ok_or_else(|| eyre!("Required repository ID not found in response"))?;
 
-    if state.body.replace("\r\n", "\n").trim() != new_body.replace("\r\n", "\n").trim() {
-        args.push("--body");
-        args.push(new_body);
-        changed = true;
-    }
+    Ok(id.to_string())
+}
 
-    let pr_num = state.number.green().bold().to_string();
-    let pr_url = state.url.blue().underline().to_string();
-    if !changed {
-        log::info!("PR #{pr_num} is up to date: {pr_url}");
-    } else {
-        log::debug!("Updating PR #{pr_num}...");
-        util::cmd("gh", args).stdout(Stdio::null()).success()?;
-        log::info!("Updated PR #{pr_num}: {pr_url}");
-    }
+/// Performs batched updates of PRs using GitHub's GraphQL API.
+///
+/// This avoids rate limits and network latency by grouping updates into chunks
+/// (default 50) and sending them as a single GraphQL operation.
+async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<BatchUpdate>) -> Result<()> {
+    run_batched_mutation(
+        octocrab,
+        updates,
+        |update| {
+            let safe_title = json!(update.title);
+            let safe_body = json!(update.body);
+            let safe_base = json!(update.base_branch);
+            format!(
+                "updatePullRequest(input: {{pullRequestId: \"{node_id}\", baseRefName: {safe_base}, title: {safe_title}, body: {safe_body}}}) {{ clientMutationId }}\n",
+                node_id = update.node_id
+            )
+        },
+        |_, _| Ok(()),
+    )
+    .await
+}
 
+/// Performs batched creation of PRs using GitHub's GraphQL API.
+///
+/// This avoids rate limits and network latency by grouping creations into chunks
+/// (default 50) and sending them as a single GraphQL operation.
+///
+/// Returns a map of head branch name -> (number, url, node_id) for the newly
+/// created PRs.
+async fn batch_create_prs(
+    octocrab: &Octocrab,
+    repo_id: &str,
+    creations: impl IntoIterator<Item = BatchCreate>,
+) -> Result<HashMap<String, (u64, String, String)>> {
+    let mut results = HashMap::new();
+    run_batched_mutation(
+        octocrab,
+        creations,
+        |create| {
+            let safe_title = json!(create.title);
+            let safe_body = json!(create.body);
+            let safe_base = json!(create.base_branch);
+            let safe_head = json!(create.head_branch);
+            format!(
+                "createPullRequest(input: {{repositoryId: \"{repo_id}\", headRefName: {safe_head}, baseRefName: {safe_base}, title: {safe_title}, body: {safe_body}}}) {{ pullRequest {{ id number url }} }}\n"
+            )
+        },
+        |create, op_data| {
+            if let Some(pr_data) = op_data.get("pullRequest") {
+                macro_rules! get_field {
+                    ($field:ident, $as:ident $(, $to:ident)?) => {
+                        pr_data
+                            .get(stringify!($field))
+                            .and_then(|s| s.$as())
+                            .ok_or_else(|| eyre!(concat!("Missing ", stringify!($field))))?
+                            $(.$to())?
+                    };
+                }
+
+                results.insert(
+                    create.head_branch.clone(),
+                    (
+                        get_field!(number, as_u64),
+                        get_field!(url, as_str, to_string),
+                        get_field!(id, as_str, to_string),
+                    ),
+                );
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    Ok(results)
+}
+
+/// Executes batched GraphQL mutations.
+///
+/// Iterates over items in chunks of 50, builds a combined mutation string using
+/// `mutation_builder`, and processes the response using `response_handler`.
+async fn run_batched_mutation<T, M, H>(
+    octocrab: &Octocrab,
+    items: impl IntoIterator<Item = T>,
+    mutation_builder: M,
+    mut response_handler: H,
+) -> Result<()>
+where
+    M: Fn(&T) -> String,
+    H: FnMut(&T, &serde_json::Value) -> Result<()>,
+{
+    let alias = |i| format!("op{i}");
+    for chunk in items.into_iter().chunks(50).into_iter() {
+        let chunk: Vec<_> = chunk.collect();
+        let mutation_body: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, item)| format!("{}: {}", alias(i), mutation_builder(item)))
+            .collect();
+
+        let query = format!("mutation {{ {mutation_body} }}");
+        let query_body = json!({ "query": query });
+        let response: serde_json::Value = octocrab
+            .graphql(&query_body)
+            .await
+            .wrap_err("GraphQL batched mutation failed")?;
+
+        if let Some(errors) = response.get("errors") {
+            log::error!("GraphQL errors: {}", errors);
+            bail!("GraphQL errors: {:?}", errors);
+        }
+
+        let data = response
+            .get("data")
+            .ok_or_else(|| eyre!("No data in response"))?;
+
+        for (i, item) in chunk.iter().enumerate() {
+            if let Some(op_data) = data.get(alias(i)) {
+                response_handler(item, op_data)?;
+            }
+        }
+    }
     Ok(())
 }
-
-re!(gherrit_pr_id_re, r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$");
