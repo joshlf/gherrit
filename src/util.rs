@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::process::Command;
 
-use eyre::{OptionExt, Result, bail};
+use eyre::{OptionExt, Result, WrapErr, bail};
 use gix::bstr::ByteSlice;
 use gix::state::InProgress;
 
@@ -349,8 +349,58 @@ impl CommandExt for Command {
     }
 }
 
+pub fn get_github_token() -> Result<String> {
+    // Priority 1: GITHUB_TOKEN env var
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        return Ok(token);
+    }
+
+    // Priority 2: gh auth token
+    let output = Command::new("gh")
+        .arg("auth")
+        .arg("token")
+        .output()
+        .wrap_err("Failed to run `gh auth token`")?;
+
+    if output.status.success() {
+        let token = String::from_utf8(output.stdout)?.trim().to_string();
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+
+    bail!(
+        "Could not find GitHub token. Please set GITHUB_TOKEN environment variable or login via `gh auth login`."
+    )
+}
+
+pub fn get_repo_owner_name(remote_url: &str) -> Result<(String, String)> {
+    if remote_url.starts_with('/') {
+        // Fallback for local tests
+        return Ok(("owner".to_string(), "repo".to_string()));
+    }
+
+    // Supports:
+    // - https://github.com/owner/repo(.git)
+    // - git@github.com:owner/repo(.git)
+    // - alias:owner/repo(.git)
+    let re = re!(
+        r"^(?:https://github\.com/|[^/:]+:)(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?$"
+    );
+
+    if let Some(caps) = re.captures(remote_url) {
+        let owner = caps.name("owner").unwrap().as_str().to_string();
+        let repo = caps.name("repo").unwrap().as_str().to_string();
+        return Ok((owner, repo));
+    }
+
+    bail!("Unsupported remote URL format: {}", remote_url);
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     #[should_panic(expected = "Command cannot be empty")]
     fn test_cmd_macro_empty_panic() {
@@ -361,5 +411,20 @@ mod tests {
     #[should_panic(expected = "Command cannot be empty")]
     fn test_cmd_macro_whitespace_panic() {
         cmd!("   ");
+    }
+
+    #[test]
+    fn test_get_repo_owner_name() {
+        for (url, (owner, repo)) in [
+            ("https://github.com/owner/repo.git", ("owner", "repo")),
+            ("https://github.com/owner/repo", ("owner", "repo")),
+            ("git@github.com:owner/repo.git", ("owner", "repo")),
+            ("git@github.com:owner/repo", ("owner", "repo")),
+            ("alias:owner/repo.git", ("owner", "repo")),
+            ("alias:owner/repo", ("owner", "repo")),
+        ] {
+            let expect = (owner.to_string(), repo.to_string());
+            assert_eq!(get_repo_owner_name(url).unwrap(), expect);
+        }
     }
 }

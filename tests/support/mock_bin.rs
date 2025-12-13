@@ -17,6 +17,8 @@ struct MockState {
     repo_owner: String,
     #[serde(default = "default_repo")]
     repo_name: String,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl Default for MockState {
@@ -27,6 +29,7 @@ impl Default for MockState {
             push_count: 0,
             repo_owner: default_owner(),
             repo_name: default_repo(),
+            extra: std::collections::HashMap::new(),
         }
     }
 }
@@ -42,13 +45,11 @@ fn default_repo() -> String {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct PrEntry {
     number: usize,
-    #[serde(rename = "headRefName")]
-    head_ref_name: String,
-    #[serde(rename = "baseRefName")]
-    base_ref_name: String,
-    title: String,
-    body: String,
+    title: Option<String>,
+    body: Option<String>,
     url: String,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 fn main() {
@@ -130,8 +131,8 @@ fn handle_gh(args: &[String]) {
                 // Parse arguments.
                 let title = extract_arg(args, "--title").unwrap_or("No Title".into());
                 let body = extract_arg(args, "--body").unwrap_or("".into());
-                let head = extract_arg(args, "--head").unwrap_or("?".into());
-                let base = extract_arg(args, "--base").unwrap_or("main".into());
+                let _head = extract_arg(args, "--head").unwrap_or("?".into());
+                let _base = extract_arg(args, "--base").unwrap_or("main".into());
 
                 let url = update_state(|state| {
                     let max_id = state.prs.iter().map(|p| p.number).max().unwrap_or(100);
@@ -143,11 +144,10 @@ fn handle_gh(args: &[String]) {
 
                     let entry = PrEntry {
                         number: num,
-                        head_ref_name: head,
-                        base_ref_name: base,
-                        title,
-                        body,
+                        title: Some(title),
+                        body: Some(body),
                         url: u.clone(),
+                        extra: std::collections::HashMap::new(),
                     };
                     state.prs.push(entry);
                     u
@@ -172,10 +172,10 @@ fn handle_gh(args: &[String]) {
                         update_state(|state| {
                             if let Some(pr) = state.prs.iter_mut().find(|p| p.number == num) {
                                 if let Some(t) = title {
-                                    pr.title = t;
+                                    pr.title = Some(t);
                                 }
                                 if let Some(b) = body {
-                                    pr.body = b;
+                                    pr.body = Some(b);
                                 }
                             }
                         });

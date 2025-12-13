@@ -124,7 +124,12 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Hook(cmd) => match cmd {
-            HookCommands::PrePush => pre_push::run(&repo)?,
+            HookCommands::PrePush => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(pre_push::run(&repo))?
+            }
             HookCommands::PostCheckout { prev, new, flag } => {
                 manage::post_checkout(&repo, &prev, &new, &flag)?
             }

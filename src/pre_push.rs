@@ -1,18 +1,16 @@
 use core::str;
 use std::{collections::HashMap, process::Stdio, time::Instant};
 
-use gix::{ObjectId, reference::Category, refs::transaction::PreviousValue};
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-
-use crate::{
-    cmd, re,
-    util::{self, CommandExt as _, HeadState},
-};
 use eyre::{Context, Result, bail, eyre};
+use gix::{ObjectId, reference::Category, refs::transaction::PreviousValue};
 use owo_colors::OwoColorize;
 
-pub fn run(repo: &util::Repo) -> Result<()> {
+use crate::{
+    re,
+    util::{self, CommandExt as _, HeadState},
+};
+
+pub async fn run(repo: &util::Repo) -> Result<()> {
     let t0 = Instant::now();
 
     let branch_name = repo.current_branch();
@@ -53,8 +51,19 @@ pub fn run(repo: &util::Repo) -> Result<()> {
     }
 
     let latest_versions = push_to_origin(repo, &commits)?;
+    let token = util::get_github_token()?;
+    let mut builder = octocrab::Octocrab::builder().personal_token(token);
 
-    sync_prs(repo, branch_name, commits, latest_versions)
+    // TODO: Only support this in development so we don't introduce a security
+    // risk for users in prod.
+    if let Ok(api_url) = std::env::var("GHERRIT_GITHUB_API_URL") {
+        log::warn!("Using custom GitHub API URL: {}", api_url);
+        builder = builder.base_uri(api_url)?;
+    }
+
+    let octocrab = builder.build()?;
+
+    sync_prs(repo, &octocrab, branch_name, commits, latest_versions).await
 }
 
 fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
@@ -436,40 +445,31 @@ fn generate_pr_body(
     )
 }
 
-fn sync_prs(
+async fn sync_prs(
     repo: &util::Repo,
+    octocrab: &octocrab::Octocrab,
     branch_name: &str,
     commits: Vec<Commit>,
     latest_versions: HashMap<String, usize>,
 ) -> Result<()> {
-    let pr_list =
-        cmd!("gh pr list --json number,headRefName,url,title,body,baseRefName").checked_output()?;
+    // Determine owner/repo from remote URL
+    //
+    // TODO: Fallback to `gh` if this fails?
+    let remote_name = repo.default_remote_name();
+    let remote_url = repo
+        .config_string(&format!("remote.{}.url", remote_name))?
+        .ok_or_else(|| eyre!("Remote '{}' missing URL", remote_name))?;
+    let (owner, repo_name) = util::get_repo_owner_name(&remote_url)?;
 
-    #[derive(Serialize, Deserialize, Debug)]
-    #[serde(rename_all = "camelCase")]
-    struct ListEntry {
-        head_ref_name: String,
-        number: usize,
-        url: String,
-        title: String,
-        body: String,
-        base_ref_name: String,
-    }
+    let prs_page = octocrab
+        .pulls(&owner, &repo_name)
+        .list()
+        .state(octocrab::params::State::Open)
+        .per_page(100)
+        .send()
+        .await?;
 
-    let prs: Vec<ListEntry> = if pr_list.stdout.is_empty() {
-        vec![]
-    } else {
-        match serde_json::from_slice(&pr_list.stdout) {
-            Ok(prs) => prs,
-            Err(err) => {
-                let mut error = format!("failed to parse `gh` command output: {err}");
-                if let Ok(stdout) = str::from_utf8(&pr_list.stdout) {
-                    error += &format!("\ncommand output (verbatim):\n{stdout}");
-                }
-                bail!(error);
-            }
-        }
-    };
+    let prs = prs_page.items;
 
     let commits = commits
         .into_iter()
@@ -480,67 +480,64 @@ fn sync_prs(
         })
         .collect::<Vec<_>>();
 
-    let commits = commits
-        .into_par_iter()
-        .map(move |(c, parent_branch)| -> Result<_> {
-            let pr_info = prs.iter().find(|pr| pr.head_ref_name == c.gherrit_id);
+    let mut commit_pr_states = Vec::new();
+    for (c, parent_branch) in commits {
+        let pr_info = prs.iter().find(|pr| pr.head.ref_field == c.gherrit_id);
 
-            let pr_state = if let Some(pr) = pr_info {
-                log::debug!(
-                    "Found existing PR #{} for {}",
-                    pr.number.green().bold(),
-                    c.gherrit_id
-                );
-                PrState {
-                    number: pr.number,
-                    url: pr.url.clone(),
-                    title: pr.title.clone(),
-                    body: pr.body.clone(),
-                    base: pr.base_ref_name.clone(),
-                }
-            } else {
-                log::debug!("No GitHub PR exists for {}; creating one...", c.gherrit_id);
-                let (num, url) = create_gh_pr(
-                    &parent_branch,
-                    &c.gherrit_id,
-                    &c.message_title,
-                    &c.message_body,
-                )?;
+        let pr_state = if let Some(pr) = pr_info {
+            log::debug!(
+                "Found existing PR #{} for {}",
+                pr.number.green().bold(),
+                c.gherrit_id
+            );
+            PrState {
+                number: pr.number.try_into().unwrap(),
+                url: pr
+                    .html_url
+                    .clone()
+                    .map(|u| u.to_string())
+                    .unwrap_or_default(),
+                title: pr.title.clone().unwrap_or_default(),
+                body: pr.body.clone().unwrap_or_default(),
+                base: pr.base.ref_field.clone(),
+            }
+        } else {
+            log::debug!("No GitHub PR exists for {}; creating one...", c.gherrit_id);
+            let (num, url) = create_gh_pr(
+                octocrab,
+                &owner,
+                &repo_name,
+                &parent_branch,
+                &c.gherrit_id,
+                &c.message_title,
+                &c.message_body,
+            )
+            .await?;
 
-                log::info!(
-                    "Created PR #{}: {}",
-                    num.green().bold(),
-                    url.blue().underline()
-                );
-                PrState {
-                    number: num,
-                    url,
-                    title: c.message_title.clone(),
-                    body: c.message_body.clone(),
-                    base: parent_branch.clone(),
-                }
-            };
-
-            Ok((c, parent_branch, pr_state))
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
+            log::info!(
+                "Created PR #{}: {}",
+                num.green().bold(),
+                url.blue().underline()
+            );
+            PrState {
+                number: num,
+                url,
+                title: c.message_title.clone(),
+                body: c.message_body.clone(),
+                base: parent_branch.clone(),
+            }
+        };
+        commit_pr_states.push((c, parent_branch, pr_state));
+    }
 
     let is_private = is_private_stack(repo, branch_name);
 
-    // Derive base repo URL safely from the first commit's PR URL.
-    // Since `commits` is not empty (checked at the start of `run`), and
-    // `create_gh_pr` always returns a valid URL, this is safe.
-    let repo_url = commits
+    let repo_url = commit_pr_states
         .first()
         .map(|(_, _, pr_state)| pr_state.url.split("/pull/").next().unwrap_or(""))
         .unwrap_or("")
         .to_string();
 
-    // Attempt to resolve `HEAD` to a branch name so that we can refer to it
-    // in PR bodies. If we can't, then silently fail and just don't include
-    // that information in PR bodies.
     let head_branch_markdown = if !is_private {
         repo.head()
             .ok()
@@ -556,39 +553,43 @@ fn sync_prs(
         "".to_string()
     };
 
-    // A markdown bulleted list of links to each PR, with the "top" PR (the
-    // furthest from `main`) at the top of the list.
-    let gh_pr_ids_markdown = commits
+    let gh_pr_ids_markdown = commit_pr_states
         .iter()
         .rev()
         .map(|(_, _, pr_state)| format!("- #{}", pr_state.number))
         .collect::<Vec<_>>()
         .join("\n");
 
-    commits.par_iter().enumerate().try_for_each(
-        |(i, (c, parent_branch, pr_state))| -> Result<()> {
-            let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
+    for (i, (c, parent_branch, pr_state)) in commit_pr_states.iter().enumerate() {
+        let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
 
-            // Determine parent and child IDs
-            let parent_gherrit_id = (i > 0).then(|| commits[i - 1].0.gherrit_id.clone());
-            let child_gherrit_id =
-                (i < commits.len() - 1).then(|| commits[i + 1].0.gherrit_id.clone());
+        let parent_gherrit_id = (i > 0).then(|| commit_pr_states[i - 1].0.gherrit_id.clone());
+        let child_gherrit_id =
+            (i < commit_pr_states.len() - 1).then(|| commit_pr_states[i + 1].0.gherrit_id.clone());
 
-            let body = generate_pr_body(
-                c,
-                &repo_url,
-                &head_branch_markdown,
-                &gh_pr_ids_markdown,
-                latest_version,
-                parent_branch,
-                parent_gherrit_id.as_deref(),
-                child_gherrit_id.as_deref(),
-            );
+        let body = generate_pr_body(
+            c,
+            &repo_url,
+            &head_branch_markdown,
+            &gh_pr_ids_markdown,
+            latest_version,
+            parent_branch,
+            parent_gherrit_id.as_deref(),
+            child_gherrit_id.as_deref(),
+        );
 
-            edit_gh_pr(pr_state, parent_branch, &c.message_title, &body)?;
-            Ok(())
-        },
-    )?;
+        edit_gh_pr(
+            octocrab,
+            &owner,
+            &repo_name,
+            pr_state,
+            parent_branch,
+            &c.message_title,
+            &body,
+        )
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -644,63 +645,63 @@ impl TryFrom<gix::Commit<'_>> for Commit {
     }
 }
 
-fn create_gh_pr(
+async fn create_gh_pr(
+    octocrab: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
     base_branch: &str,
     head_branch: &str,
     title: &str,
     body: &str,
 ) -> Result<(usize, String)> {
-    let output = cmd!(
-        "gh pr create --base",
-        base_branch,
-        "--head",
-        head_branch,
-        "--title",
-        title,
-        "--body",
-        body,
-    )
-    .stderr(Stdio::inherit())
-    .checked_output()?;
+    let pr = octocrab
+        .pulls(owner, repo)
+        .create(title, head_branch, base_branch)
+        .body(body)
+        .send()
+        .await
+        .wrap_err("Failed to create PR")?;
 
-    let output = core::str::from_utf8(&output.stdout)?;
-    let re = re!(r"https://github.com/[a-zA-Z0-9\-_\.]+/[a-zA-Z0-9\-_\.]+/pull/([0-9]+)");
-    let captures = re.captures(output).unwrap();
-    let pr_id = captures.get(1).unwrap();
-    let pr_url = output.trim().to_string();
-    Ok((pr_id.as_str().parse()?, pr_url))
+    let number = pr.number.try_into()?; // octocrab uses u64, we us usize
+    let url = pr.html_url.map(|u| u.to_string()).unwrap_or_default();
+    Ok((number, url))
 }
 
-fn edit_gh_pr(state: &PrState, new_base: &str, new_title: &str, new_body: &str) -> Result<()> {
-    let pr_num = state.number.to_string();
-    let mut args = vec!["pr", "edit", &pr_num];
+async fn edit_gh_pr(
+    octocrab: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    state: &PrState,
+    new_base: &str,
+    new_title: &str,
+    new_body: &str,
+) -> Result<()> {
+    let pulls = octocrab.pulls(owner, repo);
+    let mut builder = pulls.update(state.number.try_into()?);
     let mut changed = false;
-
     if state.base != new_base {
-        args.push("--base");
-        args.push(new_base);
+        builder = builder.base(new_base);
         changed = true;
     }
 
     if state.title != new_title {
-        args.push("--title");
-        args.push(new_title);
+        builder = builder.title(new_title);
         changed = true;
     }
 
     if state.body.replace("\r\n", "\n").trim() != new_body.replace("\r\n", "\n").trim() {
-        args.push("--body");
-        args.push(new_body);
+        builder = builder.body(new_body);
         changed = true;
     }
 
     let pr_num = state.number.green().bold().to_string();
     let pr_url = state.url.blue().underline().to_string();
+
     if !changed {
         log::info!("PR #{pr_num} is up to date: {pr_url}");
     } else {
         log::debug!("Updating PR #{pr_num}...");
-        util::cmd("gh", args).stdout(Stdio::null()).success()?;
+        builder.send().await.wrap_err("Failed to update PR")?;
         log::info!("Updated PR #{pr_num}: {pr_url}");
     }
 
