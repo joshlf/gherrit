@@ -5,6 +5,8 @@ use std::process::Command;
 use std::sync::LazyLock;
 use tempfile::TempDir;
 
+pub mod mock_server;
+
 #[macro_export]
 macro_rules! test_context {
     () => {
@@ -110,6 +112,46 @@ impl TestContextBuilder {
             .expect("gherrit binary path must be set");
         let mock_bin = self.mock_bin.clone().expect("mock binary path must be set");
 
+        let mut mock_api_url = None;
+
+        if !is_live {
+            install_mock_binaries(dir.path(), &mock_bin, &gherrit_bin);
+            // Create initial mock state with custom repo
+            let state = mock_server::MockState {
+                repo_owner: self.owner.clone(),
+                repo_name: self.name.clone(),
+                ..Default::default()
+            };
+            let state_json = serde_json::to_string(&state).unwrap();
+            let state_path = repo_path.join("mock_state.json");
+            fs::write(&state_path, state_json).unwrap();
+
+            // Start mock server
+            let _rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            // Spawn the server on a separate thread to avoid blocking the main test thread.
+            // This ensures the runtime persists for the duration of the test context.
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to build runtime");
+
+                rt.block_on(async {
+                    let url = mock_server::start_mock_server(state_path).await;
+                    tx.send(url).expect("Failed to send mock server URL");
+                    std::future::pending::<()>().await;
+                });
+            });
+
+            mock_api_url = Some(rx.recv().unwrap());
+        }
+
         let ctx = TestContext {
             dir,
             repo_path,
@@ -117,19 +159,8 @@ impl TestContextBuilder {
             is_live,
             system_git: system_git.clone(),
             gherrit_bin_path: gherrit_bin.clone(),
+            mock_api_url,
         };
-
-        if !is_live {
-            install_mock_binaries(ctx.dir.path(), &mock_bin, &gherrit_bin);
-            // Create initial mock state with custom repo
-            let state = MockState {
-                repo_owner: self.owner.clone(),
-                repo_name: self.name.clone(),
-                ..Default::default()
-            };
-            let state_json = serde_json::to_string(&state).unwrap();
-            fs::write(ctx.repo_path.join("mock_state.json"), state_json).unwrap();
-        }
 
         if self.install_hooks {
             ctx.install_hooks();
@@ -150,6 +181,7 @@ pub struct TestContext {
     pub is_live: bool,
     pub system_git: PathBuf,
     pub gherrit_bin_path: PathBuf,
+    pub mock_api_url: Option<String>,
 }
 
 impl TestContext {
@@ -166,6 +198,11 @@ impl TestContext {
             let new_path_str = env::join_paths(paths).unwrap();
             cmd.env("PATH", new_path_str);
             cmd.env("SYSTEM_GIT_PATH", &self.system_git);
+
+            if let Some(url) = &self.mock_api_url {
+                cmd.env("GHERRIT_GITHUB_API_URL", url);
+                cmd.env("GITHUB_TOKEN", "mock-token");
+            }
         }
 
         cmd
@@ -205,7 +242,7 @@ impl TestContext {
         cmd
     }
 
-    pub fn read_mock_state(&self) -> MockState {
+    pub fn read_mock_state(&self) -> mock_server::MockState {
         let content = fs::read_to_string(self.repo_path.join("mock_state.json"))
             .expect("Failed to read mock_state.json");
         serde_json::from_str(&content).expect("Failed to parse mock state")
@@ -233,26 +270,7 @@ fn run_git_cmd(path: &Path, args: &[&str]) {
         .success();
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
-pub struct MockState {
-    #[serde(default)]
-    pub prs: Vec<PrEntry>,
-    #[serde(default)]
-    pub pushed_refs: Vec<String>,
-    #[serde(default)]
-    pub push_count: usize,
-    #[serde(default)]
-    pub repo_owner: String,
-    #[serde(default)]
-    pub repo_name: String,
-}
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
-pub struct PrEntry {
-    pub number: usize,
-    pub title: String,
-    pub body: String,
-}
 
 pub fn install_mock_binaries(path: &Path, mock_bin: &Path, gherrit_bin: &Path) {
     let git_dst = path.join(if cfg!(windows) { "git.exe" } else { "git" });

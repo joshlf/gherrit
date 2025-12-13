@@ -23,9 +23,15 @@ fn test_pre_push_pr_list_failure() {
     ctx.commit("Work");
 
     // Trigger hook
+    // Trigger hook
+    let mut state = ctx.read_mock_state();
+    state.fail_next_request = Some("list_prs".to_string());
+    state.fail_remaining = 5;
+    let state_json = serde_json::to_string(&state).unwrap();
+    std::fs::write(ctx.repo_path.join("mock_state.json"), state_json).unwrap();
+
     ctx.gherrit()
         .args(["hook", "pre-push"])
-        .env("MOCK_BIN_FAIL_CMD", "gh:list")
         .assert()
         .failure();
 }
@@ -37,9 +43,15 @@ fn test_pre_push_pr_create_failure() {
     ctx.commit("Work");
 
     // Trigger hook
+    // Trigger hook
+    let mut state = ctx.read_mock_state();
+    state.fail_next_request = Some("create_pr".to_string());
+    state.fail_remaining = 5;
+    let state_json = serde_json::to_string(&state).unwrap();
+    std::fs::write(ctx.repo_path.join("mock_state.json"), state_json).unwrap();
+
     ctx.gherrit()
         .args(["hook", "pre-push"])
-        .env("MOCK_BIN_FAIL_CMD", "gh:create")
         .assert()
         .failure();
 }
