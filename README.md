@@ -1,4 +1,4 @@
-# GHerrit
+# Gherrit
 
 > **Note:** GHerrit is currently in alpha. You're welcome to use it, but please be aware that we may make breaking changes.
 
