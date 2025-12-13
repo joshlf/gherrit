@@ -5,6 +5,8 @@ use std::process::Command;
 use std::sync::LazyLock;
 use tempfile::TempDir;
 
+pub mod mock_server;
+
 #[macro_export]
 macro_rules! test_context {
     () => {
@@ -110,17 +112,10 @@ impl TestContextBuilder {
             .expect("gherrit binary path must be set");
         let mock_bin = self.mock_bin.clone().expect("mock binary path must be set");
 
-        let ctx = TestContext {
-            dir,
-            repo_path,
-            remote_path: remote_path.clone(),
-            is_live,
-            system_git: system_git.clone(),
-            gherrit_bin_path: gherrit_bin.clone(),
-        };
+        let mut mock_api_url = None;
 
         if !is_live {
-            install_mock_binaries(ctx.dir.path(), &mock_bin, &gherrit_bin);
+            install_mock_binaries(dir.path(), &mock_bin, &gherrit_bin);
             // Create initial mock state with custom repo
             let state = MockState {
                 repo_owner: self.owner.clone(),
@@ -128,8 +123,45 @@ impl TestContextBuilder {
                 ..Default::default()
             };
             let state_json = serde_json::to_string(&state).unwrap();
-            fs::write(ctx.repo_path.join("mock_state.json"), state_json).unwrap();
+            let state_path = repo_path.join("mock_state.json");
+            fs::write(&state_path, state_json).unwrap();
+
+            // Start mock server
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            // We need to keep the runtime alive or spawn it in a way that persists.
+            // Since tests rely on `TestContext` which drops, we can perhaps use a global runtime or spawn a thread.
+            // Spawning a thread that blocks on the server is easier for sync tests.
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to build runtime");
+
+                rt.block_on(async {
+                    let url = mock_server::start_mock_server(state_path).await;
+                    tx.send(url).expect("Failed to send mock server URL");
+                    std::future::pending::<()>().await;
+                });
+            });
+
+            mock_api_url = Some(rx.recv().unwrap());
         }
+
+        let ctx = TestContext {
+            dir,
+            repo_path,
+            remote_path: remote_path.clone(),
+            is_live,
+            system_git: system_git.clone(),
+            gherrit_bin_path: gherrit_bin.clone(),
+            mock_api_url,
+        };
 
         if self.install_hooks {
             ctx.install_hooks();
@@ -150,6 +182,7 @@ pub struct TestContext {
     pub is_live: bool,
     pub system_git: PathBuf,
     pub gherrit_bin_path: PathBuf,
+    pub mock_api_url: Option<String>,
 }
 
 impl TestContext {
@@ -166,6 +199,11 @@ impl TestContext {
             let new_path_str = env::join_paths(paths).unwrap();
             cmd.env("PATH", new_path_str);
             cmd.env("SYSTEM_GIT_PATH", &self.system_git);
+
+            if let Some(url) = &self.mock_api_url {
+                cmd.env("GHERRIT_GITHUB_API_URL", url);
+                cmd.env("GITHUB_TOKEN", "mock-token");
+            }
         }
 
         cmd
