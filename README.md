@@ -1,8 +1,8 @@
-# GHerrit
+# Gherrit
 
-> **Note:** GHerrit is currently in alpha. You're welcome to use it, but please be aware that we may make breaking changes.
+> **Note:** Gherrit is currently in alpha. You're welcome to use it, but please be aware that we may make breaking changes.
 
-**GHerrit** is a tool that brings a **Gerrit-style "Stacked Diffs" workflow** to GitHub.
+**Gherrit** is a tool that brings a **Gerrit-style "Stacked Diffs" workflow** to GitHub.
 
 It allows you to maintain a single local branch containing a stack of commits
 (e.g., `feature-A` -> `feature-B` -> `feature-C`) and automatically
@@ -13,26 +13,26 @@ synchronizes them to GitHub as a chain of dependent Pull Requests.
 ### Prerequisites
 
   * **Rust**: You must have a working Rust toolchain (`cargo`).
-  * **GitHub CLI (`gh`)**: GHerrit uses the `gh` tool to create and manage PRs. Ensure you are authenticated (`gh auth login`).
+  * **GitHub CLI (`gh`)**: Gherrit uses the `gh` tool to create and manage PRs. Ensure you are authenticated (`gh auth login`).
 
 ### Setup
 
 1.  **Install the Binary:**
 
     ```bash
-    cargo install --git https://github.com/joshlf/gherrit
+    cargo install --git https://github.com/joshlf/Gherrit
     ```
 
 2.  **Install Hooks:**
-    GHerrit relies on Git hooks to intercept branch creation, commits, and
+    Gherrit relies on Git hooks to intercept branch creation, commits, and
     pushes. In the repository you wish to manage:
 
     ```bash
-    gherrit install
+    Gherrit install
     ```
 
 3.  **Setup GitHub Action (Optional but Recommended):**
-    To enable automatic cascading merges (where merging a parent PR automatically rebases its child), add the following workflow to your repository at `.github/workflows/gherrit-rebase-stack.yml`:
+    To enable automatic cascading merges (where merging a parent PR automatically rebases its child), add the following workflow to your repository at `.github/workflows/Gherrit-rebase-stack.yml`:
 
     ```yaml
     name: Rebase Stack
@@ -55,7 +55,7 @@ synchronizes them to GitHub as a chain of dependent Pull Requests.
               token: ${{ secrets.GITHUB_TOKEN }}
 
           - name: Run Gherrit Cascade
-            uses: joshlf/gherrit@main
+            uses: joshlf/Gherrit@main
             with:
               token: ${{ secrets.GITHUB_TOKEN }}
               pr_body: ${{ github.event.pull_request.body }}
@@ -79,7 +79,7 @@ git commit -m "optimize database query construction"
 git commit -m "add api endpoints"
 ```
 
-*Note: The `commit-msg` hook automatically appends a unique `gherrit-pr-id` to every commit message.*
+*Note: The `commit-msg` hook automatically appends a unique `Gherrit-pr-id` to every commit message.*
 
 ### 2\. Pushing
 
@@ -89,13 +89,13 @@ When you are ready to upload your changes, simply push:
 git push
 ```
 
-**GHerrit intercepts this push.** Instead of pushing your local branch directly, it:
+**Gherrit intercepts this push.** Instead of pushing your local branch directly, it:
 
 1.  Analyzes your stack of commits.
 2.  Pushes each commit to a dedicated "phantom branch" on GitHub.
 3.  Creates or Updates a Pull Request for each commit.
 4.  Updates the PR bodies to include navigation links.
-5.  Injects a "Patch History" table into the PR description. Because GHerrit
+5.  Injects a "Patch History" table into the PR description. Because Gherrit
     tracks every version of your commit, this table provides direct links to
     view the **diff between versions** (e.g., "Compare v3 vs v2"). This allows
     reviewers to immediately see what changed since their last review.
@@ -117,14 +117,14 @@ Then push again:
 git push
 ```
 
-GHerrit will detect the changes based on the persistent `gherrit-pr-id` in the commit trailers and update the corresponding PRs in place.
+Gherrit will detect the changes based on the persistent `Gherrit-pr-id` in the commit trailers and update the corresponding PRs in place.
 
 ## Configuration
 
 ### Public vs. Private Stacks
 
-By default, GHerrit configures managed branches as **Private Stacks**. On `git
-push`, GHerrit will synchronize your stack to GitHub without actually pushing
+By default, Gherrit configures managed branches as **Private Stacks**. On `git
+push`, Gherrit will synchronize your stack to GitHub without actually pushing
 your local branch tip to the remote server. This avoids cluttering the remote
 repository with branches and avoids leaking the names of your local branches to
 remote users.
@@ -136,13 +136,13 @@ git config branch.<your-branch>.pushRemote origin
 
 ## Design & Architecture
 
-*If you only intend to **use** GHerrit, and don't care about its internals, then you can stop reading now.*
+*If you only intend to **use** Gherrit, and don't care about its internals, then you can stop reading now.*
 
 ### Core Architecture
 
-#### `gherrit-pr-id` Trailer and Phantom Branches
+#### `Gherrit-pr-id` Trailer and Phantom Branches
 
-Inspired by Gerrit, each commit managed by GHerrit includes a trailer line in its commit message, e.g., `gherrit-pr-id: G847...`.
+Inspired by Gerrit, each commit managed by Gherrit includes a trailer line in its commit message, e.g., `Gherrit-pr-id: G847...`.
 
 GitHub identifies PRs by *branch name* (specifically, a PR is a request to
 merge the contents of one *branch* into another). A branch can contain multiple
@@ -154,27 +154,27 @@ stable key for the commit that survives rebases and other commit changes.
 
 Since the user will have a single branch locally containing multiple commits, a
 normal `git push` would simply result in a single PR for the whole branch.
-Instead, GHerrit pushes changes by synthesizing "phantom" branches: Each commit
-is pushed to a branch whose name matches that commit's `gherrit-pr-id` trailer.
-GHerrit then uses the `gh` tool to create or update one PR for each commit,
+Instead, Gherrit pushes changes by synthesizing "phantom" branches: Each commit
+is pushed to a branch whose name matches that commit's `Gherrit-pr-id` trailer.
+Gherrit then uses the `gh` tool to create or update one PR for each commit,
 setting the base and source branches to the appropriate phantom branches.
 
 #### Version Tags
 
-In addition to pushing branches, GHerrit pushes a lightweight tag for every
+In addition to pushing branches, Gherrit pushes a lightweight tag for every
 version of every commit in the stack, formatted as
-`refs/tags/gherrit/<id>/v<version>`. Normally, force-push workflows destroy the
-history of previous iterations. By tagging every version, GHerrit persists the
+`refs/tags/Gherrit/<id>/v<version>`. Normally, force-push workflows destroy the
+history of previous iterations. By tagging every version, Gherrit persists the
 entire evolution of a PR. These version tags can be used to diff any two
-versions of a PR – this is how GHerrit generates the **Patch History Table** in
+versions of a PR – this is how Gherrit generates the **Patch History Table** in
 the PR description.
 
 #### Optimistic Concurrency Control
 
-GHerrit enforces optimistic locking to prevent race conditions when multiple
+Gherrit enforces optimistic locking to prevent race conditions when multiple
 users update the same stack. When pushing a new version tag (e.g., `v2`),
-GHerrit uses the atomic push option:
-`--force-with-lease=refs/tags/gherrit/<id>/v<ver>:`.
+Gherrit uses the atomic push option:
+`--force-with-lease=refs/tags/Gherrit/<id>/v<ver>:`.
 
 The trailing colon (`:`) tells Git to ensure the ref does **not** already exist
 on the remote. If another user has already pushed `v2` in the interim, the
@@ -183,13 +183,13 @@ rebase, preserving the integrity of the patch history.
 
 #### `pre-push` Hook
 
-GHerrit synchronizes changes with GitHub in a `pre-push` hook. This allows
+Gherrit synchronizes changes with GitHub in a `pre-push` hook. This allows
 users to use their normal `git push` flow instead of using a bespoke command
-like (hypothetically) `gherrit sync`.
+like (hypothetically) `Gherrit sync`.
 
 ##### "Loopback" Interception Strategy
 
-By default, GHerrit configures managed branches to treat the local repository as
+By default, Gherrit configures managed branches to treat the local repository as
 its own upstream. It sets:
 
 *   `branch.<name>.pushRemote = .`
@@ -198,7 +198,7 @@ its own upstream. It sets:
 
 This configuration has two benefits:
 
-1.  **Interception:** On `git push`, once GHerrit's `pre-push` hook returns
+1.  **Interception:** On `git push`, once Gherrit's `pre-push` hook returns
     (after synchronizing the stack to GitHub), Git will always complete the
     push. Other than causing `git push` to fail with a user-visible error,
     there is no way to for the `pre-push` hook to prevent the push from
@@ -216,7 +216,7 @@ Since Gerrit supports stacked commits, the Gerrit UI for a particular commit lis
 
 &nbsp;
 
-GHerrit emulates this by rewriting each PR's message with links to other PRs in the same stack:
+Gherrit emulates this by rewriting each PR's message with links to other PRs in the same stack:
 
 <img width="915" height="317" alt="Screenshot 2025-12-02 at 6 46 15 PM" src="https://github.com/user-attachments/assets/6ee80641-af67-4b37-9f57-797207637bbe" />
 
@@ -229,10 +229,10 @@ and merged into `main`, GitHub sees the commits in `feature-B` as "new"
 relative to `main`, even if they are identical to the ones just merged. This
 often results in "phantom diffs" or merge conflicts.
 
-To solve this, GHerrit implements a **Cascading Merge** system:
+To solve this, Gherrit implements a **Cascading Merge** system:
 
-1.  **Metadata Injection**: When pushing, GHerrit injects hidden metadata into the PR description (inside an HTML comment) containing the IDs of the parent and child PRs.
-2.  **Automated Rebase**: A GitHub Action (`gherrit-rebase-stack.yml`) triggers whenever a PR is merged. It:
+1.  **Metadata Injection**: When pushing, Gherrit injects hidden metadata into the PR description (inside an HTML comment) containing the IDs of the parent and child PRs.
+2.  **Automated Rebase**: A GitHub Action (`Gherrit-rebase-stack.yml`) triggers whenever a PR is merged. It:
     *   Reads the metadata to find the *child* PR's ID.
     *   Finds the child PR by its synthesized branch name (e.g., `G...`)
     *   Retargets the child PR to base off `main`.
@@ -245,13 +245,13 @@ chain healthy without manual intervention.
 
 ### Hybrid Workflow Support
 
-GHerrit is designed to work seamlessly with developers using other, non-GHerrit
-workflows. In order to accomplish this, GHerrit tracks whether each local
+Gherrit is designed to work seamlessly with developers using other, non-Gherrit
+workflows. In order to accomplish this, Gherrit tracks whether each local
 branch is "managed" or "unmanaged". By default, branches created locally are
 managed, while branches created remotely (and checked out locally) are
-"unmanaged". A branch's management state can be changed with `gherrit manage`
-or `gherrit unmanage`.
+"unmanaged". A branch's management state can be changed with `Gherrit manage`
+or `Gherrit unmanage`.
 
 The `commit-msg` and `pre-push` hooks respect the management state – when
 operating on an unmanaged branch, both are no-ops, allowing `git commit` and
-`git push` to behave as though GHerrit didn't exist.
+`git push` to behave as though Gherrit didn't exist.
