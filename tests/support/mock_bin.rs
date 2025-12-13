@@ -8,8 +8,6 @@ use std::process::Command;
 #[derive(Serialize, Deserialize, Debug)]
 struct MockState {
     #[serde(default)]
-    prs: Vec<PrEntry>,
-    #[serde(default)]
     pushed_refs: Vec<String>,
     #[serde(default)]
     push_count: usize,
@@ -17,16 +15,18 @@ struct MockState {
     repo_owner: String,
     #[serde(default = "default_repo")]
     repo_name: String,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl Default for MockState {
     fn default() -> Self {
         Self {
-            prs: vec![],
             pushed_refs: vec![],
             push_count: 0,
             repo_owner: default_owner(),
             repo_name: default_repo(),
+            extra: std::collections::HashMap::new(),
         }
     }
 }
@@ -39,18 +39,6 @@ fn default_repo() -> String {
     "repo".to_string()
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct PrEntry {
-    number: usize,
-    #[serde(rename = "headRefName")]
-    head_ref_name: String,
-    #[serde(rename = "baseRefName")]
-    base_ref_name: String,
-    title: String,
-    body: String,
-    url: String,
-}
-
 fn main() {
     let args: Vec<String> = env::args().collect();
     // Detect identity via filename (handles .exe on Windows)
@@ -60,12 +48,8 @@ fn main() {
         .to_string_lossy()
         .to_string();
 
-    if prog_name == "git" {
-        handle_git(&args);
-    } else {
-        // Default to gh behavior if named gh or mock-gh
-        handle_gh(&args);
-    }
+    assert_eq!(prog_name, "git");
+    handle_git(&args);
 }
 
 fn try_simulate_failure(command: &str, args: &[String]) {
@@ -113,96 +97,6 @@ fn handle_git(args: &[String]) {
         .expect("Failed to run real git from mock shim");
 
     std::process::exit(status.code().unwrap_or(1));
-}
-
-fn handle_gh(args: &[String]) {
-    try_simulate_failure("gh", &args[1..]);
-
-    // args[0] is program name, args[1] is subcommand (e.g., "pr")
-    let subcmd = args.get(1).map(|s| s.as_str());
-    if let Some("pr") = subcmd {
-        match args.get(2).map(|s| s.as_str()) {
-            Some("list") => {
-                let state = read_state();
-                println!("{}", serde_json::to_string(&state.prs).unwrap());
-            }
-            Some("create") => {
-                // Parse arguments.
-                let title = extract_arg(args, "--title").unwrap_or("No Title".into());
-                let body = extract_arg(args, "--body").unwrap_or("".into());
-                let head = extract_arg(args, "--head").unwrap_or("?".into());
-                let base = extract_arg(args, "--base").unwrap_or("main".into());
-
-                let url = update_state(|state| {
-                    let max_id = state.prs.iter().map(|p| p.number).max().unwrap_or(100);
-                    let num = max_id + 1;
-                    let u = format!(
-                        "https://github.com/{}/{}/pull/{num}",
-                        state.repo_owner, state.repo_name
-                    );
-
-                    let entry = PrEntry {
-                        number: num,
-                        head_ref_name: head,
-                        base_ref_name: base,
-                        title,
-                        body,
-                        url: u.clone(),
-                    };
-                    state.prs.push(entry);
-                    u
-                });
-
-                println!("{}", url);
-            }
-            Some("edit") => {
-                // usage: gh pr edit <number> ...
-                if let Some(id_or_url) = args.get(3) {
-                    let target_number = if let Ok(num) = id_or_url.parse::<usize>() {
-                        Some(num)
-                    } else {
-                        let s = read_state();
-                        s.prs.iter().find(|p| p.url == *id_or_url).map(|p| p.number)
-                    };
-
-                    if let Some(num) = target_number {
-                        let title = extract_arg(args, "--title");
-                        let body = extract_arg(args, "--body");
-
-                        update_state(|state| {
-                            if let Some(pr) = state.prs.iter_mut().find(|p| p.number == num) {
-                                if let Some(t) = title {
-                                    pr.title = t;
-                                }
-                                if let Some(b) = body {
-                                    pr.body = b;
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn extract_arg(args: &[String], key: &str) -> Option<String> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if arg == key {
-            return iter.next().cloned();
-        }
-    }
-    None
-}
-
-fn read_state() -> MockState {
-    if let Ok(content) = fs::read_to_string("mock_state.json") {
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        MockState::default()
-    }
 }
 
 fn update_state<O, F>(f: F) -> O
