@@ -17,8 +17,11 @@ Ensure the project builds and passes checks.
 
 ```bash
 cargo check --tests
-cargo test
+GHERRIT_TEST_BUILD=1 cargo test
 ```
+
+`GHERRIT_TEST_BUILD=1` is **required** in order to enable test-only behavior. If
+it is not set when building the binary under test, some tests will fail.
 
 ## Testing Strategy
 
