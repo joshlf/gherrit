@@ -1,3 +1,5 @@
+// TODO: Review all test changes before merging.
+
 const MANAGED_PRIVATE: &str = "managedPrivate";
 const MANAGED_PUBLIC: &str = "managedPublic";
 
@@ -380,10 +382,10 @@ fn test_pr_body_generation() {
         let pr_b = state
             .prs
             .iter()
-            .find(|pr| pr.title == "Commit B")
+            .find(|pr| pr.title.as_deref() == Some("Commit B"))
             .expect("PR for Commit B not found");
 
-        let body = &pr_b.body;
+        let body = pr_b.body.as_ref().unwrap();
 
         // 1. Verify Metadata JSON
         // Should contain <!-- gherrit-meta: { ... } -->
@@ -425,10 +427,10 @@ fn test_pr_body_generation() {
         let pr_c = state
             .prs
             .iter()
-            .find(|pr| pr.title == "Commit C")
+            .find(|pr| pr.title.as_deref() == Some("Commit C"))
             .expect("PR for Commit C not found");
 
-        let body = &pr_c.body;
+        let body = pr_c.body.as_ref().unwrap();
 
         // Assert table exists now
         assert!(
@@ -525,7 +527,7 @@ fn test_public_stack_links() {
 
     if !ctx.is_live {
         let state = ctx.read_mock_state();
-        let body = &state.prs[0].body;
+        let body = state.prs[0].body.as_ref().unwrap();
         assert!(
             !body.contains("This PR is on branch"),
             "Private stack should NOT link to local branch"
@@ -542,7 +544,7 @@ fn test_public_stack_links() {
 
     if !ctx.is_live {
         let state = ctx.read_mock_state();
-        let body = &state.prs[0].body; // Get the updated body
+        let body = state.prs[0].body.as_ref().unwrap(); // Get the updated body
         assert!(
             body.contains("This PR is on branch"),
             "Public stack SHOULD link to local branch"
