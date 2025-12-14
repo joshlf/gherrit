@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "gherrit"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "assert_cmd",
  "clap",
