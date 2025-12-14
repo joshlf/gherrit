@@ -1,13 +1,14 @@
 use core::str;
 use std::{collections::HashMap, process::Stdio, time::Instant};
 
+use eyre::{Context, Result, bail, eyre};
 use gix::{ObjectId, reference::Category, refs::transaction::PreviousValue};
-use rayon::prelude::*;
+use owo_colors::OwoColorize;
+
+use crate::{
     re,
     util::{self, CommandExt as _, HeadState},
 };
-use eyre::{Context, Result, bail, eyre};
-use owo_colors::OwoColorize;
 
 pub async fn run(repo: &util::Repo) -> Result<()> {
     let t0 = Instant::now();
@@ -51,9 +52,14 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
 
     let latest_versions = push_to_origin(repo, &commits)?;
     let token = util::get_github_token()?;
-    let octocrab = octocrab::Octocrab::builder()
-        .personal_token(token)
-        .build()?;
+    let mut builder = octocrab::Octocrab::builder().personal_token(token);
+
+    if let Ok(api_url) = std::env::var("GHERRIT_GITHUB_API_URL") {
+        log::warn!("Using custom GitHub API URL: {}", api_url);
+        builder = builder.base_uri(api_url)?;
+    }
+
+    let octocrab = builder.build()?;
 
     sync_prs(repo, &octocrab, branch_name, commits, latest_versions).await
 }
@@ -494,7 +500,7 @@ async fn sync_prs(
                 c.gherrit_id
             );
             PrState {
-                number: pr.number,
+                number: pr.number.try_into().unwrap(),
                 url: pr
                     .html_url
                     .clone()
@@ -679,10 +685,9 @@ async fn edit_gh_pr(
     new_title: &str,
     new_body: &str,
 ) -> Result<()> {
-    let mut builder = octocrab
-        .pulls(owner, repo)
-        .update(state.number.try_into()?);
-mut changed = false
+    let pulls = octocrab.pulls(owner, repo);
+    let mut builder = pulls.update(state.number.try_into()?);
+    let mut changed = false;
     if state.base != new_base {
         builder = builder.base(new_base);
         changed = true;
