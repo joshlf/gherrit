@@ -487,56 +487,83 @@ async fn sync_prs(
         .collect::<Vec<_>>();
 
     let mut commit_pr_states = Vec::new();
-    for (c, parent_branch) in commits {
+    let mut creations = Vec::new();
+
+    // 1. Identify existing PRs and queue missing ones for creation
+    for (c, parent_branch) in &commits {
         let pr_info = prs.iter().find(|pr| pr.head.ref_field == c.gherrit_id);
 
-        let pr_state = if let Some(pr) = pr_info {
+        if let Some(pr) = pr_info {
             log::debug!(
                 "Found existing PR #{} for {}",
                 pr.number.green().bold(),
                 c.gherrit_id
             );
-            PrState {
+            commit_pr_states.push(PrState {
                 number: pr.number.try_into().unwrap(),
                 url: pr
                     .html_url
                     .clone()
                     .map(|u| u.to_string())
                     .unwrap_or_default(),
-                node_id: pr.node_id.clone().unwrap_or_default(),
+                node_id: pr.node_id.clone().unwrap(),
                 title: pr.title.clone().unwrap_or_default(),
                 body: pr.body.clone().unwrap_or_default(),
                 base: pr.base.ref_field.clone(),
-            }
+            });
         } else {
-            log::debug!("No GitHub PR exists for {}; creating one...", c.gherrit_id);
-            let (num, url, node_id) = create_gh_pr(
-                octocrab,
-                &owner,
-                &repo_name,
-                &parent_branch,
-                &c.gherrit_id,
-                &c.message_title,
-                &c.message_body,
-            )
-            .await?;
+            log::debug!(
+                "No GitHub PR exists for {}; queuing creation...",
+                c.gherrit_id
+            );
+            // We use a placeholder state initially, will fill after batch creation
+            creations.push(BatchCreate {
+                title: c.message_title.clone(),
+                body: c.message_body.clone(),
+                base: parent_branch.clone(),
+                head: c.gherrit_id.clone(),
+            });
+        }
+    }
 
+    // 2. Batch Create missing PRs
+    let new_prs = if !creations.is_empty() {
+        log::info!("Creating {} new PRs in batch...", creations.len());
+        let repo_id = fetch_repo_id(octocrab, &owner, &repo_name).await?;
+        let created = batch_create_prs(octocrab, &repo_id, creations).await?;
+        log::info!("Batch creation complete.");
+        created
+    } else {
+        HashMap::<String, (usize, String, String)>::new()
+    };
+
+    // Re-assemble the full list of states (merging existing and new)
+    // We iterate original commits again to maintain order and match states
+    let mut final_commit_pr_states = Vec::new();
+    let mut existing_states_iter = commit_pr_states.into_iter();
+
+    for (c, parent_branch) in commits {
+        let pr_state = if let Some((number, url, node_id)) = new_prs.get(&c.gherrit_id) {
             log::info!(
                 "Created PR #{}: {}",
-                num.green().bold(),
+                number.green().bold(),
                 url.blue().underline()
             );
             PrState {
-                number: num,
-                url,
-                node_id,
+                number: *number,
+                url: url.clone(),
+                node_id: node_id.clone(),
                 title: c.message_title.clone(),
                 body: c.message_body.clone(),
                 base: parent_branch.clone(),
             }
+        } else {
+            existing_states_iter.next().expect("State mismatch")
         };
-        commit_pr_states.push((c, parent_branch, pr_state));
+        final_commit_pr_states.push((c, parent_branch, pr_state));
     }
+
+    let commit_pr_states = final_commit_pr_states;
 
     let is_private = is_private_stack(repo, branch_name);
 
@@ -678,28 +705,6 @@ impl TryFrom<gix::Commit<'_>> for Commit {
     }
 }
 
-async fn create_gh_pr(
-    octocrab: &octocrab::Octocrab,
-    owner: &str,
-    repo: &str,
-    base_branch: &str,
-    head_branch: &str,
-    title: &str,
-    body: &str,
-) -> Result<(usize, String, String)> {
-    let pr = octocrab
-        .pulls(owner, repo)
-        .create(title, head_branch, base_branch)
-        .body(body)
-        .send()
-        .await
-        .wrap_err("Failed to create PR")?;
-
-    let number = pr.number.try_into()?; // octocrab uses u64, we us usize
-    let url = pr.html_url.map(|u| u.to_string()).unwrap_or_default();
-    Ok((number, url, pr.node_id.unwrap_or_default()))
-}
-
 re!(gherrit_pr_id_re, r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$");
 
 struct BatchUpdate {
@@ -707,6 +712,36 @@ struct BatchUpdate {
     title: String,
     body: String,
     base: String,
+}
+
+struct BatchCreate {
+    title: String,
+    body: String,
+    base: String,
+    head: String,
+}
+
+async fn fetch_repo_id(octocrab: &octocrab::Octocrab, owner: &str, repo: &str) -> Result<String> {
+    let query = format!(r#"query {{ repository(owner: "{owner}", name: "{repo}") {{ id }} }}"#);
+    let query_body = json!({ "query": query });
+    let response: serde_json::Value = octocrab
+        .graphql(&query_body)
+        .await
+        .wrap_err("Failed to fetch repository ID")?;
+
+    if let Some(errors) = response.get("errors") {
+        log::error!("GraphQL errors: {}", errors);
+        bail!("Failed to fetch repository ID: {:?}", errors);
+    }
+
+    let id = response
+        .get("data")
+        .and_then(|d| d.get("repository"))
+        .and_then(|r| r.get("id"))
+        .and_then(|id| id.as_str())
+        .ok_or_else(|| eyre!("Required repository ID not found in response"))?;
+
+    Ok(id.to_string())
 }
 
 /// Perform batched updates of Pull Requests using GitHub's GraphQL API.
@@ -748,4 +783,79 @@ async fn batch_update_prs(octocrab: &octocrab::Octocrab, updates: Vec<BatchUpdat
         }
     }
     Ok(())
+}
+
+/// Perform batched creation of Pull Requests using GitHub's GraphQL API.
+///
+/// Returns a map of head branch name -> (number, url, node_id).
+async fn batch_create_prs(
+    octocrab: &octocrab::Octocrab,
+    repo_id: &str,
+    creations: Vec<BatchCreate>,
+) -> Result<HashMap<String, (usize, String, String)>> {
+    if creations.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    log::info!("Sending batch creation request for {} PRs", creations.len());
+
+    let mut results = HashMap::new();
+
+    for chunk in creations.chunks(50) {
+        let mut mutation_body = String::new();
+        for (i, create) in chunk.iter().enumerate() {
+            let safe_title = json!(create.title);
+            let safe_body = json!(create.body);
+            let safe_base = json!(create.base);
+            let safe_head = json!(create.head);
+
+            mutation_body.push_str(&format!(
+                "create{i}: createPullRequest(input: {{repositoryId: \"{repo_id}\", headRefName: {safe_head}, baseRefName: {safe_base}, title: {safe_title}, body: {safe_body}}}) {{ pullRequest {{ id number url }} }}\n",
+                repo_id = repo_id,
+                safe_head = safe_head,
+                safe_base = safe_base,
+                safe_title = safe_title,
+                safe_body = safe_body
+            ));
+        }
+
+        let query = format!("mutation {{ {} }}", mutation_body);
+        let query_body = json!({ "query": query });
+        let response: serde_json::Value = octocrab
+            .graphql(&query_body)
+            .await
+            .wrap_err("GraphQL batch create failed")?;
+
+        if let Some(errors) = response.get("errors") {
+            log::error!("Batch create errors: {}", errors);
+            bail!("Batch create failed: {:?}", errors);
+        }
+
+        let data = response
+            .get("data")
+            .ok_or_else(|| eyre!("No data in response"))?;
+
+        for (i, create) in chunk.iter().enumerate() {
+            let alias = format!("create{}", i);
+            if let Some(pr_data) = data.get(&alias).and_then(|d| d.get("pullRequest")) {
+                let number = pr_data
+                    .get("number")
+                    .and_then(|n| n.as_u64())
+                    .ok_or_else(|| eyre!("Missing number"))?;
+                let url = pr_data
+                    .get("url")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let node_id = pr_data
+                    .get("id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+
+                results.insert(create.head.clone(), (number as usize, url, node_id));
+            }
+        }
+    }
+    Ok(results)
 }

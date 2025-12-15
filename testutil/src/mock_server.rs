@@ -295,7 +295,7 @@ async fn graphql(
 
     // Support failure injection for updates (mapped to "update_pr" for compatibility)
     if let Some(action) = &mock_state.fail_next_request {
-        if action == "update_pr" || action == "graphql" {
+        if action == "update_pr" || action == "create_pr" || action == "graphql" {
             if mock_state.fail_remaining > 0 {
                 mock_state.fail_remaining -= 1;
             }
@@ -311,23 +311,30 @@ async fn graphql(
         }
     }
 
-    // Simple regex to find batched mutations
-    // Matches `updateN: updatePullRequest(input: { ... }) {`
-    // We use `.+?` non-greedy match for fields until the closing `}) {`.
-    let re =
+    // Regex for `updatePullRequest`
+    let update_re =
         Regex::new(r#"update(?P<idx>\d+): updatePullRequest\(input: \{(?P<fields>.+?)\}\) \{"#)
-            .expect("Regex compilation failed");
-    // ... regexes ...
+            .expect("Update regex failed");
+    // Regex for `createPullRequest`
+    // Matches `create0: createPullRequest(input: {repositoryId: "...", headRefName: "...", baseRefName: "...", title: "...", body: "..."}) { pullRequest { id number url node_id } }`
+    // We assume a standard structure for the response fields requested by the client.
+    let create_re =
+        Regex::new(r#"create(?P<idx>\d+): createPullRequest\(input: \{(?P<fields>.+?)\}\)"#)
+            .expect("Create regex failed");
+
+    // Common field regexes
     let title_re = Regex::new(r#"title: (?P<val>"(?:\\.|[^"\\])*")"#).expect("Title regex failed");
     let body_re = Regex::new(r#"body: (?P<val>"(?:\\.|[^"\\])*")"#).expect("Body regex failed");
     let id_re = Regex::new(r#"pullRequestId: "(?P<val>[^"]+)""#).expect("ID regex failed");
     let base_re = Regex::new(r#"baseRefName: "(?P<val>[^"]+)""#).expect("Base regex failed");
+    let head_re = Regex::new(r#"headRefName: "(?P<val>[^"]+)""#).expect("Head regex failed");
+    let _repo_id_re =
+        Regex::new(r#"repositoryId: "(?P<val>[^"]+)""#).expect("Repo ID regex failed");
 
     let mut response_data = serde_json::Map::new();
 
-    let matches: Vec<_> = re.captures_iter(query).collect();
-
-    for caps in matches {
+    // Process Updates
+    for caps in update_re.captures_iter(query) {
         let idx = caps.name("idx").expect("Missing idx capture").as_str();
         let fields = caps
             .name("fields")
@@ -344,7 +351,6 @@ async fn graphql(
         // Find PR
         if let Some(pr) = mock_state.prs.iter_mut().find(|p| p.node_id == node_id) {
             if let Some(c) = title_re.captures(fields) {
-                // Needs unescaping? serde_json::from_str handles quotes and escapes
                 let val_str = c.name("val").unwrap().as_str();
                 if let Ok(val) = serde_json::from_str::<String>(val_str) {
                     pr.title = Some(val);
@@ -373,6 +379,133 @@ async fn graphql(
                 }),
             );
         }
+    }
+
+    // Process Creations
+    for caps in create_re.captures_iter(query) {
+        let idx = caps.name("idx").expect("Missing idx capture").as_str();
+        let fields = caps
+            .name("fields")
+            .expect("Missing fields capture")
+            .as_str();
+
+        // Extract required fields
+        let head = head_re
+            .captures(fields)
+            .and_then(|c| c.name("val"))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        let base = base_re
+            .captures(fields)
+            .and_then(|c| c.name("val"))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        let title_str = title_re
+            .captures(fields)
+            .and_then(|c| c.name("val"))
+            .map(|m| m.as_str())
+            .unwrap_or("\"\"");
+        let title = serde_json::from_str::<String>(title_str).unwrap_or_default();
+        let body_str = body_re
+            .captures(fields)
+            .and_then(|c| c.name("val"))
+            .map(|m| m.as_str())
+            .unwrap_or("\"\"");
+        let body = serde_json::from_str::<String>(body_str).unwrap_or_default();
+
+        // Check if PR exists (idempotency simulation, though usually GitHub errors)
+        // For simplicity, we just create a new one.
+
+        let max_id = mock_state.prs.iter().map(|p| p.number).max().unwrap_or(0);
+        let num = max_id + 1;
+        let html_url = format!(
+            "https://github.com/{}/{}/pull/{}",
+            mock_state.repo_owner, mock_state.repo_name, num
+        ); // Simplified
+        let api_url = format!(
+            "https://api.github.com/repos/{}/{}/pulls/{}",
+            mock_state.repo_owner, mock_state.repo_name, num
+        );
+        let node_id = format!("PR_NODE_{}", num);
+
+        let entry = PrEntry {
+            id: num as u64,
+            number: num,
+            html_url: html_url.clone(),
+            api_url,
+            node_id: node_id.clone(),
+            state: "open".to_string(),
+            user: User {
+                login: "test-user".to_string(),
+                id: 1,
+                node_id: "MDQ6VXNlcjE=".to_string(),
+                avatar_url: "https://example.com/avatar".to_string(),
+                gravatar_id: "".to_string(),
+                url: "https://api.github.com/users/test-user".to_string(),
+                html_url: "https://github.com/test-user".to_string(),
+                followers_url: "https://api.github.com/users/test-user/followers".to_string(),
+                following_url: "https://api.github.com/users/test-user/following{/other_user}"
+                    .to_string(),
+                gists_url: "https://api.github.com/users/test-user/gists{/gist_id}".to_string(),
+                starred_url: "https://api.github.com/users/test-user/starred{/owner}{/repo}"
+                    .to_string(),
+                subscriptions_url: "https://api.github.com/users/test-user/subscriptions"
+                    .to_string(),
+                organizations_url: "https://api.github.com/users/test-user/orgs".to_string(),
+                repos_url: "https://api.github.com/users/test-user/repos".to_string(),
+                events_url: "https://api.github.com/users/test-user/events{/privacy}".to_string(),
+                received_events_url: "https://api.github.com/users/test-user/received_events"
+                    .to_string(),
+                type_field: "User".to_string(),
+                site_admin: false,
+            },
+            title: Some(title),
+            body: Some(body),
+            head: RefInfo {
+                ref_field: head,
+                sha: "".to_string(),
+            },
+            base: RefInfo {
+                ref_field: base,
+                sha: "".to_string(),
+            },
+            created_at: "2023-01-01T00:00:00Z".to_string(),
+            updated_at: "2023-01-01T00:00:00Z".to_string(),
+        };
+
+        mock_state.prs.push(entry);
+
+        let alias = format!("create{}", idx);
+        response_data.insert(
+            alias,
+            serde_json::json!({
+                "clientMutationId": null,
+                "pullRequest": {
+                    "id": node_id,
+                    "number": num,
+                    "url": html_url,
+                }
+            }),
+        );
+    }
+
+    // Process Repo ID Fetch (simple query)
+    if query.contains("query { repository(owner:") {
+        response_data.insert(
+            "repository".to_string(),
+            serde_json::json!({
+                "id": "REPO_NODE_ID"
+            }),
+        );
+        // If it was a generic query, we might need a different structure.
+        // Assuming the client sends `query { repository(...) { id } }`
+        return Ok(Json(serde_json::json!({
+            "data": {
+                "repository": {
+                     "id": "REPO_NODE_ID"
+                }
+            }
+        })));
     }
 
     write_state(&state.state_path, &mock_state);
