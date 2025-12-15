@@ -69,7 +69,11 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
 
     let octocrab = builder.build()?;
 
-    sync_prs(repo, &octocrab, branch_name, commits, latest_versions).await
+    let num_commits = commits.len();
+    sync_prs(repo, &octocrab, branch_name, commits, latest_versions).await?;
+
+    log::info!("Successfully synced {num_commits} commits.");
+    Ok(())
 }
 
 fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
