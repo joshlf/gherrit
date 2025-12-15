@@ -3430,6 +3430,7 @@ dependencies = [
  "assert_cmd",
  "axum",
  "predicates",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

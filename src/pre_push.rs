@@ -4,6 +4,7 @@ use std::{collections::HashMap, process::Stdio, time::Instant};
 use eyre::{Context, Result, bail, eyre};
 use gix::{ObjectId, reference::Category, refs::transaction::PreviousValue};
 use owo_colors::OwoColorize;
+use serde_json::json;
 
 use crate::{
     re,
@@ -445,6 +446,12 @@ fn generate_pr_body(
     )
 }
 
+/// Syncs the local stack of commits with GitHub Pull Requests.
+///
+/// This function:
+/// 1. Finds existing PRs or creates new ones for new commits.
+/// 2. Updates PR metadata (title, body, base branch) to match the local stack.
+/// 3. Updates are queued and executed in batches to optimize performance.
 async fn sync_prs(
     repo: &util::Repo,
     octocrab: &octocrab::Octocrab,
@@ -453,8 +460,7 @@ async fn sync_prs(
     latest_versions: HashMap<String, usize>,
 ) -> Result<()> {
     // Determine owner/repo from remote URL
-    //
-    // TODO: Fallback to `gh` if this fails?
+    // Determine owner/repo from remote URL
     let remote_name = repo.default_remote_name();
     let remote_url = repo
         .config_string(&format!("remote.{}.url", remote_name))?
@@ -497,13 +503,14 @@ async fn sync_prs(
                     .clone()
                     .map(|u| u.to_string())
                     .unwrap_or_default(),
+                node_id: pr.node_id.clone().unwrap_or_default(),
                 title: pr.title.clone().unwrap_or_default(),
                 body: pr.body.clone().unwrap_or_default(),
                 base: pr.base.ref_field.clone(),
             }
         } else {
             log::debug!("No GitHub PR exists for {}; creating one...", c.gherrit_id);
-            let (num, url) = create_gh_pr(
+            let (num, url, node_id) = create_gh_pr(
                 octocrab,
                 &owner,
                 &repo_name,
@@ -522,6 +529,7 @@ async fn sync_prs(
             PrState {
                 number: num,
                 url,
+                node_id,
                 title: c.message_title.clone(),
                 body: c.message_body.clone(),
                 base: parent_branch.clone(),
@@ -560,6 +568,8 @@ async fn sync_prs(
         .collect::<Vec<_>>()
         .join("\n");
 
+    let mut updates = Vec::new();
+
     for (i, (c, parent_branch, pr_state)) in commit_pr_states.iter().enumerate() {
         let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
 
@@ -578,16 +588,38 @@ async fn sync_prs(
             child_gherrit_id.as_deref(),
         );
 
-        edit_gh_pr(
-            octocrab,
-            &owner,
-            &repo_name,
-            pr_state,
-            parent_branch,
-            &c.message_title,
-            &body,
-        )
-        .await?;
+        let pr_num = pr_state.number.green().bold().to_string();
+        let pr_url = pr_state.url.blue().underline().to_string();
+
+        let mut changed = false;
+        if pr_state.base != *parent_branch {
+            changed = true;
+        }
+        if pr_state.title != c.message_title {
+            changed = true;
+        }
+        if pr_state.body.replace("\r\n", "\n").trim() != body.replace("\r\n", "\n").trim() {
+            changed = true;
+        }
+
+        if changed {
+            log::debug!("Queuing update for PR #{}", pr_num);
+            updates.push(BatchUpdate {
+                node_id: pr_state.node_id.clone(),
+                title: c.message_title.clone(),
+                body: body.clone(),
+                base: parent_branch.clone(),
+            });
+            log::info!("Queued update for PR #{}: {}", pr_num, pr_url);
+        } else {
+            log::info!("PR #{} is up to date: {}", pr_num, pr_url);
+        }
+    }
+
+    if !updates.is_empty() {
+        log::info!("Updating batch of {} PRs...", updates.len());
+        batch_update_prs(octocrab, updates).await?;
+        log::info!("Batch update complete.");
     }
 
     Ok(())
@@ -612,6 +644,7 @@ struct Commit {
 struct PrState {
     number: usize,
     url: String,
+    node_id: String,
     title: String,
     body: String,
     base: String,
@@ -653,7 +686,7 @@ async fn create_gh_pr(
     head_branch: &str,
     title: &str,
     body: &str,
-) -> Result<(usize, String)> {
+) -> Result<(usize, String, String)> {
     let pr = octocrab
         .pulls(owner, repo)
         .create(title, head_branch, base_branch)
@@ -664,48 +697,55 @@ async fn create_gh_pr(
 
     let number = pr.number.try_into()?; // octocrab uses u64, we us usize
     let url = pr.html_url.map(|u| u.to_string()).unwrap_or_default();
-    Ok((number, url))
-}
-
-async fn edit_gh_pr(
-    octocrab: &octocrab::Octocrab,
-    owner: &str,
-    repo: &str,
-    state: &PrState,
-    new_base: &str,
-    new_title: &str,
-    new_body: &str,
-) -> Result<()> {
-    let pulls = octocrab.pulls(owner, repo);
-    let mut builder = pulls.update(state.number.try_into()?);
-    let mut changed = false;
-    if state.base != new_base {
-        builder = builder.base(new_base);
-        changed = true;
-    }
-
-    if state.title != new_title {
-        builder = builder.title(new_title);
-        changed = true;
-    }
-
-    if state.body.replace("\r\n", "\n").trim() != new_body.replace("\r\n", "\n").trim() {
-        builder = builder.body(new_body);
-        changed = true;
-    }
-
-    let pr_num = state.number.green().bold().to_string();
-    let pr_url = state.url.blue().underline().to_string();
-
-    if !changed {
-        log::info!("PR #{pr_num} is up to date: {pr_url}");
-    } else {
-        log::debug!("Updating PR #{pr_num}...");
-        builder.send().await.wrap_err("Failed to update PR")?;
-        log::info!("Updated PR #{pr_num}: {pr_url}");
-    }
-
-    Ok(())
+    Ok((number, url, pr.node_id.unwrap_or_default()))
 }
 
 re!(gherrit_pr_id_re, r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$");
+
+struct BatchUpdate {
+    node_id: String,
+    title: String,
+    body: String,
+    base: String,
+}
+
+/// Perform batched updates of Pull Requests using GitHub's GraphQL API.
+///
+/// This avoids rate limits and network latency by grouping updates into chunks
+/// (default 50) and sending them as a single aliased mutation.
+async fn batch_update_prs(octocrab: &octocrab::Octocrab, updates: Vec<BatchUpdate>) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    // Chunking by 50 to avoid complexity limits
+    for chunk in updates.chunks(50) {
+        let mut mutation_body = String::new();
+        for (i, update) in chunk.iter().enumerate() {
+            let safe_title = json!(update.title);
+            let safe_body = json!(update.body);
+            let safe_base = json!(update.base);
+
+            mutation_body.push_str(&format!(
+                "update{i}: updatePullRequest(input: {{pullRequestId: \"{node_id}\", baseRefName: {safe_base}, title: {safe_title}, body: {safe_body}}}) {{ clientMutationId }}\n",
+                node_id = update.node_id,
+                safe_base = safe_base,
+                safe_title = safe_title,
+                safe_body = safe_body
+            ));
+        }
+
+        let query = format!("mutation {{ {} }}", mutation_body);
+        let query_body = json!({ "query": query });
+        let response: serde_json::Value = octocrab
+            .graphql(&query_body)
+            .await
+            .wrap_err("GraphQL batch update failed")?;
+
+        if let Some(errors) = response.get("errors") {
+            log::error!("Batch update errors: {}", errors);
+            bail!("Batch update failed: {:?}", errors);
+        }
+    }
+    Ok(())
+}

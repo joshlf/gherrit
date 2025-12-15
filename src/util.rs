@@ -374,19 +374,19 @@ pub fn get_github_token() -> Result<String> {
     )
 }
 
+/// Parses the owner and repository name from a remote URL.
+///
+/// Supports the following formats:
+/// - `https://github.com/owner/repo(.git)`
+/// - `git@github.com:owner/repo(.git)`
+/// - `alias:owner/repo(.git)`
 pub fn get_repo_owner_name(remote_url: &str) -> Result<(String, String)> {
     if remote_url.starts_with('/') {
         // Fallback for local tests
         return Ok(("owner".to_string(), "repo".to_string()));
     }
 
-    // Supports:
-    // - https://github.com/owner/repo(.git)
-    // - git@github.com:owner/repo(.git)
-    // - alias:owner/repo(.git)
-    let re = re!(
-        r"^(?:https://github\.com/|[^/:]+:)(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?$"
-    );
+    let re = re!(r"^(?:https://github\.com/|[^/:]+:)(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?$");
 
     if let Some(caps) = re.captures(remote_url) {
         let owner = caps.name("owner").unwrap().as_str().to_string();

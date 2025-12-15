@@ -4,6 +4,7 @@ use axum::{
     routing::{get, patch},
     Json, Router,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -93,12 +94,16 @@ struct AppState {
     state_path: PathBuf,
 }
 
+/// Starts a mock GitHub API server on a random local port.
+///
+/// Returns the address of the running server (e.g., `http://127.0.0.1:12345`).
 pub async fn start_mock_server(state_path: PathBuf) -> String {
     let app_state = AppState { state_path };
 
     let app = Router::new()
         .route("/repos/{owner}/{repo}/pulls", get(list_prs).post(create_pr))
         .route("/repos/{owner}/{repo}/pulls/{number}", patch(update_pr))
+        .route("/graphql", axum::routing::post(graphql))
         .with_state(app_state);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -112,6 +117,8 @@ pub async fn start_mock_server(state_path: PathBuf) -> String {
     url
 }
 
+/// Handler for `GET /repos/:owner/:repo/pulls`.
+/// Returns a list of PRs from the mock state.
 async fn list_prs(State(state): State<AppState>) -> Result<Json<Vec<PrEntry>>, StatusCode> {
     let mut mock_state = read_state(&state.state_path);
     if let Some(action) = &mock_state.fail_next_request {
@@ -137,6 +144,8 @@ struct CreatePrPayload {
     body: Option<String>,
 }
 
+/// Handler for `POST /repos/:owner/:repo/pulls`.
+/// Creates a new PR in the mock state.
 async fn create_pr(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
@@ -170,7 +179,7 @@ async fn create_pr(
         number: num,
         html_url: html_url.clone(),
         api_url: api_url.clone(),
-        node_id: "MDExOlB1bGxSZXF1ZXN0MQ==".to_string(),
+        node_id: format!("PR_NODE_{}", num),
         state: "open".to_string(),
         user: User {
             login: "test-user".to_string(),
@@ -222,6 +231,8 @@ struct UpdatePrPayload {
     base: Option<String>,
 }
 
+/// Handler for `PATCH /repos/:owner/:repo/pulls/:number`.
+/// Updates an existing PR in the mock state.
 async fn update_pr(
     State(state): State<AppState>,
     Path((_owner, _repo, number)): Path<(String, String, usize)>,
@@ -258,6 +269,117 @@ async fn update_pr(
     } else {
         Err(StatusCode::NOT_FOUND)
     }
+}
+
+/// Handler for `POST /graphql`.
+///
+/// Handles batched `updatePullRequest` mutations used by `gherrit` for efficiency.
+/// It uses regex to parse aliased mutations (e.g., `update0`, `update1`) from the query string
+/// and updates the mock state accordingly.
+async fn graphql(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let query = payload
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            eprintln!(
+                "DEBUG: Invalid GraphQL payload (missing 'query'): {}",
+                payload
+            );
+            StatusCode::BAD_REQUEST
+        })?;
+
+    let mut mock_state = read_state(&state.state_path);
+
+    // Support failure injection for updates (mapped to "update_pr" for compatibility)
+    if let Some(action) = &mock_state.fail_next_request {
+        if action == "update_pr" || action == "graphql" {
+            if mock_state.fail_remaining > 0 {
+                mock_state.fail_remaining -= 1;
+            }
+            if mock_state.fail_remaining == 0 {
+                mock_state.fail_next_request = None;
+            }
+            write_state(&state.state_path, &mock_state);
+            return Ok(Json(serde_json::json!({
+                "errors": [
+                    { "message": "Injected failure" }
+                ]
+            })));
+        }
+    }
+
+    // Simple regex to find batched mutations
+    // Matches `updateN: updatePullRequest(input: { ... }) {`
+    // We use `.+?` non-greedy match for fields until the closing `}) {`.
+    let re =
+        Regex::new(r#"update(?P<idx>\d+): updatePullRequest\(input: \{(?P<fields>.+?)\}\) \{"#)
+            .expect("Regex compilation failed");
+    // ... regexes ...
+    let title_re = Regex::new(r#"title: (?P<val>"(?:\\.|[^"\\])*")"#).expect("Title regex failed");
+    let body_re = Regex::new(r#"body: (?P<val>"(?:\\.|[^"\\])*")"#).expect("Body regex failed");
+    let id_re = Regex::new(r#"pullRequestId: "(?P<val>[^"]+)""#).expect("ID regex failed");
+    let base_re = Regex::new(r#"baseRefName: "(?P<val>[^"]+)""#).expect("Base regex failed");
+
+    let mut response_data = serde_json::Map::new();
+
+    let matches: Vec<_> = re.captures_iter(query).collect();
+
+    for caps in matches {
+        let idx = caps.name("idx").expect("Missing idx capture").as_str();
+        let fields = caps
+            .name("fields")
+            .expect("Missing fields capture")
+            .as_str();
+
+        // Extract ID
+        let node_id = if let Some(c) = id_re.captures(fields) {
+            c.name("val").unwrap().as_str().to_string()
+        } else {
+            continue;
+        };
+
+        // Find PR
+        if let Some(pr) = mock_state.prs.iter_mut().find(|p| p.node_id == node_id) {
+            if let Some(c) = title_re.captures(fields) {
+                // Needs unescaping? serde_json::from_str handles quotes and escapes
+                let val_str = c.name("val").unwrap().as_str();
+                if let Ok(val) = serde_json::from_str::<String>(val_str) {
+                    pr.title = Some(val);
+                }
+            }
+            if let Some(c) = body_re.captures(fields) {
+                let val_str = c.name("val").unwrap().as_str();
+                if let Ok(val) = serde_json::from_str::<String>(val_str) {
+                    pr.body = Some(val);
+                }
+            }
+            if let Some(c) = base_re.captures(fields) {
+                let val = c.name("val").unwrap().as_str();
+                pr.base.ref_field = val.to_string();
+            }
+
+            // Add success response for this alias
+            let alias = format!("update{}", idx);
+            response_data.insert(
+                alias,
+                serde_json::json!({
+                    "clientMutationId": null,
+                    "pullRequest": {
+                        "id": pr.node_id
+                    }
+                }),
+            );
+        }
+    }
+
+    write_state(&state.state_path, &mock_state);
+
+    Ok(Json(serde_json::json!({
+        "data": response_data
+    })))
 }
 
 fn read_state(path: &PathBuf) -> MockState {
