@@ -276,6 +276,13 @@ impl TestContext {
     pub fn checkout_new(&self, branch_name: &str) {
         self.run_git(&["checkout", "-b", branch_name]);
     }
+
+    pub fn inject_failure(&self, request_type: &str, remaining: usize) {
+        let mut state = self.read_mock_state();
+        state.fail_next_request = Some(request_type.to_string());
+        state.fail_remaining = remaining;
+        mock_server::write_state(&self.repo_path.join("mock_state.json"), &state);
+    }
 }
 
 fn run_git_cmd(path: &Path, args: &[&str]) {
