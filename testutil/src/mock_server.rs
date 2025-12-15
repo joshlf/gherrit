@@ -248,9 +248,10 @@ async fn graphql(
     let create_re = re!(
         r#"op(?P<idx>\d+): createPullRequest\(input: \{ repositoryId: "[^"]+", baseRefName: "(?P<base>[^"]+)", headRefName: "(?P<head>[^"]+)", title: (?P<title>"(?:\\.|[^"\\])*"), body: (?P<body>"(?:\\.|[^"\\])*") \}\)"#
     );
-    // We skip matching 'descendant' parts like 'repository' explicitly to be
-    // safer against spacing/formatting variations.
-    let pr_query_re = re!(r#"op(?P<idx>\d+):.*?pullRequests\(headRefName:\s*"(?P<head>[^"]+)""#);
+    // We match repository fields to ensure correct formatting (preventing double quotes bug)
+    let pr_query_re = re!(
+        r#"op(?P<idx>\d+): repository\(owner: "(?P<owner>[^"]+)", name: "(?P<name>[^"]+)"\) \{ pullRequests\(headRefName:\s*"(?P<head>[^"]+)""#
+    );
 
     // Process Updates
     for caps in update_re.captures_iter(query) {
@@ -396,7 +397,7 @@ async fn graphql(
     // Process Repo ID Fetch (simple query fallback)
     if !has_pr_query
         && response_data.is_empty()
-        && (query.contains("query { repository(owner:")
+        && (query.contains("query { repository(owner: \"owner\", name: \"repo\")")
             || query.contains("repository(owner: $owner, name: $name)"))
     {
         return Ok(Json(serde_json::json!({
