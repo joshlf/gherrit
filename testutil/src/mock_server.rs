@@ -5,7 +5,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use regex::Regex;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -148,12 +148,6 @@ fn check_and_apply_failure(mock_state: &mut MockState, action_name: &str) -> boo
     false
 }
 
-fn extract_val(re: &Regex, text: &str) -> Option<String> {
-    re.captures(text)
-        .and_then(|c| c.name("val"))
-        .map(|m| m.as_str().to_string())
-}
-
 /// Handler for `GET /repos/:owner/:repo/pulls`.
 /// Returns a list of PRs from the mock state.
 async fn list_prs(
@@ -232,11 +226,6 @@ async fn graphql(
     let mut mock_state = read_state(&state.state_path);
 
     // Support failure injection.
-    //
-    // We check for specific action names that map to GraphQL operations.
-    // "update_pr" and "create_pr" are used to fail specific logical operations.
-    // "graphql" is a catch-all for any GraphQL request. Support failure
-    // injection.
     if check_and_apply_failure(&mut mock_state, "update_pr")
         || check_and_apply_failure(&mut mock_state, "create_pr")
         || check_and_apply_failure(&mut mock_state, "graphql")
@@ -249,63 +238,45 @@ async fn graphql(
         })));
     }
 
-    // Regex for `updatePullRequest`
-    let update_re = re!(r#"op(?P<idx>\d+): updatePullRequest\(input: \{(?P<fields>.+?)\}\) \{"#);
-
-    // Regex for `createPullRequest`.
-    let create_re = re!(r#"op(?P<idx>\d+): createPullRequest\(input: \{(?P<fields>.+?)\}\)"#);
-
-    // Common field regexes
-    let title_re = re!(r#"title: (?P<val>"(?:\\.|[^"\\])*")"#);
-    let body_re = re!(r#"body: (?P<val>"(?:\\.|[^"\\])*")"#);
-    let id_re = re!(r#"pullRequestId: "(?P<val>[^"]+)""#);
-    let base_re = re!(r#"baseRefName: "(?P<val>[^"]+)""#);
-    let head_re = re!(r#"headRefName: "(?P<val>[^"]+)""#);
-
     let mut response_data = serde_json::Map::new();
+
+    // Regex definitions
+    // These regexes capture the full JSON string for complex fields like title and body.
+    let update_re = re!(
+        r#"op(?P<idx>\d+): updatePullRequest\(input: \{pullRequestId: "(?P<id>[^"]+)", baseRefName: "(?P<base>[^"]+)", title: (?P<title>"(?:\\.|[^"\\])*"), body: (?P<body>"(?:\\.|[^"\\])*")\}\)"#
+    );
+    let create_re = re!(
+        r#"op(?P<idx>\d+): createPullRequest\(input: \{ repositoryId: "[^"]+", baseRefName: "(?P<base>[^"]+)", headRefName: "(?P<head>[^"]+)", title: (?P<title>"(?:\\.|[^"\\])*"), body: (?P<body>"(?:\\.|[^"\\])*") \}\)"#
+    );
+    // Modified regex for pullRequests to handle potential spacing and quotes correctly
+    // op0: repository... pullRequests(headRefName: "head"
+    // We skip matching 'repository' explicitly to be safer against spacing/formatting variations.
+    let pr_query_re = re!(r#"op(?P<idx>\d+):.*?pullRequests\(headRefName:\s*"(?P<head>[^"]+)""#);
 
     // Process Updates
     for caps in update_re.captures_iter(query) {
-        let idx = caps.name("idx").expect("Missing idx capture").as_str();
-        let fields = caps
-            .name("fields")
-            .expect("Missing fields capture")
-            .as_str();
+        let idx = caps.name("idx").expect("Missing idx").as_str();
+        let node_id = caps.name("id").expect("Missing id").as_str();
+        let title = caps.name("title").expect("Missing title").as_str();
+        let body = caps.name("body").expect("Missing body").as_str();
+        let base = caps.name("base").expect("Missing base").as_str();
 
-        // Extract ID
-        let node_id = match extract_val(id_re, fields) {
-            Some(id) => id,
-            None => continue,
-        };
-
-        // Find PR
         if let Some(pr) = mock_state.prs.iter_mut().find(|p| p.node_id == node_id) {
-            if let Some(val_str) = extract_val(title_re, fields) {
-                if let Ok(val) = serde_json::from_str::<String>(&val_str) {
-                    pr.title = Some(val);
-                }
-            }
-            if let Some(val_str) = extract_val(body_re, fields) {
-                if let Ok(val) = serde_json::from_str::<String>(&val_str) {
-                    pr.body = Some(val);
-                }
-            }
-            if let Some(val) = extract_val(base_re, fields) {
-                pr.base.ref_field = val;
-            }
-            if let Some(val) = extract_val(head_re, fields) {
-                pr.head.ref_field = val;
-            }
+            pr.title = Some(serde_json::from_str::<String>(title).unwrap());
+            pr.body = Some(serde_json::from_str::<String>(body).unwrap());
+            pr.base.ref_field = base.to_string();
+        }
 
-            // Add success response for this alias
-            let alias = format!("op{}", idx);
+        let alias = format!("op{}", idx);
+
+        // Regression test helper: inject failure if body contains specific trigger
+        if body.contains("TRIGGER_GRAPHQL_NULL") {
+            response_data.insert(alias, serde_json::Value::Null);
+        } else {
             response_data.insert(
                 alias,
                 serde_json::json!({
-                    "clientMutationId": null,
-                    "pullRequest": {
-                        "id": pr.node_id
-                    }
+                    "clientMutationId": null
                 }),
             );
         }
@@ -313,48 +284,31 @@ async fn graphql(
 
     // Process Creations
     for caps in create_re.captures_iter(query) {
-        let idx = caps.name("idx").expect("Missing idx capture").as_str();
-        let fields = caps
-            .name("fields")
-            .expect("Missing fields capture")
-            .as_str();
+        let idx = caps.name("idx").expect("Missing idx").as_str();
+        let base = caps.name("base").expect("Missing base").as_str();
+        let head = caps.name("head").expect("Missing head").as_str();
+        let title = caps.name("title").expect("Missing title").as_str();
+        let body = caps.name("body").expect("Missing body").as_str();
 
-        let head = extract_val(head_re, fields).unwrap_or_default();
-        let base = extract_val(base_re, fields).unwrap_or_default();
+        let num = mock_state.prs.len() as u64 + 1;
+        let node_id = format!("PR_{}", num);
+        let html_url = format!("http://github.com/owner/repo/pull/{}", num);
 
-        let extract_or_empty = |re: &Regex| {
-            let json = extract_val(re, fields).unwrap_or_default();
-            serde_json::from_str::<String>(&json).unwrap_or_default()
-        };
-
-        let title = extract_or_empty(title_re);
-        let body = extract_or_empty(body_re);
-
-        // Check if PR exists (idempotency simulation, though usually GitHub
-        // errors). For simplicity, we just create a new one.
-
-        let max_id = mock_state.prs.iter().map(|p| p.number).max().unwrap_or(0);
-        let num = max_id + 1;
-        let html_url = format!(
-            "https://github.com/{}/{}/pull/{}",
-            mock_state.repo_owner, mock_state.repo_name, num
-        ); // Simplified
-        let api_url = format!(
-            "https://api.github.com/repos/{}/{}/pulls/{}",
-            mock_state.repo_owner, mock_state.repo_name, num
-        );
-        let node_id = format!("PR_NODE_{}", num);
+        let title_val = serde_json::from_str::<String>(title)
+            .expect("Failed to parse title in mock server; client may have sent invalid JSON");
+        let body_val = serde_json::from_str::<String>(body)
+            .expect("Failed to parse body in mock server; client may have sent invalid JSON");
 
         let entry = PrEntry {
-            id: num as u64,
-            number: num,
+            id: num,
+            number: num as usize,
             html_url: html_url.clone(),
-            api_url,
+            api_url: format!("http://api.github.com/repos/owner/repo/pulls/{}", num),
             node_id: node_id.clone(),
-            state: "open".to_string(),
+            state: "OPEN".to_string(),
             user: User {
                 login: "test-user".to_string(),
-                id: 1,
+                id: 123,
                 node_id: "MDQ6VXNlcjE=".to_string(),
                 avatar_url: "https://example.com/avatar".to_string(),
                 gravatar_id: "".to_string(),
@@ -376,14 +330,14 @@ async fn graphql(
                 type_field: "User".to_string(),
                 site_admin: false,
             },
-            title: Some(title),
-            body: Some(body),
+            title: Some(title_val),
+            body: Some(body_val),
             head: RefInfo {
-                ref_field: head,
+                ref_field: head.to_string(),
                 sha: "".to_string(),
             },
             base: RefInfo {
-                ref_field: base,
+                ref_field: base.to_string(),
                 sha: "".to_string(),
             },
             created_at: "2023-01-01T00:00:00Z".to_string(),
@@ -406,22 +360,49 @@ async fn graphql(
         );
     }
 
-    // Process Repo ID Fetch (simple query)
-    if query.contains("query { repository(owner:")
-        || query.contains("repository(owner: $owner, name: $name)")
-    {
+    // Process batched pullRequests query
+    let mut has_pr_query = false;
+    for caps in pr_query_re.captures_iter(query) {
+        has_pr_query = true;
+        let idx = caps.name("idx").expect("Missing idx").as_str();
+        let head = caps.name("head").expect("Missing head").as_str();
+
+        let alias = format!("op{}", idx);
+
+        // Find matching PR
+        let nodes = if let Some(pr) = mock_state.prs.iter().find(|p| p.head.ref_field == head) {
+            vec![serde_json::json!({
+                "number": pr.number,
+                "id": pr.node_id,
+                "title": pr.title,
+                "body": pr.body,
+                "baseRefName": pr.base.ref_field,
+                "state": pr.state,
+            })]
+        } else {
+            vec![]
+        };
+
         response_data.insert(
-            "repository".to_string(),
+            alias,
             serde_json::json!({
-                "id": "REPO_NODE_ID"
+                "pullRequests": {
+                    "nodes": nodes
+                }
             }),
         );
-        // If it was a generic query, we might need a different structure.
-        // Assuming the client sends `query { repository(...) { id } }`
+    }
+
+    // Process Repo ID Fetch (simple query fallback)
+    if !has_pr_query
+        && response_data.is_empty()
+        && (query.contains("query { repository(owner:")
+            || query.contains("repository(owner: $owner, name: $name)"))
+    {
         return Ok(Json(serde_json::json!({
             "data": {
                 "repository": {
-                     "id": "REPO_NODE_ID"
+                    "id": "REPO_NODE_ID"
                 }
             }
         })));
@@ -442,7 +423,7 @@ fn read_state(path: &PathBuf) -> MockState {
     }
 }
 
-fn write_state(path: &PathBuf, state: &MockState) {
+pub fn write_state(path: &PathBuf, state: &MockState) {
     let content = serde_json::to_string(state).unwrap();
     fs::write(path, content).unwrap();
 }
