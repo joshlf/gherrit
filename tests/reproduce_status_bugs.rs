@@ -45,13 +45,7 @@ fn test_pre_push_edit_failure() {
     ]);
 
     // Run hook with failure injection
-    // Run hook with failure injection
-    let mut state = ctx.read_mock_state();
-    state.fail_next_request = Some("update_pr".to_string());
-    state.fail_remaining = 5;
-    let state_json = serde_json::to_string(&state).unwrap();
-    let state_path = ctx.repo_path.join("mock_state.json");
-    std::fs::write(&state_path, state_json).unwrap();
+    ctx.inject_failure("update_pr", 5);
 
     ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
 }
