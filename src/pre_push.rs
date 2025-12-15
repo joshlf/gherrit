@@ -756,6 +756,33 @@ struct BatchCreate {
     head_branch: String,
 }
 
+/// Formats a string with JSON values, safely avoiding variable capture.
+///
+/// This macro is used to format strings with JSON values, which are then passed
+/// to the GraphQL API. It intentionally doesn't support normal string
+/// interpolation, which would present injection vulnerabilities. Instead, all
+/// values are formatted as JSON before being interpolated.
+macro_rules! safe_json_format {
+    ($fmt:literal, $($key:ident = $value:expr),* $(,)?) => {{
+        // Inner function to avoid capturing environment variables.
+        fn inner($($key: serde_json::Value),*) -> String {
+            format!($fmt)
+        }
+
+        inner($(serde_json::json!($value)),*)
+    }};
+}
+
+/// Recursively looks up nested values from a JSON object, converting lookup
+/// failures to `Result::Err` values.
+macro_rules! json_get {
+    ($val:ident [$key:expr] $(.$as:ident())? $([$rest_key:expr] $(.$rest_as:ident())?)*) => {
+        $val
+            .get($key)$(.and_then(|v| v.$as()))?.ok_or_else(|| eyre!("Missing JSON field in GraphQL response: `{}`", stringify!($key)))
+            $(.and_then(|v| v.get($rest_key)$(.and_then(|v| v.$rest_as()))?.ok_or_else(|| eyre!("Missing JSON field in GraphQL response: `{}`", stringify!($rest_key)))))*
+    };
+}
+
 /// Fetches the global Repository Node ID for the given owner and repo.
 ///
 /// This ID (e.g., "R_kgDOL...") is required for creating PRs via the GraphQL
@@ -783,13 +810,7 @@ async fn fetch_repo_id(octocrab: &Octocrab, remote: &Remote) -> Result<String> {
         bail!("Failed to fetch repository ID: {:?}", errors);
     }
 
-    let id = response
-        .get("data")
-        .and_then(|d| d.get("repository"))
-        .and_then(|r| r.get("id"))
-        .and_then(|id| id.as_str())
-        .ok_or_else(|| eyre!("Required repository ID not found in response"))?;
-
+    let id = json_get!(response["data"]["repository"]["id"].as_str())?;
     Ok(id.to_string())
 }
 
@@ -800,15 +821,15 @@ async fn fetch_repo_id(octocrab: &Octocrab, remote: &Remote) -> Result<String> {
 async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<BatchUpdate>) -> Result<()> {
     run_batched_graphql(
         octocrab,
-        "mutation",
+        GraphQlOp::Mutation,
         updates,
         |update| {
-            let node_id = json!(update.node_id);
-            let title = json!(update.title);
-            let body = json!(update.body);
-            let base = json!(update.base_branch);
-            format!(
-                "updatePullRequest(input: {{pullRequestId: {node_id}, baseRefName: {base}, title: {title}, body: {body}}}) {{ clientMutationId }}"
+            safe_json_format!(
+                "updatePullRequest(input: {{pullRequestId: {node_id}, baseRefName: {base}, title: {title}, body: {body}}}) {{ clientMutationId }}",
+                node_id = update.node_id,
+                base = update.base_branch,
+                title = update.title,
+                body = update.body,
             )
         },
         |update, op_data| {
@@ -841,36 +862,23 @@ async fn batch_create_prs(
 
     run_batched_graphql(
         octocrab,
-        "mutation",
+        GraphQlOp::Mutation,
         creations_list,
         |create| {
-            let repo_id = json!(repo_id);
-            let base = json!(create.base_branch);
-            let head = json!(create.head_branch);
-            let title = json!(create.title);
-            let body = json!(create.body);
-            format!(
-                "createPullRequest(input: {{ repositoryId: {repo_id}, baseRefName: {base}, headRefName: {head}, title: {title}, body: {body} }}) {{ pullRequest {{ number, url, id }} }}"
+            safe_json_format!(
+                "createPullRequest(input: {{ repositoryId: {repo_id}, baseRefName: {base}, headRefName: {head}, title: {title}, body: {body} }}) {{ pullRequest {{ number, url, id }} }}",
+                repo_id = repo_id,
+                base = create.base_branch,
+                head = create.head_branch,
+                title = create.title,
+                body = create.body,
             )
         },
         |create, val| {
-            let pr = val
-                .get("pullRequest")
-                .ok_or_else(|| eyre!("Missing pullRequest"))?;
-            let node_id = pr
-                .get("id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| eyre!("Missing id"))?
-                .to_string();
-            let number = pr
-                .get("number")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| eyre!("Missing number"))?;
-            let url = pr
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| eyre!("Missing url"))?
-                .to_string();
+            let pr = json_get!(val["pullRequest"])?;
+            let node_id = json_get!(pr["id"].as_str())?.to_string();
+            let number = json_get!(pr["number"].as_u64())?;
+            let url = json_get!(pr["url"].as_str())?.to_string();
 
             created_prs.insert(create.head_branch.clone(), (number, url, node_id));
             Ok(())
@@ -893,12 +901,14 @@ async fn batch_fetch_prs(
 
     run_batched_graphql(
         octocrab,
-        "query",
+        GraphQlOp::Query,
         head_refs,
         |head_ref| {
-             let safe_head = json!(head_ref);
-             format!(
-                "repository(owner: {owner}, name: {repo_name}) {{ pullRequests(headRefName: {safe_head}, first: 1, states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, title, body, baseRefName, state }} }} }}"
+            safe_json_format!(
+                "repository(owner: {owner}, name: {repo_name}) {{ pullRequests(headRefName: {head_ref}, first: 1, states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, title, body, baseRefName, state }} }} }}",
+                owner = owner,
+                repo_name = repo_name,
+                head_ref = head_ref,
             )
         },
         |head_ref, val| {
@@ -908,30 +918,17 @@ async fn batch_fetch_prs(
                 .and_then(|n| n.as_array())
                 && let Some(node) = nodes.first()
             {
-                let number = node
-                    .get("number")
-                    .and_then(|n| n.as_u64())
-                    .ok_or_else(|| eyre!("Missing number"))?;
-                let id = node
-                    .get("id")
-                    .and_then(|id| id.as_str())
-                    .ok_or_else(|| eyre!("Missing id"))?;
-
-                // Use serde_json::from_value for cleaner enum deserialization
-                let state_val = node.get("state").ok_or_else(|| eyre!("Missing state"))?;
+                let number = json_get!(node["number"].as_u64())?;
+                let id = json_get!(node["id"].as_str())?;
                 let state: PullRequestState =
-                    serde_json::from_value(state_val.clone()).wrap_err("Failed to parse PR state")?;
+                    serde_json::from_value(json_get!(node["state"])?.clone()).wrap_err("Failed to parse PR state")?;
 
                 all_prs.push(PrState {
                     number,
                     node_id: id.to_string(),
                     title: node.get("title").and_then(|t| t.as_str()).map(ToString::to_string),
                     body: node.get("body").and_then(|b| b.as_str()).map(ToString::to_string),
-                    base_branch: node
-                        .get("baseRefName")
-                        .and_then(|b| b.as_str())
-                        .ok_or_else(|| eyre!("PR #{} is missing a base branch name", number))?
-                        .to_string(),
+                    base_branch: json_get!(node["baseRefName"].as_str()).map(|s| s.to_string())?,
                     head_branch: head_ref.to_string(),
                     state,
                 });
@@ -943,13 +940,18 @@ async fn batch_fetch_prs(
     Ok(all_prs)
 }
 
+enum GraphQlOp {
+    Query,
+    Mutation,
+}
+
 /// Executes batched GraphQL operations (queries or mutations).
 ///
 /// Iterates over items in chunks of 50, builds a combined query string using
 /// `query_builder`, and processes the response using `response_handler`.
 async fn run_batched_graphql<T, M, H>(
     octocrab: &Octocrab,
-    operation_type: &str,
+    operation_type: GraphQlOp,
     items: impl IntoIterator<Item = T>,
     query_builder: M,
     mut response_handler: H,
@@ -967,7 +969,13 @@ where
             .map(|(i, item)| format!("{}: {}", alias(i), query_builder(item)))
             .collect();
 
-        let query = format!("{operation_type} {{ {query_body} }}");
+        let query = format!(
+            "{} {{ {query_body} }}",
+            match operation_type {
+                GraphQlOp::Query => "query",
+                GraphQlOp::Mutation => "mutation",
+            }
+        );
         let query_body = json!({ "query": query });
         let response: serde_json::Value = octocrab
             .graphql(&query_body)
@@ -979,9 +987,7 @@ where
             bail!("GraphQL errors: {:?}", errors);
         }
 
-        let data = response
-            .get("data")
-            .ok_or_else(|| eyre!("No data in response"))?;
+        let data = json_get!(response["data"])?;
 
         for (i, item) in chunk.iter().enumerate() {
             if let Some(op_data) = data.get(alias(i)) {
