@@ -31,7 +31,7 @@ fn test_pagination_bug() {
             "html_url": format!("http://github.com/owner/repo/pull/{}", i),
             "url": format!("http://api.github.com/repos/owner/repo/pulls/{}", i),
             "node_id": format!("PR_{}", i),
-            "state": "open",
+            "state": "OPEN",
             "user": {
                 "login": "test",
                 "id": 1,
