@@ -1,9 +1,6 @@
+use std::{env, fs, io::Write, path::PathBuf, process::Command};
+
 use serde::{Deserialize, Serialize};
-use std::env;
-use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct MockState {
@@ -42,11 +39,7 @@ fn default_repo() -> String {
 fn main() {
     let args: Vec<String> = env::args().collect();
     // Detect identity via filename (handles .exe on Windows)
-    let prog_name = PathBuf::from(&args[0])
-        .file_stem()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let prog_name = PathBuf::from(&args[0]).file_stem().unwrap().to_string_lossy().to_string();
 
     assert_eq!(prog_name, "git");
     handle_git(&args);
@@ -145,8 +138,7 @@ where
 
     // Write the updated state and atomic commit (rename).
     let new_content = serde_json::to_string(&state).unwrap();
-    lock.with_mut(|out| out.write_all(new_content.as_bytes()))
-        .unwrap();
+    lock.with_mut(|out| out.write_all(new_content.as_bytes())).unwrap();
 
     lock.commit().unwrap();
 

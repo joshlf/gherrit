@@ -1,8 +1,10 @@
 use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
 
-use crate::cmd;
-use crate::util::{self, CommandExt as _, HeadState};
+use crate::{
+    cmd,
+    util::{self, CommandExt as _, HeadState},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -121,10 +123,7 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
                 // FIXME(#219): Add the ability to save the user's custom
                 // configuration so it can be restored during a subsequent
                 // `gherrit unmanage`.
-                log::warn!(
-                    "Configuration drift detected for branch {}.",
-                    branch_name.yellow()
-                );
+                log::warn!("Configuration drift detected for branch {}.", branch_name.yellow());
                 let (article, state) = match old_state {
                     Some(State::Unmanaged) | None => ("an", "unmanaged"),
                     Some(State::Private) => ("a", "private"),
@@ -244,9 +243,8 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
     }
 
     // Creation detection: Bail if we're just checking out an already-existing branch.
-    let is_new = repo
-        .is_newly_created_branch(branch_name)
-        .wrap_err("Failed to check if branch is new")?;
+    let is_new =
+        repo.is_newly_created_branch(branch_name).wrap_err("Failed to check if branch is new")?;
     if !is_new {
         log::debug!(" Branch '{}' is not newly created.", branch_name);
         return Ok(());

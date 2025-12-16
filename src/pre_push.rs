@@ -26,16 +26,10 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
 
     match repo.is_managed(branch_name)? {
         false => {
-            log::info!(
-                "Branch {} is UNMANAGED. Allowing standard push.",
-                branch_name.yellow()
-            );
+            log::info!("Branch {} is UNMANAGED. Allowing standard push.", branch_name.yellow());
             return Ok(());
         }
-        true => log::info!(
-            "Branch {} is MANAGED. Syncing stack...",
-            branch_name.yellow()
-        ),
+        true => log::info!("Branch {} is MANAGED. Syncing stack...", branch_name.yellow()),
     }
 
     let commits = collect_commits(repo).wrap_err("Failed to collect commits")?;
@@ -92,16 +86,7 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     let default_branch = repo.find_default_branch_on_default_remote();
 
     let num_commits = commits.len();
-    sync_prs(
-        repo,
-        &octocrab,
-        branch_name,
-        &default_branch,
-        commits,
-        latest_versions,
-        prs,
-    )
-    .await?;
+    sync_prs(repo, &octocrab, branch_name, &default_branch, commits, latest_versions, prs).await?;
 
     log::info!("Successfully synced {num_commits} commits.");
     Ok(())
@@ -127,11 +112,7 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
     let mut commits = repo
         .rev_walk([head])
         .all()?
-        .take_while(|res| {
-            res.as_ref()
-                .map(|info| info.id != default_ref)
-                .unwrap_or(true)
-        })
+        .take_while(|res| res.as_ref().map(|info| info.id != default_ref).unwrap_or(true))
         .map(|res| -> Result<_> { Ok(res?.object()?) })
         .collect::<Result<Vec<_>>>()?;
     commits.reverse();
@@ -143,10 +124,7 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
             let msg = c.message()?;
             let title = core::str::from_utf8(msg.title)?;
 
-            if ["fixup!", "squash!", "amend!"]
-                .iter()
-                .any(|p| title.starts_with(p))
-            {
+            if ["fixup!", "squash!", "amend!"].iter().any(|p| title.starts_with(p)) {
                 // FIXME: Currently, the indent before `git rebase` is not
                 // preserved.
                 bail!(
@@ -228,20 +206,14 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
                 .unwrap_or("");
 
             refspecs.push(format!("{}:refs/heads/{}", c.id, c.gherrit_id));
-            refspecs.push(format!(
-                "--force-with-lease=refs/heads/{}:{expected_sha}",
-                c.gherrit_id
-            ));
+            refspecs.push(format!("--force-with-lease=refs/heads/{}:{expected_sha}", c.gherrit_id));
 
             // Lock the next version tag to prevent concurrent pushes of the
             // same version. `--force-with-lease=<ref>:` means "expect the ref
             // to NOT exist", and causes the server to fail the operation if it
             // does exist. This prevents overwriting if someone else pushed
             // next_ver already.
-            refspecs.push(format!(
-                "{}:refs/tags/gherrit/{}/v{}",
-                c.id, c.gherrit_id, next_ver
-            ));
+            refspecs.push(format!("{}:refs/tags/gherrit/{}/v{}", c.id, c.gherrit_id, next_ver));
             refspecs.push(format!(
                 "--force-with-lease=refs/tags/gherrit/{}/v{next_ver}:",
                 c.gherrit_id
@@ -478,12 +450,8 @@ fn generate_pr_body(
     }
 
     // Generate Metadata JSON
-    let parent_val = parent_id
-        .map(|s| format!("\"{}\"", s))
-        .unwrap_or("null".to_string());
-    let child_val = child_id
-        .map(|s| format!("\"{}\"", s))
-        .unwrap_or("null".to_string());
+    let parent_val = parent_id.map(|s| format!("\"{}\"", s)).unwrap_or("null".to_string());
+    let child_val = child_id.map(|s| format!("\"{}\"", s)).unwrap_or("null".to_string());
 
     let meta_json = format!(
         r#"{{"id": "{}", "parent": {}, "child": {}}}"#,
@@ -542,17 +510,10 @@ async fn sync_prs(
             let pr_info = prs.iter().find(|pr| pr.head_branch == c.gherrit_id);
 
             if let Some(pr) = pr_info {
-                log::debug!(
-                    "Found existing PR #{} for {}",
-                    pr.number.green().bold(),
-                    c.gherrit_id
-                );
+                log::debug!("Found existing PR #{} for {}", pr.number.green().bold(), c.gherrit_id);
                 Ok(PrResolution::Existing(pr.clone()))
             } else {
-                log::debug!(
-                    "No GitHub PR exists for {}; queuing creation...",
-                    c.gherrit_id
-                );
+                log::debug!("No GitHub PR exists for {}; queuing creation...", c.gherrit_id);
                 Ok(PrResolution::ToCreate(BatchCreate {
                     title: c.message_title.clone(),
                     body: c.message_body.clone(),
@@ -590,11 +551,7 @@ async fn sync_prs(
             PrResolution::Existing(state) => state,
             PrResolution::ToCreate(create) => {
                 if let Some((number, url, node_id)) = new_prs.get(&create.head_branch) {
-                    log::info!(
-                        "Created PR #{}: {}",
-                        number.green().bold(),
-                        url.blue().underline()
-                    );
+                    log::info!("Created PR #{}: {}", number.green().bold(), url.blue().underline());
                     PrState {
                         number: *number,
                         node_id: node_id.clone(),
@@ -657,11 +614,7 @@ async fn sync_prs(
             );
 
             let pr_num = pr_state.number.green().bold().to_string();
-            let pr_url = remote
-                .pr_url(pr_state.number)
-                .blue()
-                .underline()
-                .to_string();
+            let pr_url = remote.pr_url(pr_state.number).blue().underline().to_string();
 
             let body_changed = pr_state.body.as_ref().is_none_or(|b| {
                 b.replace("\r\n", "\n").trim() != body.replace("\r\n", "\n").trim()
@@ -717,11 +670,8 @@ impl TryFrom<gix::Commit<'_>> for Commit {
     fn try_from(c: gix::Commit) -> Result<Self> {
         let message = c.message()?;
         let message_title = core::str::from_utf8(message.title)?.to_string();
-        let message_body = message
-            .body
-            .map(|body| core::str::from_utf8(body).unwrap())
-            .unwrap_or("")
-            .to_string();
+        let message_body =
+            message.body.map(|body| core::str::from_utf8(body).unwrap()).unwrap_or("").to_string();
         let gherrit_id = {
             let re = gherrit_pr_id_re();
             let captures = re
@@ -730,12 +680,7 @@ impl TryFrom<gix::Commit<'_>> for Commit {
             captures.get(1).unwrap().as_str().to_string()
         };
 
-        Ok(Commit {
-            id: c.id,
-            gherrit_id,
-            message_title,
-            message_body,
-        })
+        Ok(Commit { id: c.id, gherrit_id, message_title, message_body })
     }
 }
 
@@ -803,10 +748,8 @@ async fn fetch_repo_id(octocrab: &Octocrab, remote: &Remote) -> Result<String> {
             "name": remote.repo_name,
         }
     });
-    let response: serde_json::Value = octocrab
-        .graphql(&query_body)
-        .await
-        .wrap_err("Failed to fetch repository ID")?;
+    let response: serde_json::Value =
+        octocrab.graphql(&query_body).await.wrap_err("Failed to fetch repository ID")?;
 
     if let Some(errors) = response.get("errors") {
         log::error!("GraphQL errors: {}", errors);
@@ -989,10 +932,8 @@ where
             }
         );
         let query_body = json!({ "query": query });
-        let response: serde_json::Value = octocrab
-            .graphql(&query_body)
-            .await
-            .wrap_err("GraphQL batched operation failed")?;
+        let response: serde_json::Value =
+            octocrab.graphql(&query_body).await.wrap_err("GraphQL batched operation failed")?;
 
         if let Some(errors) = response.get("errors") {
             log::error!("GraphQL errors: {}", errors);

@@ -1,3 +1,5 @@
+use std::{collections::HashMap, fs, path::PathBuf};
+
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -5,11 +7,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
 use tokio::net::TcpListener;
 
 #[macro_export]
@@ -114,10 +112,7 @@ pub async fn start_mock_server(state_path: PathBuf) -> String {
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
 
-    let app_state = AppState {
-        state_path,
-        base_url: url.clone(),
-    };
+    let app_state = AppState { state_path, base_url: url.clone() };
 
     let app = Router::new()
         .route("/repos/{owner}/{repo}/pulls", get(list_prs))
@@ -161,14 +156,8 @@ async fn list_prs(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    let page = params
-        .get("page")
-        .and_then(|p| p.parse::<usize>().ok())
-        .unwrap_or(1);
-    let per_page = params
-        .get("per_page")
-        .and_then(|p| p.parse::<usize>().ok())
-        .unwrap_or(30);
+    let page = params.get("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+    let per_page = params.get("per_page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(30);
 
     let start = (page - 1) * per_page;
     let end = start + per_page;
@@ -212,16 +201,10 @@ async fn graphql(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let query = payload
-        .get("query")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            eprintln!(
-                "DEBUG: Invalid GraphQL payload (missing 'query'): {}",
-                payload
-            );
-            StatusCode::BAD_REQUEST
-        })?;
+    let query = payload.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
+        eprintln!("DEBUG: Invalid GraphQL payload (missing 'query'): {}", payload);
+        StatusCode::BAD_REQUEST
+    })?;
 
     let mut mock_state = read_state(&state.state_path);
 
@@ -333,14 +316,8 @@ async fn graphql(
             },
             title: Some(title_val),
             body: Some(body_val),
-            head: RefInfo {
-                ref_field: head.to_string(),
-                sha: "".to_string(),
-            },
-            base: RefInfo {
-                ref_field: base.to_string(),
-                sha: "".to_string(),
-            },
+            head: RefInfo { ref_field: head.to_string(), sha: "".to_string() },
+            base: RefInfo { ref_field: base.to_string(), sha: "".to_string() },
             created_at: "2023-01-01T00:00:00Z".to_string(),
             updated_at: "2023-01-01T00:00:00Z".to_string(),
         };

@@ -13,12 +13,8 @@ fn assert_autosquash_error(
 ) -> assert_cmd::assert::Assert {
     output
         .failure()
-        .stderr(predicate::str::contains(
-            "Stack contains pending fixup/squash/amend commits",
-        ))
-        .stderr(predicate::str::contains(format!(
-            "git rebase -i --autosquash {remote}/{branch}",
-        )))
+        .stderr(predicate::str::contains("Stack contains pending fixup/squash/amend commits"))
+        .stderr(predicate::str::contains(format!("git rebase -i --autosquash {remote}/{branch}",)))
 }
 
 #[test]

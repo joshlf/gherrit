@@ -11,9 +11,7 @@ fn test_pre_push_ls_remote_failure() {
         .env("MOCK_BIN_FAIL_CMD", "git:ls-remote")
         .assert()
         .success()
-        .stderr(predicates::str::contains(
-            "Failed to fetch remote branch states",
-        ));
+        .stderr(predicates::str::contains("Failed to fetch remote branch states"));
 }
 
 #[test]
@@ -44,9 +42,7 @@ fn test_pre_push_pr_create_failure() {
 fn test_commit_msg_git_var_failure() {
     #[cfg(unix)]
     {
-        let ctx = testutil::test_context_minimal!()
-            .install_hooks(true)
-            .build();
+        let ctx = testutil::test_context_minimal!().install_hooks(true).build();
         ctx.gherrit().args(["manage"]).assert().success();
 
         let msg_file = ctx.repo_path.join("COMMIT_EDITMSG");
@@ -64,9 +60,7 @@ fn test_commit_msg_git_var_failure() {
 fn test_commit_msg_trailers_failure() {
     #[cfg(unix)]
     {
-        let ctx = testutil::test_context_minimal!()
-            .install_hooks(true)
-            .build();
+        let ctx = testutil::test_context_minimal!().install_hooks(true).build();
         ctx.gherrit().args(["manage"]).assert().success();
 
         let msg_file = ctx.repo_path.join("COMMIT_EDITMSG");

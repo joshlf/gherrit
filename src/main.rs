@@ -6,7 +6,6 @@ mod util;
 
 use clap::{Parser, Subcommand};
 use eyre::{Result, WrapErr};
-
 use manage::State;
 
 #[derive(Parser)]
@@ -57,11 +56,7 @@ enum HookCommands {
     /// Git pre-push hook.
     PrePush,
     /// Git post-checkout hook.
-    PostCheckout {
-        prev: String,
-        new: String,
-        flag: String,
-    },
+    PostCheckout { prev: String, new: String, flag: String },
     /// Git commit-msg hook.
     CommitMsg {
         /// The file containing the commit message.
@@ -74,8 +69,9 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format({
-            use owo_colors::OwoColorize as _;
             use std::io::Write as _;
+
+            use owo_colors::OwoColorize as _;
 
             let prefix = "[gherrit]".bold().green().to_string();
             let level_style_error = " [ERROR]".red().to_string();
@@ -103,9 +99,7 @@ fn main() -> ExitCode {
     }
 
     if let Err(e) = run() {
-        format!("{:#}", e)
-            .lines()
-            .for_each(|line| log::error!("{}", line));
+        format!("{:#}", e).lines().for_each(|line| log::error!("{}", line));
         return ExitCode::FAILURE;
     }
 
@@ -114,10 +108,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     // Limit concurrency to avoid hitting GitHub's abuse limits.
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(6)
-        .build_global()
-        .unwrap();
+    rayon::ThreadPoolBuilder::new().num_threads(6).build_global().unwrap();
 
     let cli = Cli::parse();
     let repo = util::Repo::open(".").wrap_err("Failed to open repo")?;
@@ -135,11 +126,7 @@ fn run() -> Result<()> {
             }
             HookCommands::CommitMsg { file } => commit_msg::run(&repo, &file)?,
         },
-        Commands::Manage {
-            force,
-            public,
-            private,
-        } => {
+        Commands::Manage { force, public, private } => {
             let target_state = if public {
                 State::Public
             } else if private {
@@ -156,10 +143,7 @@ fn run() -> Result<()> {
             manage::set_state(&repo, target_state, force)?
         }
         Commands::Unmanage { force } => manage::set_state(&repo, State::Unmanaged, force)?,
-        Commands::Install {
-            force,
-            allow_global,
-        } => install::install(&repo, force, allow_global)?,
+        Commands::Install { force, allow_global } => install::install(&repo, force, allow_global)?,
     }
 
     Ok(())

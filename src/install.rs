@@ -1,10 +1,11 @@
-use crate::util::Repo;
-use eyre::{Result, WrapErr, bail};
-use owo_colors::OwoColorize;
-use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
+
+use eyre::{Result, WrapErr, bail};
+use owo_colors::OwoColorize;
+
+use crate::util::Repo;
 
 const REQUIRED_HOOKS: &[&str] = &["pre-push", "commit-msg", "post-checkout"];
 const PROLOGUE: &str = "# gherrit-installer: managed";
@@ -72,11 +73,8 @@ fn resolve_hooks_dir(repo: &Repo, allow_global: bool) -> Result<PathBuf> {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
         // Best effort canonicalization
-        let abs_hooks = if path_buf.exists() {
-            path_buf.canonicalize().unwrap_or(path_buf)
-        } else {
-            path_buf
-        };
+        let abs_hooks =
+            if path_buf.exists() { path_buf.canonicalize().unwrap_or(path_buf) } else { path_buf };
 
         if !abs_hooks.starts_with(&root) {
             if allow_global {

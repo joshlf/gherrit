@@ -1,8 +1,10 @@
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::LazyLock;
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::LazyLock,
+};
+
 use tempfile::TempDir;
 
 pub mod mock_server;
@@ -112,10 +114,7 @@ impl TestContextBuilder {
 
         init_git_repo(&repo_path, &remote_path);
 
-        let gherrit_bin = self
-            .gherrit_bin
-            .clone()
-            .expect("gherrit binary path must be set");
+        let gherrit_bin = self.gherrit_bin.clone().expect("gherrit binary path must be set");
         let mock_bin = self.mock_bin.clone().expect("mock binary path must be set");
 
         let mock_server = (!is_live).then(|| {
@@ -149,10 +148,7 @@ impl TestContextBuilder {
                 });
             });
 
-            MockServerInfo {
-                url: rx.recv().unwrap(),
-                shutdown_tx,
-            }
+            MockServerInfo { url: rx.recv().unwrap(), shutdown_tx }
         });
 
         let ctx = TestContext {
@@ -286,20 +282,12 @@ impl TestContext {
 }
 
 fn run_git_cmd(path: &Path, args: &[&str]) {
-    assert_cmd::Command::new("git")
-        .current_dir(path)
-        .args(args)
-        .assert()
-        .success();
+    assert_cmd::Command::new("git").current_dir(path).args(args).assert().success();
 }
 
 pub fn install_mock_binaries(path: &Path, mock_bin: &Path, gherrit_bin: &Path) {
     let git_dst = path.join(if cfg!(windows) { "git.exe" } else { "git" });
-    let gherrit_dst = path.join(if cfg!(windows) {
-        "gherrit.exe"
-    } else {
-        "gherrit"
-    });
+    let gherrit_dst = path.join(if cfg!(windows) { "gherrit.exe" } else { "gherrit" });
 
     fs::copy(mock_bin, &git_dst).unwrap();
     fs::copy(gherrit_bin, &gherrit_dst).unwrap();
@@ -321,10 +309,7 @@ fn init_git_repo(path: &Path, remote_path: &Path) {
     // Explicitly unmanage main to satisfy strict config checks
     run_git_cmd(path, &["config", "branch.main.gherritManaged", "false"]);
     // Add origin remote
-    run_git_cmd(
-        path,
-        &["remote", "add", "origin", remote_path.to_str().unwrap()],
-    );
+    run_git_cmd(path, &["remote", "add", "origin", remote_path.to_str().unwrap()]);
 }
 
 static SYSTEM_GIT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {

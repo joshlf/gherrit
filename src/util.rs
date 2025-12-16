@@ -1,9 +1,7 @@
-use std::ffi::OsStr;
-use std::process::Command;
+use std::{ffi::OsStr, process::Command};
 
 use eyre::{OptionExt, Result, WrapErr, bail, eyre};
-use gix::bstr::ByteSlice;
-use gix::state::InProgress;
+use gix::{bstr::ByteSlice, state::InProgress};
 
 use crate::manage::State;
 
@@ -122,10 +120,7 @@ impl Repo {
         // `gherrit` doesn't need to be run from the root of the repository.
         let inner = gix::discover(path)?;
         let current_branch = get_current_branch(&inner)?;
-        Ok(Self {
-            inner,
-            current_branch,
-        })
+        Ok(Self { inner, current_branch })
     }
 
     pub fn current_branch(&self) -> &HeadState {
@@ -213,10 +208,7 @@ impl Repo {
         // Try to infer the default branch from the remote HEAD.
         let remote_head_ref = format!("refs/remotes/{}/HEAD", remote_name);
         if let Ok(head_ref) = self.inner.find_reference(&remote_head_ref) {
-            let target_name = head_ref
-                .target()
-                .try_name()
-                .map(|n| n.as_bstr().to_string());
+            let target_name = head_ref.target().try_name().map(|n| n.as_bstr().to_string());
             if let Some(target) = target_name {
                 let prefix = format!("refs/remotes/{}/", remote_name);
                 if let Some(stripped) = target.strip_prefix(&prefix) {
@@ -247,10 +239,7 @@ impl Repo {
 
     pub fn find_default_branch_on_default_remote(&self) -> String {
         let branches = self.find_default_branches(&self.default_remote_name());
-        branches
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "main".to_string())
+        branches.first().cloned().unwrap_or_else(|| "main".to_string())
     }
 
     pub fn is_a_default_branch_on_default_remote(&self, branch_name: &str) -> bool {
@@ -302,10 +291,7 @@ pub struct Remote {
 
 impl Remote {
     pub fn pr_url(&self, pr_number: u64) -> String {
-        format!(
-            "https://github.com/{}/{}/pull/{}",
-            self.owner, self.repo_name, pr_number
-        )
+        format!("https://github.com/{}/{}/pull/{}", self.owner, self.repo_name, pr_number)
     }
 }
 
@@ -325,11 +311,7 @@ fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
         let git_dir = repo.path();
         let try_read_ref = |path: PathBuf| -> Option<String> {
             std::fs::read_to_string(path).ok().map(|content| {
-                content
-                    .trim()
-                    .strip_prefix("refs/heads/")
-                    .unwrap_or(content.trim())
-                    .to_string()
+                content.trim().strip_prefix("refs/heads/").unwrap_or(content.trim()).to_string()
             })
         };
 
@@ -363,10 +345,7 @@ impl CommandExt for Command {
         let output = self.output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "Command {self:?} failed with status: {}. Stderr: {stderr}",
-                output.status,
-            );
+            bail!("Command {self:?} failed with status: {}. Stderr: {stderr}", output.status,);
         }
         Ok(output)
     }
@@ -381,9 +360,7 @@ pub fn get_github_token() -> Result<String> {
     }
 
     // Priority 2: gh auth token
-    let output = cmd!("gh auth token")
-        .output()
-        .wrap_err("Failed to run `gh auth token`")?;
+    let output = cmd!("gh auth token").output().wrap_err("Failed to run `gh auth token`")?;
 
     if output.status.success() {
         let token = String::from_utf8(output.stdout)?.trim().to_string();

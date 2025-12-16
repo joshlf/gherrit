@@ -11,11 +11,7 @@ fn test_reproduce_unmanaged_sync() {
 
     // Condition 1: Explicit Unmanaged
     ctx.checkout_new("explicit-unmanaged");
-    ctx.run_git(&[
-        "config",
-        "branch.explicit-unmanaged.gherritManaged",
-        "false",
-    ]);
+    ctx.run_git(&["config", "branch.explicit-unmanaged.gherritManaged", "false"]);
     ctx.commit("Explicit Commit");
 
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
@@ -29,18 +25,8 @@ fn test_reproduce_unmanaged_sync() {
 
     // Condition 2: Implicit Unmanaged
     ctx.checkout_new("implicit-unmanaged");
-    ctx.run_git(&[
-        "config",
-        "--unset",
-        "branch.implicit-unmanaged.gherritManaged",
-    ]);
-    ctx.run_git(&[
-        "commit",
-        "--allow-empty",
-        "-m",
-        "Implicit Commit",
-        "--no-verify",
-    ]);
+    ctx.run_git(&["config", "--unset", "branch.implicit-unmanaged.gherritManaged"]);
+    ctx.run_git(&["commit", "--allow-empty", "-m", "Implicit Commit", "--no-verify"]);
 
     let _ = ctx.gherrit().args(["hook", "pre-push"]).output().unwrap();
 

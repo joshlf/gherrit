@@ -11,10 +11,7 @@ fn test_commit_msg_hook() {
     ctx.gherrit().args(["manage"]).assert().success();
 
     // Run hook
-    ctx.gherrit()
-        .args(["hook", "commit-msg", msg_file.to_str().unwrap()])
-        .assert()
-        .success();
+    ctx.gherrit().args(["hook", "commit-msg", msg_file.to_str().unwrap()]).assert().success();
 
     // Verify trailer was added
     let content = std::fs::read_to_string(msg_file).unwrap();
@@ -49,18 +46,13 @@ fn test_full_stack_lifecycle_mocked() {
         // Verify we pushed phantom branches or tags. The mock intercepts 'git
         // push origin <refspec>...'. GHerrit pushes refspecs like
         // 'refs/heads/G...:refs/heads/G...' or tags.
-        assert!(
-            !state.pushed_refs.is_empty(),
-            "Expected some refs to be pushed"
-        );
+        assert!(!state.pushed_refs.is_empty(), "Expected some refs to be pushed");
     }
 }
 
 #[test]
 fn test_branch_management() {
-    let ctx = testutil::test_context_minimal!()
-        .install_hooks(true)
-        .build();
+    let ctx = testutil::test_context_minimal!().install_hooks(true).build();
 
     // Create a branch to manage
     ctx.checkout_new("feature-A");
@@ -71,10 +63,7 @@ fn test_branch_management() {
     // Attempt manage - should fail (drift)
     ctx.gherrit().args(["manage"]).assert().success(); // Logs warning, no change
     // Assert still unmanaged (missing key)
-    ctx.git()
-        .args(["config", "branch.feature-A.gherritManaged"])
-        .assert()
-        .failure();
+    ctx.git().args(["config", "branch.feature-A.gherritManaged"]).assert().failure();
 
     ctx.gherrit().args(["manage", "--force"]).assert().success();
 
@@ -86,18 +75,10 @@ fn test_branch_management() {
         .stdout(format!("{}\n", MANAGED_PRIVATE));
 
     // Assert pushRemote updated to loopback (Private default)
-    ctx.git()
-        .args(["config", "branch.feature-A.pushRemote"])
-        .assert()
-        .success()
-        .stdout(".\n");
+    ctx.git().args(["config", "branch.feature-A.pushRemote"]).assert().success().stdout(".\n");
 
     // Assert other keys set
-    ctx.git()
-        .args(["config", "branch.feature-A.remote"])
-        .assert()
-        .success()
-        .stdout(".\n");
+    ctx.git().args(["config", "branch.feature-A.remote"]).assert().success().stdout(".\n");
     ctx.git()
         .args(["config", "branch.feature-A.merge"])
         .assert()
@@ -115,20 +96,11 @@ fn test_branch_management() {
         .stdout("false\n");
 
     // Assert cleanup (keys should be unset)
-    ctx.git()
-        .args(["config", "branch.feature-A.remote"])
-        .assert()
-        .failure();
-    ctx.git()
-        .args(["config", "branch.feature-A.merge"])
-        .assert()
-        .failure();
+    ctx.git().args(["config", "branch.feature-A.remote"]).assert().failure();
+    ctx.git().args(["config", "branch.feature-A.merge"]).assert().failure();
 
     // Assert pushRemote unset
-    ctx.git()
-        .args(["config", "branch.feature-A.pushRemote"])
-        .assert()
-        .failure();
+    ctx.git().args(["config", "branch.feature-A.pushRemote"]).assert().failure();
 }
 
 #[test]
@@ -156,13 +128,7 @@ fn test_post_checkout_hook() {
 
     // Checkout tracking branch atomically so config is set when hook runs
     // This implicitly runs post-checkout hook.
-    ctx.run_git(&[
-        "checkout",
-        "-b",
-        "collab-feature",
-        "--track",
-        "origin/collab-feature",
-    ]);
+    ctx.run_git(&["checkout", "-b", "collab-feature", "--track", "origin/collab-feature"]);
 
     // Assert managed = false
     ctx.git()
@@ -189,10 +155,7 @@ fn test_commit_msg_edge_cases() {
         .success();
 
     let content_after = std::fs::read_to_string(&squash_msg_file).unwrap();
-    assert_eq!(
-        content_after, squash_content,
-        "Commit-msg hook should ignore squash commits"
-    );
+    assert_eq!(content_after, squash_content, "Commit-msg hook should ignore squash commits");
 
     // Scenario B: Detached HEAD
     ctx.run_git(&["checkout", "--detach"]);
@@ -206,17 +169,12 @@ fn test_commit_msg_edge_cases() {
         .success();
 
     let content_after = std::fs::read_to_string(&detached_msg_file).unwrap();
-    assert_eq!(
-        content_after, detached_content,
-        "Commit-msg hook should ignore detached HEAD"
-    );
+    assert_eq!(content_after, detached_content, "Commit-msg hook should ignore detached HEAD");
 }
 
 #[test]
 fn test_pre_push_ancestry_check() {
-    let ctx = testutil::test_context_minimal!()
-        .install_hooks(true)
-        .build();
+    let ctx = testutil::test_context_minimal!().install_hooks(true).build();
 
     // Setup: Create a normal history first (common init)
     ctx.commit("Initial Root");
@@ -254,11 +212,7 @@ fn test_version_increment() {
     if !ctx.is_live {
         let state = ctx.read_mock_state();
         let has_v1 = state.pushed_refs.iter().any(|r| r.contains("/v1"));
-        assert!(
-            has_v1,
-            "Expected v1 tag to be pushed. Refs: {:?}",
-            state.pushed_refs
-        );
+        assert!(has_v1, "Expected v1 tag to be pushed. Refs: {:?}", state.pushed_refs);
         pushed_count_v1 = state.pushed_refs.len();
     }
 
@@ -271,11 +225,7 @@ fn test_version_increment() {
     if !ctx.is_live {
         let state = ctx.read_mock_state();
         let has_v2 = state.pushed_refs.iter().any(|r| r.contains("/v2"));
-        assert!(
-            has_v2,
-            "Expected v2 tag to be pushed. Refs: {:?}",
-            state.pushed_refs
-        );
+        assert!(has_v2, "Expected v2 tag to be pushed. Refs: {:?}", state.pushed_refs);
 
         // We check the *new* pushes only.
         let new_pushes = &state.pushed_refs[pushed_count_v1..];
@@ -392,27 +342,15 @@ fn test_pr_body_generation() {
 
         // 1. Verify Metadata JSON
         // Should contain <!-- gherrit-meta: { ... } -->
-        assert!(
-            body.contains("<!-- gherrit-meta: {"),
-            "Body missing gherrit-meta block"
-        );
+        assert!(body.contains("<!-- gherrit-meta: {"), "Body missing gherrit-meta block");
 
         // Verify parent/child keys exist (basic check, since IDs are dynamic)
-        assert!(
-            body.contains(r#""parent": "G"#),
-            "Body missing valid parent field"
-        );
-        assert!(
-            body.contains(r#""child": "G"#),
-            "Body missing valid child field"
-        );
+        assert!(body.contains(r#""parent": "G"#), "Body missing valid parent field");
+        assert!(body.contains(r#""child": "G"#), "Body missing valid child field");
 
         // 2. Verify Table
         // For v1, the history table is NOT generated.
-        assert!(
-            !body.contains("| Version |"),
-            "Table should NOT be present for v1"
-        );
+        assert!(!body.contains("| Version |"), "Table should NOT be present for v1");
     }
 
     // 4. Update to v2 to verify the Patch History Table appears
@@ -436,10 +374,7 @@ fn test_pr_body_generation() {
         let body = pr_c.body.as_ref().unwrap();
 
         // Assert table exists now
-        assert!(
-            body.contains("| Version |"),
-            "Patch History Table should appear for v2"
-        );
+        assert!(body.contains("| Version |"), "Patch History Table should appear for v2");
         assert!(body.contains("v1 |"), "Table should reference v1");
     }
 }
@@ -517,9 +452,7 @@ fn test_rebase_detection() {
 
 #[test]
 fn test_public_stack_links() {
-    let ctx = testutil::test_context_minimal!()
-        .install_hooks(true)
-        .build();
+    let ctx = testutil::test_context_minimal!().install_hooks(true).build();
 
     ctx.commit("Init");
     // 1. Private Mode (Default)
@@ -548,14 +481,8 @@ fn test_public_stack_links() {
     if !ctx.is_live {
         let state = ctx.read_mock_state();
         let body = state.prs[0].body.as_ref().unwrap(); // Get the updated body
-        assert!(
-            body.contains("This PR is on branch"),
-            "Public stack SHOULD link to local branch"
-        );
-        assert!(
-            body.contains("[public-feature]"),
-            "Link should mention the branch name"
-        );
+        assert!(body.contains("This PR is on branch"), "Public stack SHOULD link to local branch");
+        assert!(body.contains("[public-feature]"), "Link should mention the branch name");
     }
 }
 
@@ -579,10 +506,7 @@ fn test_install_command_edge_cases() {
     assert_eq!(std::fs::read_to_string(&pre_push).unwrap(), "foo");
 
     // Scenario B: Force Overwrite
-    ctx.gherrit()
-        .args(["install", "--force"])
-        .assert()
-        .success();
+    ctx.gherrit().args(["install", "--force"]).assert().success();
 
     let content = std::fs::read_to_string(&pre_push).unwrap();
     assert!(content.contains("# gherrit-installer: managed"));
@@ -618,10 +542,7 @@ fn test_install_configuration_and_security() {
     }
 
     ctx.gherrit().args(["install"]).assert().success();
-    assert!(
-        default_hooks.join("pre-push").exists(),
-        "Should create directory and install hook"
-    );
+    assert!(default_hooks.join("pre-push").exists(), "Should create directory and install hook");
 
     // Scenario B: Custom core.hooksPath (Internal)
     // --------------------------------------------
@@ -629,10 +550,7 @@ fn test_install_configuration_and_security() {
     ctx.run_git(&["config", "core.hooksPath", ".githooks"]);
 
     ctx.gherrit().args(["install"]).assert().success();
-    assert!(
-        custom_internal.join("pre-push").exists(),
-        "Should respect core.hooksPath within repo"
-    );
+    assert!(custom_internal.join("pre-push").exists(), "Should respect core.hooksPath within repo");
 
     // Scenario C: Custom core.hooksPath (External/Global) - Security Block
     // --------------------------------------------------------------------
@@ -655,10 +573,7 @@ fn test_install_configuration_and_security() {
 
     // Scenario D: Custom core.hooksPath (External) - Allow Global
     // -----------------------------------------------------------
-    ctx.gherrit()
-        .args(["install", "--allow-global"])
-        .assert()
-        .success();
+    ctx.gherrit().args(["install", "--allow-global"]).assert().success();
 
     assert!(
         external_dir.path().join("pre-push").exists(),
@@ -679,9 +594,7 @@ fn test_manage_detached_head() {
             .args(args)
             .assert()
             .failure()
-            .stderr(predicates::str::contains(
-                "Cannot get management state in detached HEAD",
-            ))
+            .stderr(predicates::str::contains("Cannot get management state in detached HEAD"))
     };
 
     test(&["manage"]);
@@ -697,31 +610,17 @@ fn test_unmanage_cleanup_logic() {
     ctx.checkout_new("feature-cleanup");
 
     // Manually configure the state to exact values that trigger the deep cleanup logic
-    ctx.run_git(&[
-        "config",
-        "branch.feature-cleanup.gherritManaged",
-        MANAGED_PRIVATE,
-    ]);
+    ctx.run_git(&["config", "branch.feature-cleanup.gherritManaged", MANAGED_PRIVATE]);
     ctx.run_git(&["config", "branch.feature-cleanup.pushRemote", "."]);
     ctx.run_git(&["config", "branch.feature-cleanup.remote", "."]);
-    ctx.run_git(&[
-        "config",
-        "branch.feature-cleanup.merge",
-        "refs/heads/feature-cleanup",
-    ]);
+    ctx.run_git(&["config", "branch.feature-cleanup.merge", "refs/heads/feature-cleanup"]);
 
     // Run unmanage
     ctx.gherrit().args(["unmanage"]).assert().success();
 
     // Verify cleanup: remote and merge keys should be removed
-    ctx.git()
-        .args(["config", "branch.feature-cleanup.remote"])
-        .assert()
-        .failure();
-    ctx.git()
-        .args(["config", "branch.feature-cleanup.merge"])
-        .assert()
-        .failure();
+    ctx.git().args(["config", "branch.feature-cleanup.remote"]).assert().failure();
+    ctx.git().args(["config", "branch.feature-cleanup.merge"]).assert().failure();
     // gherritManaged should be false
     ctx.git()
         .args(["config", "branch.feature-cleanup.gherritManaged"])
@@ -732,9 +631,7 @@ fn test_unmanage_cleanup_logic() {
 
 #[test]
 fn test_pre_push_failure() {
-    let ctx = testutil::test_context_minimal!()
-        .install_hooks(true)
-        .build();
+    let ctx = testutil::test_context_minimal!().install_hooks(true).build();
     ctx.commit("Init");
 
     ctx.checkout_new("feature-fail");
@@ -786,21 +683,14 @@ fn test_manage_drift_detection() {
     ctx.checkout_new("drift-feature");
 
     // 1. Initialize managed private branch
-    ctx.gherrit()
-        .args(["manage", "--private"])
-        .assert()
-        .success();
+    ctx.gherrit().args(["manage", "--private"]).assert().success();
 
     // 2. Manually sabotage
     ctx.run_git(&["config", "branch.drift-feature.pushRemote", "origin"]);
 
     // 3. Attempt Switch to Public (without force)
     // The command should exit with 0 but log a warning and NOT apply changes.
-    let output = ctx
-        .gherrit()
-        .args(["manage", "--public"])
-        .assert()
-        .success();
+    let output = ctx.gherrit().args(["manage", "--public"]).assert().success();
 
     let stderr = std::str::from_utf8(&output.get_output().stderr).unwrap();
     assert!(stderr.contains("Configuration drift detected"));
@@ -813,10 +703,7 @@ fn test_manage_drift_detection() {
         .stdout(format!("{}\n", MANAGED_PRIVATE));
 
     // 4. Force Switch
-    ctx.gherrit()
-        .args(["manage", "--public", "--force"])
-        .assert()
-        .success();
+    ctx.gherrit().args(["manage", "--public", "--force"]).assert().success();
 
     // Assert Success
     ctx.git()
@@ -825,10 +712,7 @@ fn test_manage_drift_detection() {
         .stdout(format!("{}\n", MANAGED_PUBLIC));
 
     // Check pushRemote is now origin
-    ctx.git()
-        .args(["config", "branch.drift-feature.pushRemote"])
-        .assert()
-        .stdout("origin\n");
+    ctx.git().args(["config", "branch.drift-feature.pushRemote"]).assert().stdout("origin\n");
 }
 
 #[test]
@@ -837,34 +721,16 @@ fn test_manage_toggle_visibility() {
     ctx.checkout_new("visibility-feature");
 
     // 1. Private
-    ctx.gherrit()
-        .args(["manage", "--private"])
-        .assert()
-        .success();
-    ctx.git()
-        .args(["config", "branch.visibility-feature.pushRemote"])
-        .assert()
-        .stdout(".\n");
+    ctx.gherrit().args(["manage", "--private"]).assert().success();
+    ctx.git().args(["config", "branch.visibility-feature.pushRemote"]).assert().stdout(".\n");
 
     // 2. Public
-    ctx.gherrit()
-        .args(["manage", "--public"])
-        .assert()
-        .success();
-    ctx.git()
-        .args(["config", "branch.visibility-feature.pushRemote"])
-        .assert()
-        .stdout("origin\n");
+    ctx.gherrit().args(["manage", "--public"]).assert().success();
+    ctx.git().args(["config", "branch.visibility-feature.pushRemote"]).assert().stdout("origin\n");
 
     // 3. Private again
-    ctx.gherrit()
-        .args(["manage", "--private"])
-        .assert()
-        .success();
-    ctx.git()
-        .args(["config", "branch.visibility-feature.pushRemote"])
-        .assert()
-        .stdout(".\n");
+    ctx.gherrit().args(["manage", "--private"]).assert().success();
+    ctx.git().args(["config", "branch.visibility-feature.pushRemote"]).assert().stdout(".\n");
 }
 
 #[test]
@@ -873,11 +739,7 @@ fn test_manage_mutually_exclusive_flags() {
     ctx.checkout_new("conflict-feature");
 
     // Attempt to set both flags
-    let assert = ctx
-        .gherrit()
-        .args(["manage", "--public", "--private"])
-        .assert()
-        .failure();
+    let assert = ctx.gherrit().args(["manage", "--public", "--private"]).assert().failure();
 
     // Verify error message from clap
     let output = assert.get_output();
@@ -891,11 +753,7 @@ fn test_manage_invalid_config() {
     ctx.checkout_new("invalid-config-feature");
 
     // Manually set invalid config
-    ctx.run_git(&[
-        "config",
-        "branch.invalid-config-feature.gherritManaged",
-        "bad-value",
-    ]);
+    ctx.run_git(&["config", "branch.invalid-config-feature.gherritManaged", "bad-value"]);
 
     // Attempt to manage; should fail
     let assert = ctx.gherrit().args(["manage"]).assert().failure();
@@ -917,13 +775,7 @@ fn test_post_checkout_drift_detection() {
     // Switch to new tracking branch - this triggers post-checkout
     let assert = ctx
         .git()
-        .args([
-            "checkout",
-            "-b",
-            "drift-shared",
-            "--track",
-            "origin/drift-shared",
-        ])
+        .args(["checkout", "-b", "drift-shared", "--track", "origin/drift-shared"])
         .assert()
         .success();
     let stderr = std::str::from_utf8(&assert.get_output().stderr).unwrap();
@@ -939,11 +791,7 @@ fn test_post_checkout_drift_detection() {
     ctx.run_git(&["config", "branch.drift-stack.remote", "origin"]);
 
     // Switch to it
-    let assert = ctx
-        .git()
-        .args(["checkout", "drift-stack"])
-        .assert()
-        .success();
+    let assert = ctx.git().args(["checkout", "drift-stack"]).assert().success();
     let stderr = std::str::from_utf8(&assert.get_output().stderr).unwrap();
     assert!(
         stderr.contains("Configuration drift detected"),
