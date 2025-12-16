@@ -3,9 +3,7 @@
 fn test_commit_msg_trailer_failure() {
     use std::os::unix::fs::PermissionsExt;
 
-    let ctx = testutil::test_context_minimal!()
-        .install_hooks(true)
-        .build();
+    let ctx = testutil::test_context_minimal!().install_hooks(true).build();
 
     // Manage branch to enable hook
     ctx.gherrit().args(["manage"]).assert().success();
@@ -19,10 +17,7 @@ fn test_commit_msg_trailer_failure() {
     std::fs::set_permissions(&msg_file, perms).unwrap();
 
     // Hook should fail if it can't write trailer
-    ctx.gherrit()
-        .args(["hook", "commit-msg", msg_file.to_str().unwrap()])
-        .assert()
-        .failure();
+    ctx.gherrit().args(["hook", "commit-msg", msg_file.to_str().unwrap()]).assert().failure();
 }
 
 #[test]
@@ -36,13 +31,7 @@ fn test_pre_push_edit_failure() {
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
     // Amend commit to trigger update (edit)
-    ctx.run_git(&[
-        "commit",
-        "--amend",
-        "--allow-empty",
-        "-m",
-        "Initial Work (Updated)",
-    ]);
+    ctx.run_git(&["commit", "--amend", "--allow-empty", "-m", "Initial Work (Updated)"]);
 
     // Run hook with failure injection
     ctx.inject_failure("update_pr", 5);

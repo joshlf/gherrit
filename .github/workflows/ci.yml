@@ -32,7 +32,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check Formatting
-        run: cargo fmt -- --check
+        run: cargo +nightly fmt -- --check
 
       - name: Clippy (Library & Binaries)
         run: cargo clippy

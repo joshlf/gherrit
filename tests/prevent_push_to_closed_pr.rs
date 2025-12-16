@@ -26,11 +26,7 @@ fn verify_push_to_non_open_fail(state_arg: &str, expected_msg_part: &str) {
     // 4. Verify no new push happened
     if !ctx.is_live {
         let state = ctx.read_mock_state();
-        assert_eq!(
-            state.push_count, 1,
-            "Should not have pushed to {} PR",
-            state_arg
-        );
+        assert_eq!(state.push_count, 1, "Should not have pushed to {} PR", state_arg);
     }
 }
 

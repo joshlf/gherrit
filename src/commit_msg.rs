@@ -18,22 +18,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fs;
-use std::path::Path;
+use std::{fs, path::Path};
+
+use eyre::{Result, WrapErr, bail};
+use owo_colors::OwoColorize;
 
 use crate::{
     cmd,
     util::{self, CommandExt as _},
 };
-use eyre::{Result, WrapErr, bail};
-use owo_colors::OwoColorize;
 
 pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     let msg_path = Path::new(msg_file);
-    if !msg_path
-        .try_exists()
-        .wrap_err("Failed to check file existence")?
-    {
+    if !msg_path.try_exists().wrap_err("Failed to check file existence")? {
         bail!("File does not exist: {}", msg_path.display().red().bold());
     }
 
@@ -53,11 +50,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     // These commits are transient and shouldn't be part of the persistent
     // managed stack.
     let msg_content = fs::read_to_string(msg_path).wrap_err("Failed to read msg file")?;
-    if msg_content
-        .lines()
-        .next()
-        .is_some_and(|l| l.starts_with("squash! "))
-    {
+    if msg_content.lines().next().is_some_and(|l| l.starts_with("squash! ")) {
         return Ok(());
     }
 
@@ -65,9 +58,8 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     // Construct the input: "Ident\nRefHash\nMsgContent"
     let input_data = {
         let committer_ident = cmd!("git var GIT_COMMITTER_IDENT").checked_output()?;
-        let committer_ident = String::from_utf8_lossy(committer_ident.stdout.as_slice())
-            .trim()
-            .to_string();
+        let committer_ident =
+            String::from_utf8_lossy(committer_ident.stdout.as_slice()).trim().to_string();
 
         // Use HEAD or the empty tree hash if this is the first commit
         let refhash = repo
