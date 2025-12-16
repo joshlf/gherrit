@@ -24,7 +24,5 @@ fn test_regression_batch_update_silent_failure() {
     // 3. Push again - Expect Failure due to null response
     let assert = ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
 
-    assert.stderr(predicate::str::contains(
-        "The batched GraphQL mutation failed to update PR",
-    ));
+    assert.stderr(predicate::str::contains("The batched GraphQL mutation failed to update PR"));
 }

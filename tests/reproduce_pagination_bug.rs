@@ -19,11 +19,8 @@ fn test_pagination_bug() {
     let mut prs = Vec::new();
     for i in 1..=110 {
         let is_target = i == 105;
-        let head_ref = if is_target {
-            change_id.to_string()
-        } else {
-            format!("other-change-{}", i)
-        };
+        let head_ref =
+            if is_target { change_id.to_string() } else { format!("other-change-{}", i) };
 
         let pr = serde_json::json!({
             "id": i,
@@ -66,18 +63,11 @@ fn test_pagination_bug() {
         "repo_owner": "owner",
         "repo_name": "repo"
     });
-    std::fs::write(
-        repo_path.join("mock_state.json"),
-        serde_json::to_string(&state).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(repo_path.join("mock_state.json"), serde_json::to_string(&state).unwrap())
+        .unwrap();
 
     // 5. Run gherrit hook pre-push
-    let assert = ctx
-        .gherrit()
-        .args(["hook", "pre-push"])
-        .env("RUST_LOG", "debug")
-        .assert();
+    let assert = ctx.gherrit().args(["hook", "pre-push"]).env("RUST_LOG", "debug").assert();
 
     let output = assert.get_output();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -85,9 +75,6 @@ fn test_pagination_bug() {
     println!("Stderr: {}", stderr);
 
     if !stderr.contains("Found existing PR #105") {
-        panic!(
-            "Regression: Failed to find PR #105 (likely pagination bug). Logs:\n{}",
-            stderr
-        );
+        panic!("Regression: Failed to find PR #105 (likely pagination bug). Logs:\n{}", stderr);
     }
 }

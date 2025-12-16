@@ -32,7 +32,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check Formatting
-        run: cargo fmt -- --check
+        run: |
+          set -eo pipefail
+          rustup component add --toolchain nightly rustfmt
+          cargo +nightly fmt -- --check
 
       - name: Clippy (Library & Binaries)
         run: cargo clippy
