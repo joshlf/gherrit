@@ -294,8 +294,8 @@ impl Remote {
         format!("https://github.com/{}/{}/pull/{}", self.owner, self.repo_name, pr_number)
     }
 
-    pub fn repo_url(&self) -> String {
-        format!("https://github.com/{}/{}", self.owner, self.repo_name)
+    pub fn repo_url_relative(&self) -> String {
+        format!("/{}/{}", self.owner, self.repo_name)
     }
 }
 
