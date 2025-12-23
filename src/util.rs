@@ -293,6 +293,10 @@ impl Remote {
     pub fn pr_url(&self, pr_number: u64) -> String {
         format!("https://github.com/{}/{}/pull/{}", self.owner, self.repo_name, pr_number)
     }
+
+    pub fn url(&self) -> String {
+        format!("https://github.com/{}/{}", self.owner, self.repo_name)
+    }
 }
 
 /// Determines the current HEAD state.
