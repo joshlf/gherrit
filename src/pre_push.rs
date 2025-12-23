@@ -439,15 +439,17 @@ impl PrBodyBuilder<'_> {
                 )?;
 
                 // Header
-                w.write_str("| Version | Base |")?;
-                for v in 1..slf.latest_version {
-                    write!(w, "v{}|", v)?;
+                w.write_str("|Version|")?;
+                for v in (1..slf.latest_version).rev() {
+                    write!(w, " v{} |", v)?;
                 }
-                w.write_str("\n|:---|:---|")?;
+                w.write_str("Base|")?;
+
+                w.write_str("\n|:---|")?;
                 for _ in 1..slf.latest_version {
                     w.write_str(":---|")?;
                 }
-                w.write_str("\n")?;
+                w.write_str(":---|\n")?;
 
                 let prefix = if slf.latest_version <= 8 { "vs " } else { "" };
 
@@ -455,16 +457,8 @@ impl PrBodyBuilder<'_> {
                 for v_row in (1..=slf.latest_version).rev() {
                     write!(w, "|v{}|", v_row)?;
 
-                    // Base column (v0)
-                    // Compare base_branch..v_row
-                    write!(
-                        w,
-                        "[{}Base]({}/compare/{}..gherrit/{}/v{})|",
-                        prefix, slf.repo_url, slf.base_branch, slf.c.gherrit_id, v_row
-                    )?;
-
                     // Previous version columns
-                    for v_col in 1..slf.latest_version {
+                    for v_col in (1..slf.latest_version).rev() {
                         if v_col < v_row {
                             use HistoryTableFormat::*;
                             // In sparse mode, only show:
@@ -496,6 +490,14 @@ impl PrBodyBuilder<'_> {
                             w.write_str("|")?;
                         }
                     }
+
+                    // Base column (v0) – compare base_branch..v_row.
+                    write!(
+                        w,
+                        "[{}Base]({}/compare/{}..gherrit/{}/v{})|",
+                        prefix, slf.repo_url, slf.base_branch, slf.c.gherrit_id, v_row
+                    )?;
+
                     w.write_str("\n")?;
                 }
                 w.write_str("\n</details>")?;

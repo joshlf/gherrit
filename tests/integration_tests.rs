@@ -374,7 +374,7 @@ fn test_pr_body_generation() {
         let body = pr_c.body.as_ref().unwrap();
 
         // Assert table exists now
-        assert!(body.contains("| Version |"), "Patch History Table should appear for v2");
+        assert!(body.contains("|Version|"), "Patch History Table should appear for v2");
         assert!(body.contains("v1|"), "Table should reference v1");
     }
 }
