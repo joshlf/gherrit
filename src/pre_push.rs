@@ -598,7 +598,7 @@ async fn sync_prs(
 
             let body = generate_pr_body(
                 c,
-                &remote.pr_url(pr_state.number),
+                &remote.repo_url(),
                 head_branch_markdown.as_deref(),
                 &gh_pr_ids_markdown,
                 latest_version,
