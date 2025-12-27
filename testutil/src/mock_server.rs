@@ -1,10 +1,14 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -98,25 +102,34 @@ pub struct RefInfo {
     pub ref_field: String,
     pub sha: String,
 }
+
 #[derive(Clone)]
 struct AppState {
-    state_path: PathBuf,
+    state: Arc<Mutex<MockState>>,
     base_url: String,
 }
 
 /// Starts a mock GitHub API server on a random local port.
 ///
 /// Returns the address of the running server (e.g., `http://127.0.0.1:12345`).
-pub async fn start_mock_server(state_path: PathBuf) -> String {
+pub async fn start_mock_server(initial_state: MockState) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
 
-    let app_state = AppState { state_path, base_url: url.clone() };
+    let app_state = AppState {
+        state: Arc::new(Mutex::new(initial_state)),
+        base_url: url.clone(),
+    };
 
     let app = Router::new()
+        // Test Control API
+        .route("/_test/state", get(get_state))
+        .route("/_test/fail", post(set_failure))
+        .route("/_test/git-push", post(record_git_push))
+        // GitHub API Mocks
         .route("/repos/{owner}/{repo}/pulls", get(list_prs))
-        .route("/graphql", axum::routing::post(graphql))
+        .route("/graphql", post(graphql))
         .with_state(app_state);
 
     tokio::spawn(async move {
@@ -125,6 +138,38 @@ pub async fn start_mock_server(state_path: PathBuf) -> String {
 
     url
 }
+
+// --- Test Control Handlers ---
+
+async fn get_state(State(state): State<AppState>) -> Json<MockState> {
+    let mock_state = state.state.lock().unwrap();
+    Json(mock_state.clone())
+}
+
+#[derive(Deserialize)]
+struct FailRequest {
+    request_type: String,
+    remaining: usize,
+}
+
+async fn set_failure(State(state): State<AppState>, Json(req): Json<FailRequest>) {
+    let mut mock_state = state.state.lock().unwrap();
+    mock_state.fail_next_request = Some(req.request_type);
+    mock_state.fail_remaining = req.remaining;
+}
+
+#[derive(Deserialize)]
+struct PushRequest {
+    refspecs: Vec<String>,
+}
+
+async fn record_git_push(State(state): State<AppState>, Json(req): Json<PushRequest>) {
+    let mut mock_state = state.state.lock().unwrap();
+    mock_state.pushed_refs.extend(req.refspecs);
+    mock_state.push_count += 1;
+}
+
+// --- GitHub API Handlers ---
 
 fn check_and_apply_failure(mock_state: &mut MockState, action_name: &str) -> bool {
     if let Some(action) = &mock_state.fail_next_request {
@@ -143,16 +188,13 @@ fn check_and_apply_failure(mock_state: &mut MockState, action_name: &str) -> boo
     false
 }
 
-/// Handler for `GET /repos/:owner/:repo/pulls`.
-/// Returns a list of PRs from the mock state.
 async fn list_prs(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let mut mock_state = read_state(&state.state_path);
+    let mut mock_state = state.state.lock().unwrap();
     if check_and_apply_failure(&mut mock_state, "list_prs") {
-        write_state(&state.state_path, &mock_state);
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -188,15 +230,6 @@ async fn list_prs(
     Ok((headers, Json(items)))
 }
 
-/// Handler for `POST /graphql`.
-///
-/// This mock implementation does *not* use a real GraphQL parser. Instead, it
-/// relies on simple regex matching to identify supported mutations
-/// (`updatePullRequest` and `createPullRequest`) and extract their input
-/// fields.
-///
-/// This strategy is sufficient for the specific, predictable queries generated
-/// by the client's batching logic (aliased mutations).
 async fn graphql(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
@@ -206,14 +239,13 @@ async fn graphql(
         StatusCode::BAD_REQUEST
     })?;
 
-    let mut mock_state = read_state(&state.state_path);
+    let mut mock_state = state.state.lock().unwrap();
 
     // Support failure injection.
     if check_and_apply_failure(&mut mock_state, "update_pr")
         || check_and_apply_failure(&mut mock_state, "create_pr")
         || check_and_apply_failure(&mut mock_state, "graphql")
     {
-        write_state(&state.state_path, &mock_state);
         return Ok(Json(serde_json::json!({
             "errors": [
                 { "message": "Injected failure" }
@@ -386,22 +418,7 @@ async fn graphql(
         })));
     }
 
-    write_state(&state.state_path, &mock_state);
-
     Ok(Json(serde_json::json!({
         "data": response_data
     })))
-}
-
-fn read_state(path: &PathBuf) -> MockState {
-    if let Ok(content) = fs::read_to_string(path) {
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        MockState::default()
-    }
-}
-
-pub fn write_state(path: &PathBuf, state: &MockState) {
-    let content = serde_json::to_string(state).unwrap();
-    fs::write(path, content).unwrap();
 }

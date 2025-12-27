@@ -124,17 +124,11 @@ impl TestContextBuilder {
                 repo_name: self.name.clone(),
                 ..Default::default()
             };
-            let state_json = serde_json::to_string(&state).unwrap();
-            let state_path = repo_path.join("mock_state.json");
-            fs::write(&state_path, state_json).unwrap();
 
             // Spawn the server on a separate thread to avoid blocking the main
-            // test thread. This ensures the runtime persists for the duration
-            // of the test context.
-
+            // test thread.
             let (tx, rx) = std::sync::mpsc::channel();
-            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
+            
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -142,13 +136,24 @@ impl TestContextBuilder {
                     .expect("Failed to build runtime");
 
                 rt.block_on(async {
-                    let url = mock_server::start_mock_server(state_path).await;
+                    let url = mock_server::start_mock_server(state).await;
                     tx.send(url).expect("Failed to send mock server URL");
-                    let _ = shutdown_rx.await;
+                    // Keep runtime alive indefinitely for the test
+                    // In a real scenario we might want a shutdown signal, 
+                    // but for short lived tests it's fine.
+                    pub struct Pending;
+                    impl std::future::Future for Pending {
+                        type Output = ();
+                        fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+                            std::task::Poll::Pending
+                        }
+                    }
+                    Pending.await;
                 });
             });
-
-            MockServerInfo { url: rx.recv().unwrap(), shutdown_tx }
+            
+            let url = rx.recv().unwrap();
+            MockServerInfo { url }
         });
 
         let ctx = TestContext {
@@ -185,15 +190,6 @@ pub struct TestContext {
 
 pub struct MockServerInfo {
     pub url: String,
-    pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
-}
-
-impl Drop for TestContext {
-    fn drop(&mut self) {
-        if let Some(server) = self.mock_server.take() {
-            let _ = server.shutdown_tx.send(());
-        }
-    }
 }
 
 impl TestContext {
@@ -213,6 +209,7 @@ impl TestContext {
 
             if let Some(server) = &self.mock_server {
                 cmd.env("GHERRIT_GITHUB_API_URL", &server.url);
+                cmd.env("GHERRIT_TEST_SERVER_URL", &server.url);
                 cmd.env("GITHUB_TOKEN", "mock-token");
             }
         }
@@ -230,6 +227,10 @@ impl TestContext {
             let new_path_str = env::join_paths(paths).unwrap();
             cmd.env("PATH", new_path_str);
             cmd.env("SYSTEM_GIT_PATH", &self.system_git);
+            
+            if let Some(server) = &self.mock_server {
+                cmd.env("GHERRIT_TEST_SERVER_URL", &server.url);
+            }
         }
 
         cmd
@@ -249,15 +250,23 @@ impl TestContext {
             let new_path_str = env::join_paths(paths).unwrap();
             cmd.env("PATH", new_path_str);
             cmd.env("SYSTEM_GIT_PATH", &self.system_git);
+            
+             if let Some(server) = &self.mock_server {
+                cmd.env("GHERRIT_TEST_SERVER_URL", &server.url);
+            }
         }
 
         cmd
     }
 
     pub fn read_mock_state(&self) -> mock_server::MockState {
-        let content = fs::read_to_string(self.repo_path.join("mock_state.json"))
-            .expect("Failed to read mock_state.json");
-        serde_json::from_str(&content).expect("Failed to parse mock state")
+        let server = self.mock_server.as_ref().expect("Mock server not running");
+        let url = format!("{}/_test/state", server.url);
+        ureq::get(&url)
+            .call()
+            .expect("Failed to get mock state")
+            .into_json()
+            .expect("Failed to parse mock state")
     }
 
     pub fn install_hooks(&self) {
@@ -274,10 +283,14 @@ impl TestContext {
     }
 
     pub fn inject_failure(&self, request_type: &str, remaining: usize) {
-        let mut state = self.read_mock_state();
-        state.fail_next_request = Some(request_type.to_string());
-        state.fail_remaining = remaining;
-        mock_server::write_state(&self.repo_path.join("mock_state.json"), &state);
+        let server = self.mock_server.as_ref().expect("Mock server not running");
+        let url = format!("{}/_test/fail", server.url);
+        ureq::post(&url)
+            .send_json(serde_json::json!({
+                "request_type": request_type,
+                "remaining": remaining
+            }))
+            .expect("Failed to inject failure");
     }
 }
 
