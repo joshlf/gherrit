@@ -648,17 +648,20 @@ async fn sync_prs(
         })
         .flatten();
 
-    let gh_pr_ids_markdown = commit_pr_states
-        .iter()
-        .rev()
-        .map(|(_, _, pr_state)| format!("- #{}", pr_state.number))
-        .collect::<Vec<_>>()
-        .join("\n");
-
     let updates: Vec<BatchUpdate> = commit_pr_states
         .iter()
         .enumerate()
         .filter_map(|(i, (c, parent_branch, pr_state))| {
+            let gh_pr_ids_markdown = commit_pr_states
+                .iter()
+                .rev()
+                .map(|(_, _, state)| {
+                    let prefix = if state.number == pr_state.number { "👉" } else { "&#x3000;" };
+                    format!("- {} #{}", prefix, state.number)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
             let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
 
             let parent_gherrit_id = (i > 0).then(|| commit_pr_states[i - 1].0.gherrit_id.clone());
