@@ -9,6 +9,9 @@ use tempfile::TempDir;
 
 pub mod mock_server;
 
+pub const DEFAULT_OWNER: &str = "owner";
+pub const DEFAULT_REPO: &str = "repo";
+
 #[macro_export]
 macro_rules! test_context {
     () => {
@@ -68,8 +71,8 @@ impl Default for TestContextBuilder {
 impl TestContextBuilder {
     pub fn new() -> Self {
         Self {
-            owner: "owner".to_string(),
-            name: "repo".to_string(),
+            owner: DEFAULT_OWNER.to_string(),
+            name: DEFAULT_REPO.to_string(),
             install_hooks: true,
             initial_commit: true,
             gherrit_bin: None,
@@ -79,8 +82,8 @@ impl TestContextBuilder {
 
     pub fn new_minimal() -> Self {
         Self {
-            owner: "owner".to_string(),
-            name: "repo".to_string(),
+            owner: DEFAULT_OWNER.to_string(),
+            name: DEFAULT_REPO.to_string(),
             install_hooks: false,
             initial_commit: false,
             gherrit_bin: None,
@@ -125,7 +128,9 @@ impl TestContextBuilder {
         let repo_path = dir.path().join("local");
         fs::create_dir(&repo_path).unwrap();
 
-        let remote_path = dir.path().join("remote.git");
+        let remote_parent = dir.path().join(&self.owner);
+        fs::create_dir_all(&remote_parent).unwrap();
+        let remote_path = remote_parent.join(format!("{}.git", self.name));
         init_git_bare_repo(&remote_path);
 
         let is_live = env::var("GHERRIT_LIVE_TEST").is_ok();
@@ -142,6 +147,7 @@ impl TestContextBuilder {
 
         let mock_server = (!is_live).then(|| {
             install_mock_binaries(dir.path(), &mock_bin, &gherrit_bin);
+
             let state = mock_server::MockState::new(self.owner.clone(), self.name.clone());
 
             let state = Arc::new(RwLock::new(state));
