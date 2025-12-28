@@ -1,10 +1,13 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -19,30 +22,25 @@ macro_rules! re {
     }};
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct MockState {
-    #[serde(default)]
     pub prs: Vec<PrEntry>,
-    #[serde(default)]
     pub pushed_refs: Vec<String>,
-    #[serde(default)]
     pub push_count: usize,
-    #[serde(default = "default_owner")]
     pub repo_owner: String,
-    #[serde(default = "default_repo")]
     pub repo_name: String,
-    #[serde(default)]
     pub fail_next_request: Option<String>,
-    #[serde(default)]
     pub fail_remaining: usize,
 }
 
-fn default_owner() -> String {
-    "owner".to_string()
-}
+impl MockState {
+    pub fn new(owner: String, name: String) -> Self {
+        Self { repo_owner: owner, repo_name: name, ..Default::default() }
+    }
 
-fn default_repo() -> String {
-    "repo".to_string()
+    pub fn add_pr(&mut self, pr: PrEntry) {
+        self.prs.push(pr);
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -98,25 +96,41 @@ pub struct RefInfo {
     pub ref_field: String,
     pub sha: String,
 }
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GitRequest {
+    pub args: Vec<String>,
+    pub cwd: String,
+    pub env: HashMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GitResponse {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub passthrough: bool,
+}
+
 #[derive(Clone)]
 struct AppState {
-    state_path: PathBuf,
+    state: Arc<RwLock<MockState>>,
     base_url: String,
 }
 
 /// Starts a mock GitHub API server on a random local port.
-///
 /// Returns the address of the running server (e.g., `http://127.0.0.1:12345`).
-pub async fn start_mock_server(state_path: PathBuf) -> String {
+pub async fn start_mock_server(state: Arc<RwLock<MockState>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
 
-    let app_state = AppState { state_path, base_url: url.clone() };
+    let app_state = AppState { state, base_url: url.clone() };
 
     let app = Router::new()
         .route("/repos/{owner}/{repo}/pulls", get(list_prs))
-        .route("/graphql", axum::routing::post(graphql))
+        .route("/graphql", post(graphql))
+        .route("/_internal/git", post(handle_git))
         .with_state(app_state);
 
     tokio::spawn(async move {
@@ -143,16 +157,72 @@ fn check_and_apply_failure(mock_state: &mut MockState, action_name: &str) -> boo
     false
 }
 
-/// Handler for `GET /repos/:owner/:repo/pulls`.
-/// Returns a list of PRs from the mock state.
+async fn handle_git(
+    State(app_state): State<AppState>,
+    Json(req): Json<GitRequest>,
+) -> Json<GitResponse> {
+    let mut state = app_state.state.write().unwrap();
+
+    // Check for simulated failure
+    if let Some(subcommand) = req.args.get(1) {
+        if let Some(fail_cmd) = req.env.get("MOCK_BIN_FAIL_CMD") {
+            if fail_cmd == &format!("git:{}", subcommand) {
+                return Json(GitResponse {
+                    stdout: "".to_string(),
+                    stderr: format!("Simulated failure for git {}", subcommand),
+                    exit_code: 1,
+                    passthrough: false,
+                });
+            }
+        }
+    }
+
+    // Spy on "push" logic
+    if req.args.contains(&"push".to_string()) {
+        let refspecs: Vec<String> = req
+            .args
+            .iter()
+            .skip(1)
+            .filter(|arg| arg.starts_with("refs/") || arg.contains(":"))
+            .cloned()
+            .collect();
+
+        state.pushed_refs.extend(refspecs);
+        state.push_count += 1;
+        let repo_owner = state.repo_owner.clone();
+        let repo_name = state.repo_name.clone();
+
+        // We want to verify the output in tests, so we print the expected GitHub msg
+        let stderr = format!(
+            "remote: \nremote: Create a pull request for 'feature' on GitHub by visiting:\nremote:      https://github.com/{}/{}/pull/new/feature\nremote: \n",
+            repo_owner, repo_name
+        );
+
+        // For now, we still want to passthrough to real git to actually move refs in the local repo
+        return Json(GitResponse {
+            stdout: "".to_string(),
+            stderr,
+            exit_code: 0,
+            passthrough: true,
+        });
+    }
+
+    // Default: strict passthrough
+    Json(GitResponse {
+        stdout: "".to_string(),
+        stderr: "".to_string(),
+        exit_code: 0,
+        passthrough: true,
+    })
+}
+
 async fn list_prs(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let mut mock_state = read_state(&state.state_path);
+    let mut mock_state = state.state.write().unwrap();
     if check_and_apply_failure(&mut mock_state, "list_prs") {
-        write_state(&state.state_path, &mock_state);
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -160,9 +230,9 @@ async fn list_prs(
     let per_page = params.get("per_page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(30);
 
     let start = (page - 1) * per_page;
+    let total = mock_state.prs.len();
     let end = start + per_page;
 
-    let total = mock_state.prs.len();
     let items = if start >= total {
         Vec::new()
     } else {
@@ -188,15 +258,6 @@ async fn list_prs(
     Ok((headers, Json(items)))
 }
 
-/// Handler for `POST /graphql`.
-///
-/// This mock implementation does *not* use a real GraphQL parser. Instead, it
-/// relies on simple regex matching to identify supported mutations
-/// (`updatePullRequest` and `createPullRequest`) and extract their input
-/// fields.
-///
-/// This strategy is sufficient for the specific, predictable queries generated
-/// by the client's batching logic (aliased mutations).
 async fn graphql(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
@@ -206,14 +267,12 @@ async fn graphql(
         StatusCode::BAD_REQUEST
     })?;
 
-    let mut mock_state = read_state(&state.state_path);
+    let mut mock_state = state.state.write().unwrap();
 
-    // Support failure injection.
     if check_and_apply_failure(&mut mock_state, "update_pr")
         || check_and_apply_failure(&mut mock_state, "create_pr")
         || check_and_apply_failure(&mut mock_state, "graphql")
     {
-        write_state(&state.state_path, &mock_state);
         return Ok(Json(serde_json::json!({
             "errors": [
                 { "message": "Injected failure" }
@@ -223,15 +282,12 @@ async fn graphql(
 
     let mut response_data = serde_json::Map::new();
 
-    // Regex definitions
-    // These regexes capture the full JSON string for complex fields like title and body.
     let update_re = re!(
         r#"op(?P<idx>\d+): updatePullRequest\(input: \{pullRequestId: "(?P<id>[^"]+)", baseRefName: "(?P<base>[^"]+)", title: (?P<title>"(?:\\.|[^"\\])*"), body: (?P<body>"(?:\\.|[^"\\])*")\}\)"#
     );
     let create_re = re!(
         r#"op(?P<idx>\d+): createPullRequest\(input: \{ repositoryId: "[^"]+", baseRefName: "(?P<base>[^"]+)", headRefName: "(?P<head>[^"]+)", title: (?P<title>"(?:\\.|[^"\\])*"), body: (?P<body>"(?:\\.|[^"\\])*") \}\)"#
     );
-    // We match repository fields to ensure correct formatting (preventing double quotes bug)
     let pr_query_re = re!(
         r#"op(?P<idx>\d+): repository\(owner: "(?P<owner>[^"]+)", name: "(?P<name>[^"]+)"\) \{ pullRequests\(headRefName:\s*"(?P<head>[^"]+)""#
     );
@@ -252,8 +308,6 @@ async fn graphql(
 
         let alias = format!("op{}", idx);
 
-        // Inject failure for error handling tests if body contains specific
-        // trigger.
         if body.contains("TRIGGER_GRAPHQL_NULL") {
             response_data.insert(alias, serde_json::Value::Null);
         } else {
@@ -278,10 +332,8 @@ async fn graphql(
         let node_id = format!("PR_{}", num);
         let html_url = format!("http://github.com/owner/repo/pull/{}", num);
 
-        let title_val = serde_json::from_str::<String>(title)
-            .expect("Failed to parse title in mock server; client may have sent invalid JSON");
-        let body_val = serde_json::from_str::<String>(body)
-            .expect("Failed to parse body in mock server; client may have sent invalid JSON");
+        let title_val = serde_json::from_str::<String>(title).expect("Failed to parse title");
+        let body_val = serde_json::from_str::<String>(body).expect("Failed to parse body");
 
         let entry = PrEntry {
             id: num,
@@ -347,7 +399,6 @@ async fn graphql(
 
         let alias = format!("op{}", idx);
 
-        // Find matching PR
         let nodes = if let Some(pr) = mock_state.prs.iter().find(|p| p.head.ref_field == head) {
             vec![serde_json::json!({
                 "number": pr.number,
@@ -371,7 +422,6 @@ async fn graphql(
         );
     }
 
-    // Process Repo ID Fetch (simple query fallback)
     if !has_pr_query
         && response_data.is_empty()
         && (query.contains("query { repository(owner: \"owner\", name: \"repo\")")
@@ -386,22 +436,7 @@ async fn graphql(
         })));
     }
 
-    write_state(&state.state_path, &mock_state);
-
     Ok(Json(serde_json::json!({
         "data": response_data
     })))
-}
-
-fn read_state(path: &PathBuf) -> MockState {
-    if let Ok(content) = fs::read_to_string(path) {
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        MockState::default()
-    }
-}
-
-pub fn write_state(path: &PathBuf, state: &MockState) {
-    let content = serde_json::to_string(state).unwrap();
-    fs::write(path, content).unwrap();
 }
