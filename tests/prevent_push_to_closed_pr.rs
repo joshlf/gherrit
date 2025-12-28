@@ -10,11 +10,11 @@ fn verify_push_to_non_open_fail(state_arg: &str, expected_msg_part: &str) {
 
     // 2. Simulate PR State Change on GitHub
     if !ctx.is_live {
-        let mut state = ctx.read_mock_state();
-        let pr = state.prs.last_mut().expect("PR not found");
+        let mut state_lock =
+            ctx.mock_server_state.as_ref().expect("Mock state not available").write().unwrap();
+        let pr = state_lock.prs.last_mut().expect("PR not found");
 
         pr.state = state_arg.to_string();
-        testutil::mock_server::write_state(&ctx.repo_path.join("mock_state.json"), &state);
     }
 
     // 3. Amend and Push (Should Fail)
