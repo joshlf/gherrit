@@ -1,7 +1,6 @@
 #[test]
 fn test_pagination_bug() {
     let ctx = testutil::test_context!().build();
-    let repo_path = &ctx.repo_path;
 
     // 1. Setup base commit on main
     ctx.commit("Init");
@@ -16,55 +15,51 @@ fn test_pagination_bug() {
     ctx.commit(&msg);
 
     // 4. Generate 110 PRs in the mock server state
-    let mut prs = Vec::new();
-    for i in 1..=110 {
-        let is_target = i == 105;
-        let head_ref =
-            if is_target { change_id.to_string() } else { format!("other-change-{}", i) };
+    {
+        let mut locked_state = ctx.mock_server_state.as_ref().unwrap().write().unwrap();
 
-        let pr = serde_json::json!({
-            "id": i,
-            "number": i,
-            "html_url": format!("http://github.com/owner/repo/pull/{}", i),
-            "url": format!("http://api.github.com/repos/owner/repo/pulls/{}", i),
-            "node_id": format!("PR_{}", i),
-            "state": "OPEN",
-            "user": {
-                "login": "test",
-                "id": 1,
-                "node_id": "U1",
-                "avatar_url": "http://example.com/avatar",
-                "gravatar_id": "",
-                "url": "http://example.com/users/test",
-                "html_url": "http://example.com/users/test",
-                "followers_url": "http://example.com/users/test/followers",
-                "following_url": "http://example.com/users/test/following{/other_user}",
-                "gists_url": "http://example.com/users/test/gists{/gist_id}",
-                "starred_url": "http://example.com/users/test/starred{/owner}{/repo}",
-                "subscriptions_url": "http://example.com/users/test/subscriptions",
-                "organizations_url": "http://example.com/users/test/orgs",
-                "repos_url": "http://example.com/users/test/repos",
-                "events_url": "http://example.com/users/test/events{/privacy}",
-                "received_events_url": "http://example.com/users/test/received_events",
-                "type": "User",
-                "site_admin": false
-            },
-            "head": { "ref": head_ref, "sha": "sha" },
-            "base": { "ref": "main", "sha": "sha" },
-            "created_at": "2024-01-01T00:00:00Z",
-            "updated_at": "2024-01-01T00:00:00Z"
-        });
-        prs.push(pr);
+        for i in 1..=110 {
+            let is_target = i == 105;
+            let head_ref =
+                if is_target { change_id.to_string() } else { format!("other-change-{}", i) };
+
+            let pr_json = serde_json::json!({
+                "id": i,
+                "number": i,
+                "html_url": format!("http://github.com/owner/repo/pull/{}", i),
+                "url": format!("http://api.github.com/repos/owner/repo/pulls/{}", i),
+                "node_id": format!("PR_{}", i),
+                "state": "OPEN",
+                "user": {
+                    "login": "test",
+                    "id": 1,
+                    "node_id": "U1",
+                    "avatar_url": "http://example.com/avatar",
+                    "gravatar_id": "",
+                    "url": "http://example.com/users/test",
+                    "html_url": "http://example.com/users/test",
+                    "followers_url": "http://example.com/users/test/followers",
+                    "following_url": "http://example.com/users/test/following{/other_user}",
+                    "gists_url": "http://example.com/users/test/gists{/gist_id}",
+                    "starred_url": "http://example.com/users/test/starred{/owner}{/repo}",
+                    "subscriptions_url": "http://example.com/users/test/subscriptions",
+                    "organizations_url": "http://example.com/users/test/orgs",
+                    "repos_url": "http://example.com/users/test/repos",
+                    "events_url": "http://example.com/users/test/events{/privacy}",
+                    "received_events_url": "http://example.com/users/test/received_events",
+                    "type": "User",
+                    "site_admin": false
+                },
+                "head": { "ref": head_ref, "sha": "sha" },
+                "base": { "ref": "main", "sha": "sha" },
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z"
+            });
+
+            let pr: testutil::mock_server::PrEntry = serde_json::from_value(pr_json).unwrap();
+            locked_state.add_pr(pr);
+        }
     }
-
-    // Write state directly to file
-    let state = serde_json::json!({
-        "prs": prs,
-        "repo_owner": "owner",
-        "repo_name": "repo"
-    });
-    std::fs::write(repo_path.join("mock_state.json"), serde_json::to_string(&state).unwrap())
-        .unwrap();
 
     // 5. Run gherrit hook pre-push
     let assert = ctx.gherrit().args(["hook", "pre-push"]).env("RUST_LOG", "debug").assert();

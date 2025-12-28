@@ -38,9 +38,8 @@ testutil = { path = "testutil" }
 libc = "0.2"
 
 [[bin]]
-name = "mock_bin"
-path = "tests/support/mock_bin.rs"
-test = false
+name = "gherrit"
+path = "src/main.rs"
 
 [workspace]
 members = ["testutil"]
