@@ -12,3 +12,9 @@ predicates = "3.1"
 axum = "0.8.7"
 tokio = { version = "1.48.0", features = ["full"] }
 regex = "1.12.2"
+gix = { version = "0.75.0", default-features = false }
+escargot = "0.5.15"
+
+[[bin]]
+name = "mock_bin"
+path = "src/mock_bin.rs"

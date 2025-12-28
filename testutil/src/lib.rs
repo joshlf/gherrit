@@ -12,20 +12,27 @@ pub mod mock_server;
 #[macro_export]
 macro_rules! test_context {
     () => {
-        $crate::TestContextBuilder::new().binaries(
-            assert_cmd::cargo::cargo_bin!("gherrit"),
-            assert_cmd::cargo::cargo_bin!("mock_bin"),
-        )
+        $crate::TestContextBuilder::new()
+            .binaries(assert_cmd::cargo::cargo_bin!("gherrit"), $crate::build_mock_bin())
     };
+}
+
+#[doc(hidden)]
+pub fn build_mock_bin() -> PathBuf {
+    escargot::CargoBuild::new()
+        .bin("mock_bin")
+        .manifest_path(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .run()
+        .unwrap()
+        .path()
+        .to_path_buf()
 }
 
 #[macro_export]
 macro_rules! test_context_minimal {
     () => {
-        $crate::TestContextBuilder::new_minimal().binaries(
-            assert_cmd::cargo::cargo_bin!("gherrit"),
-            assert_cmd::cargo::cargo_bin!("mock_bin"),
-        )
+        $crate::TestContextBuilder::new_minimal()
+            .binaries(assert_cmd::cargo::cargo_bin!("gherrit"), $crate::build_mock_bin())
     };
 }
 
