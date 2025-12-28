@@ -9,6 +9,9 @@ use tempfile::TempDir;
 
 pub mod mock_server;
 
+pub const DEFAULT_OWNER: &str = "owner";
+pub const DEFAULT_REPO: &str = "repo";
+
 #[macro_export]
 macro_rules! test_context {
     () => {
@@ -68,8 +71,8 @@ impl Default for TestContextBuilder {
 impl TestContextBuilder {
     pub fn new() -> Self {
         Self {
-            owner: "owner".to_string(),
-            name: "repo".to_string(),
+            owner: DEFAULT_OWNER.to_string(),
+            name: DEFAULT_REPO.to_string(),
             install_hooks: true,
             initial_commit: true,
             gherrit_bin: None,
@@ -79,8 +82,8 @@ impl TestContextBuilder {
 
     pub fn new_minimal() -> Self {
         Self {
-            owner: "owner".to_string(),
-            name: "repo".to_string(),
+            owner: DEFAULT_OWNER.to_string(),
+            name: DEFAULT_REPO.to_string(),
             install_hooks: false,
             initial_commit: false,
             gherrit_bin: None,
