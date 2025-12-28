@@ -23,14 +23,26 @@ pub fn build_mock_bin() -> PathBuf {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let target_dir = manifest_dir.parent().unwrap().join("target").join("mock_bin_build");
 
-        escargot::CargoBuild::new()
-            .bin("mock_bin")
-            .manifest_path(manifest_dir.join("Cargo.toml"))
-            .target_dir(target_dir)
-            .run()
-            .expect("Failed to build mock_bin")
-            .path()
-            .to_path_buf()
+        // Debug: Print where we are building
+        eprintln!("Building mock_bin at {:?}", manifest_dir);
+
+        // Use std::process::Command instead of escargot to ensure output is visible
+        let status = Command::new("cargo")
+            .args(["build", "--bin", "mock_bin"])
+            .arg("--manifest-path")
+            .arg(manifest_dir.join("Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .status()
+            .expect("Failed to execute cargo build for mock_bin");
+
+        if !status.success() {
+            panic!("Failed to build mock_bin. See stdout/stderr for details.");
+        }
+
+        target_dir
+            .join("debug")
+            .join(if cfg!(windows) { "mock_bin.exe" } else { "mock_bin" })
     });
     MOCK_BIN.clone()
 }
