@@ -37,5 +37,9 @@ fastrand = "2.3"
 testutil = { path = "testutil" }
 libc = "0.2"
 
+[[bin]]
+name = "gherrit"
+path = "src/main.rs"
+
 [workspace]
 members = ["testutil"]
