@@ -10,22 +10,27 @@ use tempfile::TempDir;
 pub mod mock_server;
 
 #[macro_export]
+macro_rules! find_mock_bin {
+    () => {{
+        let gherrit = assert_cmd::cargo::cargo_bin!("gherrit");
+        let exe = if cfg!(windows) { "mock_bin.exe" } else { "mock_bin" };
+        gherrit.parent().unwrap().join(exe)
+    }};
+}
+
+#[macro_export]
 macro_rules! test_context {
     () => {
-        $crate::TestContextBuilder::new().binaries(
-            assert_cmd::cargo::cargo_bin!("gherrit"),
-            assert_cmd::cargo::cargo_bin!("mock_bin"),
-        )
+        $crate::TestContextBuilder::new()
+            .binaries(assert_cmd::cargo::cargo_bin!("gherrit"), $crate::find_mock_bin!())
     };
 }
 
 #[macro_export]
 macro_rules! test_context_minimal {
     () => {
-        $crate::TestContextBuilder::new_minimal().binaries(
-            assert_cmd::cargo::cargo_bin!("gherrit"),
-            assert_cmd::cargo::cargo_bin!("mock_bin"),
-        )
+        $crate::TestContextBuilder::new_minimal()
+            .binaries(assert_cmd::cargo::cargo_bin!("gherrit"), $crate::find_mock_bin!())
     };
 }
 
