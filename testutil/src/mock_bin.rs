@@ -1,6 +1,6 @@
 use std::{collections::HashMap, env, path::PathBuf, process::Command};
 
-use serde::{Deserialize, Serialize};
+// use serde::{Deserialize, Serialize};
 use testutil::mock_server::{GitRequest, GitResponse};
 
 fn main() {
