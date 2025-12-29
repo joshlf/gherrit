@@ -11,29 +11,31 @@ fn test_reproduce_unmanaged_sync() {
 
     // Condition 1: Explicit Unmanaged
     ctx.checkout_new("explicit-unmanaged");
-    ctx.run_git(&["config", "branch.explicit-unmanaged.gherritManaged", "false"]);
+    ctx.set_config("branch.explicit-unmanaged.gherritManaged", Some("false"));
     ctx.commit("Explicit Commit");
 
-    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+    ctx.hook("pre-push").assert().success();
 
-    let state = ctx.read_mock_state();
-    assert!(
-        state.prs.is_empty(),
-        "Explicit unmanaged branch should NOT sync PRs. Found: {:?}",
-        state.prs
-    );
+    ctx.maybe_inspect_mock_state(|state| {
+        assert!(
+            state.prs.is_empty(),
+            "Explicit unmanaged branch should NOT sync PRs. Found: {:?}",
+            state.prs
+        );
+    });
 
     // Condition 2: Implicit Unmanaged
     ctx.checkout_new("implicit-unmanaged");
-    ctx.run_git(&["config", "--unset", "branch.implicit-unmanaged.gherritManaged"]);
+    ctx.set_config("branch.implicit-unmanaged.gherritManaged", None);
     ctx.run_git(&["commit", "--allow-empty", "-m", "Implicit Commit", "--no-verify"]);
 
-    let _ = ctx.gherrit().args(["hook", "pre-push"]).output().unwrap();
+    let _ = ctx.hook("pre-push").output().unwrap();
 
-    let state = ctx.read_mock_state();
-    assert!(
-        state.prs.is_empty(),
-        "Implicit unmanaged branch should NOT sync PRs. Found: {:?}",
-        state.prs
-    );
+    ctx.maybe_inspect_mock_state(|state| {
+        assert!(
+            state.prs.is_empty(),
+            "Implicit unmanaged branch should NOT sync PRs. Found: {:?}",
+            state.prs
+        );
+    });
 }

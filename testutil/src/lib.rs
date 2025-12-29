@@ -11,6 +11,8 @@ pub mod mock_server;
 
 pub const DEFAULT_OWNER: &str = "owner";
 pub const DEFAULT_REPO: &str = "repo";
+pub const MANAGED_PRIVATE: &str = "managedPrivate";
+pub const MANAGED_PUBLIC: &str = "managedPublic";
 
 #[macro_export]
 macro_rules! test_context {
@@ -70,14 +72,9 @@ impl Default for TestContextBuilder {
 
 impl TestContextBuilder {
     pub fn new() -> Self {
-        Self {
-            owner: DEFAULT_OWNER.to_string(),
-            name: DEFAULT_REPO.to_string(),
-            install_hooks: true,
-            initial_commit: true,
-            gherrit_bin: None,
-            mock_bin: None,
-        }
+        let mut slf = Self::new_minimal();
+        slf.install_hooks(true).initial_commit(true);
+        slf
     }
 
     pub fn new_minimal() -> Self {
@@ -216,6 +213,14 @@ pub struct MockServerInfo {
     pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum FailureKind {
+    GraphQl,
+    CreatePr,
+    UpdatePr,
+    Named(String),
+}
+
 impl Drop for TestContext {
     fn drop(&mut self) {
         if let Some(server) = self.mock_server.take() {
@@ -293,11 +298,86 @@ impl TestContext {
         self.run_git(&["checkout", "-b", branch_name]);
     }
 
-    pub fn inject_failure(&self, request_type: &str, remaining: usize) {
+    pub fn inject_failure(&self, kind: FailureKind, remaining: usize) {
         let mut state =
             self.mock_server_state.as_ref().expect("Mock state not available").write().unwrap();
-        state.fail_next_request = Some(request_type.to_string());
+
+        state.fail_next_request = Some(kind);
         state.fail_remaining = remaining;
+    }
+
+    pub fn maybe_inspect_mock_state(&self, f: impl FnOnce(&mock_server::MockState)) {
+        if !self.is_live {
+            let state = self.read_mock_state();
+            f(&state);
+        }
+    }
+
+    pub fn maybe_mutate_mock_state(&self, f: impl FnOnce(&mut mock_server::MockState)) {
+        if !self.is_live {
+            let mut state =
+                self.mock_server_state.as_ref().expect("Mock state not available").write().unwrap();
+            f(&mut state);
+        }
+    }
+
+    pub fn assert_pushed(&self, ref_name: &str) {
+        self.maybe_inspect_mock_state(|state| {
+            let found = state.pushed_refs.iter().any(|r| r == ref_name);
+            assert!(
+                found,
+                "Expected ref '{}' to be pushed. Refs: {:?}",
+                ref_name, state.pushed_refs
+            );
+        });
+    }
+
+    pub fn count_pushed_containing(&self, substring: &str) -> usize {
+        let mut count = 0;
+        self.maybe_inspect_mock_state(|state| {
+            count = state
+                .pushed_refs
+                .iter()
+                .filter(|r| !r.starts_with("--"))
+                .filter(|r| r.contains(substring))
+                .count();
+        });
+        count
+    }
+
+    pub fn set_config(&self, key: &str, value: Option<&str>) {
+        if let Some(val) = value {
+            self.git().args(["config", key, val]).assert().success();
+        } else {
+            // Ignore error if key doesn't exist when unsetting
+            let _ = self.git().args(["config", "--unset", key]).output();
+        }
+    }
+
+    pub fn assert_config(&self, key: &str, expected_value: Option<&str>) {
+        if let Some(val) = expected_value {
+            self.git().args(["config", key]).assert().success().stdout(format!("{}\n", val));
+        } else {
+            self.git().args(["config", key]).assert().failure();
+        }
+    }
+
+    pub fn hook(&self, name: &str) -> assert_cmd::Command {
+        let mut cmd = self.gherrit();
+        cmd.args(["hook", name]);
+        cmd
+    }
+
+    pub fn manage(&self) -> assert_cmd::Command {
+        let mut cmd = self.gherrit();
+        cmd.arg("manage");
+        cmd
+    }
+
+    pub fn unmanage(&self) -> assert_cmd::Command {
+        let mut cmd = self.gherrit();
+        cmd.arg("unmanage");
+        cmd
     }
 }
 

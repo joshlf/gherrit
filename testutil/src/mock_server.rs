@@ -14,6 +14,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::FailureKind;
+
 #[derive(Debug, Clone, Default)]
 pub struct MockState {
     pub prs: Vec<PrEntry>,
@@ -21,7 +23,7 @@ pub struct MockState {
     pub push_count: usize,
     pub repo_owner: String,
     pub repo_name: String,
-    pub fail_next_request: Option<String>,
+    pub fail_next_request: Option<FailureKind>,
     pub fail_remaining: usize,
     pub schema: Option<Valid<apollo_compiler::Schema>>,
 }
@@ -195,22 +197,27 @@ pub async fn start_mock_server(state: Arc<RwLock<MockState>>) -> String {
     url
 }
 
-fn check_and_apply_failure(mock_state: &mut MockState, action_name: &str) -> bool {
-    if let Some(action) = &mock_state.fail_next_request {
-        let matches = action == action_name
-            || (action == "graphql" && matches!(action_name, "update_pr" | "create_pr"));
+fn check_and_apply_failure(mock_state: &mut MockState, action: FailureKind) -> bool {
+    use FailureKind::*;
 
-        if matches {
-            if mock_state.fail_remaining > 0 {
-                mock_state.fail_remaining -= 1;
-            }
-            if mock_state.fail_remaining == 0 {
-                mock_state.fail_next_request = None;
-            }
-            return true;
-        }
+    let Some(fail_action) = &mock_state.fail_next_request else { return false };
+    let matches = match (fail_action, action) {
+        (GraphQl, GraphQl | CreatePr | UpdatePr) => true,
+        (f, a) => f == &a,
+    };
+
+    if !matches {
+        return false;
     }
-    false
+
+    if mock_state.fail_remaining > 0 {
+        mock_state.fail_remaining -= 1;
+    }
+    if mock_state.fail_remaining == 0 {
+        mock_state.fail_next_request = None;
+    }
+
+    true
 }
 
 async fn handle_git(
@@ -279,7 +286,7 @@ async fn list_prs(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let mut mock_state = state.state.write().unwrap();
-    if check_and_apply_failure(&mut mock_state, "list_prs") {
+    if check_and_apply_failure(&mut mock_state, FailureKind::Named("list_prs".to_string())) {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -327,9 +334,9 @@ async fn graphql(
 
     let mut mock_state = state.state.write().unwrap();
 
-    if check_and_apply_failure(&mut mock_state, "update_pr")
-        || check_and_apply_failure(&mut mock_state, "create_pr")
-        || check_and_apply_failure(&mut mock_state, "graphql")
+    if check_and_apply_failure(&mut mock_state, FailureKind::UpdatePr)
+        || check_and_apply_failure(&mut mock_state, FailureKind::CreatePr)
+        || check_and_apply_failure(&mut mock_state, FailureKind::GraphQl)
     {
         return Ok(Json(serde_json::json!({
             "errors": [
