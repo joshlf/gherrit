@@ -9,24 +9,21 @@ fn verify_push_to_non_open_fail(state_arg: &str, expected_msg_part: &str) {
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
     // 2. Simulate PR State Change on GitHub
-    if !ctx.is_live {
-        let mut state_lock = ctx.mock_server_state.as_ref().unwrap().write().unwrap();
-        let pr = state_lock.prs.last_mut().unwrap();
-
+    ctx.maybe_mutate_mock_state(|state| {
+        let pr = state.prs.last_mut().unwrap();
         pr.state = state_arg.to_string();
-    }
+    });
 
     // 3. Amend and Push (Should Fail)
     ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
-    let assert = ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
-
-    assert.stderr(predicate::str::contains(expected_msg_part));
+    ctx.hook("pre-push").assert().failure().stderr(predicate::str::contains(expected_msg_part));
 
     // 4. Verify no new push happened
-    if !ctx.is_live {
-        let state = ctx.read_mock_state();
+    ctx.maybe_inspect_mock_state(|state| {
+        let pr = &state.prs[0];
+        assert_eq!(pr.state, state_arg);
         assert_eq!(state.push_count, 1, "Should not have pushed to {} PR", state_arg);
-    }
+    });
 }
 
 #[test]
