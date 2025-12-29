@@ -16,12 +16,13 @@ fn test_reproduce_unmanaged_sync() {
 
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
-    let state = ctx.read_mock_state();
-    assert!(
-        state.prs.is_empty(),
-        "Explicit unmanaged branch should NOT sync PRs. Found: {:?}",
-        state.prs
-    );
+    ctx.maybe_inspect_mock_state(|state| {
+        assert!(
+            state.prs.is_empty(),
+            "Explicit unmanaged branch should NOT sync PRs. Found: {:?}",
+            state.prs
+        );
+    });
 
     // Condition 2: Implicit Unmanaged
     ctx.checkout_new("implicit-unmanaged");
@@ -30,10 +31,11 @@ fn test_reproduce_unmanaged_sync() {
 
     let _ = ctx.gherrit().args(["hook", "pre-push"]).output().unwrap();
 
-    let state = ctx.read_mock_state();
-    assert!(
-        state.prs.is_empty(),
-        "Implicit unmanaged branch should NOT sync PRs. Found: {:?}",
-        state.prs
-    );
+    ctx.maybe_inspect_mock_state(|state| {
+        assert!(
+            state.prs.is_empty(),
+            "Implicit unmanaged branch should NOT sync PRs. Found: {:?}",
+            state.prs
+        );
+    });
 }

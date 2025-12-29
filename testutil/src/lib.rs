@@ -216,6 +216,14 @@ pub struct MockServerInfo {
     pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
 }
 
+#[derive(Debug, Clone)]
+pub enum FailureKind {
+    GraphQl,
+    CreatePr,
+    UpdatePr,
+    GitCmd(String),
+}
+
 impl Drop for TestContext {
     fn drop(&mut self) {
         if let Some(server) = self.mock_server.take() {
@@ -293,11 +301,33 @@ impl TestContext {
         self.run_git(&["checkout", "-b", branch_name]);
     }
 
-    pub fn inject_failure(&self, request_type: &str, remaining: usize) {
+    pub fn inject_failure(&self, kind: FailureKind, remaining: usize) {
         let mut state =
             self.mock_server_state.as_ref().expect("Mock state not available").write().unwrap();
-        state.fail_next_request = Some(request_type.to_string());
+
+        let request_type = match kind {
+            FailureKind::GraphQl => "graphql".to_string(),
+            FailureKind::CreatePr => "create_pr".to_string(),
+            FailureKind::UpdatePr => "update_pr".to_string(),
+            FailureKind::GitCmd(cmd) => format!("git:{}", cmd),
+        };
+
+        state.fail_next_request = Some(request_type);
         state.fail_remaining = remaining;
+    }
+
+    pub fn maybe_inspect_mock_state<F>(&self, f: F)
+    where
+        F: FnOnce(&mock_server::MockState),
+    {
+        if !self.is_live {
+            let state = self.read_mock_state();
+            f(&state);
+        }
+    }
+
+    pub fn assert_config(&self, key: &str, expected_value: &str) {
+        self.git().args(["config", key]).assert().success().stdout(format!("{}\n", expected_value));
     }
 }
 

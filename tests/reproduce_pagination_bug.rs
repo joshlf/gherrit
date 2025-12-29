@@ -23,40 +23,15 @@ fn test_pagination_bug() {
             let head_ref =
                 if is_target { change_id.to_string() } else { format!("other-change-{}", i) };
 
-            let pr_json = serde_json::json!({
-                "id": i,
-                "number": i,
-                "html_url": format!("http://github.com/owner/repo/pull/{}", i),
-                "url": format!("http://api.github.com/repos/owner/repo/pulls/{}", i),
-                "node_id": format!("PR_{}", i),
-                "state": "OPEN",
-                "user": {
-                    "login": "test",
-                    "id": 1,
-                    "node_id": "U1",
-                    "avatar_url": "http://example.com/avatar",
-                    "gravatar_id": "",
-                    "url": "http://example.com/users/test",
-                    "html_url": "http://example.com/users/test",
-                    "followers_url": "http://example.com/users/test/followers",
-                    "following_url": "http://example.com/users/test/following{/other_user}",
-                    "gists_url": "http://example.com/users/test/gists{/gist_id}",
-                    "starred_url": "http://example.com/users/test/starred{/owner}{/repo}",
-                    "subscriptions_url": "http://example.com/users/test/subscriptions",
-                    "organizations_url": "http://example.com/users/test/orgs",
-                    "repos_url": "http://example.com/users/test/repos",
-                    "events_url": "http://example.com/users/test/events{/privacy}",
-                    "received_events_url": "http://example.com/users/test/received_events",
-                    "type": "User",
-                    "site_admin": false
-                },
-                "head": { "ref": head_ref, "sha": "sha" },
-                "base": { "ref": "main", "sha": "sha" },
-                "created_at": "2024-01-01T00:00:00Z",
-                "updated_at": "2024-01-01T00:00:00Z"
+            let pr = testutil::mock_server::PrEntry::mock(testutil::mock_server::MockPrArgs {
+                id: i as u64,
+                title: format!("PR {}", i),
+                body: "body".to_string(),
+                head: head_ref,
+                base: "main".to_string(),
+                repo_owner: "owner",
+                repo_name: "repo",
             });
-
-            let pr: testutil::mock_server::PrEntry = serde_json::from_value(pr_json).unwrap();
             locked_state.add_pr(pr);
         }
     }

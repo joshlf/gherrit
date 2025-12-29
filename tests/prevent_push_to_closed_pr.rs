@@ -23,10 +23,11 @@ fn verify_push_to_non_open_fail(state_arg: &str, expected_msg_part: &str) {
     assert.stderr(predicate::str::contains(expected_msg_part));
 
     // 4. Verify no new push happened
-    if !ctx.is_live {
-        let state = ctx.read_mock_state();
+    ctx.maybe_inspect_mock_state(|state| {
+        let pr = &state.prs[0];
+        assert_eq!(pr.state, state_arg);
         assert_eq!(state.push_count, 1, "Should not have pushed to {} PR", state_arg);
-    }
+    });
 }
 
 #[test]

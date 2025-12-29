@@ -40,14 +40,13 @@ fn test_full_stack_lifecycle_mocked() {
         .stderr(predicates::str::contains("Successfully synced 2 commits"));
 
     // Verify Side Effects (Mock Only)
-    if !ctx.is_live {
-        let state = ctx.read_mock_state();
+    ctx.maybe_inspect_mock_state(|state| {
         assert_eq!(state.prs.len(), 2, "Expected 2 PRs created");
         // Verify we pushed phantom branches or tags. The mock intercepts 'git
         // push origin <refspec>...'. GHerrit pushes refspecs like
         // 'refs/heads/G...:refs/heads/G...' or tags.
         assert!(!state.pushed_refs.is_empty(), "Expected some refs to be pushed");
-    }
+    });
 }
 
 #[test]
@@ -68,32 +67,20 @@ fn test_branch_management() {
     ctx.gherrit().args(["manage", "--force"]).assert().success();
 
     // Assert managed
-    ctx.git()
-        .args(["config", "branch.feature-A.gherritManaged"])
-        .assert()
-        .success()
-        .stdout(format!("{}\n", MANAGED_PRIVATE));
+    ctx.assert_config("branch.feature-A.gherritManaged", MANAGED_PRIVATE);
 
     // Assert pushRemote updated to loopback (Private default)
-    ctx.git().args(["config", "branch.feature-A.pushRemote"]).assert().success().stdout(".\n");
+    ctx.assert_config("branch.feature-A.pushRemote", ".");
 
     // Assert other keys set
-    ctx.git().args(["config", "branch.feature-A.remote"]).assert().success().stdout(".\n");
-    ctx.git()
-        .args(["config", "branch.feature-A.merge"])
-        .assert()
-        .success()
-        .stdout("refs/heads/feature-A\n");
+    ctx.assert_config("branch.feature-A.remote", ".");
+    ctx.assert_config("branch.feature-A.merge", "refs/heads/feature-A");
 
     // Scenario B: Unmanage Cleanup
     ctx.gherrit().args(["unmanage"]).assert().success();
 
     // Assert unmanaged (key exists but is false)
-    ctx.git()
-        .args(["config", "branch.feature-A.gherritManaged"])
-        .assert()
-        .success()
-        .stdout("false\n");
+    ctx.assert_config("branch.feature-A.gherritManaged", "false");
 
     // Assert cleanup (keys should be unset)
     ctx.git().args(["config", "branch.feature-A.remote"]).assert().failure();
@@ -111,11 +98,7 @@ fn test_post_checkout_hook() {
 
     ctx.checkout_new("feature-stack");
 
-    ctx.git()
-        .args(["config", "branch.feature-stack.gherritManaged"])
-        .assert()
-        .success()
-        .stdout(format!("{}\n", MANAGED_PRIVATE));
+    ctx.assert_config("branch.feature-stack.gherritManaged", MANAGED_PRIVATE);
 
     // Scenario B: Existing Branch
     // ------------------------------------------------
@@ -131,11 +114,7 @@ fn test_post_checkout_hook() {
     ctx.run_git(&["checkout", "-b", "collab-feature", "--track", "origin/collab-feature"]);
 
     // Assert managed = false
-    ctx.git()
-        .args(["config", "branch.collab-feature.gherritManaged"])
-        .assert()
-        .success()
-        .stdout("false\n");
+    ctx.assert_config("branch.collab-feature.gherritManaged", "false");
 }
 
 #[test]
@@ -209,12 +188,11 @@ fn test_version_increment() {
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
     let mut pushed_count_v1 = 0;
-    if !ctx.is_live {
-        let state = ctx.read_mock_state();
+    ctx.maybe_inspect_mock_state(|state| {
         let has_v1 = state.pushed_refs.iter().any(|r| r.contains("/v1"));
         assert!(has_v1, "Expected v1 tag to be pushed. Refs: {:?}", state.pushed_refs);
         pushed_count_v1 = state.pushed_refs.len();
-    }
+    });
 
     // Amend commit (modifies SHA, keeps Change-ID)
     ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
@@ -222,8 +200,7 @@ fn test_version_increment() {
     // Push 2 (v2)
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
-    if !ctx.is_live {
-        let state = ctx.read_mock_state();
+    ctx.maybe_inspect_mock_state(|state| {
         let has_v2 = state.pushed_refs.iter().any(|r| r.contains("/v2"));
         assert!(has_v2, "Expected v2 tag to be pushed. Refs: {:?}", state.pushed_refs);
 
@@ -235,7 +212,9 @@ fn test_version_increment() {
             "v1 tag should NOT be pushed again in the second push. New pushes: {:?}",
             new_pushes
         );
+    });
 
+    if !ctx.is_live {
         // Verify that tags actually exist on the remote
         let output = ctx.remote_git().args(["tag", "-l"]).output().unwrap();
         let tags = std::str::from_utf8(&output.stdout).unwrap();
@@ -321,9 +300,7 @@ fn test_pr_body_generation() {
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
     // Verify
-    if !ctx.is_live {
-        let state = ctx.read_mock_state();
-
+    ctx.maybe_inspect_mock_state(|state| {
         // Find PR for Commit B (should be the middle one, index 1)
         // mock_bin typically creates PRs in order [A, B, C] or based on commit list.
         // We know we created 3 PRs.
@@ -351,7 +328,7 @@ fn test_pr_body_generation() {
         // 2. Verify Table
         // For v1, the history table is NOT generated.
         assert!(!body.contains("| Version |"), "Table should NOT be present for v1");
-    }
+    });
 
     // 4. Update to v2 to verify the Patch History Table appears
     ctx.run_git(&["checkout", "feature-stack"]); // Ensure we are on the branch
@@ -362,8 +339,7 @@ fn test_pr_body_generation() {
     // Sync again
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
-    if !ctx.is_live {
-        let state = ctx.read_mock_state();
+    ctx.maybe_inspect_mock_state(|state| {
         // Find PR for Commit C (the tip)
         let pr_c = state
             .prs
@@ -376,7 +352,7 @@ fn test_pr_body_generation() {
         // Assert table exists now
         assert!(body.contains("|Version|"), "Patch History Table should appear for v2");
         assert!(body.contains("v1|"), "Table should reference v1");
-    }
+    });
 }
 
 #[test]
@@ -395,9 +371,7 @@ fn test_large_stack_batching() {
     // Using simple pre-push hook invocation.
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
-    if !ctx.is_live {
-        let state = ctx.read_mock_state();
-
+    ctx.maybe_inspect_mock_state(|state| {
         // Assert: 85 PRs created
         assert_eq!(state.prs.len(), 85, "Expected 85 PRs created");
 
@@ -421,7 +395,7 @@ fn test_large_stack_batching() {
             state.push_count, 2,
             "Expected 2 push invocations for 85 commits (batch size 80)"
         );
-    }
+    });
 }
 
 #[test]
@@ -443,11 +417,7 @@ fn test_rebase_detection() {
     ctx.gherrit().args(["manage"]).assert().success();
 
     // Verify config was applied to 'feature-rebase'
-    ctx.git()
-        .args(["config", "branch.feature-rebase.gherritManaged"])
-        .assert()
-        .success()
-        .stdout(format!("{}\n", MANAGED_PRIVATE));
+    ctx.assert_config("branch.feature-rebase.gherritManaged", MANAGED_PRIVATE);
 }
 
 #[test]
@@ -461,14 +431,13 @@ fn test_public_stack_links() {
 
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
-    if !ctx.is_live {
-        let state = ctx.read_mock_state();
+    ctx.maybe_inspect_mock_state(|state| {
         let body = state.prs[0].body.as_ref().unwrap();
         assert!(
             !body.contains("This PR is on branch"),
             "Private stack should NOT link to local branch"
         );
-    }
+    });
 
     // 2. Public Mode
     // Manually set pushRemote to origin (simulating a public stack)
@@ -478,12 +447,11 @@ fn test_public_stack_links() {
     ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
-    if !ctx.is_live {
-        let state = ctx.read_mock_state();
+    ctx.maybe_inspect_mock_state(|state| {
         let body = state.prs[0].body.as_ref().unwrap(); // Get the updated body
         assert!(body.contains("This PR is on branch"), "Public stack SHOULD link to local branch");
         assert!(body.contains("[public-feature]"), "Link should mention the branch name");
-    }
+    });
 }
 
 #[test]
@@ -622,11 +590,7 @@ fn test_unmanage_cleanup_logic() {
     ctx.git().args(["config", "branch.feature-cleanup.remote"]).assert().failure();
     ctx.git().args(["config", "branch.feature-cleanup.merge"]).assert().failure();
     // gherritManaged should be false
-    ctx.git()
-        .args(["config", "branch.feature-cleanup.gherritManaged"])
-        .assert()
-        .success()
-        .stdout("false\n");
+    ctx.assert_config("branch.feature-cleanup.gherritManaged", "false");
 }
 
 #[test]
@@ -697,22 +661,16 @@ fn test_manage_drift_detection() {
     assert!(stderr.contains("- pushRemote: current='origin', expected='.'"));
 
     // Assert state matches OLD state (Private)
-    ctx.git()
-        .args(["config", "branch.drift-feature.gherritManaged"])
-        .assert()
-        .stdout(format!("{}\n", MANAGED_PRIVATE));
+    ctx.assert_config("branch.drift-feature.gherritManaged", MANAGED_PRIVATE);
 
     // 4. Force Switch
     ctx.gherrit().args(["manage", "--public", "--force"]).assert().success();
 
     // Assert Success
-    ctx.git()
-        .args(["config", "branch.drift-feature.gherritManaged"])
-        .assert()
-        .stdout(format!("{}\n", MANAGED_PUBLIC));
+    ctx.assert_config("branch.drift-feature.gherritManaged", MANAGED_PUBLIC);
 
     // Check pushRemote is now origin
-    ctx.git().args(["config", "branch.drift-feature.pushRemote"]).assert().stdout("origin\n");
+    ctx.assert_config("branch.drift-feature.pushRemote", "origin");
 }
 
 #[test]
@@ -722,15 +680,15 @@ fn test_manage_toggle_visibility() {
 
     // 1. Private
     ctx.gherrit().args(["manage", "--private"]).assert().success();
-    ctx.git().args(["config", "branch.visibility-feature.pushRemote"]).assert().stdout(".\n");
+    ctx.assert_config("branch.visibility-feature.pushRemote", ".");
 
     // 2. Public
     ctx.gherrit().args(["manage", "--public"]).assert().success();
-    ctx.git().args(["config", "branch.visibility-feature.pushRemote"]).assert().stdout("origin\n");
+    ctx.assert_config("branch.visibility-feature.pushRemote", "origin");
 
     // 3. Private again
     ctx.gherrit().args(["manage", "--private"]).assert().success();
-    ctx.git().args(["config", "branch.visibility-feature.pushRemote"]).assert().stdout(".\n");
+    ctx.assert_config("branch.visibility-feature.pushRemote", ".");
 }
 
 #[test]
