@@ -40,21 +40,12 @@ struct TestCase {
 }
 
 const BRANCH: &str = "feature";
-const MANAGE_PRIVATE: &str = "managedPrivate";
-const MANAGE_PUBLIC: &str = "managedPublic";
 
 /// Helper to force the repo into a specific state
 fn setup_state(ctx: &TestContext, state: StartState) {
     // Always start with a clean branch
     let _ = ctx.git().args(["branch", "-D", BRANCH]).output();
     ctx.checkout_new(BRANCH);
-
-    let set_config = |key: &str, val: &str| {
-        ctx.run_git(&["config", key, val]);
-    };
-    let unset_config = |key: &str| {
-        let _ = ctx.git().args(["config", "--unset", key]).ok();
-    };
 
     let key_managed = format!("branch.{BRANCH}.gherritManaged");
     let key_push = format!("branch.{BRANCH}.pushRemote");
@@ -63,79 +54,70 @@ fn setup_state(ctx: &TestContext, state: StartState) {
 
     match state {
         StartState::UnmanagedClean => {
-            unset_config(&key_managed);
-            unset_config(&key_push);
-            unset_config(&key_remote);
-            unset_config(&key_merge);
+            ctx.set_config(&key_managed, Some("false"));
+            ctx.set_config(&key_push, None);
+            ctx.set_config(&key_remote, None);
+            ctx.set_config(&key_merge, None);
         }
         StartState::UnmanagedDirty => {
-            unset_config(&key_managed);
-            set_config(&key_push, "dirty-remote");
+            ctx.set_config(&key_managed, Some("false"));
+            ctx.set_config(&key_push, Some("dirty-remote"));
         }
         StartState::PrivateClean => {
-            set_config(&key_managed, MANAGE_PRIVATE);
-            set_config(&key_push, ".");
-            set_config(&key_remote, ".");
-            set_config(&key_merge, &format!("refs/heads/{BRANCH}"));
+            ctx.set_config(&key_managed, Some(testutil::MANAGED_PRIVATE));
+            ctx.set_config(&key_push, Some("."));
+            ctx.set_config(&key_remote, Some("."));
+            ctx.set_config(&key_merge, Some(&format!("refs/heads/{BRANCH}")));
         }
         StartState::PrivateDrifted => {
-            set_config(&key_managed, MANAGE_PRIVATE);
-            set_config(&key_push, "drifted-remote");
-            set_config(&key_remote, ".");
-            set_config(&key_merge, &format!("refs/heads/{BRANCH}"));
+            ctx.set_config(&key_managed, Some(testutil::MANAGED_PRIVATE));
+            ctx.set_config(&key_push, Some("drifted-remote"));
+            ctx.set_config(&key_remote, Some("."));
+            ctx.set_config(&key_merge, Some(&format!("refs/heads/{BRANCH}")));
         }
         StartState::PublicClean => {
-            set_config(&key_managed, MANAGE_PUBLIC);
-            set_config(&key_push, "origin");
-            set_config(&key_remote, ".");
-            set_config(&key_merge, &format!("refs/heads/{BRANCH}"));
+            ctx.set_config(&key_managed, Some(testutil::MANAGED_PUBLIC));
+            ctx.set_config(&key_push, Some("origin"));
+            ctx.set_config(&key_remote, Some("."));
+            ctx.set_config(&key_merge, Some(&format!("refs/heads/{BRANCH}")));
         }
         StartState::PublicDrifted => {
-            set_config(&key_managed, MANAGE_PUBLIC);
-            set_config(&key_push, "drifted-remote");
-            set_config(&key_remote, ".");
-            set_config(&key_merge, &format!("refs/heads/{BRANCH}"));
+            ctx.set_config(&key_managed, Some(testutil::MANAGED_PUBLIC));
+            ctx.set_config(&key_push, Some("drifted-remote"));
+            ctx.set_config(&key_remote, Some("."));
+            ctx.set_config(&key_merge, Some(&format!("refs/heads/{BRANCH}")));
         }
     }
 }
 
 fn verify_state(ctx: &TestContext, expected: StartState) {
-    let get_config = |key: &str| -> Option<String> {
-        let output = ctx.git().args(["config", key]).output().ok()?;
-        if output.status.success() {
-            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-        } else {
-            None
-        }
-    };
-
-    let val_managed = get_config(&format!("branch.{BRANCH}.gherritManaged"));
-    let val_push = get_config(&format!("branch.{BRANCH}.pushRemote"));
+    let key_managed = format!("branch.{BRANCH}.gherritManaged");
+    let key_push = format!("branch.{BRANCH}.pushRemote");
 
     match expected {
         StartState::UnmanagedClean => {
-            assert_eq!(val_managed.as_deref().unwrap_or("false"), "false");
-            assert!(val_push.is_none(), "Expected pushRemote to be unset");
+            ctx.assert_config(&key_managed, Some("false"));
+            ctx.assert_config(&key_push, None);
         }
         StartState::UnmanagedDirty => {
-            assert_eq!(val_managed.as_deref().unwrap_or("false"), "false");
-            assert_eq!(val_push.as_deref(), Some("dirty-remote"));
+            ctx.assert_config(&key_managed, Some("false"));
+            ctx.assert_config(&key_push, Some("dirty-remote"));
         }
         StartState::PrivateClean => {
-            assert_eq!(val_managed.as_deref(), Some(MANAGE_PRIVATE));
-            assert_eq!(val_push.as_deref(), Some("."));
+            ctx.assert_config(&key_managed, Some(testutil::MANAGED_PRIVATE));
+            ctx.assert_config(&key_push, Some("."));
         }
         StartState::PrivateDrifted => {
-            assert_eq!(val_managed.as_deref(), Some(MANAGE_PRIVATE));
-            assert_eq!(val_push.as_deref(), Some("drifted-remote"));
+            ctx.assert_config(&key_managed, Some(testutil::MANAGED_PRIVATE));
+            ctx.assert_config(&key_push, Some("drifted-remote"));
         }
         StartState::PublicClean => {
-            assert_eq!(val_managed.as_deref(), Some(MANAGE_PUBLIC));
-            assert_eq!(val_push.as_deref(), Some("origin"));
+            ctx.assert_config(&key_managed, Some(testutil::MANAGED_PUBLIC));
+            ctx.assert_config(&key_push, Some("origin"));
         }
         StartState::PublicDrifted => {
-            assert_eq!(val_managed.as_deref(), Some(MANAGE_PUBLIC));
-            assert_eq!(val_push.as_deref(), Some("drifted-remote"));
+            ctx.assert_config(&key_managed, Some(testutil::MANAGED_PUBLIC));
+            ctx.assert_config(&key_push, Some("drifted-remote"));
         }
     }
 }
@@ -192,19 +174,21 @@ fn test_branch_config_transitions() {
         println!("Running Case: {}", case.id);
         setup_state(&ctx, case.start);
 
-        let mut cmd = ctx.gherrit();
+        let mut cmd;
         match case.cmd {
             Command::ManageDefault => {
-                cmd.arg("manage");
+                cmd = ctx.manage();
             }
             Command::ManagePrivate => {
-                cmd.args(["manage", "--private"]);
+                cmd = ctx.manage();
+                cmd.arg("--private");
             }
             Command::ManagePublic => {
-                cmd.args(["manage", "--public"]);
+                cmd = ctx.manage();
+                cmd.arg("--public");
             }
             Command::Unmanage => {
-                cmd.arg("unmanage");
+                cmd = ctx.unmanage();
             }
         }
 

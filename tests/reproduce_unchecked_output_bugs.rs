@@ -1,3 +1,5 @@
+use predicates::prelude::*;
+
 #[test]
 fn test_pre_push_ls_remote_failure() {
     let ctx = testutil::test_context!().build();
@@ -11,7 +13,7 @@ fn test_pre_push_ls_remote_failure() {
         .env("MOCK_BIN_FAIL_CMD", "git:ls-remote")
         .assert()
         .success()
-        .stderr(predicates::str::contains("Failed to fetch remote branch states"));
+        .stderr(predicate::str::contains("Failed to fetch remote branch states"));
 }
 
 #[test]
@@ -21,7 +23,7 @@ fn test_pre_push_pr_list_failure() {
     ctx.commit("Work");
 
     // Trigger hook
-    ctx.inject_failure("graphql", 5);
+    ctx.inject_failure(testutil::FailureKind::GraphQl, 5);
 
     ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
 }
@@ -33,7 +35,7 @@ fn test_pre_push_pr_create_failure() {
     ctx.commit("Work");
 
     // Trigger hook
-    ctx.inject_failure("create_pr", 5);
+    ctx.inject_failure(testutil::FailureKind::CreatePr, 5);
 
     ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
 }

@@ -14,7 +14,7 @@ fn assert_autosquash_error(
     output
         .failure()
         .stderr(predicate::str::contains("Stack contains pending fixup/squash/amend commits"))
-        .stderr(predicate::str::contains(format!("git rebase -i --autosquash {remote}/{branch}",)))
+        .stderr(predicate::str::contains(format!("git rebase -i --autosquash {remote}/{branch}")))
 }
 
 #[test]
@@ -93,14 +93,8 @@ fn test_precedence_over_trailer_check() {
     let output = ctx.gherrit().args(["hook", "pre-push"]).assert();
 
     // Must fail with autosquash error, NOT missing trailer error
-    let output = assert_autosquash_error(output, "origin", "main");
-
-    let stderr = std::str::from_utf8(&output.get_output().stderr).unwrap();
-    assert!(
-        !stderr.contains("missing gherrit-pr-id trailer"),
-        "Error should not be about missing trailer. Got: {}",
-        stderr
-    );
+    assert_autosquash_error(output, "origin", "main")
+        .stderr(predicate::str::contains("missing gherrit-pr-id trailer").not());
 }
 
 #[test]

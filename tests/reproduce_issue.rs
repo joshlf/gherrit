@@ -23,12 +23,12 @@ fn test_special_characters_in_repo_url() {
         ctx.checkout_new("feature-stack");
 
         // Manage must happen before commit to ensure the commit-msg hook adds the trailer
-        ctx.gherrit().args(["manage"]).assert().success();
+        ctx.manage().assert().success();
 
         ctx.run_git(&["commit", "--allow-empty", "-m", "Commit A"]);
 
         // Run pre-push hook
         // This fails if the regex doesn't match the generated URL
-        ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+        ctx.hook("pre-push").assert().success();
     }
 }
