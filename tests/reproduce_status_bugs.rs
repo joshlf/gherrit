@@ -34,7 +34,7 @@ fn test_pre_push_edit_failure() {
     ctx.run_git(&["commit", "--amend", "--allow-empty", "-m", "Initial Work (Updated)"]);
 
     // Run hook with failure injection
-    ctx.inject_failure("update_pr", 5);
+    ctx.inject_failure(testutil::FailureKind::UpdatePr, 5);
 
     ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
 }

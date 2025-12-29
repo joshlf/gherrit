@@ -11,9 +11,11 @@ fn test_reproduce_pr_base_branch_bug() {
 
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
-    if !ctx.is_live {
-        let state = ctx.read_mock_state();
-        let pr = state.prs.last().expect("PR should have been created");
-        assert_eq!(pr.base.ref_field, "main");
-    }
+    ctx.maybe_inspect_mock_state(|state| {
+        let pr = &state.prs[0];
+        assert_eq!(
+            pr.base.ref_field, "main",
+            "PR should target main, not the parent feature branch"
+        );
+    });
 }
