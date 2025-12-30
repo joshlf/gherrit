@@ -1,0 +1,15 @@
+---
+source: testutil/src/lib.rs
+expression: content
+---
+EXIT_CODE: 2
+
+STDOUT:
+(empty)
+
+STDERR:
+error: the argument '--public' cannot be used with '--private'
+
+Usage: gherrit manage --public
+
+For more information, try '--help'.

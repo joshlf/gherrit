@@ -1,0 +1,14 @@
+---
+source: testutil/src/lib.rs
+expression: content
+---
+EXIT_CODE: 1
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] [ERROR] Refusing to overwrite unmanaged hooks:
+[gherrit] [ERROR]   - [REPO_PATH]/.git/hooks/pre-push
+[gherrit] [ERROR] 
+[gherrit] [ERROR] Use --force to overwrite them.

@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, LazyLock, RwLock},
 };
 
+use regex::Regex;
 use tempfile::TempDir;
 
 pub mod mock_server;
@@ -13,6 +14,15 @@ pub const DEFAULT_OWNER: &str = "owner";
 pub const DEFAULT_REPO: &str = "repo";
 pub const MANAGED_PRIVATE: &str = "managedPrivate";
 pub const MANAGED_PUBLIC: &str = "managedPublic";
+
+static SHA_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[0-9a-f]{40}\b").expect("Invalid regex"));
+
+static MOCK_URL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"http://127\.0\.0\.1:\d+").expect("Invalid regex"));
+
+static GHERRIT_ID_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bG[0-9a-fA-F]{16,}\b").expect("Invalid regex"));
 
 #[macro_export]
 macro_rules! test_context {
@@ -378,6 +388,57 @@ impl TestContext {
         let mut cmd = self.gherrit();
         cmd.arg("unmanage");
         cmd
+    }
+
+    pub fn sanitize(&self, output: &str) -> String {
+        self.sanitize_with_redactions(output, &[])
+    }
+
+    pub fn sanitize_with_redactions(&self, output: &str, redactions: &[(&str, &str)]) -> String {
+        let mut output = output.replace(self.repo_path.to_str().unwrap(), "[REPO_PATH]");
+        output = output.replace(self.remote_path.to_str().unwrap(), "[REMOTE_PATH]");
+        output = output.replace('\\', "/"); // Normalize windows paths
+
+        for (target, replacement) in redactions {
+            output = output.replace(target, replacement);
+        }
+
+        let output = SHA_REGEX.replace_all(&output, "[SHA]");
+        let output = GHERRIT_ID_REGEX.replace_all(&output, "[GHERRIT_ID]");
+        MOCK_URL_REGEX.replace_all(&output, "[MOCK_SERVER_URL]").to_string()
+    }
+
+    pub fn assert_snapshot(&self, cmd: &mut assert_cmd::Command, name: &str) {
+        self.assert_snapshot_with_redactions(cmd, name, &[]);
+    }
+
+    pub fn assert_snapshot_with_redactions(
+        &self,
+        cmd: &mut assert_cmd::Command,
+        name: &str,
+        redactions: &[(&str, &str)],
+    ) {
+        let output = cmd.output().expect("Failed to execute command");
+
+        // 1. Sanitize Output
+        let stdout =
+            self.sanitize_with_redactions(&String::from_utf8_lossy(&output.stdout), redactions);
+        let stderr =
+            self.sanitize_with_redactions(&String::from_utf8_lossy(&output.stderr), redactions);
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        // 2. Format the Snapshot
+        // We want a readable format that shows exactly what happened.
+        let content = format!(
+            "EXIT_CODE: {}\n\nSTDOUT:\n{}\n\nSTDERR:\n{}\n",
+            exit_code,
+            if stdout.is_empty() { "(empty)" } else { &stdout },
+            if stderr.is_empty() { "(empty)" } else { &stderr }
+        );
+
+        // 3. Assert
+        // Use the `name` argument to distinguish multiple snapshots in one test.
+        insta::assert_snapshot!(name, content);
     }
 }
 

@@ -35,7 +35,7 @@ struct TestCase {
     start: StartState,
     cmd: Command,
     force: bool,
-    expected_result: ExpectedResult,
+    _expected_result: ExpectedResult,
     expected_final_state: StartState,
 }
 
@@ -130,41 +130,41 @@ fn test_branch_config_transitions() {
 
         vec![
             // Unmanaged Clean -> ...
-            TestCase { id: "T01", start: UnmanagedClean, cmd: ManageDefault, force: false, expected_result: Success, expected_final_state: PrivateClean },
-            TestCase { id: "T02", start: UnmanagedClean, cmd: ManagePublic, force: false, expected_result: Success, expected_final_state: PublicClean },
-            TestCase { id: "T03", start: UnmanagedClean, cmd: Unmanage, force: false, expected_result: Success, expected_final_state: UnmanagedClean },
+            TestCase { id: "T01", start: UnmanagedClean, cmd: ManageDefault, force: false, _expected_result: Success, expected_final_state: PrivateClean },
+            TestCase { id: "T02", start: UnmanagedClean, cmd: ManagePublic, force: false, _expected_result: Success, expected_final_state: PublicClean },
+            TestCase { id: "T03", start: UnmanagedClean, cmd: Unmanage, force: false, _expected_result: Success, expected_final_state: UnmanagedClean },
 
             // Unmanaged Dirty -> ...
-            TestCase { id: "T04", start: UnmanagedDirty, cmd: ManagePrivate, force: false, expected_result: Block, expected_final_state: UnmanagedDirty },
-            TestCase { id: "T05", start: UnmanagedDirty, cmd: ManagePrivate, force: true, expected_result: Success, expected_final_state: PrivateClean },
-            TestCase { id: "T06", start: UnmanagedDirty, cmd: ManagePublic, force: false, expected_result: Block, expected_final_state: UnmanagedDirty },
-            TestCase { id: "T07", start: UnmanagedDirty, cmd: ManagePublic, force: true, expected_result: Success, expected_final_state: PublicClean },
+            TestCase { id: "T04", start: UnmanagedDirty, cmd: ManagePrivate, force: false, _expected_result: Block, expected_final_state: UnmanagedDirty },
+            TestCase { id: "T05", start: UnmanagedDirty, cmd: ManagePrivate, force: true, _expected_result: Success, expected_final_state: PrivateClean },
+            TestCase { id: "T06", start: UnmanagedDirty, cmd: ManagePublic, force: false, _expected_result: Block, expected_final_state: UnmanagedDirty },
+            TestCase { id: "T07", start: UnmanagedDirty, cmd: ManagePublic, force: true, _expected_result: Success, expected_final_state: PublicClean },
 
             // Private Clean -> ...
-            TestCase { id: "T08", start: PrivateClean, cmd: ManagePrivate, force: false, expected_result: Success, expected_final_state: PrivateClean },
-            TestCase { id: "T09", start: PrivateClean, cmd: ManagePublic, force: false, expected_result: Success, expected_final_state: PublicClean },
-            TestCase { id: "T10", start: PrivateClean, cmd: Unmanage, force: false, expected_result: Success, expected_final_state: UnmanagedClean },
+            TestCase { id: "T08", start: PrivateClean, cmd: ManagePrivate, force: false, _expected_result: Success, expected_final_state: PrivateClean },
+            TestCase { id: "T09", start: PrivateClean, cmd: ManagePublic, force: false, _expected_result: Success, expected_final_state: PublicClean },
+            TestCase { id: "T10", start: PrivateClean, cmd: Unmanage, force: false, _expected_result: Success, expected_final_state: UnmanagedClean },
 
             // Private Drifted -> ...
-            TestCase { id: "T11", start: PrivateDrifted, cmd: ManagePrivate, force: false, expected_result: Block, expected_final_state: PrivateDrifted },
-            TestCase { id: "T12", start: PrivateDrifted, cmd: ManagePrivate, force: true, expected_result: Success, expected_final_state: PrivateClean },
-            TestCase { id: "T13", start: PrivateDrifted, cmd: ManagePublic, force: false, expected_result: Block, expected_final_state: PrivateDrifted },
-            TestCase { id: "T14", start: PrivateDrifted, cmd: ManagePublic, force: true, expected_result: Success, expected_final_state: PublicClean },
-            TestCase { id: "T15", start: PrivateDrifted, cmd: Unmanage, force: false, expected_result: Block, expected_final_state: PrivateDrifted },
-            TestCase { id: "T16", start: PrivateDrifted, cmd: Unmanage, force: true, expected_result: Success, expected_final_state: UnmanagedClean },
+            TestCase { id: "T11", start: PrivateDrifted, cmd: ManagePrivate, force: false, _expected_result: Block, expected_final_state: PrivateDrifted },
+            TestCase { id: "T12", start: PrivateDrifted, cmd: ManagePrivate, force: true, _expected_result: Success, expected_final_state: PrivateClean },
+            TestCase { id: "T13", start: PrivateDrifted, cmd: ManagePublic, force: false, _expected_result: Block, expected_final_state: PrivateDrifted },
+            TestCase { id: "T14", start: PrivateDrifted, cmd: ManagePublic, force: true, _expected_result: Success, expected_final_state: PublicClean },
+            TestCase { id: "T15", start: PrivateDrifted, cmd: Unmanage, force: false, _expected_result: Block, expected_final_state: PrivateDrifted },
+            TestCase { id: "T16", start: PrivateDrifted, cmd: Unmanage, force: true, _expected_result: Success, expected_final_state: UnmanagedClean },
 
             // Public Clean -> ...
-            TestCase { id: "T17", start: PublicClean, cmd: ManagePrivate, force: false, expected_result: Success, expected_final_state: PrivateClean },
-            TestCase { id: "T18", start: PublicClean, cmd: ManagePublic, force: false, expected_result: Success, expected_final_state: PublicClean },
-            TestCase { id: "T19", start: PublicClean, cmd: Unmanage, force: false, expected_result: Success, expected_final_state: UnmanagedClean },
+            TestCase { id: "T17", start: PublicClean, cmd: ManagePrivate, force: false, _expected_result: Success, expected_final_state: PrivateClean },
+            TestCase { id: "T18", start: PublicClean, cmd: ManagePublic, force: false, _expected_result: Success, expected_final_state: PublicClean },
+            TestCase { id: "T19", start: PublicClean, cmd: Unmanage, force: false, _expected_result: Success, expected_final_state: UnmanagedClean },
 
             // Public Drifted -> ...
-            TestCase { id: "T20", start: PublicDrifted, cmd: ManagePrivate, force: false, expected_result: Block, expected_final_state: PublicDrifted },
-            TestCase { id: "T21", start: PublicDrifted, cmd: ManagePrivate, force: true, expected_result: Success, expected_final_state: PrivateClean },
-            TestCase { id: "T22", start: PublicDrifted, cmd: ManagePublic, force: false, expected_result: Block, expected_final_state: PublicDrifted },
-            TestCase { id: "T23", start: PublicDrifted, cmd: ManagePublic, force: true, expected_result: Success, expected_final_state: PublicClean },
-            TestCase { id: "T24", start: PublicDrifted, cmd: Unmanage, force: false, expected_result: Block, expected_final_state: PublicDrifted },
-            TestCase { id: "T25", start: PublicDrifted, cmd: Unmanage, force: true, expected_result: Success, expected_final_state: UnmanagedClean },
+            TestCase { id: "T20", start: PublicDrifted, cmd: ManagePrivate, force: false, _expected_result: Block, expected_final_state: PublicDrifted },
+            TestCase { id: "T21", start: PublicDrifted, cmd: ManagePrivate, force: true, _expected_result: Success, expected_final_state: PrivateClean },
+            TestCase { id: "T22", start: PublicDrifted, cmd: ManagePublic, force: false, _expected_result: Block, expected_final_state: PublicDrifted },
+            TestCase { id: "T23", start: PublicDrifted, cmd: ManagePublic, force: true, _expected_result: Success, expected_final_state: PublicClean },
+            TestCase { id: "T24", start: PublicDrifted, cmd: Unmanage, force: false, _expected_result: Block, expected_final_state: PublicDrifted },
+            TestCase { id: "T25", start: PublicDrifted, cmd: Unmanage, force: true, _expected_result: Success, expected_final_state: UnmanagedClean },
         ]
     };
 
@@ -196,18 +196,7 @@ fn test_branch_config_transitions() {
             cmd.arg("--force");
         }
 
-        let assert = cmd.assert().success(); // All these commands should exit 0, even blocks (they just warn)
-        // Check output for blocks
-        if case.expected_result == ExpectedResult::Block {
-            let output = assert.get_output();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("drift detected"),
-                "Case {}: Expected warning about drift, got: {}",
-                case.id,
-                stderr
-            );
-        }
+        ctx.assert_snapshot(&mut cmd, &format!("transition_case_{}", case.id));
 
         verify_state(&ctx, case.expected_final_state);
     }

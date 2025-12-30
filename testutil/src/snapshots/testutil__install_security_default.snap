@@ -1,0 +1,13 @@
+---
+source: testutil/src/lib.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] Installed pre-push
+[gherrit] Installed commit-msg
+[gherrit] Installed post-checkout

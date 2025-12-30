@@ -1,0 +1,11 @@
+---
+source: testutil/src/lib.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+(empty)
