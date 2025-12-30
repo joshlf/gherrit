@@ -1,0 +1,12 @@
+---
+source: tests/integration_tests.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] Branch visibility-feature is now managed by GHerrit in public mode.
+[gherrit]   - 'git push' will sync PRs and will also push visibility-feature itself.

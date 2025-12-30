@@ -1,0 +1,11 @@
+---
+source: tests/integration_tests.rs
+expression: content
+---
+EXIT_CODE: 1
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] [ERROR] Failed to write hook file: "[REPO_PATH]/.git/hooks/pre-push": Permission denied (os error 13)

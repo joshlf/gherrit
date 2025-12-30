@@ -1,0 +1,20 @@
+---
+source: tests/integration_tests.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] Branch public-feature is MANAGED. Syncing stack...
+[gherrit] [WARN] Using custom GitHub API URL: [MOCK_SERVER_URL]
+[gherrit] Pushing chunk to remote...
+[gherrit] Creating 1 PRs...
+[gherrit] Created 1 PRs.
+[gherrit] Created PR #1: http://github.com/repos/owner/repo/pulls/1
+[gherrit] Queued update for PR #1: https://github.com/owner/repo/pull/1
+[gherrit] Updating batch of 1 PRs...
+[gherrit] Batch update complete.
+[gherrit] Successfully synced 1 commits.
