@@ -1,0 +1,16 @@
+---
+source: tests/integration_tests.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] [WARN] Configuration drift detected for branch feature-A.
+[gherrit] [WARN] The current git configuration does not match the expected state for an unmanaged branch.
+[gherrit] [WARN]   - pushRemote: current='origin', expected='<unset>'
+[gherrit] [WARN] Overwriting manual changes (--force).
+[gherrit] Branch feature-A is now managed by GHerrit in private mode.
+[gherrit]   - 'git push' will sync PRs only, but will not push feature-A itself.

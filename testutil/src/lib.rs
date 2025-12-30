@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, LazyLock, RwLock},
 };
 
+use regex::Regex;
 use tempfile::TempDir;
 
 pub mod mock_server;
@@ -13,6 +14,15 @@ pub const DEFAULT_OWNER: &str = "owner";
 pub const DEFAULT_REPO: &str = "repo";
 pub const MANAGED_PRIVATE: &str = "managedPrivate";
 pub const MANAGED_PUBLIC: &str = "managedPublic";
+
+static SHA_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[0-9a-f]{40}\b").expect("Invalid regex"));
+
+static MOCK_URL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"http://127\.0\.0\.1:\d+").expect("Invalid regex"));
+
+static GHERRIT_ID_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bG[0-9a-fA-F]{16,}\b").expect("Invalid regex"));
 
 #[macro_export]
 macro_rules! test_context {
@@ -379,6 +389,75 @@ impl TestContext {
         cmd.arg("unmanage");
         cmd
     }
+
+    pub fn sanitize(&self, output: &str) -> String {
+        self.sanitize_with_redactions(output, &[])
+    }
+
+    pub fn sanitize_with_redactions(&self, output: &str, redactions: &[(&str, &str)]) -> String {
+        let mut output = output.replace(self.repo_path.to_str().unwrap(), "[REPO_PATH]");
+        output = output.replace(self.remote_path.to_str().unwrap(), "[REMOTE_PATH]");
+
+        for (target, replacement) in redactions {
+            output = output.replace(target, replacement);
+        }
+
+        let output = SHA_REGEX.replace_all(&output, "[SHA]");
+        let output = GHERRIT_ID_REGEX.replace_all(&output, "[GHERRIT_ID]");
+        MOCK_URL_REGEX.replace_all(&output, "[MOCK_SERVER_URL]").to_string()
+    }
+}
+
+pub trait IntoCommandRef {
+    fn as_command_mut(&mut self) -> &mut assert_cmd::Command;
+}
+
+impl IntoCommandRef for assert_cmd::Command {
+    fn as_command_mut(&mut self) -> &mut assert_cmd::Command {
+        self
+    }
+}
+
+impl IntoCommandRef for &mut assert_cmd::Command {
+    fn as_command_mut(&mut self) -> &mut assert_cmd::Command {
+        self
+    }
+}
+
+impl TestContext {
+    pub fn execute_and_format(
+        &self,
+        mut cmd: impl IntoCommandRef,
+        redactions: &[(&str, &str)],
+    ) -> String {
+        let cmd = cmd.as_command_mut();
+        let output = cmd.output().expect("Failed to execute command");
+
+        let stdout =
+            self.sanitize_with_redactions(&String::from_utf8_lossy(&output.stdout), redactions);
+        let stderr =
+            self.sanitize_with_redactions(&String::from_utf8_lossy(&output.stderr), redactions);
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        // This output will be stored verbatim in the filesystem.
+        format!(
+            "EXIT_CODE: {}\n\nSTDOUT:\n{}\n\nSTDERR:\n{}\n",
+            exit_code,
+            if stdout.is_empty() { "(empty)" } else { &stdout },
+            if stderr.is_empty() { "(empty)" } else { &stderr }
+        )
+    }
+}
+
+#[macro_export]
+macro_rules! assert_snapshot {
+    ($ctx:expr, $cmd:expr, $name:expr $(,)?) => {
+        $crate::assert_snapshot!($ctx, $cmd, $name, &[])
+    };
+    ($ctx:expr, $cmd:expr, $name:expr, $redactions:expr $(,)?) => {
+        let content = $ctx.execute_and_format($cmd, $redactions);
+        insta::assert_snapshot!($name, content);
+    };
 }
 
 fn run_git_cmd(path: &Path, args: &[&str]) {

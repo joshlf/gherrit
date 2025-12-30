@@ -1,0 +1,17 @@
+---
+source: tests/integration_tests.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+Switched to branch 'drift-stack'
+[gherrit] Detected drift-stack as a new branch.
+[gherrit] [WARN] Configuration drift detected for branch drift-stack.
+[gherrit] [WARN] The current git configuration does not match the expected state for an unmanaged branch.
+[gherrit] [WARN]   - remote: current='origin', expected='<unset>'
+[gherrit] [WARN] Use --force to overwrite manual changes.
+[gherrit] To opt-out, run: gherrit unmanage
