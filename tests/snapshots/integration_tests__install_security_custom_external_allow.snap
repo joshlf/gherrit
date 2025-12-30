@@ -1,0 +1,14 @@
+---
+source: tests/integration_tests.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] [WARN] Installing to external/global hooks path (allowed by --allow-global): "[EXTERNAL_HOOKS_PATH]"
+[gherrit] Installed pre-push
+[gherrit] Installed commit-msg
+[gherrit] Installed post-checkout
