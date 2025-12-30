@@ -1,0 +1,12 @@
+---
+source: tests/integration_tests.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] Branch feature-rebase is now managed by GHerrit in private mode.
+[gherrit]   - 'git push' will sync PRs only, but will not push feature-rebase itself.

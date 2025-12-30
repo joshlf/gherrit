@@ -1,0 +1,13 @@
+---
+source: tests/reproduce_unmanaged_sync.rs
+expression: content
+---
+EXIT_CODE: 1
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] [ERROR] It is unclear whether branch 'implicit-unmanaged' should be managed by GHerrit.
+[gherrit] [ERROR] Run 'gherrit manage' to sync it as a GHerrit stack.
+[gherrit] [ERROR] Run 'gherrit unmanage' to push it as a standard Git branch.

@@ -1,0 +1,19 @@
+---
+source: tests/integration_tests.rs
+expression: content
+---
+EXIT_CODE: 1
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] Branch feature-conflict is MANAGED. Syncing stack...
+[gherrit] [WARN] Using custom GitHub API URL: [MOCK_SERVER_URL]
+[gherrit] Pushing chunk to remote...
+error: atomic push failed for ref refs/tags/gherrit/[GHERRIT_ID]/v2. status: 7
+To [REMOTE_PATH]
+ ! [rejected]        [SHA] -> [GHERRIT_ID] (atomic push failed)
+ ! [rejected]        [SHA] -> gherrit/[GHERRIT_ID]/v2 (stale info)
+error: failed to push some refs to '[REMOTE_PATH]'
+[gherrit] [ERROR] `git push` failed. The remote might be ahead or changed. Run `git fetch origin` to sync.
