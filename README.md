@@ -13,14 +13,15 @@ synchronizes them to GitHub as a chain of dependent Pull Requests.
 ### Prerequisites
 
   * **Rust**: You must have a working Rust toolchain (`cargo`).
-  * **GitHub CLI (`gh`)**: GHerrit uses the `gh` tool to create and manage PRs. Ensure you are authenticated (`gh auth login`).
+  * **GitHub CLI (`gh`)**: GHerrit uses the `gh` tool to authenticate to GitHub so it can
+    create and manage PRs. Ensure you are authenticated (`gh auth login`).
 
 ### Setup
 
 1.  **Install the Binary:**
 
     ```bash
-    cargo install --git https://github.com/joshlf/gherrit
+    cargo install --git https://github.com/joshlf/gherrit gherrit
     ```
 
 2.  **Install Hooks:**
@@ -79,7 +80,7 @@ git commit -m "optimize database query construction"
 git commit -m "add api endpoints"
 ```
 
-*Note: The `commit-msg` hook automatically appends a unique `gherrit-pr-id` to every commit message.*
+*Note: GHerrit's `commit-msg` hook automatically appends a unique `gherrit-pr-id` to every commit message.*
 
 ### 2\. Pushing
 
@@ -131,7 +132,7 @@ remote users.
 
 If you wish to maintain a **Public Stack** (where your local branch is *also* pushed to `origin` for backup or collaboration), you can override this:
 ```bash
-git config branch.<your-branch>.pushRemote origin
+gherrit manage --public
 ```
 
 ## Design & Architecture
@@ -156,7 +157,7 @@ Since the user will have a single branch locally containing multiple commits, a
 normal `git push` would simply result in a single PR for the whole branch.
 Instead, GHerrit pushes changes by synthesizing "phantom" branches: Each commit
 is pushed to a branch whose name matches that commit's `gherrit-pr-id` trailer.
-GHerrit then uses the `gh` tool to create or update one PR for each commit,
+GHerrit then uses the GitHub API to create or update one PR for each commit,
 setting the base and source branches to the appropriate phantom branches.
 
 #### Version Tags
