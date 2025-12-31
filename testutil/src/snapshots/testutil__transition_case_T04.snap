@@ -1,0 +1,14 @@
+---
+source: testutil/src/lib.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] [WARN] Configuration drift detected for branch feature.
+[gherrit] [WARN] The current git configuration does not match the expected state for an unmanaged branch.
+[gherrit] [WARN]   - pushRemote: current='dirty-remote', expected='<unset>'
+[gherrit] [WARN] Use --force to overwrite manual changes.

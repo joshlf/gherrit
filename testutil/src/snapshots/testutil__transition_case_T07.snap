@@ -1,0 +1,18 @@
+---
+source: testutil/src/lib.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] [WARN] Configuration drift detected for branch feature.
+[gherrit] [WARN] The current git configuration does not match the expected state for an unmanaged branch.
+[gherrit] [WARN]   - pushRemote: current='dirty-remote', expected='<unset>'
+[gherrit] [WARN]   - remote: current='.', expected='<unset>'
+[gherrit] [WARN]   - merge: current='refs/heads/feature', expected='<unset>'
+[gherrit] [WARN] Overwriting manual changes (--force).
+[gherrit] Branch feature is now managed by GHerrit in public mode.
+[gherrit]   - 'git push' will sync PRs and will also push feature itself.

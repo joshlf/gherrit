@@ -5,10 +5,13 @@ fn test_commit_msg_hook() {
     std::fs::write(&msg_file, "feat: my cool feature").unwrap();
 
     // Must manage the branch first so the hook runs
-    ctx.manage().assert().success();
+    ctx.assert_snapshot(&mut ctx.manage(), "commit_msg_hook_manage");
 
     // Run hook
-    ctx.gherrit().args(["hook", "commit-msg", msg_file.to_str().unwrap()]).assert().success();
+    ctx.assert_snapshot(
+        ctx.gherrit().args(["hook", "commit-msg", msg_file.to_str().unwrap()]),
+        "commit_msg_hook_run",
+    );
 
     // Verify trailer was added
     let content = std::fs::read_to_string(msg_file).unwrap();
@@ -30,11 +33,11 @@ fn test_full_stack_lifecycle_mocked() {
     // because simulating a real 'git push' that calls the hook recursively is
     // complex in a test env.
     // Verify valid sync
-    ctx.gherrit()
-        .args(["hook", "pre-push"])
-        .assert()
-        .success()
-        .stderr(predicates::str::contains("Successfully synced 2 commits"));
+    // Trigge Pre-Push Hook (Simulate 'git push'). We call the hook directly
+    // because simulating a real 'git push' that calls the hook recursively is
+    // complex in a test env.
+    // Verify valid sync
+    ctx.assert_snapshot(ctx.gherrit().args(["hook", "pre-push"]), "full_stack_lifecycle_push");
 
     // Verify Side Effects (Mock Only)
     ctx.maybe_inspect_mock_state(|state| {
@@ -57,11 +60,14 @@ fn test_branch_management() {
     ctx.run_git(&["config", "branch.feature-A.pushRemote", "origin"]);
 
     // Attempt manage - should fail (drift)
-    ctx.manage().assert().success(); // Logs warning, no change
+    ctx.assert_snapshot(&mut ctx.manage(), "branch_management_drift_warning"); // Logs warning, no change
     // Assert still unmanaged (missing key)
     ctx.git().args(["config", "branch.feature-A.gherritManaged"]).assert().failure();
 
-    ctx.gherrit().args(["manage", "--force"]).assert().success();
+    ctx.assert_snapshot(
+        ctx.gherrit().args(["manage", "--force"]),
+        "branch_management_force_manage",
+    );
 
     // Assert managed
     ctx.assert_config("branch.feature-A.gherritManaged", Some(testutil::MANAGED_PRIVATE));
@@ -74,7 +80,7 @@ fn test_branch_management() {
     ctx.assert_config("branch.feature-A.merge", Some("refs/heads/feature-A"));
 
     // Scenario B: Unmanage Cleanup
-    ctx.unmanage().assert().success();
+    ctx.assert_snapshot(&mut ctx.unmanage(), "branch_management_unmanage");
 
     // Assert unmanaged (key exists but is false)
     ctx.assert_config("branch.feature-A.gherritManaged", Some("false"));
@@ -118,17 +124,17 @@ fn test_post_checkout_hook() {
 fn test_commit_msg_edge_cases() {
     let ctx = testutil::test_context!().build();
     // Ensure we are managed so the hook is active
-    ctx.manage().assert().success();
+    ctx.assert_snapshot(&mut ctx.manage(), "commit_msg_edge_manage");
 
     // Scenario A: Squash Commit
     let squash_msg_file = ctx.repo_path.join("SQUASH_MSG");
     let squash_content = "squash! some other commit";
     std::fs::write(&squash_msg_file, squash_content).unwrap();
 
-    ctx.gherrit()
-        .args(["hook", "commit-msg", squash_msg_file.to_str().unwrap()])
-        .assert()
-        .success();
+    ctx.assert_snapshot(
+        ctx.gherrit().args(["hook", "commit-msg", squash_msg_file.to_str().unwrap()]),
+        "commit_msg_squash",
+    );
 
     let content_after = std::fs::read_to_string(&squash_msg_file).unwrap();
     assert_eq!(content_after, squash_content, "Commit-msg hook should ignore squash commits");
@@ -139,10 +145,10 @@ fn test_commit_msg_edge_cases() {
     let detached_content = "feat: detached work";
     std::fs::write(&detached_msg_file, detached_content).unwrap();
 
-    ctx.gherrit()
-        .args(["hook", "commit-msg", detached_msg_file.to_str().unwrap()])
-        .assert()
-        .success();
+    ctx.assert_snapshot(
+        ctx.gherrit().args(["hook", "commit-msg", detached_msg_file.to_str().unwrap()]),
+        "commit_msg_detached",
+    );
 
     let content_after = std::fs::read_to_string(&detached_msg_file).unwrap();
     assert_eq!(content_after, detached_content, "Commit-msg hook should ignore detached HEAD");
@@ -150,7 +156,7 @@ fn test_commit_msg_edge_cases() {
 
 #[test]
 fn test_pre_push_ancestry_check() {
-    use predicates::prelude::*;
+    // use predicates::prelude::*; // Unused
 
     let ctx = testutil::test_context_minimal!().install_hooks(true).build();
 
@@ -163,9 +169,9 @@ fn test_pre_push_ancestry_check() {
 
     // Trigger pre-push hook; it should fail because it can't find the merge
     // base with 'main'
-    ctx.hook("pre-push").assert().failure().stderr(
-        predicate::str::contains("not based on").or(predicate::str::contains("share history")),
-    );
+    // Trigger pre-push hook; it should fail because it can't find the merge
+    // base with 'main'
+    ctx.assert_snapshot(&mut ctx.hook("pre-push"), "pre_push_ancestry_failure");
 }
 
 #[test]
@@ -177,7 +183,7 @@ fn test_version_increment() {
     ctx.commit("Feature Commit");
 
     // Push 1 (v1)
-    ctx.hook("pre-push").assert().success();
+    ctx.assert_snapshot(&mut ctx.hook("pre-push"), "version_increment_v1");
 
     // Verify v1 pushed
     let v1_count = ctx.count_pushed_containing("/v1");
@@ -187,7 +193,7 @@ fn test_version_increment() {
     ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
 
     // Push 2 (v2)
-    ctx.hook("pre-push").assert().success();
+    ctx.assert_snapshot(&mut ctx.hook("pre-push"), "version_increment_v2");
 
     // Verify v2 pushed
     let v2_count = ctx.count_pushed_containing("/v2");
@@ -215,7 +221,7 @@ fn test_optimistic_locking_conflict() {
     ctx.commit("Commit V1");
 
     // Push V1
-    ctx.hook("pre-push").assert().success();
+    ctx.assert_snapshot(&mut ctx.hook("pre-push"), "optimistic_locking_v1");
 
     // Retrieve the gherrit_id from local refs
     let output = ctx
@@ -250,19 +256,7 @@ fn test_optimistic_locking_conflict() {
     ctx.run_git(&["commit", "--amend", "--allow-empty", "-m", &new_msg]);
 
     // Attempt push - should fail due to atomic lock
-    let output = ctx.hook("pre-push").assert().failure();
-
-    let stderr = std::str::from_utf8(&output.get_output().stderr).unwrap();
-    assert!(
-        stderr.contains("`git push` failed"),
-        "Expected push failure due to lock, got: {}",
-        stderr
-    );
-    assert!(
-        stderr.contains("stale info") || stderr.contains("atomic push failed"),
-        "Expected atomic push failure (stale info), got: {}",
-        stderr
-    );
+    ctx.assert_snapshot(&mut ctx.hook("pre-push"), "optimistic_locking_v2_fail");
 }
 
 #[test]
@@ -280,7 +274,7 @@ fn test_pr_body_generation() {
     // We can verify this implicitly by checking the PR bodies later.
 
     // Sync
-    ctx.hook("pre-push").assert().success();
+    ctx.assert_snapshot(&mut ctx.hook("pre-push"), "pr_body_generation_v1");
 
     // Verify
     ctx.maybe_inspect_mock_state(|state| {
@@ -320,7 +314,7 @@ fn test_pr_body_generation() {
     ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
 
     // Sync again
-    ctx.hook("pre-push").assert().success();
+    ctx.assert_snapshot(&mut ctx.hook("pre-push"), "pr_body_generation_v2");
 
     ctx.maybe_inspect_mock_state(|state| {
         // Find PR for Commit C (the tip)
@@ -352,7 +346,7 @@ fn test_large_stack_batching() {
 
     // Sync - should succeed without error
     // Using simple pre-push hook invocation.
-    ctx.hook("pre-push").assert().success();
+    ctx.assert_snapshot(&mut ctx.hook("pre-push"), "large_stack_batching");
 
     ctx.maybe_inspect_mock_state(|state| {
         // Assert: 85 PRs created
@@ -387,7 +381,7 @@ fn test_rebase_detection() {
     std::fs::write(rebase_dir.join("head-name"), "refs/heads/feature-rebase").unwrap();
 
     // Run manage - should succeed by detecting 'feature-rebase'
-    ctx.manage().assert().success();
+    ctx.assert_snapshot(&mut ctx.manage(), "rebase_detection_manage");
 
     // Verify config was applied to 'feature-rebase'
     ctx.assert_config("branch.feature-rebase.gherritManaged", Some(testutil::MANAGED_PRIVATE));
@@ -402,7 +396,7 @@ fn test_public_stack_links() {
     ctx.checkout_new("public-feature");
     ctx.commit("Public Commit");
 
-    ctx.hook("pre-push").assert().success();
+    ctx.assert_snapshot(&mut ctx.hook("pre-push"), "public_stack_links_private");
 
     ctx.maybe_inspect_mock_state(|state| {
         let body = state.prs[0].body.as_ref().unwrap();
@@ -418,7 +412,7 @@ fn test_public_stack_links() {
 
     // Force an update so the body regenerates (amend commit)
     ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
-    ctx.hook("pre-push").assert().success();
+    ctx.assert_snapshot(&mut ctx.hook("pre-push"), "public_stack_links_public");
 
     ctx.maybe_inspect_mock_state(|state| {
         let body = state.prs[0].body.as_ref().unwrap(); // Get the updated body
@@ -438,31 +432,24 @@ fn test_install_command_edge_cases() {
     // Scenario A: Conflict
     std::fs::write(&pre_push, "foo").unwrap();
 
-    ctx.gherrit()
-        .args(["install"])
-        .assert()
-        .failure() // Should fail
-        .stderr(predicates::str::contains("Refusing to overwrite"));
+    ctx.assert_snapshot(ctx.gherrit().args(["install"]), "install_edge_cases_conflict");
 
     assert_eq!(std::fs::read_to_string(&pre_push).unwrap(), "foo");
 
     // Scenario B: Force Overwrite
-    ctx.gherrit().args(["install", "--force"]).assert().success();
+    ctx.assert_snapshot(ctx.gherrit().args(["install", "--force"]), "install_edge_cases_force");
 
     let content = std::fs::read_to_string(&pre_push).unwrap();
     assert!(content.contains("# gherrit-installer: managed"));
 
     // Scenario C: Idempotency (Safe to run again)
-    ctx.gherrit().args(["install"]).assert().success();
+    ctx.assert_snapshot(ctx.gherrit().args(["install"]), "install_edge_cases_idempotent");
 
     // Scenario D: Safe Update (Modify but keep sentinel)
     let modified = content + "\n# Some custom comment";
     std::fs::write(&pre_push, modified).unwrap();
 
-    ctx.gherrit()
-        .args(["install"]) // Should detect sentinel and update gracefully
-        .assert()
-        .success();
+    ctx.assert_snapshot(ctx.gherrit().args(["install"]), "install_edge_cases_upgrade");
 
     // Content should be reset to standard shim (losing custom comment, which is expected behavior for managed hooks)
     let reset_content = std::fs::read_to_string(&pre_push).unwrap();
@@ -482,7 +469,7 @@ fn test_install_configuration_and_security() {
         std::fs::remove_dir_all(&default_hooks).unwrap();
     }
 
-    ctx.gherrit().args(["install"]).assert().success();
+    ctx.assert_snapshot(ctx.gherrit().args(["install"]), "install_security_default");
     assert!(default_hooks.join("pre-push").exists(), "Should create directory and install hook");
 
     // Scenario B: Custom core.hooksPath (Internal)
@@ -490,7 +477,7 @@ fn test_install_configuration_and_security() {
     let custom_internal = ctx.repo_path.join(".githooks");
     ctx.run_git(&["config", "core.hooksPath", ".githooks"]);
 
-    ctx.gherrit().args(["install"]).assert().success();
+    ctx.assert_snapshot(ctx.gherrit().args(["install"]), "install_security_custom_internal");
     assert!(custom_internal.join("pre-push").exists(), "Should respect core.hooksPath within repo");
 
     // Scenario C: Custom core.hooksPath (External/Global) - Security Block
@@ -501,11 +488,11 @@ fn test_install_configuration_and_security() {
     // We must use absolute path for git config to ensure gherrit sees it as external
     ctx.run_git(&["config", "core.hooksPath", ext_path]);
 
-    ctx.gherrit()
-        .args(["install"])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("external/global hooks path"));
+    ctx.assert_snapshot_with_redactions(
+        ctx.gherrit().args(["install"]), // Should fail
+        "install_security_custom_external_block",
+        &[(ext_path, "[EXTERNAL_HOOKS_PATH]")],
+    );
 
     assert!(
         !external_dir.path().join("pre-push").exists(),
@@ -514,7 +501,11 @@ fn test_install_configuration_and_security() {
 
     // Scenario D: Custom core.hooksPath (External) - Allow Global
     // -----------------------------------------------------------
-    ctx.gherrit().args(["install", "--allow-global"]).assert().success();
+    ctx.assert_snapshot_with_redactions(
+        ctx.gherrit().args(["install", "--allow-global"]),
+        "install_security_custom_external_allow",
+        &[(ext_path, "[EXTERNAL_HOOKS_PATH]")],
+    );
 
     assert!(
         external_dir.path().join("pre-push").exists(),
@@ -530,18 +521,14 @@ fn test_manage_detached_head() {
     // Enter detached HEAD state
     ctx.run_git(&["checkout", "--detach"]);
 
-    let test = |args: &[_]| {
-        ctx.gherrit()
-            .args(args)
-            .assert()
-            .failure()
-            .stderr(predicates::str::contains("Cannot get management state in detached HEAD"))
+    let test = |args: &[_], name| {
+        ctx.assert_snapshot(ctx.gherrit().args(args), name);
     };
 
-    test(&["manage"]);
-    test(&["manage", "--public"]);
-    test(&["manage", "--private"]);
-    test(&["unmanage"]);
+    test(&["manage"], "manage_detached_head");
+    test(&["manage", "--public"], "manage_public_detached_head");
+    test(&["manage", "--private"], "manage_private_detached_head");
+    test(&["unmanage"], "unmanage_detached_head");
 }
 
 #[test]
@@ -557,7 +544,7 @@ fn test_unmanage_cleanup_logic() {
     ctx.run_git(&["config", "branch.feature-cleanup.merge", "refs/heads/feature-cleanup"]);
 
     // Run unmanage
-    ctx.unmanage().assert().success();
+    ctx.assert_snapshot(&mut ctx.unmanage(), "unmanage_cleanup");
 
     // Verify cleanup: remote and merge keys should be removed
     ctx.git().args(["config", "branch.feature-cleanup.remote"]).assert().failure();
@@ -578,11 +565,7 @@ fn test_pre_push_failure() {
     ctx.run_git(&["remote", "add", "broken-remote", "/path/to/nowhere"]);
     ctx.run_git(&["config", "gherrit.remote", "broken-remote"]);
 
-    ctx.gherrit()
-        .args(["hook", "pre-push"])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("`git push` failed"));
+    ctx.assert_snapshot(&mut ctx.hook("pre-push"), "pre_push_failure_broken_remote");
 }
 
 #[test]
@@ -606,7 +589,7 @@ fn test_install_read_only_fs() {
     std::fs::set_permissions(&hooks_dir, perms).unwrap();
 
     // Attempt installation, verifying failure due to permission denied
-    ctx.gherrit().args(["install"]).assert().failure();
+    ctx.assert_snapshot(ctx.gherrit().args(["install"]), "install_read_only_fs");
 
     // Cleanup: Restore permissions so TempDir cleanup doesn't panic
     let mut perms = std::fs::metadata(&hooks_dir).unwrap().permissions();
@@ -620,24 +603,23 @@ fn test_manage_drift_detection() {
     ctx.checkout_new("drift-feature");
 
     // 1. Initialize managed private branch
-    ctx.gherrit().args(["manage", "--private"]).assert().success();
+    ctx.assert_snapshot(ctx.gherrit().args(["manage", "--private"]), "manage_drift_init");
 
     // 2. Manually sabotage
     ctx.run_git(&["config", "branch.drift-feature.pushRemote", "origin"]);
 
     // 3. Attempt Switch to Public (without force)
     // The command should exit with 0 but log a warning and NOT apply changes.
-    let output = ctx.gherrit().args(["manage", "--public"]).assert().success();
-
-    let stderr = std::str::from_utf8(&output.get_output().stderr).unwrap();
-    assert!(stderr.contains("Configuration drift detected"));
-    assert!(stderr.contains("- pushRemote: current='origin', expected='.'"));
+    ctx.assert_snapshot(ctx.gherrit().args(["manage", "--public"]), "manage_drift_attempt_switch");
 
     // Assert state matches OLD state (Private)
     ctx.assert_config("branch.drift-feature.gherritManaged", Some(testutil::MANAGED_PRIVATE));
 
     // 4. Force Switch
-    ctx.gherrit().args(["manage", "--public", "--force"]).assert().success();
+    ctx.assert_snapshot(
+        ctx.gherrit().args(["manage", "--public", "--force"]),
+        "manage_drift_force_switch",
+    );
 
     // Assert Success
     ctx.assert_config("branch.drift-feature.gherritManaged", Some(testutil::MANAGED_PUBLIC));
@@ -652,15 +634,18 @@ fn test_manage_toggle_visibility() {
     ctx.checkout_new("visibility-feature");
 
     // 1. Private
-    ctx.gherrit().args(["manage", "--private"]).assert().success();
+    ctx.assert_snapshot(ctx.gherrit().args(["manage", "--private"]), "manage_toggle_init_private");
     ctx.assert_config("branch.visibility-feature.pushRemote", Some("."));
 
     // 2. Public
-    ctx.gherrit().args(["manage", "--public"]).assert().success();
+    ctx.assert_snapshot(ctx.gherrit().args(["manage", "--public"]), "manage_toggle_switch_public");
     ctx.assert_config("branch.visibility-feature.pushRemote", Some("origin"));
 
     // 3. Private again
-    ctx.gherrit().args(["manage", "--private"]).assert().success();
+    ctx.assert_snapshot(
+        ctx.gherrit().args(["manage", "--private"]),
+        "manage_toggle_switch_private",
+    );
     ctx.assert_config("branch.visibility-feature.pushRemote", Some("."));
 }
 
@@ -670,12 +655,10 @@ fn test_manage_mutually_exclusive_flags() {
     ctx.checkout_new("conflict-feature");
 
     // Attempt to set both flags
-    let assert = ctx.gherrit().args(["manage", "--public", "--private"]).assert().failure();
-
-    // Verify error message from clap
-    let output = assert.get_output();
-    let stderr = std::str::from_utf8(&output.stderr).unwrap();
-    assert!(stderr.contains("the argument '--public' cannot be used with '--private'"));
+    ctx.assert_snapshot(
+        ctx.gherrit().args(["manage", "--public", "--private"]),
+        "manage_mutually_exclusive",
+    );
 }
 
 #[test]
@@ -687,12 +670,7 @@ fn test_manage_invalid_config() {
     ctx.run_git(&["config", "branch.invalid-config-feature.gherritManaged", "bad-value"]);
 
     // Attempt to manage; should fail
-    let assert = ctx.manage().assert().failure();
-
-    let output = assert.get_output();
-    let stderr = std::str::from_utf8(&output.stderr).unwrap();
-    assert!(stderr.contains("Invalid gherritManaged value"));
-    assert!(stderr.contains("bad-value"));
+    ctx.assert_snapshot(&mut ctx.manage(), "manage_invalid_config");
 }
 
 #[test]
@@ -704,15 +682,9 @@ fn test_post_checkout_drift_detection() {
     ctx.run_git(&["update-ref", "refs/remotes/origin/drift-shared", "HEAD"]);
 
     // Switch to new tracking branch - this triggers post-checkout
-    let assert = ctx
-        .git()
-        .args(["checkout", "-b", "drift-shared", "--track", "origin/drift-shared"])
-        .assert()
-        .success();
-    let stderr = std::str::from_utf8(&assert.get_output().stderr).unwrap();
-    assert!(
-        !stderr.contains("Configuration drift detected"),
-        "Expected NO drift warning for shared branch (silent unmanage)"
+    ctx.assert_snapshot(
+        ctx.git().args(["checkout", "-b", "drift-shared", "--track", "origin/drift-shared"]),
+        "post_checkout_drift_shared",
     );
 
     // Condition B: New Stack Drift (Private vs Pre-existing Config)
@@ -722,11 +694,5 @@ fn test_post_checkout_drift_detection() {
     ctx.run_git(&["config", "branch.drift-stack.remote", "origin"]);
 
     // Switch to it
-    let assert = ctx.git().args(["checkout", "drift-stack"]).assert().success();
-    let stderr = std::str::from_utf8(&assert.get_output().stderr).unwrap();
-    assert!(
-        stderr.contains("Configuration drift detected"),
-        "Expected drift warning for new stack"
-    );
-    assert!(stderr.contains("- remote: current='origin', expected='<unset>'"));
+    ctx.assert_snapshot(ctx.git().args(["checkout", "drift-stack"]), "post_checkout_drift_stack");
 }

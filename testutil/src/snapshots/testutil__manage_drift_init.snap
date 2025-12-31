@@ -1,0 +1,12 @@
+---
+source: testutil/src/lib.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] Branch drift-feature is now managed by GHerrit in private mode.
+[gherrit]   - 'git push' will sync PRs only, but will not push drift-feature itself.

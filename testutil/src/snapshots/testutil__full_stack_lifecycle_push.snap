@@ -1,0 +1,22 @@
+---
+source: testutil/src/lib.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] Branch feature-stack is MANAGED. Syncing stack...
+[gherrit] [WARN] Using custom GitHub API URL: [MOCK_SERVER_URL]
+[gherrit] Pushing chunk to remote...
+[gherrit] Creating 2 PRs...
+[gherrit] Created 2 PRs.
+[gherrit] Created PR #1: http://github.com/repos/owner/repo/pulls/1
+[gherrit] Created PR #2: http://github.com/repos/owner/repo/pulls/2
+[gherrit] Queued update for PR #1: https://github.com/owner/repo/pull/1
+[gherrit] Queued update for PR #2: https://github.com/owner/repo/pull/2
+[gherrit] Updating batch of 2 PRs...
+[gherrit] Batch update complete.
+[gherrit] Successfully synced 2 commits.

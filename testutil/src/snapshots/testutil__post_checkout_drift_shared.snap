@@ -1,0 +1,15 @@
+---
+source: testutil/src/lib.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+branch 'drift-shared' set up to track 'origin/drift-shared'.
+
+
+STDERR:
+Switched to a new branch 'drift-shared'
+[gherrit] Detected drift-shared as a shared branch.
+[gherrit] Branch drift-shared is now unmanaged by GHerrit.
+[gherrit] To have GHerrit manage this branch, run: gherrit manage

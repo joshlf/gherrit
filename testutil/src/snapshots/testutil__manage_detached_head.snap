@@ -1,0 +1,11 @@
+---
+source: testutil/src/lib.rs
+expression: content
+---
+EXIT_CODE: 1
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] [ERROR] Cannot get management state in detached HEAD

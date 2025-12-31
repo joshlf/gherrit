@@ -1,0 +1,189 @@
+---
+source: testutil/src/lib.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] Branch large-stack is MANAGED. Syncing stack...
+[gherrit] [WARN] Using custom GitHub API URL: [MOCK_SERVER_URL]
+[gherrit] Pushing chunk to remote...
+[gherrit] Pushing chunk to remote...
+[gherrit] Creating 85 PRs...
+[gherrit] Created 85 PRs.
+[gherrit] Created PR #1: http://github.com/repos/owner/repo/pulls/1
+[gherrit] Created PR #2: http://github.com/repos/owner/repo/pulls/2
+[gherrit] Created PR #3: http://github.com/repos/owner/repo/pulls/3
+[gherrit] Created PR #4: http://github.com/repos/owner/repo/pulls/4
+[gherrit] Created PR #5: http://github.com/repos/owner/repo/pulls/5
+[gherrit] Created PR #6: http://github.com/repos/owner/repo/pulls/6
+[gherrit] Created PR #7: http://github.com/repos/owner/repo/pulls/7
+[gherrit] Created PR #8: http://github.com/repos/owner/repo/pulls/8
+[gherrit] Created PR #9: http://github.com/repos/owner/repo/pulls/9
+[gherrit] Created PR #10: http://github.com/repos/owner/repo/pulls/10
+[gherrit] Created PR #11: http://github.com/repos/owner/repo/pulls/11
+[gherrit] Created PR #12: http://github.com/repos/owner/repo/pulls/12
+[gherrit] Created PR #13: http://github.com/repos/owner/repo/pulls/13
+[gherrit] Created PR #14: http://github.com/repos/owner/repo/pulls/14
+[gherrit] Created PR #15: http://github.com/repos/owner/repo/pulls/15
+[gherrit] Created PR #16: http://github.com/repos/owner/repo/pulls/16
+[gherrit] Created PR #17: http://github.com/repos/owner/repo/pulls/17
+[gherrit] Created PR #18: http://github.com/repos/owner/repo/pulls/18
+[gherrit] Created PR #19: http://github.com/repos/owner/repo/pulls/19
+[gherrit] Created PR #20: http://github.com/repos/owner/repo/pulls/20
+[gherrit] Created PR #21: http://github.com/repos/owner/repo/pulls/21
+[gherrit] Created PR #22: http://github.com/repos/owner/repo/pulls/22
+[gherrit] Created PR #23: http://github.com/repos/owner/repo/pulls/23
+[gherrit] Created PR #24: http://github.com/repos/owner/repo/pulls/24
+[gherrit] Created PR #25: http://github.com/repos/owner/repo/pulls/25
+[gherrit] Created PR #26: http://github.com/repos/owner/repo/pulls/26
+[gherrit] Created PR #27: http://github.com/repos/owner/repo/pulls/27
+[gherrit] Created PR #28: http://github.com/repos/owner/repo/pulls/28
+[gherrit] Created PR #29: http://github.com/repos/owner/repo/pulls/29
+[gherrit] Created PR #30: http://github.com/repos/owner/repo/pulls/30
+[gherrit] Created PR #31: http://github.com/repos/owner/repo/pulls/31
+[gherrit] Created PR #32: http://github.com/repos/owner/repo/pulls/32
+[gherrit] Created PR #33: http://github.com/repos/owner/repo/pulls/33
+[gherrit] Created PR #34: http://github.com/repos/owner/repo/pulls/34
+[gherrit] Created PR #35: http://github.com/repos/owner/repo/pulls/35
+[gherrit] Created PR #36: http://github.com/repos/owner/repo/pulls/36
+[gherrit] Created PR #37: http://github.com/repos/owner/repo/pulls/37
+[gherrit] Created PR #38: http://github.com/repos/owner/repo/pulls/38
+[gherrit] Created PR #39: http://github.com/repos/owner/repo/pulls/39
+[gherrit] Created PR #40: http://github.com/repos/owner/repo/pulls/40
+[gherrit] Created PR #41: http://github.com/repos/owner/repo/pulls/41
+[gherrit] Created PR #42: http://github.com/repos/owner/repo/pulls/42
+[gherrit] Created PR #43: http://github.com/repos/owner/repo/pulls/43
+[gherrit] Created PR #44: http://github.com/repos/owner/repo/pulls/44
+[gherrit] Created PR #45: http://github.com/repos/owner/repo/pulls/45
+[gherrit] Created PR #46: http://github.com/repos/owner/repo/pulls/46
+[gherrit] Created PR #47: http://github.com/repos/owner/repo/pulls/47
+[gherrit] Created PR #48: http://github.com/repos/owner/repo/pulls/48
+[gherrit] Created PR #49: http://github.com/repos/owner/repo/pulls/49
+[gherrit] Created PR #50: http://github.com/repos/owner/repo/pulls/50
+[gherrit] Created PR #51: http://github.com/repos/owner/repo/pulls/51
+[gherrit] Created PR #52: http://github.com/repos/owner/repo/pulls/52
+[gherrit] Created PR #53: http://github.com/repos/owner/repo/pulls/53
+[gherrit] Created PR #54: http://github.com/repos/owner/repo/pulls/54
+[gherrit] Created PR #55: http://github.com/repos/owner/repo/pulls/55
+[gherrit] Created PR #56: http://github.com/repos/owner/repo/pulls/56
+[gherrit] Created PR #57: http://github.com/repos/owner/repo/pulls/57
+[gherrit] Created PR #58: http://github.com/repos/owner/repo/pulls/58
+[gherrit] Created PR #59: http://github.com/repos/owner/repo/pulls/59
+[gherrit] Created PR #60: http://github.com/repos/owner/repo/pulls/60
+[gherrit] Created PR #61: http://github.com/repos/owner/repo/pulls/61
+[gherrit] Created PR #62: http://github.com/repos/owner/repo/pulls/62
+[gherrit] Created PR #63: http://github.com/repos/owner/repo/pulls/63
+[gherrit] Created PR #64: http://github.com/repos/owner/repo/pulls/64
+[gherrit] Created PR #65: http://github.com/repos/owner/repo/pulls/65
+[gherrit] Created PR #66: http://github.com/repos/owner/repo/pulls/66
+[gherrit] Created PR #67: http://github.com/repos/owner/repo/pulls/67
+[gherrit] Created PR #68: http://github.com/repos/owner/repo/pulls/68
+[gherrit] Created PR #69: http://github.com/repos/owner/repo/pulls/69
+[gherrit] Created PR #70: http://github.com/repos/owner/repo/pulls/70
+[gherrit] Created PR #71: http://github.com/repos/owner/repo/pulls/71
+[gherrit] Created PR #72: http://github.com/repos/owner/repo/pulls/72
+[gherrit] Created PR #73: http://github.com/repos/owner/repo/pulls/73
+[gherrit] Created PR #74: http://github.com/repos/owner/repo/pulls/74
+[gherrit] Created PR #75: http://github.com/repos/owner/repo/pulls/75
+[gherrit] Created PR #76: http://github.com/repos/owner/repo/pulls/76
+[gherrit] Created PR #77: http://github.com/repos/owner/repo/pulls/77
+[gherrit] Created PR #78: http://github.com/repos/owner/repo/pulls/78
+[gherrit] Created PR #79: http://github.com/repos/owner/repo/pulls/79
+[gherrit] Created PR #80: http://github.com/repos/owner/repo/pulls/80
+[gherrit] Created PR #81: http://github.com/repos/owner/repo/pulls/81
+[gherrit] Created PR #82: http://github.com/repos/owner/repo/pulls/82
+[gherrit] Created PR #83: http://github.com/repos/owner/repo/pulls/83
+[gherrit] Created PR #84: http://github.com/repos/owner/repo/pulls/84
+[gherrit] Created PR #85: http://github.com/repos/owner/repo/pulls/85
+[gherrit] Queued update for PR #1: https://github.com/owner/repo/pull/1
+[gherrit] Queued update for PR #2: https://github.com/owner/repo/pull/2
+[gherrit] Queued update for PR #3: https://github.com/owner/repo/pull/3
+[gherrit] Queued update for PR #4: https://github.com/owner/repo/pull/4
+[gherrit] Queued update for PR #5: https://github.com/owner/repo/pull/5
+[gherrit] Queued update for PR #6: https://github.com/owner/repo/pull/6
+[gherrit] Queued update for PR #7: https://github.com/owner/repo/pull/7
+[gherrit] Queued update for PR #8: https://github.com/owner/repo/pull/8
+[gherrit] Queued update for PR #9: https://github.com/owner/repo/pull/9
+[gherrit] Queued update for PR #10: https://github.com/owner/repo/pull/10
+[gherrit] Queued update for PR #11: https://github.com/owner/repo/pull/11
+[gherrit] Queued update for PR #12: https://github.com/owner/repo/pull/12
+[gherrit] Queued update for PR #13: https://github.com/owner/repo/pull/13
+[gherrit] Queued update for PR #14: https://github.com/owner/repo/pull/14
+[gherrit] Queued update for PR #15: https://github.com/owner/repo/pull/15
+[gherrit] Queued update for PR #16: https://github.com/owner/repo/pull/16
+[gherrit] Queued update for PR #17: https://github.com/owner/repo/pull/17
+[gherrit] Queued update for PR #18: https://github.com/owner/repo/pull/18
+[gherrit] Queued update for PR #19: https://github.com/owner/repo/pull/19
+[gherrit] Queued update for PR #20: https://github.com/owner/repo/pull/20
+[gherrit] Queued update for PR #21: https://github.com/owner/repo/pull/21
+[gherrit] Queued update for PR #22: https://github.com/owner/repo/pull/22
+[gherrit] Queued update for PR #23: https://github.com/owner/repo/pull/23
+[gherrit] Queued update for PR #24: https://github.com/owner/repo/pull/24
+[gherrit] Queued update for PR #25: https://github.com/owner/repo/pull/25
+[gherrit] Queued update for PR #26: https://github.com/owner/repo/pull/26
+[gherrit] Queued update for PR #27: https://github.com/owner/repo/pull/27
+[gherrit] Queued update for PR #28: https://github.com/owner/repo/pull/28
+[gherrit] Queued update for PR #29: https://github.com/owner/repo/pull/29
+[gherrit] Queued update for PR #30: https://github.com/owner/repo/pull/30
+[gherrit] Queued update for PR #31: https://github.com/owner/repo/pull/31
+[gherrit] Queued update for PR #32: https://github.com/owner/repo/pull/32
+[gherrit] Queued update for PR #33: https://github.com/owner/repo/pull/33
+[gherrit] Queued update for PR #34: https://github.com/owner/repo/pull/34
+[gherrit] Queued update for PR #35: https://github.com/owner/repo/pull/35
+[gherrit] Queued update for PR #36: https://github.com/owner/repo/pull/36
+[gherrit] Queued update for PR #37: https://github.com/owner/repo/pull/37
+[gherrit] Queued update for PR #38: https://github.com/owner/repo/pull/38
+[gherrit] Queued update for PR #39: https://github.com/owner/repo/pull/39
+[gherrit] Queued update for PR #40: https://github.com/owner/repo/pull/40
+[gherrit] Queued update for PR #41: https://github.com/owner/repo/pull/41
+[gherrit] Queued update for PR #42: https://github.com/owner/repo/pull/42
+[gherrit] Queued update for PR #43: https://github.com/owner/repo/pull/43
+[gherrit] Queued update for PR #44: https://github.com/owner/repo/pull/44
+[gherrit] Queued update for PR #45: https://github.com/owner/repo/pull/45
+[gherrit] Queued update for PR #46: https://github.com/owner/repo/pull/46
+[gherrit] Queued update for PR #47: https://github.com/owner/repo/pull/47
+[gherrit] Queued update for PR #48: https://github.com/owner/repo/pull/48
+[gherrit] Queued update for PR #49: https://github.com/owner/repo/pull/49
+[gherrit] Queued update for PR #50: https://github.com/owner/repo/pull/50
+[gherrit] Queued update for PR #51: https://github.com/owner/repo/pull/51
+[gherrit] Queued update for PR #52: https://github.com/owner/repo/pull/52
+[gherrit] Queued update for PR #53: https://github.com/owner/repo/pull/53
+[gherrit] Queued update for PR #54: https://github.com/owner/repo/pull/54
+[gherrit] Queued update for PR #55: https://github.com/owner/repo/pull/55
+[gherrit] Queued update for PR #56: https://github.com/owner/repo/pull/56
+[gherrit] Queued update for PR #57: https://github.com/owner/repo/pull/57
+[gherrit] Queued update for PR #58: https://github.com/owner/repo/pull/58
+[gherrit] Queued update for PR #59: https://github.com/owner/repo/pull/59
+[gherrit] Queued update for PR #60: https://github.com/owner/repo/pull/60
+[gherrit] Queued update for PR #61: https://github.com/owner/repo/pull/61
+[gherrit] Queued update for PR #62: https://github.com/owner/repo/pull/62
+[gherrit] Queued update for PR #63: https://github.com/owner/repo/pull/63
+[gherrit] Queued update for PR #64: https://github.com/owner/repo/pull/64
+[gherrit] Queued update for PR #65: https://github.com/owner/repo/pull/65
+[gherrit] Queued update for PR #66: https://github.com/owner/repo/pull/66
+[gherrit] Queued update for PR #67: https://github.com/owner/repo/pull/67
+[gherrit] Queued update for PR #68: https://github.com/owner/repo/pull/68
+[gherrit] Queued update for PR #69: https://github.com/owner/repo/pull/69
+[gherrit] Queued update for PR #70: https://github.com/owner/repo/pull/70
+[gherrit] Queued update for PR #71: https://github.com/owner/repo/pull/71
+[gherrit] Queued update for PR #72: https://github.com/owner/repo/pull/72
+[gherrit] Queued update for PR #73: https://github.com/owner/repo/pull/73
+[gherrit] Queued update for PR #74: https://github.com/owner/repo/pull/74
+[gherrit] Queued update for PR #75: https://github.com/owner/repo/pull/75
+[gherrit] Queued update for PR #76: https://github.com/owner/repo/pull/76
+[gherrit] Queued update for PR #77: https://github.com/owner/repo/pull/77
+[gherrit] Queued update for PR #78: https://github.com/owner/repo/pull/78
+[gherrit] Queued update for PR #79: https://github.com/owner/repo/pull/79
+[gherrit] Queued update for PR #80: https://github.com/owner/repo/pull/80
+[gherrit] Queued update for PR #81: https://github.com/owner/repo/pull/81
+[gherrit] Queued update for PR #82: https://github.com/owner/repo/pull/82
+[gherrit] Queued update for PR #83: https://github.com/owner/repo/pull/83
+[gherrit] Queued update for PR #84: https://github.com/owner/repo/pull/84
+[gherrit] Queued update for PR #85: https://github.com/owner/repo/pull/85
+[gherrit] Updating batch of 85 PRs...
+[gherrit] Batch update complete.
+[gherrit] Successfully synced 85 commits.

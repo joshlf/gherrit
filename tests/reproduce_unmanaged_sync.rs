@@ -14,7 +14,7 @@ fn test_reproduce_unmanaged_sync() {
     ctx.set_config("branch.explicit-unmanaged.gherritManaged", Some("false"));
     ctx.commit("Explicit Commit");
 
-    ctx.hook("pre-push").assert().success();
+    ctx.assert_snapshot(&mut ctx.hook("pre-push"), "reproduce_unmanaged_sync_explicit");
 
     ctx.maybe_inspect_mock_state(|state| {
         assert!(
@@ -29,7 +29,7 @@ fn test_reproduce_unmanaged_sync() {
     ctx.set_config("branch.implicit-unmanaged.gherritManaged", None);
     ctx.run_git(&["commit", "--allow-empty", "-m", "Implicit Commit", "--no-verify"]);
 
-    let _ = ctx.hook("pre-push").output().unwrap();
+    ctx.assert_snapshot(&mut ctx.hook("pre-push"), "reproduce_unmanaged_sync_implicit");
 
     ctx.maybe_inspect_mock_state(|state| {
         assert!(
