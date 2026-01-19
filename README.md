@@ -1,6 +1,7 @@
 # GHerrit
 
-> **Note:** GHerrit is currently in alpha. You're welcome to use it, but please be aware that we may make breaking changes.
+> **Note:** GHerrit is currently in alpha. You're welcome to use it, but please
+> be aware that we may make breaking changes.
 
 **GHerrit** is a tool that brings a **Gerrit-style "Stacked Diffs" workflow** to GitHub.
 
@@ -33,7 +34,9 @@ synchronizes them to GitHub as a chain of dependent Pull Requests.
     ```
 
 3.  **Setup GitHub Action (Optional but Recommended):**
-    To enable automatic cascading merges (where merging a parent PR automatically rebases its child), add the following workflow to your repository at `.github/workflows/gherrit-rebase-stack.yml`:
+    To enable automatic cascading merges (where merging a parent PR
+    automatically rebases its child), add the following workflow to your
+    repository at `.github/workflows/gherrit-rebase-stack.yml`:
 
     ```yaml
     name: Rebase Stack
@@ -80,7 +83,8 @@ git commit -m "optimize database query construction"
 git commit -m "add api endpoints"
 ```
 
-*Note: GHerrit's `commit-msg` hook automatically appends a unique `gherrit-pr-id` to every commit message.*
+*Note: GHerrit's `commit-msg` hook automatically appends a unique
+`gherrit-pr-id` to every commit message.*
 
 ### 2\. Pushing
 
@@ -118,7 +122,8 @@ Then push again:
 git push
 ```
 
-GHerrit will detect the changes based on the persistent `gherrit-pr-id` in the commit trailers and update the corresponding PRs in place.
+GHerrit will detect the changes based on the persistent `gherrit-pr-id` in the
+commit trailers and update the corresponding PRs in place.
 
 ## Configuration
 
@@ -130,7 +135,8 @@ your local branch tip to the remote server. This avoids cluttering the remote
 repository with branches and avoids leaking the names of your local branches to
 remote users.
 
-If you wish to maintain a **Public Stack** (where your local branch is *also* pushed to `origin` for backup or collaboration), you can override this:
+If you wish to maintain a **Public Stack** (where your local branch is *also*
+pushed to `origin` for backup or collaboration), you can override this:
 ```bash
 gherrit manage --public
 ```
