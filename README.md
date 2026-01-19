@@ -3,7 +3,8 @@
 > **Note:** GHerrit is currently in alpha. You're welcome to use it, but please
 > be aware that we may make breaking changes.
 
-**GHerrit** is a tool that brings a **Gerrit-style "Stacked Diffs" workflow** to GitHub.
+**GHerrit** is a tool that brings a **Gerrit-style "Stacked Diffs" workflow**
+to GitHub.
 
 It allows you to maintain a single local branch containing a stack of commits
 (e.g., `feature-A` -> `feature-B` -> `feature-C`) and automatically
@@ -14,8 +15,9 @@ synchronizes them to GitHub as a chain of dependent Pull Requests.
 ### Prerequisites
 
   * **Rust**: You must have a working Rust toolchain (`cargo`).
-  * **GitHub CLI (`gh`)**: GHerrit uses the `gh` tool to authenticate to GitHub so it can
-    create and manage PRs. Ensure you are authenticated (`gh auth login`).
+  * **GitHub CLI (`gh`)**: GHerrit uses the `gh` tool to authenticate to GitHub
+    so it can create and manage PRs. Ensure you are authenticated (`gh auth
+    login`).
 
 ### Setup
 
@@ -143,13 +145,15 @@ gherrit manage --public
 
 ## Design & Architecture
 
-*If you only intend to **use** GHerrit, and don't care about its internals, then you can stop reading now.*
+*If you only intend to **use** GHerrit, and don't care about its internals,
+then you can stop reading now.*
 
 ### Core Architecture
 
 #### `gherrit-pr-id` Trailer and Phantom Branches
 
-Inspired by Gerrit, each commit managed by GHerrit includes a trailer line in its commit message, e.g., `gherrit-pr-id: G847...`.
+Inspired by Gerrit, each commit managed by GHerrit includes a trailer line in
+its commit message, e.g., `gherrit-pr-id: G847...`.
 
 GitHub identifies PRs by *branch name* (specifically, a PR is a request to
 merge the contents of one *branch* into another). A branch can contain multiple
@@ -217,13 +221,15 @@ This configuration has two benefits:
 
 #### PR Rewriting
 
-Since Gerrit supports stacked commits, the Gerrit UI for a particular commit lists the other commits in that commit's stack:
+Since Gerrit supports stacked commits, the Gerrit UI for a particular commit
+lists the other commits in that commit's stack:
 
 <img width="1440" height="374" alt="image" src="https://github.com/user-attachments/assets/4a393bca-e839-4d1f-9092-fc8d69e2edd6" />
 
 &nbsp;
 
-GHerrit emulates this by rewriting each PR's message with links to other PRs in the same stack:
+GHerrit emulates this by rewriting each PR's message with links to other PRs in
+the same stack:
 
 <img width="915" height="317" alt="Screenshot 2025-12-02 at 6 46 15 PM" src="https://github.com/user-attachments/assets/6ee80641-af67-4b37-9f57-797207637bbe" />
 
@@ -238,8 +244,11 @@ often results in "phantom diffs" or merge conflicts.
 
 To solve this, GHerrit implements a **Cascading Merge** system:
 
-1.  **Metadata Injection**: When pushing, GHerrit injects hidden metadata into the PR description (inside an HTML comment) containing the IDs of the parent and child PRs.
-2.  **Automated Rebase**: A GitHub Action (`gherrit-rebase-stack.yml`) triggers whenever a PR is merged. It:
+1.  **Metadata Injection**: When pushing, GHerrit injects hidden metadata into
+    the PR description (inside an HTML comment) containing the IDs of the
+    parent and child PRs.
+2.  **Automated Rebase**: A GitHub Action (`gherrit-rebase-stack.yml`) triggers
+    whenever a PR is merged. It:
     *   Reads the metadata to find the *child* PR's ID.
     *   Finds the child PR by its synthesized branch name (e.g., `G...`)
     *   Retargets the child PR to base off `main`.
