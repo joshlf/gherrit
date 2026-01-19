@@ -100,27 +100,19 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
 fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
     let head = repo.rev_parse_single("HEAD")?;
     let default_branch = repo.find_default_branch_on_default_remote();
-    let default_ref_spec = format!("refs/heads/{}", default_branch);
-    let default_ref = repo.rev_parse_single(default_ref_spec.as_str())?;
+    let default_ref = repo.rev_parse_single(format!("refs/heads/{}", default_branch).as_str())?;
 
-    // Verify ancestry to safely determine if we can walk back to default_ref
-    // without traversing the entire history (e.g. if the branch is orphaned).
-    if !repo.is_ancestor(default_ref.detach(), head.detach())? {
-        let branch_name = repo.current_branch().name().unwrap_or("current branch");
-        bail!(
-            "The branch '{branch_name}' is not based on '{default_branch}'.\n\
-             GHerrit only supports stacked branches that share history with the default branch.\n\
-             Maybe you want to 'git rebase' on '{default_branch}' before pushing?"
-        );
-    }
-
-    let mut commits = repo
-        .rev_walk([head])
-        .all()?
-        .take_while(|res| res.as_ref().map(|info| info.id != default_ref).unwrap_or(true))
-        .map(|res| -> Result<_> { Ok(res?.object()?) })
-        .collect::<Result<Vec<_>>>()?;
-    commits.reverse();
+    let commits = repo.commits_between(default_ref, head).map_err(|err| match err {
+        util::CommitsBetweenError::NotAncestor => {
+            let branch_name = repo.current_branch().name().unwrap_or("current branch");
+            eyre!(
+                "The branch '{branch_name}' is not based on '{default_branch}'.\n\
+                 GHerrit only supports stacked branches that share history with the default branch.\n\
+                 Maybe you want to 'git rebase' on '{default_branch}' before pushing?"
+            )
+        }
+        util::CommitsBetweenError::Eyre(e) => e,
+    })?;
 
     let remote = repo.default_remote_name();
     commits

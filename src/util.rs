@@ -1,7 +1,7 @@
 use std::{ffi::OsStr, process::Command};
 
 use eyre::{OptionExt, Result, WrapErr, bail, eyre};
-use gix::{bstr::ByteSlice, state::InProgress};
+use gix::{Commit, Id, bstr::ByteSlice, state::InProgress};
 
 use crate::manage::State;
 
@@ -177,16 +177,6 @@ impl Repo {
         Ok(latest_log.is_some_and(|log| log.previous_oid.is_null()))
     }
 
-    /// Checks if `ancestor` is reachable from `descendant`.
-    pub fn is_ancestor(&self, ancestor: gix::ObjectId, descendant: gix::ObjectId) -> Result<bool> {
-        match self.inner.merge_base(ancestor, descendant) {
-            Ok(merge_base) => Ok(merge_base.detach() == ancestor),
-            // If there is no common ancestor (e.g., an orphan branch), `merge_base`
-            // returns an error. We treat this as "not an ancestor".
-            Err(_) => Ok(false),
-        }
-    }
-
     pub fn default_remote_name(&self) -> String {
         self.config_string("gherrit.remote")
             .unwrap_or_default()
@@ -273,6 +263,42 @@ impl Repo {
 
         let state = State::read_from(self, branch_name)?;
         Ok((branch_name.clone(), state))
+    }
+}
+
+pub enum CommitsBetweenError {
+    NotAncestor,
+    Eyre(eyre::Error),
+}
+
+impl Repo {
+    /// Returns the commits from `ancestor` to `descendant` (in that order).
+    pub fn commits_between(
+        &self,
+        ancestor: Id<'_>,
+        descendant: Id<'_>,
+    ) -> Result<Vec<Commit<'_>>, CommitsBetweenError> {
+        // If there is no common ancestor (e.g., an orphan branch), `merge_base`
+        // returns an error. We treat this as "not an ancestor".
+        let is_ancestor = self
+            .inner
+            .merge_base(ancestor, descendant)
+            .map(|merge_base| merge_base.detach() == ancestor)
+            .unwrap_or(false);
+        if !is_ancestor {
+            return Err(CommitsBetweenError::NotAncestor);
+        }
+
+        let mut commits = self
+            .rev_walk([descendant])
+            .all()
+            .map_err(|e| CommitsBetweenError::Eyre(e.into()))?
+            .take_while(|res| res.as_ref().map(|info| info.id != ancestor).unwrap_or(true))
+            .map(|res| -> color_eyre::eyre::Result<_> { Ok(res?.object()?) })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CommitsBetweenError::Eyre)?;
+        commits.reverse();
+        Ok(commits)
     }
 }
 
