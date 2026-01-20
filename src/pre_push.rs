@@ -18,28 +18,9 @@ use crate::{
 };
 
 pub async fn run(repo: &util::Repo) -> Result<()> {
-    let branch_name = repo.current_branch();
-    let branch_name = match branch_name {
-        HeadState::Attached(bn) | HeadState::Pending(bn) => bn,
-        HeadState::Detached => {
-            bail!("Cannot push from detached HEAD");
-        }
-    };
-
-    match repo.is_managed(branch_name)? {
-        false => {
-            log::info!("Branch {} is UNMANAGED. Allowing standard push.", branch_name.yellow());
-            return Ok(());
-        }
-        true => log::info!("Branch {} is MANAGED. Syncing stack...", branch_name.yellow()),
-    }
-
-    let commits = collect_commits(repo).wrap_err("Failed to collect commits")?;
-
-    if commits.is_empty() {
-        log::info!("No commits to sync.");
+    let Some(stack) = Stack::discover(repo)? else {
         return Ok(());
-    }
+    };
 
     let token = util::get_github_token()?;
     let mut builder = Octocrab::builder().personal_token(token);
@@ -56,7 +37,7 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
 
     let octocrab = builder.build()?;
 
-    let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
+    let gherrit_ids: Vec<String> = stack.commits.iter().map(|c| c.gherrit_id.clone()).collect();
     let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
 
     let errors: Vec<String> = prs.iter().filter_map(|pr| match pr.state {
@@ -76,14 +57,56 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
         );
     }
 
-    let latest_versions = push_to_origin(repo, &commits)?;
+    let latest_versions = push_to_origin(repo, &stack.commits)?;
     let default_branch = repo.find_default_branch_on_default_remote();
 
-    let num_commits = commits.len();
-    sync_prs(repo, &octocrab, branch_name, &default_branch, commits, latest_versions, prs).await?;
+    let num_commits = stack.commits.len();
+    sync_prs(
+        repo,
+        &octocrab,
+        &stack.branch_name,
+        &default_branch,
+        stack.commits,
+        latest_versions,
+        prs,
+    )
+    .await?;
 
     log::info!("Successfully synced {num_commits} commits.");
     Ok(())
+}
+
+struct Stack {
+    commits: Vec<Commit>,
+    branch_name: String,
+}
+
+impl Stack {
+    fn discover(repo: &util::Repo) -> Result<Option<Stack>> {
+        let branch_name = match repo.current_branch() {
+            HeadState::Attached(bn) | HeadState::Pending(bn) => bn.clone(),
+            HeadState::Detached => {
+                bail!("Cannot push from detached HEAD");
+            }
+        };
+
+        match repo.is_managed(&branch_name)? {
+            false => {
+                log::info!("Branch {} is UNMANAGED. Allowing standard push.", branch_name.yellow());
+                return Ok(None);
+            }
+            true => log::info!("Branch {} is MANAGED. Syncing stack...", branch_name.yellow()),
+        }
+
+        let commits = collect_commits(repo).wrap_err("Failed to collect commits")?;
+
+        if commits.is_empty() {
+            log::info!("No commits to sync.");
+            return Ok(None);
+        }
+
+        Ok(Some(Stack { commits, branch_name }))
+    }
 }
 
 fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
