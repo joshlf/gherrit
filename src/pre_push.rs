@@ -18,74 +18,195 @@ use crate::{
 };
 
 pub async fn run(repo: &util::Repo) -> Result<()> {
-    let branch_name = repo.current_branch();
-    let branch_name = match branch_name {
-        HeadState::Attached(bn) | HeadState::Pending(bn) => bn,
-        HeadState::Detached => {
-            bail!("Cannot push from detached HEAD");
-        }
+    // 1. Discovery
+    let Some(stack) = discovery::discover_stack(repo)? else {
+        return Ok(());
     };
 
-    match repo.is_managed(branch_name)? {
-        false => {
-            log::info!("Branch {} is UNMANAGED. Allowing standard push.", branch_name.yellow());
-            return Ok(());
-        }
-        true => log::info!("Branch {} is MANAGED. Syncing stack...", branch_name.yellow()),
-    }
+    // 2. Local State Preparation
+    let stack = local::create_or_update_local_refs(repo, stack)?;
 
-    let commits = collect_commits(repo).wrap_err("Failed to collect commits")?;
-    let commits = create_gherrit_refs(repo, commits).wrap_err("Failed to create refs")?;
+    // 3. Platform Validation (New Step)
+    let stack = platform::validate_stack(repo, stack).await?;
 
-    if commits.is_empty() {
-        log::info!("No commits to sync.");
-        return Ok(());
-    }
+    // 4. Git Synchronization
+    let stack = git_sync::push_stack(repo, stack)?;
 
-    let token = util::get_github_token()?;
-    let mut builder = Octocrab::builder().personal_token(token);
+    // 5. Platform Reconciliation
+    let stack = platform::reconcile_prs(repo, stack).await?;
 
-    // NOTE: It would be very dangerous to support this in production, as an
-    // attacker could use it to steal a user's GitHub API token. Thus, we only
-    // support it in testing.
-    if util::__TESTING
-        && let Ok(api_url) = std::env::var("GHERRIT_GITHUB_API_URL")
-    {
-        log::warn!("Using custom GitHub API URL: {}", api_url);
-        builder = builder.base_uri(api_url)?;
-    }
+    // 6. Reporting
+    log::info!("Successfully synced {} commits.", stack.commits.len());
 
-    let octocrab = builder.build()?;
-
-    let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
-    let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
-
-    let errors: Vec<String> = prs.iter().filter_map(|pr| match pr.state {
-        PullRequestState::Open => None,
-        PullRequestState::Closed => Some((pr.number, "closed")),
-        PullRequestState::Merged => Some((pr.number, "merged")),
-    }).map(|(number, state)| {
-        format!(
-            "Cannot push to {state} PR #{number}. Please open a new PR or reopen the existing one."
-        )
-    }).collect();
-
-    if !errors.is_empty() {
-        bail!(
-            "{}\nYou may want to rebase on the latest changes before pushing.",
-            errors.join("\n")
-        );
-    }
-
-    let latest_versions = push_to_origin(repo, &commits)?;
-    let default_branch = repo.find_default_branch_on_default_remote();
-
-    let num_commits = commits.len();
-    sync_prs(repo, &octocrab, branch_name, &default_branch, commits, latest_versions, prs).await?;
-
-    log::info!("Successfully synced {num_commits} commits.");
     Ok(())
 }
+
+// --- Pipeline States ---
+
+struct Stack<S> {
+    commits: Vec<Commit>,
+    branch_name: String,
+    extra: S,
+}
+
+struct Discovered;
+struct Prepared;
+struct Validated {
+    remote: RemoteState,
+}
+struct Synced {
+    next_versions: HashMap<String, usize>,
+    remote: RemoteState,
+}
+struct RemoteState {
+    prs: Vec<PrState>,
+    octocrab: Octocrab,
+}
+struct Reconciled;
+
+// --- Pipeline Modules ---
+
+mod discovery {
+    use super::*;
+
+    pub fn discover_stack(repo: &util::Repo) -> Result<Option<Stack<Discovered>>> {
+        let branch_name = repo.current_branch();
+        let branch_name_str = match branch_name {
+            HeadState::Attached(bn) | HeadState::Pending(bn) => bn.clone(),
+            HeadState::Detached => {
+                bail!("Cannot push from detached HEAD");
+            }
+        };
+
+        match repo.is_managed(&branch_name_str)? {
+            false => {
+                log::info!(
+                    "Branch {} is UNMANAGED. Allowing standard push.",
+                    branch_name_str.yellow()
+                );
+                return Ok(None);
+            }
+            true => log::info!("Branch {} is MANAGED. Syncing stack...", branch_name_str.yellow()),
+        }
+
+        let commits = collect_commits(repo).wrap_err("Failed to collect commits")?;
+
+        if commits.is_empty() {
+            log::info!("No commits to sync.");
+            return Ok(None);
+        }
+
+        Ok(Some(Stack { commits, branch_name: branch_name_str, extra: Discovered }))
+    }
+}
+
+mod local {
+    use super::*;
+
+    pub fn create_or_update_local_refs(
+        repo: &util::Repo,
+        stack: Stack<Discovered>,
+    ) -> Result<Stack<Prepared>> {
+        stack.commits.iter().try_for_each(|c| {
+            let rf = format!("refs/gherrit/{}", c.gherrit_id);
+            repo.reference(rf, c.id, PreviousValue::Any, "").map(drop)
+        })?;
+
+        Ok(Stack { commits: stack.commits, branch_name: stack.branch_name, extra: Prepared })
+    }
+}
+
+mod git_sync {
+    use super::*;
+
+    pub fn push_stack(repo: &util::Repo, stack: Stack<Validated>) -> Result<Stack<Synced>> {
+        // This function (originally push_to_origin) returns the map of next versions.
+        let next_versions = push_to_origin(repo, &stack.commits)?;
+
+        Ok(Stack {
+            commits: stack.commits,
+            branch_name: stack.branch_name,
+            extra: Synced {
+                next_versions,
+                remote: RemoteState {
+                    prs: stack.extra.remote.prs,
+                    octocrab: stack.extra.remote.octocrab,
+                },
+            },
+        })
+    }
+}
+
+mod platform {
+    use super::*;
+
+    pub async fn validate_stack(
+        repo: &util::Repo,
+        stack: Stack<Prepared>,
+    ) -> Result<Stack<Validated>> {
+        let token = util::get_github_token()?;
+        let mut builder = Octocrab::builder().personal_token(token);
+
+        if util::__TESTING
+            && let Ok(api_url) = std::env::var("GHERRIT_GITHUB_API_URL")
+        {
+            log::warn!("Using custom GitHub API URL: {}", api_url);
+            builder = builder.base_uri(api_url)?;
+        }
+
+        let octocrab = builder.build()?;
+
+        let gherrit_ids: Vec<String> = stack.commits.iter().map(|c| c.gherrit_id.clone()).collect();
+        let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
+
+        // Error check existing PRs (closed/merged)
+        let errors: Vec<String> = prs.iter().filter_map(|pr| match pr.state {
+            PullRequestState::Open => None,
+            PullRequestState::Closed => Some((pr.number, "closed")),
+            PullRequestState::Merged => Some((pr.number, "merged")),
+        }).map(|(number, state)| {
+            format!(
+                "Cannot push to {state} PR #{number}. Please open a new PR or reopen the existing one."
+            )
+        }).collect();
+
+        if !errors.is_empty() {
+            bail!(
+                "{}\nYou may want to rebase on the latest changes before pushing.",
+                errors.join("\n")
+            );
+        }
+
+        Ok(Stack {
+            commits: stack.commits,
+            branch_name: stack.branch_name,
+            extra: Validated { remote: RemoteState { prs, octocrab } },
+        })
+    }
+
+    pub async fn reconcile_prs(
+        repo: &util::Repo,
+        stack: Stack<Synced>,
+    ) -> Result<Stack<Reconciled>> {
+        let default_branch = repo.find_default_branch_on_default_remote();
+
+        // sync_prs expects the commits and versions
+        sync_prs(
+            repo,
+            &stack.extra.remote.octocrab,
+            &stack.branch_name,
+            &default_branch,
+            stack.commits.clone(),
+            stack.extra.next_versions.clone(),
+            stack.extra.remote.prs,
+        )
+        .await?;
+
+        Ok(Stack { commits: stack.commits, branch_name: stack.branch_name, extra: Reconciled })
+    }
+}
+
+// --- Original Functions (Refactored/Moved where necessary, but kept largely intact as implementation details) ---
 
 fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
     let head = repo.rev_parse_single("HEAD")?;
@@ -124,17 +245,6 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
             c.try_into()
         })
         .collect()
-}
-
-fn create_gherrit_refs(repo: &util::Repo, commits: Vec<Commit>) -> Result<Vec<Commit>> {
-    commits
-        .into_iter()
-        .map(|c| -> Result<_> {
-            let rf = format!("refs/gherrit/{}", c.gherrit_id);
-            let _ = repo.reference(rf, c.id, PreviousValue::Any, "")?;
-            Ok(c)
-        })
-        .collect::<Result<Vec<_>>>()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -706,6 +816,7 @@ fn is_private_stack(repo: &util::Repo, branch: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Clone, Debug)]
 struct Commit {
     id: ObjectId,
     gherrit_id: String,
