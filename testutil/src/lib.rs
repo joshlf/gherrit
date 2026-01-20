@@ -381,6 +381,23 @@ impl TestContext {
         cmd
     }
 
+    pub fn gherrit_id(&self, ref_name: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let output = self.git().args(["log", "-1", "--format=%B", ref_name]).output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git log failed for {}: {}", ref_name, stderr).into());
+        }
+
+        let stdout = String::from_utf8(output.stdout)?;
+
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("gherrit-pr-id: "))
+            .map(|id| id.trim().to_string())
+            .ok_or_else(|| format!("Commit {} is missing 'gherrit-pr-id' trailer", ref_name).into())
+    }
+
     pub fn sanitize(&self, output: &str) -> String {
         self.sanitize_with_redactions(output, &[])
     }

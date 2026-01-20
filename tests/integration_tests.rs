@@ -222,19 +222,7 @@ fn test_optimistic_locking_conflict() {
     // Push V1
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "optimistic_locking_v1");
 
-    // Retrieve the gherrit_id from local refs
-    let output = ctx
-        .git()
-        .args(["for-each-ref", "--format=%(refname:short)", "refs/gherrit/"])
-        .output()
-        .unwrap();
-    let stdout = std::str::from_utf8(&output.stdout).unwrap();
-    let gherrit_id = stdout
-        .lines()
-        .next()
-        .expect("No gherrit ref found")
-        .strip_prefix("gherrit/")
-        .expect("Invalid ref format");
+    let gherrit_id = ctx.gherrit_id("HEAD").unwrap();
 
     // Simulate race condition: Create v2 tag on REMOTE manually. The next
     // version should be v2 (since v1 exists). Note that in a bare repo, we can
