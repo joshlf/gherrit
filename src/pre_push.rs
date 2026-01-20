@@ -3,7 +3,6 @@ use std::{
     fmt::{self, Write},
     process::Stdio,
     str,
-    time::Instant,
 };
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
@@ -19,8 +18,6 @@ use crate::{
 };
 
 pub async fn run(repo: &util::Repo) -> Result<()> {
-    let t0 = Instant::now();
-
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) | HeadState::Pending(bn) => bn,
@@ -38,14 +35,7 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     }
 
     let commits = collect_commits(repo).wrap_err("Failed to collect commits")?;
-
-    let t1 = Instant::now();
-    log::trace!("t0 -> t1: {:?}", t1 - t0);
-
     let commits = create_gherrit_refs(repo, commits).wrap_err("Failed to create refs")?;
-
-    let t2 = Instant::now();
-    log::trace!("t1 -> t2: {:?}", t2 - t1);
 
     if commits.is_empty() {
         log::info!("No commits to sync.");
