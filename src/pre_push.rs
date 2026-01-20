@@ -35,7 +35,6 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     }
 
     let commits = collect_commits(repo).wrap_err("Failed to collect commits")?;
-    let commits = create_gherrit_refs(repo, commits).wrap_err("Failed to create refs")?;
 
     if commits.is_empty() {
         log::info!("No commits to sync.");
@@ -124,17 +123,6 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
             c.try_into()
         })
         .collect()
-}
-
-fn create_gherrit_refs(repo: &util::Repo, commits: Vec<Commit>) -> Result<Vec<Commit>> {
-    commits
-        .into_iter()
-        .map(|c| -> Result<_> {
-            let rf = format!("refs/gherrit/{}", c.gherrit_id);
-            let _ = repo.reference(rf, c.id, PreviousValue::Any, "")?;
-            Ok(c)
-        })
-        .collect::<Result<Vec<_>>>()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]

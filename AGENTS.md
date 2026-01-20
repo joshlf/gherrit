@@ -27,9 +27,9 @@ represented as a chain of Pull Requests on GitHub.
 
 It achieves this by:
 1.  Intercepting `git push` via the `pre-push` hook.
-2.  Creating unique `refs/gherrit/<id>` refs for every commit.
-3.  Pushing these refs to the remote.
-4.  Using the `gh` CLI tool to create/update PRs and chain them together (setting the base of one PR to the head of the previous one).
+2.  Pushing unique `refs/gherrit/<id>` refs for every commit to the remote.
+3.  Using the `gh` CLI tool to create/update PRs and chain them together
+    (setting the base of one PR to the head of the previous one).
 
 ### Project Structure
 
