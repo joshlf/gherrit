@@ -375,6 +375,7 @@ impl PrBodyBuilder<'_> {
             writeln!(w, "{}{}", slf.head_branch_markdown.unwrap_or(""), slf.gh_pr_ids_markdown)?;
             write_history_table(slf, &mut w, format)?;
             w.write_str("\n")?;
+            w.write_str("*Stacked PRs enabled by [GHerrit](https://github.com/joshlf/gherrit).*\n")?;
             w.write_str("<!-- WARNING: GHerrit relies on the following metadata to work properly. DO NOT EDIT OR REMOVE. -->")?;
             write!(
                 w,
