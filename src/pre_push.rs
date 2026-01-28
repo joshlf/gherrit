@@ -626,7 +626,7 @@ async fn sync_prs(
                 .iter()
                 .rev()
                 .map(|(_, _, state)| {
-                    let prefix = if state.number == pr_state.number { "👉" } else { "&#x3000;" };
+                    let prefix = if state.number == pr_state.number { "👉" } else { "&#x3000;&#x2009;" };
                     format!("- {} #{}", prefix, state.number)
                 })
                 .collect::<Vec<_>>()
