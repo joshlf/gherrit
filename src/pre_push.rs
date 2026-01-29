@@ -657,23 +657,23 @@ async fn sync_prs(
             let pr_num = pr_state.number.green().bold().to_string();
             let pr_url = remote.pr_url(pr_state.number).blue().underline().to_string();
 
-            let body_changed = pr_state.body.as_ref().is_none_or(|b| {
-                b.replace("\r\n", "\n").trim() != body.replace("\r\n", "\n").trim()
-            });
+            let title =
+                (pr_state.title != Some(c.message_title.clone())).then(|| c.message_title.clone());
+            let body = {
+                let body_changed = pr_state.body.as_ref().is_none_or(|b| {
+                    b.replace("\r\n", "\n").trim() != body.replace("\r\n", "\n").trim()
+                });
+                body_changed.then(|| body.clone())
+            };
+            let base_branch =
+                (pr_state.base_branch != parent_branch.as_str()).then(|| parent_branch.to_string());
 
-            let changed = pr_state.base_branch != parent_branch.as_str()
-                || pr_state.title != Some(c.message_title.clone())
-                || body_changed;
+            let changed = base_branch.is_some() || title.is_some() || body.is_some();
 
             if changed {
                 log::debug!("Queuing update for PR #{}", pr_num);
                 log::info!("Queued update for PR #{}: {}", pr_num, pr_url);
-                Some(BatchUpdate {
-                    node_id: pr_state.node_id.clone(),
-                    title: c.message_title.clone(),
-                    body: body.clone(),
-                    base_branch: parent_branch.to_string(),
-                })
+                Some(BatchUpdate { node_id: pr_state.node_id.clone(), title, body, base_branch })
             } else {
                 log::info!("PR #{} is up to date: {}", pr_num, pr_url);
                 None
@@ -731,9 +731,14 @@ re!(gherrit_pr_id_re, r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$");
 struct BatchUpdate {
     /// The global Node ID of the Pull Request (required for GraphQL mutations).
     node_id: String,
-    title: String,
-    body: String,
-    base_branch: String,
+    title: Option<String>,
+    body: Option<String>,
+    // NOTE: Omitting updates to the base branch is not just an optimization -
+    // when a PR is in the merge queue, updating the base branch will cause
+    // GitHub to reject the update (even if it's a no-op update which updates
+    // the base to a value identical to its current value). Omitting the base
+    // branch field in that case allows the update to succeed. See #271.
+    base_branch: Option<String>,
 }
 
 /// A request to create a new PR in a batch.
@@ -752,13 +757,37 @@ struct BatchCreate {
 /// interpolation, which would present injection vulnerabilities. Instead, all
 /// values are formatted as JSON before being interpolated.
 macro_rules! safe_json_format {
-    ($fmt:literal, $($key:ident = $value:expr),* $(,)?) => {{
+    // Handle optional fields (?: operator)
+    (@inner $parts:ident, $key:literal ? $value:expr) => {
+        if let Some(ref v) = $value {
+            // Make sure `$key` is a `&str` so that it's formatted correctly
+            // using `{:?}`.
+            let key: &str = $key;
+            $parts.push(format!("{}: {}", key, serde_json::json!(v)));
+        }
+    };
+
+    // Handle mandatory fields (: operator)
+    (@inner $parts:ident, $key:literal : $value:expr) => {{
+        // Make sure `$key` is a `&str` so that it's formatted correctly using
+        // `{:?}`.
+        let key: &str = $key;
+        $parts.push(format!("{}: {}", key, serde_json::json!($value)));
+    }};
+
+    ($fmt:literal $(, $k:ident = $v:expr)* $(, ($target:ident = { $($key:literal $op:tt $value:expr),* $(,)? }))? $(,)?) => {{
+        #[allow(unused_mut)]
+        let mut parts: Vec<String> = Vec::new();
+        $($(
+            safe_json_format!(@inner parts, $key $op $value);
+        )*)?
+
         // Inner function to avoid capturing environment variables.
-        fn inner($($key: serde_json::Value),*) -> String {
-            format!($fmt)
+        fn inner($($k: serde_json::Value,)* _target: String) -> String {
+            format!($fmt $(, $target = _target)?)
         }
 
-        inner($(serde_json::json!($value)),*)
+        inner($(serde_json::json!($v),)* parts.join(", "))
     }};
 }
 
@@ -812,11 +841,13 @@ async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<BatchUpdate>) -> Res
         updates,
         |update| {
             safe_json_format!(
-                "updatePullRequest(input: {{pullRequestId: {node_id}, baseRefName: {base}, title: {title}, body: {body}}}) {{ clientMutationId }}",
-                node_id = update.node_id,
-                base = update.base_branch,
-                title = update.title,
-                body = update.body,
+                "updatePullRequest(input: {{ {fields} }}) {{ clientMutationId }}",
+                (fields = {
+                    "pullRequestId" : update.node_id,
+                    "baseRefName" ? update.base_branch,
+                    "title" ? update.title,
+                    "body" ? update.body,
+                })
             )
         },
         |update, op_data| {
@@ -853,12 +884,14 @@ async fn batch_create_prs(
         creations_list,
         |create| {
             safe_json_format!(
-                "createPullRequest(input: {{ repositoryId: {repo_id}, baseRefName: {base}, headRefName: {head}, title: {title}, body: {body} }}) {{ pullRequest {{ number, url, id }} }}",
-                repo_id = repo_id,
-                base = create.base_branch,
-                head = create.head_branch,
-                title = create.title,
-                body = create.body,
+                "createPullRequest(input: {{ {fields} }}) {{ pullRequest {{ number, url, id }} }}",
+                (fields = {
+                    "repositoryId" : repo_id,
+                    "baseRefName" : create.base_branch,
+                    "headRefName" : create.head_branch,
+                    "title" : create.title,
+                    "body" : create.body,
+                })
             )
         },
         |create, val| {
@@ -869,8 +902,9 @@ async fn batch_create_prs(
 
             created_prs.insert(create.head_branch.clone(), (number, url, node_id));
             Ok(())
-        }
-    ).await?;
+        },
+    )
+    .await?;
 
     Ok(created_prs)
 }

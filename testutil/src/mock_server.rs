@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
 
@@ -25,6 +25,7 @@ pub struct MockState {
     pub repo_name: String,
     pub fail_next_request: Option<FailureKind>,
     pub fail_remaining: usize,
+    pub locked_prs: HashSet<u64>,
     pub schema: Option<Valid<apollo_compiler::Schema>>,
 }
 
@@ -356,6 +357,8 @@ async fn graphql(
 
     let mut response_data = serde_json::Map::new();
 
+    let mut errors = Vec::new();
+
     for operation in document.operations.iter() {
         for selection in operation.selection_set.selections.iter() {
             if let executable::Selection::Field(field) = selection {
@@ -368,7 +371,11 @@ async fn graphql(
 
                 match field.name.as_str() {
                     "updatePullRequest" => {
-                        handle_update_pr(&mut mock_state, field, &alias, &mut response_data);
+                        if let Err(msg) =
+                            handle_update_pr(&mut mock_state, field, &alias, &mut response_data)
+                        {
+                            errors.push(serde_json::json!({ "message": msg }));
+                        }
                     }
                     "createPullRequest" => {
                         handle_create_pr(&mut mock_state, field, &alias, &mut response_data);
@@ -388,9 +395,13 @@ async fn graphql(
         }
     }
 
-    Ok(Json(serde_json::json!({
-        "data": response_data
-    })))
+    let mut response_json = serde_json::Map::new();
+    response_json.insert("data".to_string(), serde_json::Value::Object(response_data));
+    if !errors.is_empty() {
+        response_json.insert("errors".to_string(), serde_json::Value::Array(errors));
+    }
+
+    Ok(Json(serde_json::Value::Object(response_json)))
 }
 
 fn extract_input_field<'a>(
@@ -421,7 +432,7 @@ fn handle_update_pr(
     field: &executable::Field,
     alias: &str,
     response_data: &mut serde_json::Map<String, serde_json::Value>,
-) {
+) -> Result<(), String> {
     if let Some(input) = extract_input_field(field, "input") {
         let node_id = get_string_field(input, "pullRequestId").unwrap();
         let title = get_string_field(input, "title");
@@ -429,6 +440,10 @@ fn handle_update_pr(
         let base = get_string_field(input, "baseRefName");
 
         if let Some(pr) = mock_state.prs.iter_mut().find(|p| p.node_id == node_id) {
+            if mock_state.locked_prs.contains(&pr.id) && base.is_some() {
+                return Err("Pull request is in a merge queue and cannot be updated".to_string());
+            }
+
             if let Some(t) = title {
                 pr.title = Some(t);
             }
@@ -451,6 +466,7 @@ fn handle_update_pr(
             );
         }
     }
+    Ok(())
 }
 
 fn handle_create_pr(
