@@ -374,6 +374,7 @@ impl PrBodyBuilder<'_> {
             w.write_str("\n\n---\n\n")?;
             writeln!(w, "{}{}", slf.head_branch_markdown.unwrap_or(""), slf.gh_pr_ids_markdown)?;
             write_history_table(slf, &mut w, format)?;
+            write_download_section(slf, &mut w)?;
             w.write_str("\n\n")?;
             w.write_str(
                 "*Stacked PRs enabled by [GHerrit](https://github.com/joshlf/gherrit).*\n\n",
@@ -476,6 +477,32 @@ impl PrBodyBuilder<'_> {
                 w.write_str("\n</details>")?;
             }
 
+            Ok(())
+        }
+
+        fn write_download_section(slf: &PrBodyBuilder, mut w: impl Write) -> fmt::Result {
+            let id = &slf.c.gherrit_id;
+
+            w.write_str(
+                "\n<details>\n<summary><strong>📥 Download this PR</strong></summary>\n\n",
+            )?;
+
+            // While `git fetch origin {id}` would work most of the time, we use
+            // the full `refs/heads/` syntax to avoid ambiguity with tags of the
+            // same name.
+            let fetch_cmd = format!("git fetch origin refs/heads/{id}");
+            let commands = [
+                ("Branch", format!("{fetch_cmd} && git checkout -b pr-{id} FETCH_HEAD")),
+                ("Checkout", format!("{fetch_cmd} && git checkout FETCH_HEAD")),
+                ("Cherry Pick", format!("{fetch_cmd} && git cherry-pick FETCH_HEAD")),
+                ("Pull", format!("git pull origin refs/heads/{id}")),
+            ];
+
+            for (title, command) in commands {
+                writeln!(w, "**{title}**\n```bash\n{command}\n```\n")?;
+            }
+
+            w.write_str("</details>")?;
             Ok(())
         }
 
