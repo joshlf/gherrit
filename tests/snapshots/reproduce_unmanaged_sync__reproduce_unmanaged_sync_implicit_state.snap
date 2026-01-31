@@ -1,0 +1,5 @@
+---
+source: tests/reproduce_unmanaged_sync.rs
+expression: ctx.formatted_mock_pr_state()
+---
+[]

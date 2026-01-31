@@ -19,11 +19,8 @@ fn verify_push_to_non_open_fail(state_arg: &str, expected_msg_part: &str) {
     ctx.hook("pre-push").assert().failure().stderr(predicate::str::contains(expected_msg_part));
 
     // 4. Verify no new push happened
-    ctx.maybe_inspect_mock_state(|state| {
-        let pr = &state.prs[0];
-        assert_eq!(pr.state, state_arg);
-        assert_eq!(state.push_count, 1, "Should not have pushed to {} PR", state_arg);
-    });
+    let name = format!("prevent_push_to_{}_pr_state", state_arg.to_lowercase());
+    testutil::assert_pr_snapshot!(ctx, name.as_str());
 }
 
 #[test]

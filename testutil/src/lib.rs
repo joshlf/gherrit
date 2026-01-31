@@ -322,6 +322,15 @@ impl TestContext {
         }
     }
 
+    pub fn formatted_mock_pr_state(&self) -> String {
+        let mut content = String::new();
+        self.maybe_inspect_mock_state(|state| {
+            let json = serde_json::to_string_pretty(&state.prs).expect("Failed to serialize PRs");
+            content = self.sanitize(&json);
+        });
+        content
+    }
+
     pub fn assert_pushed(&self, ref_name: &str) {
         self.maybe_inspect_mock_state(|state| {
             let found = state.pushed_refs.iter().any(|r| r == ref_name);
@@ -468,6 +477,13 @@ macro_rules! assert_snapshot {
     ($ctx:expr, $cmd:expr, $name:expr, $redactions:expr $(,)?) => {
         let content = $ctx.execute_and_format($cmd, $redactions);
         insta::assert_snapshot!($name, content);
+    };
+}
+
+#[macro_export]
+macro_rules! assert_pr_snapshot {
+    ($ctx:expr, $name:expr $(,)?) => {
+        insta::assert_snapshot!($name, $ctx.formatted_mock_pr_state());
     };
 }
 

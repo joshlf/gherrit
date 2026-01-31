@@ -40,13 +40,7 @@ fn test_full_stack_lifecycle_mocked() {
     );
 
     // Verify Side Effects (Mock Only)
-    ctx.maybe_inspect_mock_state(|state| {
-        assert_eq!(state.prs.len(), 2, "Expected 2 PRs created");
-        // Verify we pushed phantom branches or tags. The mock intercepts 'git
-        // push origin <refspec>...'. GHerrit pushes refspecs like
-        // 'refs/heads/G...:refs/heads/G...' or tags.
-        assert!(!state.pushed_refs.is_empty(), "Expected some refs to be pushed");
-    });
+    testutil::assert_pr_snapshot!(ctx, "full_stack_lifecycle_state");
 }
 
 #[test]
@@ -264,39 +258,7 @@ fn test_pr_body_generation() {
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "pr_body_generation_v1");
 
     // Verify
-    ctx.maybe_inspect_mock_state(|state| {
-        // Find PR for Commit B (should be the middle one, index 1)
-        // mock_bin typically creates PRs in order [A, B, C] or based on commit list.
-        // We know we created 3 PRs.
-        assert_eq!(state.prs.len(), 3, "Expected 3 PRs");
-
-        // The mock bin stores PRs. We need to find the one corresponding to Commit B.
-        // Commit B is the parent of C and child of A.
-        // Let's filter by title
-        let pr_b = state
-            .prs
-            .iter()
-            .find(|pr| pr.title.as_deref() == Some("Commit B"))
-            .expect("PR for Commit B not found");
-
-        let body = pr_b.body.as_ref().unwrap();
-
-        // 1. Verify Metadata JSON
-        // Should contain <!-- gherrit-meta: { ... } -->
-        assert!(body.contains("<!-- gherrit-meta: {"), "Body missing gherrit-meta block");
-
-        // Verify parent/child keys exist (basic check, since IDs are dynamic)
-        assert!(body.contains(r#""parent": "G"#), "Body missing valid parent field");
-        assert!(body.contains(r#""child": "G"#), "Body missing valid child field");
-
-        // 2. Verify Table
-        // For v1, the history table is NOT generated.
-        assert!(!body.contains("| Version |"), "Table should NOT be present for v1");
-
-        // 3. Verify Download Section
-        assert!(body.contains("⬇️ Download this PR"), "Download section should be present");
-        assert!(body.contains("git fetch origin"), "Download command should be present");
-    });
+    testutil::assert_pr_snapshot!(ctx, "pr_body_generation_v1_state");
 
     // 4. Update to v2 to verify the Patch History Table appears
     ctx.run_git(&["checkout", "feature-stack"]); // Ensure we are on the branch
@@ -307,20 +269,7 @@ fn test_pr_body_generation() {
     // Sync again
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "pr_body_generation_v2");
 
-    ctx.maybe_inspect_mock_state(|state| {
-        // Find PR for Commit C (the tip)
-        let pr_c = state
-            .prs
-            .iter()
-            .find(|pr| pr.title.as_deref() == Some("Commit C"))
-            .expect("PR for Commit C not found");
-
-        let body = pr_c.body.as_ref().unwrap();
-
-        // Assert table exists now
-        assert!(body.contains("|Version|"), "Patch History Table should appear for v2");
-        assert!(body.contains("v1|"), "Table should reference v1");
-    });
+    testutil::assert_pr_snapshot!(ctx, "pr_body_generation_v2_state");
 }
 
 #[test]
@@ -340,15 +289,14 @@ fn test_large_stack_batching() {
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "large_stack_batching");
 
     ctx.maybe_inspect_mock_state(|state| {
-        // Assert: 85 PRs created
-        assert_eq!(state.prs.len(), 85, "Expected 85 PRs created");
-
         // Assert: Push was split into 2 batches (80 + 5)
         assert_eq!(
             state.push_count, 2,
             "Expected 2 push invocations for 85 commits (batch size 80)"
         );
     });
+
+    testutil::assert_pr_snapshot!(ctx, "large_stack_batching_state");
 
     // Assert: 85 refs pushed (actually more, since tags are also pushed)
     // Check refs/gherrit/<ID>/v1 count.
@@ -389,13 +337,7 @@ fn test_public_stack_links() {
 
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "public_stack_links_private");
 
-    ctx.maybe_inspect_mock_state(|state| {
-        let body = state.prs[0].body.as_ref().unwrap();
-        assert!(
-            !body.contains("This PR is on branch"),
-            "Private stack should NOT link to local branch"
-        );
-    });
+    testutil::assert_pr_snapshot!(ctx, "public_stack_links_private_state");
 
     // 2. Public Mode
     // Manually set pushRemote to origin (simulating a public stack)
@@ -405,11 +347,7 @@ fn test_public_stack_links() {
     ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "public_stack_links_public");
 
-    ctx.maybe_inspect_mock_state(|state| {
-        let body = state.prs[0].body.as_ref().unwrap(); // Get the updated body
-        assert!(body.contains("This PR is on branch"), "Public stack SHOULD link to local branch");
-        assert!(body.contains("[public-feature]"), "Link should mention the branch name");
-    });
+    testutil::assert_pr_snapshot!(ctx, "public_stack_links_public_state");
 }
 
 #[test]
