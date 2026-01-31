@@ -374,6 +374,7 @@ impl PrBodyBuilder<'_> {
             w.write_str("\n\n---\n\n")?;
             writeln!(w, "{}{}", slf.head_branch_markdown.unwrap_or(""), slf.gh_pr_ids_markdown)?;
             write_history_table(slf, &mut w, format)?;
+            write_download_section(slf, &mut w)?;
             w.write_str("\n\n")?;
             w.write_str(
                 "*Stacked PRs enabled by [GHerrit](https://github.com/joshlf/gherrit).*\n\n",
@@ -476,6 +477,35 @@ impl PrBodyBuilder<'_> {
                 w.write_str("\n</details>")?;
             }
 
+            Ok(())
+        }
+
+        fn write_download_section(slf: &PrBodyBuilder, mut w: impl Write) -> fmt::Result {
+            let id = &slf.c.gherrit_id;
+            let origin = "origin"; // Hardcoded as per requirements
+
+            w.write_str("\n<details>\n<summary><strong>📥 Download this PR</strong></summary>\n\n")?;
+
+            w.write_str("**Branch**\n```bash\n")?;
+            writeln!(
+                w,
+                "git fetch {origin} refs/heads/{id} && git checkout -b change-{id} FETCH_HEAD"
+            )?;
+            w.write_str("\n```\n\n")?;
+
+            w.write_str("**Checkout**\n```bash\n")?;
+            writeln!(w, "git fetch {origin} refs/heads/{id} && git checkout FETCH_HEAD")?;
+            w.write_str("\n```\n\n")?;
+
+            w.write_str("**Cherry Pick**\n```bash\n")?;
+            writeln!(w, "git fetch {origin} refs/heads/{id} && git cherry-pick FETCH_HEAD")?;
+            w.write_str("\n```\n\n")?;
+
+            w.write_str("**Pull**\n```bash\n")?;
+            writeln!(w, "git pull {origin} refs/heads/{id}")?;
+            w.write_str("\n```\n\n")?;
+
+            w.write_str("</details>")?;
             Ok(())
         }
 
