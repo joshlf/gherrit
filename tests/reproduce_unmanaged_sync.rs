@@ -16,13 +16,7 @@ fn test_reproduce_unmanaged_sync() {
 
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "reproduce_unmanaged_sync_explicit");
 
-    ctx.maybe_inspect_mock_state(|state| {
-        assert!(
-            state.prs.is_empty(),
-            "Explicit unmanaged branch should NOT sync PRs. Found: {:?}",
-            state.prs
-        );
-    });
+    testutil::assert_pr_snapshot!(ctx, "reproduce_unmanaged_sync_explicit_state");
 
     // Condition 2: Implicit Unmanaged
     ctx.checkout_new("implicit-unmanaged");
@@ -31,11 +25,5 @@ fn test_reproduce_unmanaged_sync() {
 
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "reproduce_unmanaged_sync_implicit");
 
-    ctx.maybe_inspect_mock_state(|state| {
-        assert!(
-            state.prs.is_empty(),
-            "Implicit unmanaged branch should NOT sync PRs. Found: {:?}",
-            state.prs
-        );
-    });
+    testutil::assert_pr_snapshot!(ctx, "reproduce_unmanaged_sync_implicit_state");
 }

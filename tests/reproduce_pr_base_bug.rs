@@ -11,11 +11,5 @@ fn test_reproduce_pr_base_branch_bug() {
 
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
-    ctx.maybe_inspect_mock_state(|state| {
-        let pr = &state.prs[0];
-        assert_eq!(
-            pr.base.ref_field, "main",
-            "PR should target main, not the parent feature branch"
-        );
-    });
+    testutil::assert_pr_snapshot!(ctx, "reproduce_pr_base_bug_state");
 }
