@@ -292,6 +292,10 @@ fn test_pr_body_generation() {
         // 2. Verify Table
         // For v1, the history table is NOT generated.
         assert!(!body.contains("| Version |"), "Table should NOT be present for v1");
+
+        // 3. Verify Download Section
+        assert!(body.contains("📥 Download this PR"), "Download section should be present");
+        assert!(body.contains("git fetch origin"), "Download command should be present");
     });
 
     // 4. Update to v2 to verify the Patch History Table appears
