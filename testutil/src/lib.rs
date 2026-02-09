@@ -232,6 +232,10 @@ impl Drop for TestContext {
 
 impl TestContext {
     fn configure_mock_env(&self, cmd: &mut assert_cmd::Command) {
+        // Enforce deterministic timestamps for git commits to ensure stable IDs in snapshots
+        cmd.env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z");
+        cmd.env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z");
+
         if !self.is_live {
             // Prepend temp dir to PATH so 'gh' and 'git' resolve to our mock
             let mut paths = vec![self.dir.path().to_path_buf()];
@@ -431,7 +435,7 @@ impl TestContext {
             LazyLock::new(|| Regex::new(r"http://127\.0\.0\.1:\d+").expect("Invalid regex"));
 
         static GHERRIT_ID_REGEX: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"\bG[0-9a-fA-F]{16,}\b").expect("Invalid regex"));
+            LazyLock::new(|| Regex::new(r"\bG[a-zA-Z0-9]{16,}\b").expect("Invalid regex"));
 
         let output = SHA_REGEX.replace_all(&output, "[SHA]");
         let output = GHERRIT_ID_REGEX.replace_all(&output, "[GHERRIT_ID]");
