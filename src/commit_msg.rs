@@ -81,7 +81,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
         .wrap_err("Failed to compute hash")?;
 
         // Initialize the hash with the salt.
-        let mut hash: [u8; 20] = rand::random();
+        let mut hash: [u8; 20] = if util::__TESTING { [0; 20] } else { rand::random() };
 
         // Mix in the object hash using a simple XOR. This isn't
         // cryptographically secure, but it's good enough for our purposes –
@@ -93,12 +93,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
         hash
     };
 
-    // Poor man's hex encoding
-    let mut hash_str = String::with_capacity(hash.len() * 2);
-    for b in hash {
-        use std::fmt::Write as _;
-        write!(&mut hash_str, "{:02x}", b).unwrap();
-    }
+    let hash_str = data_encoding::BASE32.encode(&hash);
 
     // Check if trailer exists
     let output = cmd!("git interpret-trailers --parse", msg_file).checked_output()?;
