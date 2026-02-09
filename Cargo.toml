@@ -8,7 +8,13 @@ description = "Gerrit-style stacked diffs for GitHub"
 repository = "https://github.com/joshlf/gherrit"
 
 [profile.release]
-debug = true
+# Strip full debug info, but keep line tables for backtraces. This makes full
+# GDB debugging difficult, but ensures that backtraces provide file/line and
+# function names.
+strip = "none"
+debug = "line-tables-only"
+debug-assertions = true
+lto = true
 
 [dependencies]
 gix = { version = "0.75.0", features = ["blocking-network-client"] }
