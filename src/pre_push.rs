@@ -7,7 +7,6 @@ use std::{
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
 use gix::{ObjectId, reference::Category, refs::transaction::PreviousValue};
-use itertools::Itertools;
 use octocrab::Octocrab;
 use owo_colors::OwoColorize;
 use serde_json::json;
@@ -1018,9 +1017,30 @@ where
     M: Fn(&T) -> String,
     H: FnMut(&T, &serde_json::Value) -> Result<()>,
 {
+    let items: Vec<T> = items.into_iter().collect();
+    if items.is_empty() {
+        return Ok(());
+    }
+
     let alias = |i| format!("op{i}");
-    for chunk in items.into_iter().chunks(50).into_iter() {
-        let chunk: Vec<_> = chunk.collect();
+
+    // GitHub imposes a limit on the number of nodes that can be processed in a
+    // single GraphQL query (500,000 as of this writing [1]), and also imposes
+    // limits on the amount of computation resources required to process the
+    // query [2]. In order to avoid hitting these limits while still processing
+    // large batches in the optimistic case, we start with a large match size
+    // and perform exponential backoff if we hit the limits. This also ensures
+    // that we are resilient in the face of GitHub changing these limits in the
+    // future.
+    //
+    // [1] https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit
+    // [2] https://github.blog/changelog/2025-09-01-graphql-api-resource-limits/
+    let mut batch_size = 64;
+    let mut cursor = 0;
+    while cursor < items.len() {
+        let end = std::cmp::min(cursor + batch_size, items.len());
+        let chunk = &items[cursor..end];
+
         let query_body: String = chunk
             .iter()
             .enumerate()
@@ -1039,6 +1059,29 @@ where
             octocrab.graphql(&query_body).await.wrap_err("GraphQL batched operation failed")?;
 
         if let Some(errors) = response.get("errors") {
+            let is_resource_limit = errors.as_array().is_some_and(|errs| {
+                errs.iter().any(|e| {
+                    matches!(
+                        e.get("type").and_then(|t| t.as_str()),
+                        Some("RESOURCE_LIMITS_EXCEEDED" | "MAX_NODE_LIMIT_EXCEEDED")
+                    )
+                })
+            });
+            if is_resource_limit {
+                let new_batch_size = batch_size / 2;
+                log::warn!(
+                    "Hit GitHub resource limit with GraphQL batch update of size {}. Backing off to {}.",
+                    batch_size,
+                    new_batch_size
+                );
+                // FIXME: In this case, fall back to the REST API.
+                if new_batch_size == 0 {
+                    bail!("Single PR update exceeds GitHub resource limits. Cannot sync.");
+                }
+                batch_size = new_batch_size;
+                continue;
+            }
+
             log::error!("GraphQL errors: {}", errors);
             bail!("GraphQL errors: {:?}", errors);
         }
@@ -1050,6 +1093,8 @@ where
                 response_handler(item, op_data)?;
             }
         }
+
+        cursor = end;
     }
     Ok(())
 }
