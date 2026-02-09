@@ -406,9 +406,20 @@ impl TestContext {
     }
 
     pub fn sanitize_with_redactions(&self, output: &str, redactions: &[(&str, &str)]) -> String {
-        let mut output = output.replace(self.repo_path.to_str().unwrap(), "[REPO_PATH]");
-        output = output.replace(self.remote_path.to_str().unwrap(), "[REMOTE_PATH]");
+        let redactions = redactions.iter().cloned().chain([
+            (self.repo_path.to_str().unwrap(), "[REPO_PATH]"),
+            (self.remote_path.to_str().unwrap(), "[REMOTE_PATH]"),
+            // On macOS, the system may report paths starting with /private/var,
+            // while the test harness sees /var. After the redaction above, we
+            // get "/private[REPO_PATH]". This line strips that prefix. On
+            // Linux, this string won't exist, so it does nothing.
+            ("/private[", "["),
+            // This git error message only appears on some platforms/git
+            // versions.
+            ("fatal: the remote end hung up unexpectedly\n", ""),
+        ]);
 
+        let mut output = output.to_string();
         for (target, replacement) in redactions {
             output = output.replace(target, replacement);
         }
