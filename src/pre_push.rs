@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     collections::HashMap,
     fmt::{self, Write},
     process::Stdio,
@@ -1035,10 +1036,10 @@ where
     //
     // [1] https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit
     // [2] https://github.blog/changelog/2025-09-01-graphql-api-resource-limits/
-    let mut batch_size = 64;
+    let mut batch_size = cmp::min(64, items.len());
     let mut cursor = 0;
     while cursor < items.len() {
-        let end = std::cmp::min(cursor + batch_size, items.len());
+        let end = cmp::min(cursor + batch_size, items.len());
         let chunk = &items[cursor..end];
 
         let query_body: String = chunk
@@ -1055,68 +1056,75 @@ where
             }
         );
 
-        // HEURISTIC: Check query size before sending. GitHub's WAF/load
-        // balancer/some other middleware seems to silently drop or truncate
-        // requests larger than ~600KB, leading to confusing "missing query
-        // attribute" errors. We preemptively backoff if we exceed a conservative
-        // limit (256KB).
-        let query_size = query.len();
-        const MAX_QUERY_SIZE: usize = 256 * 1024; // 256 KB
+        // Attempt to perform the query. Returns:
+        // - Ok(Some(response)): Success
+        // - Ok(None): Heuristic or API limit hit (needs backoff)
+        // - Err(e): Fatal error (bail)
+        let response = async {
+            // HEURISTIC: Check query size before sending. GitHub's WAF/load
+            // balancer/some other middleware seems to silently drop or truncate
+            // requests larger than ~600KB, leading to confusing "missing query
+            // attribute" errors. We preemptively backoff if we exceed a
+            // conservative limit (256KB).
+            const MAX_QUERY_SIZE: usize = 256 * 1024; // 256 KB
+            if query.len() > MAX_QUERY_SIZE {
+                log::warn!(
+                    "GraphQL query size ({} bytes) exceeds heuristic limit ({} bytes).",
+                    query.len(),
+                    MAX_QUERY_SIZE
+                );
+                return Ok(None);
+            }
 
-        if query_size > MAX_QUERY_SIZE {
+            log::trace!("Sending GraphQL Query (Length: {}): {}", query.len(), query);
+            let request_payload = json!({ "query": query });
+            let response: serde_json::Value = octocrab
+                .graphql(&request_payload)
+                .await
+                .wrap_err("GraphQL batched operation failed")?;
+
+            if let Some(errors) = response.get("errors") {
+                let is_resource_limit = errors.as_array().is_some_and(|errs| {
+                    errs.iter().any(|e| {
+                        let type_str = e.get("type").and_then(|t| t.as_str());
+                        let msg_str = e.get("message").and_then(|m| m.as_str());
+
+                        matches!(type_str, Some("RESOURCE_LIMITS_EXCEEDED" | "MAX_NODE_LIMIT_EXCEEDED"))
+                        // HEURISTIC: We've seen this specific error message in
+                        // practice, likely due to the middleware issue
+                        // described above. We assume it's as a result of an
+                        // overly-large query.
+                        || matches!(msg_str, Some("A query attribute must be specified and must be a string."))
+                    })
+                });
+
+                if is_resource_limit {
+                    log::warn!("Hit GitHub resource limit with GraphQL batch update of size {batch_size}");
+                    return Ok(None);
+                }
+
+                log::error!("GraphQL errors: {}", errors);
+                bail!("GraphQL errors: {:?}", errors);
+            }
+
+            Ok(Some(response))
+        }.await?;
+
+        let Some(response) = response else {
             let new_batch_size = batch_size / 2;
-            log::warn!(
-                "GraphQL query size ({query_size} bytes) exceeds heuristic limit ({MAX_QUERY_SIZE} bytes). Backing off batch size from {batch_size} to {new_batch_size}.",
-            );
-            // FIXME: In this case, fall back to the REST API.
+            log::warn!("Backing off batch size from {batch_size} to {new_batch_size}.");
+
             if new_batch_size == 0 {
-                bail!("Single PR update exceeds query size limit. Cannot sync.");
+                // NOTE: Since we always divide by 2, we're guaranteed to never
+                // skip 1 (4 -> 2 -> 1 and 3 -> 1), so we know that if we reach
+                // this point, a single PR update exceeds GitHub's limits.
+                //
+                // FIXME: In this case, fall back to the REST API.
+                bail!("Single PR update exceeds GitHub resource limits. Cannot sync.");
             }
             batch_size = new_batch_size;
             continue;
-        }
-
-        log::trace!("Sending GraphQL Query (Length: {}): {}", query.len(), query);
-
-        let request_payload = json!({ "query": query });
-        let response: serde_json::Value = octocrab
-            .graphql(&request_payload)
-            .await
-            .wrap_err("GraphQL batched operation failed")?;
-
-        if let Some(errors) = response.get("errors") {
-            let is_resource_limit = errors.as_array().is_some_and(|errs| {
-                errs.iter().any(|e| {
-                    let type_str = e.get("type").and_then(|t| t.as_str());
-                    let msg_str = e.get("message").and_then(|m| m.as_str());
-
-                    matches!(type_str, Some("RESOURCE_LIMITS_EXCEEDED" | "MAX_NODE_LIMIT_EXCEEDED"))
-                    // HEURISTIC: We've seen this specific error message in
-                    // practice, likely due to the middleware issue described
-                    // above. We assume it's as a result of an overly-large
-                    // query.
-                        || msg_str
-                            == Some("A query attribute must be specified and must be a string.")
-                })
-            });
-            if is_resource_limit {
-                let new_batch_size = batch_size / 2;
-                log::warn!(
-                    "Hit GitHub resource limit with GraphQL batch update of size {}. Backing off to {}.",
-                    batch_size,
-                    new_batch_size
-                );
-                // FIXME: In this case, fall back to the REST API.
-                if new_batch_size == 0 {
-                    bail!("Single PR update exceeds GitHub resource limits. Cannot sync.");
-                }
-                batch_size = new_batch_size;
-                continue;
-            }
-
-            log::error!("GraphQL errors: {}", errors);
-            bail!("GraphQL errors: {:?}", errors);
-        }
+        };
 
         let data = json_get!(response["data"])?;
 
