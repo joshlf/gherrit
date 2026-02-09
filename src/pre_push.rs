@@ -1054,9 +1054,12 @@ where
                 GraphQlOp::Mutation => "mutation",
             }
         );
-        let query_body = json!({ "query": query });
+        let request_payload = json!({ "query": query });
+
+        log::trace!("Sending GraphQL Query (Length: {}): {}", query.len(), query);
+
         let response: serde_json::Value =
-            octocrab.graphql(&query_body).await.wrap_err("GraphQL batched operation failed")?;
+            octocrab.graphql(&request_payload).await.wrap_err("GraphQL batched operation failed")?;
 
         if let Some(errors) = response.get("errors") {
             let is_resource_limit = errors.as_array().is_some_and(|errs| {
