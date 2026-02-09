@@ -1054,17 +1054,49 @@ where
                 GraphQlOp::Mutation => "mutation",
             }
         );
-        let query_body = json!({ "query": query });
-        let response: serde_json::Value =
-            octocrab.graphql(&query_body).await.wrap_err("GraphQL batched operation failed")?;
+
+        // HEURISTIC: Check query size before sending. GitHub's WAF/load
+        // balancer/some other middleware seems to silently drop or truncate
+        // requests larger than ~600KB, leading to confusing "missing query
+        // attribute" errors. We preemptively backoff if we exceed a conservative
+        // limit (256KB).
+        let query_size = query.len();
+        const MAX_QUERY_SIZE: usize = 256 * 1024; // 256 KB
+
+        if query_size > MAX_QUERY_SIZE {
+            let new_batch_size = batch_size / 2;
+            log::warn!(
+                "GraphQL query size ({query_size} bytes) exceeds heuristic limit ({MAX_QUERY_SIZE} bytes). Backing off batch size from {batch_size} to {new_batch_size}.",
+            );
+            // FIXME: In this case, fall back to the REST API.
+            if new_batch_size == 0 {
+                bail!("Single PR update exceeds query size limit. Cannot sync.");
+            }
+            batch_size = new_batch_size;
+            continue;
+        }
+
+        log::trace!("Sending GraphQL Query (Length: {}): {}", query.len(), query);
+
+        let request_payload = json!({ "query": query });
+        let response: serde_json::Value = octocrab
+            .graphql(&request_payload)
+            .await
+            .wrap_err("GraphQL batched operation failed")?;
 
         if let Some(errors) = response.get("errors") {
             let is_resource_limit = errors.as_array().is_some_and(|errs| {
                 errs.iter().any(|e| {
-                    matches!(
-                        e.get("type").and_then(|t| t.as_str()),
-                        Some("RESOURCE_LIMITS_EXCEEDED" | "MAX_NODE_LIMIT_EXCEEDED")
-                    )
+                    let type_str = e.get("type").and_then(|t| t.as_str());
+                    let msg_str = e.get("message").and_then(|m| m.as_str());
+
+                    matches!(type_str, Some("RESOURCE_LIMITS_EXCEEDED" | "MAX_NODE_LIMIT_EXCEEDED"))
+                    // HEURISTIC: We've seen this specific error message in
+                    // practice, likely due to the middleware issue described
+                    // above. We assume it's as a result of an overly-large
+                    // query.
+                        || msg_str
+                            == Some("A query attribute must be specified and must be a string.")
                 })
             });
             if is_resource_limit {
