@@ -435,7 +435,7 @@ impl TestContext {
             LazyLock::new(|| Regex::new(r"http://127\.0\.0\.1:\d+").expect("Invalid regex"));
 
         static GHERRIT_ID_REGEX: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"\bG[a-zA-Z0-9]{16,}\b").expect("Invalid regex"));
+            LazyLock::new(|| Regex::new(r"\b[Gg][a-zA-Z0-9]{16,}\b").expect("Invalid regex"));
 
         let output = SHA_REGEX.replace_all(&output, "[SHA]");
         let output = GHERRIT_ID_REGEX.replace_all(&output, "[GHERRIT_ID]");
