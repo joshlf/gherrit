@@ -45,14 +45,17 @@ fn test_base32_format_compliance() {
     let id = id_line.trim().strip_prefix("gherrit-pr-id: ").unwrap();
 
     // 1. Case Sensitivity & Normalization
-    // Must be uppercase G + [A-Z2-7]
+    // Must be uppercase G + lowercase [a-z2-7]
     assert!(id.starts_with('G'), "ID must start with G");
     let content = &id[1..];
     assert!(
-        content.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
-        "ID must be uppercase/digits"
+        content.chars().all(|c| c.is_ascii_lowercase() || matches!(c, '2'..='7')),
+        "ID content must be lowercase letters or digits 2-7"
     );
-    assert!(!content.chars().any(|c| c.is_ascii_lowercase()), "ID must not contain lowercase");
+    assert!(
+        !content.chars().any(|c| c.is_ascii_uppercase()),
+        "ID content must not contain uppercase"
+    );
 
     // 2. Padding & Symbols
     assert!(!content.contains('='), "ID must not contain padding");
