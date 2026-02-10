@@ -49,8 +49,8 @@ fn test_base32_format_compliance() {
     assert!(id.starts_with('G'), "ID must start with G");
     let content = &id[1..];
     assert!(
-        content.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
-        "ID content must be lowercase/digits"
+        content.chars().all(|c| c.is_ascii_lowercase() || matches!(c, '2'..='7')),
+        "ID content must be lowercase letters or digits 2-7"
     );
     assert!(
         !content.chars().any(|c| c.is_ascii_uppercase()),
