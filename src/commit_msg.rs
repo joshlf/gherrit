@@ -109,7 +109,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     // --if-exists doNothing: prevents duplicates
     cmd!(
         "git interpret-trailers --in-place --where start --if-exists doNothing --trailer",
-        "gherrit-pr-id: g{hash_str}",
+        "gherrit-pr-id: G{hash_str}",
         msg_file
     )
     .success()?;
