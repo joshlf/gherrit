@@ -93,7 +93,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
         hash
     };
 
-    let hash_str = data_encoding::BASE32.encode(&hash);
+    let hash_str = data_encoding::BASE32.encode(&hash).to_ascii_lowercase();
 
     // Check if trailer exists
     let output = cmd!("git interpret-trailers --parse", msg_file).checked_output()?;
@@ -109,7 +109,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     // --if-exists doNothing: prevents duplicates
     cmd!(
         "git interpret-trailers --in-place --where start --if-exists doNothing --trailer",
-        "gherrit-pr-id: G{hash_str}",
+        "gherrit-pr-id: g{hash_str}",
         msg_file
     )
     .success()?;

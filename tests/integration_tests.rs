@@ -16,7 +16,7 @@ fn test_commit_msg_hook() {
 
     // Verify trailer was added
     let content = std::fs::read_to_string(msg_file).unwrap();
-    assert!(content.contains("\ngherrit-pr-id: G"));
+    assert!(content.contains("\ngherrit-pr-id: g"));
 }
 
 #[test]
