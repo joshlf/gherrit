@@ -93,7 +93,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
         hash
     };
 
-    let hash_str = data_encoding::BASE32.encode(&hash);
+    let hash_str = data_encoding::BASE32.encode(&hash).to_ascii_lowercase();
 
     // Check if trailer exists
     let output = cmd!("git interpret-trailers --parse", msg_file).checked_output()?;

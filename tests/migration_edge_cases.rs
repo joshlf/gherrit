@@ -44,17 +44,13 @@ fn test_base32_format_compliance() {
     let id_line = msg.lines().find(|l| l.starts_with("gherrit-pr-id: ")).expect("ID not found");
     let id = id_line.trim().strip_prefix("gherrit-pr-id: ").unwrap();
 
-    // 1. Case Sensitivity & Normalization
-    // Must be uppercase G + [A-Z2-7]
+    // Must be uppercase G + [a-z2-7]
     assert!(id.starts_with('G'), "ID must start with G");
     let content = &id[1..];
     assert!(
-        content.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
-        "ID must be uppercase/digits"
+        content.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7')),
+        "ID content must be lowercase letters or digits 2-7"
     );
-    assert!(!content.chars().any(|c| c.is_ascii_lowercase()), "ID must not contain lowercase");
 
-    // 2. Padding & Symbols
-    assert!(!content.contains('='), "ID must not contain padding");
     assert_eq!(id.len(), 33, "ID length should be 33 (1 prefix + 32 hash)");
 }
