@@ -3,7 +3,7 @@ name = "gherrit"
 version = "0.1.0-alpha"
 edition = "2024"
 rust-version = "1.89.0"
-license = "MIT OR Apache-2.0"
+license = "BSD-2-Clause OR Apache-2.0 OR MIT"
 description = "Gerrit-style stacked diffs for GitHub"
 repository = "https://github.com/joshlf/gherrit"
 
