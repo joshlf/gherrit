@@ -7,7 +7,7 @@ fn test_regression_batch_update_silent_failure() {
 
     // 1. Initial Push (creates PR)
     ctx.commit("Initial Work");
-    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
 
     // 2. Modify commit to trigger failure in mock server
     //
@@ -16,7 +16,7 @@ fn test_regression_batch_update_silent_failure() {
     ctx.amend_with_message("Initial Work\n\nTRIGGER_GRAPHQL_NULL");
 
     // 3. Push again - Expect Failure due to null response
-    let assert = ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
+    let assert = ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().failure();
 
     assert.stderr(predicate::str::contains("The batched GraphQL mutation failed to update PR"));
 }
