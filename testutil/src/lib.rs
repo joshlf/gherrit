@@ -2,13 +2,15 @@ use std::{
     collections::HashMap,
     env,
     ffi::OsString,
-    fs,
+    fs, panic,
     path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, LazyLock, RwLock,
     },
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use regex::Regex;
@@ -22,6 +24,10 @@ pub const MANAGED_PRIVATE: &str = "managedPrivate";
 pub const MANAGED_PUBLIC: &str = "managedPublic";
 
 const FIRST_GIT_TIMESTAMP: u64 = 946_684_800;
+// `assert_cmd` enforces this limit for the direct child that it launches.
+const TEST_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const MOCK_BIN_BUILD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MOCK_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[macro_export]
 macro_rules! test_context {
@@ -37,18 +43,15 @@ pub fn build_mock_bin() -> PathBuf {
         let target_dir = manifest_dir.parent().unwrap().join("target").join("mock_bin_build");
 
         eprintln!("Building mock_bin at {:?}", manifest_dir);
-        let status = Command::new("cargo")
+        assert_cmd::Command::new("cargo")
             .args(["build", "--bin", "mock_bin"])
             .arg("--manifest-path")
             .arg(manifest_dir.join("Cargo.toml"))
             .arg("--target-dir")
             .arg(&target_dir)
-            .status()
-            .expect("Failed to execute cargo build for mock_bin");
-
-        if !status.success() {
-            panic!("Failed to build mock_bin. See stdout/stderr for details.");
-        }
+            .timeout(MOCK_BIN_BUILD_TIMEOUT)
+            .assert()
+            .success();
 
         target_dir.join("debug").join(if cfg!(windows) { "mock_bin.exe" } else { "mock_bin" })
     });
@@ -158,37 +161,12 @@ impl TestContextBuilder {
             let state = Arc::new(RwLock::new(state));
             mock_server_state = Some(state.clone());
 
-            // Spawn the server on a separate thread to avoid blocking the main
-            // test thread. This ensures the runtime persists for the duration
-            // of the test context.
-
-            let (tx, rx) = std::sync::mpsc::channel();
-            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-            let state_for_server = state.clone();
-            let remote_path_for_server = remote_path.clone();
-            let system_git_for_server = system_git.clone();
-            let git_environment_for_server = test_environment.variables.clone();
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("Failed to build runtime");
-
-                rt.block_on(async {
-                    let url = mock_server::start_mock_server(
-                        state_for_server,
-                        remote_path_for_server,
-                        system_git_for_server,
-                        git_environment_for_server,
-                    )
-                    .await;
-                    tx.send(url).expect("Failed to send mock server URL");
-                    let _ = shutdown_rx.await;
-                });
-            });
-
-            MockServerInfo { url: rx.recv().unwrap(), shutdown_tx }
+            MockServerInfo::start(
+                state,
+                remote_path.clone(),
+                system_git.clone(),
+                test_environment.clone(),
+            )
         });
 
         let ctx = TestContext {
@@ -347,6 +325,7 @@ impl TestEnvironment {
     fn apply_to_assert_cmd(&self, cmd: &mut assert_cmd::Command) {
         cmd.env_clear();
         cmd.envs(self.variables.iter().cloned());
+        cmd.timeout(TEST_COMMAND_TIMEOUT);
     }
 
     fn command(&self, program: &Path) -> assert_cmd::Command {
@@ -364,7 +343,74 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: &Path) {
 
 pub struct MockServerInfo {
     pub url: String,
-    pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    server_thread: Option<JoinHandle<()>>,
+}
+
+impl MockServerInfo {
+    fn start(
+        state: Arc<RwLock<mock_server::MockState>>,
+        remote_path: PathBuf,
+        system_git: PathBuf,
+        test_environment: TestEnvironment,
+    ) -> Self {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let server_thread = thread::Builder::new()
+            .name("gherrit-mock-server".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to build mock server runtime");
+                runtime.block_on(mock_server::run_mock_server(
+                    state,
+                    remote_path,
+                    system_git,
+                    test_environment,
+                    ready_tx,
+                    shutdown_rx,
+                ));
+            })
+            .expect("Failed to spawn mock server thread");
+
+        let url = match ready_rx.recv_timeout(MOCK_SERVER_STARTUP_TIMEOUT) {
+            Ok(url) => url,
+            Err(error) => match Self::stop(Some(shutdown_tx), Some(server_thread)) {
+                Ok(()) => panic!(
+                    "Mock server did not become ready within \
+                     {MOCK_SERVER_STARTUP_TIMEOUT:?}: {error}"
+                ),
+                Err(server_panic) => panic::resume_unwind(server_panic),
+            },
+        };
+
+        Self { url, shutdown_tx: Some(shutdown_tx), server_thread: Some(server_thread) }
+    }
+
+    fn stop(
+        shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        server_thread: Option<JoinHandle<()>>,
+    ) -> thread::Result<()> {
+        if let Some(shutdown_tx) = shutdown_tx {
+            let _ = shutdown_tx.send(());
+        }
+
+        server_thread.map_or(Ok(()), JoinHandle::join)
+    }
+}
+
+impl Drop for MockServerInfo {
+    fn drop(&mut self) {
+        if let Err(server_panic) = Self::stop(self.shutdown_tx.take(), self.server_thread.take()) {
+            // Preserve a server failure during ordinary teardown, but never
+            // cause an abort by panicking again while a test panic unwinds.
+            if !thread::panicking() {
+                panic::resume_unwind(server_panic);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -376,9 +422,8 @@ pub enum FailureKind {
 
 impl Drop for TestContext {
     fn drop(&mut self) {
-        if let Some(server) = self.mock_server.take() {
-            let _ = server.shutdown_tx.send(());
-        }
+        // Stop the server before fixture directories and state are released.
+        drop(self.mock_server.take());
     }
 }
 
@@ -830,6 +875,25 @@ mod tests {
         assert!(!output.contains("SHOULD_BE_CLEARED="));
         assert!(output.lines().any(|line| line == "RUST_LOG=info"));
         assert!(output.lines().any(|line| line.starts_with("HOME=")));
+    }
+
+    #[test]
+    fn dropping_mock_server_waits_for_state_release() {
+        let state = Arc::new(RwLock::new(mock_server::MockState::default()));
+        let weak_state = Arc::downgrade(&state);
+        let test_dir = TempDir::new().unwrap();
+        let system_git = SYSTEM_GIT.clone();
+        let test_environment = TestEnvironment::new(test_dir.path(), &system_git);
+        let server = MockServerInfo::start(
+            state,
+            test_dir.path().join("remote.git"),
+            system_git,
+            test_environment,
+        );
+
+        assert!(weak_state.upgrade().is_some());
+        drop(server);
+        assert!(weak_state.upgrade().is_none(), "mock server retained state after teardown");
     }
 }
 
