@@ -8,7 +8,7 @@ fn test_pre_push_ls_remote_failure() {
     ctx.commit("Work");
 
     // Hook should succeed but warn about ls-remote failure
-    ctx.gherrit()
+    ctx.gherrit_cmd()
         .args(["hook", "pre-push"])
         .env("MOCK_BIN_FAIL_CMD", "git:ls-remote")
         .assert()
@@ -25,7 +25,20 @@ fn test_pre_push_pr_list_failure() {
     // Trigger hook
     ctx.inject_failure(testutil::FailureKind::GraphQl);
 
-    ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
+    ctx.gherrit_cmd()
+        .args(["hook", "pre-push"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Injected GraphQl failure"));
+    ctx.assert_failure_consumed();
+    ctx.maybe_inspect_mock_state(|state| {
+        assert_eq!(
+            state.graphql_requests,
+            vec![vec![testutil::mock_server::GraphQlOperation::Query]]
+        );
+        assert!(state.prs.is_empty());
+        assert!(state.pushes.is_empty());
+    });
 }
 
 #[test]
@@ -37,7 +50,20 @@ fn test_pre_push_pr_create_failure() {
     // Trigger hook
     ctx.inject_failure(testutil::FailureKind::CreatePr);
 
-    ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
+    ctx.gherrit_cmd()
+        .args(["hook", "pre-push"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Injected CreatePr failure"));
+    ctx.assert_failure_consumed();
+    ctx.maybe_inspect_mock_state(|state| {
+        assert_eq!(
+            state.graphql_requests.last(),
+            Some(&vec![testutil::mock_server::GraphQlOperation::CreatePr])
+        );
+        assert!(state.prs.is_empty());
+        assert_eq!(state.pushes.iter().filter(|push| push.succeeded()).count(), 1);
+    });
 }
 
 #[test]
@@ -45,16 +71,17 @@ fn test_commit_msg_git_var_failure() {
     #[cfg(unix)]
     {
         let ctx = testutil::test_context_minimal!().install_hooks(true).build();
-        ctx.gherrit().args(["manage"]).assert().success();
+        ctx.gherrit_cmd().args(["manage"]).assert().success();
 
         let msg_file = ctx.repo_path.join("COMMIT_EDITMSG");
         std::fs::write(&msg_file, "feat: broken git var").unwrap();
 
-        ctx.gherrit()
+        ctx.gherrit_cmd()
             .args(["hook", "commit-msg", msg_file.to_str().unwrap()])
             .env("MOCK_BIN_FAIL_CMD", "git:var")
             .assert()
-            .failure();
+            .failure()
+            .stderr(predicate::str::contains("Simulated failure for git var"));
     }
 }
 
@@ -63,15 +90,16 @@ fn test_commit_msg_trailers_failure() {
     #[cfg(unix)]
     {
         let ctx = testutil::test_context_minimal!().install_hooks(true).build();
-        ctx.gherrit().args(["manage"]).assert().success();
+        ctx.gherrit_cmd().args(["manage"]).assert().success();
 
         let msg_file = ctx.repo_path.join("COMMIT_EDITMSG");
         std::fs::write(&msg_file, "feat: broken trailers parse").unwrap();
 
-        ctx.gherrit()
+        ctx.gherrit_cmd()
             .args(["hook", "commit-msg", msg_file.to_str().unwrap()])
             .env("MOCK_BIN_FAIL_CMD", "git:interpret-trailers")
             .assert()
-            .failure();
+            .failure()
+            .stderr(predicate::str::contains("Simulated failure for git interpret-trailers"));
     }
 }
