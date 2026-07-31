@@ -26,16 +26,7 @@ const FIRST_GIT_TIMESTAMP: u64 = 946_684_800;
 #[macro_export]
 macro_rules! test_context {
     () => {
-        $crate::TestContextBuilder::new()
-            .binaries(assert_cmd::cargo::cargo_bin!("gherrit"), $crate::build_mock_bin())
-    };
-}
-
-#[macro_export]
-macro_rules! test_context_minimal {
-    () => {
-        $crate::TestContextBuilder::new_minimal()
-            .binaries(assert_cmd::cargo::cargo_bin!("gherrit"), $crate::build_mock_bin())
+        $crate::TestContextBuilder::new(assert_cmd::cargo::cargo_bin!("gherrit"))
     };
 }
 
@@ -67,63 +58,66 @@ pub fn build_mock_bin() -> PathBuf {
 pub struct TestContextBuilder {
     owner: String,
     name: String,
-    install_hooks: bool,
+    remote: bool,
+    installed_hooks: bool,
     initial_commit: bool,
-    gherrit_bin: Option<PathBuf>,
-    mock_bin: Option<PathBuf>,
-}
-
-impl Default for TestContextBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
+    mock_github: bool,
+    git_interceptor: bool,
+    gherrit_bin: PathBuf,
 }
 
 impl TestContextBuilder {
-    pub fn new() -> Self {
-        let mut slf = Self::new_minimal();
-        slf.install_hooks(true).initial_commit(true);
-        slf
-    }
-
-    pub fn new_minimal() -> Self {
+    pub fn new(gherrit_bin: impl Into<PathBuf>) -> Self {
         Self {
             owner: DEFAULT_OWNER.to_string(),
             name: DEFAULT_REPO.to_string(),
-            install_hooks: false,
+            remote: false,
+            installed_hooks: false,
             initial_commit: false,
-            gherrit_bin: None,
-            mock_bin: None,
+            mock_github: false,
+            git_interceptor: false,
+            gherrit_bin: gherrit_bin.into(),
         }
     }
 
-    pub fn binaries(&mut self, gherrit: impl Into<PathBuf>, mock: impl Into<PathBuf>) -> &mut Self {
-        self.gherrit_bin = Some(gherrit.into());
-        self.mock_bin = Some(mock.into());
-        self
-    }
-
-    pub fn owner(&mut self, owner: &str) -> &mut Self {
+    #[must_use]
+    pub fn repository(mut self, owner: &str, name: &str) -> Self {
         self.owner = owner.to_string();
-        self
-    }
-
-    pub fn name(&mut self, name: &str) -> &mut Self {
         self.name = name.to_string();
         self
     }
 
-    pub fn install_hooks(&mut self, install_hooks: bool) -> &mut Self {
-        self.install_hooks = install_hooks;
+    #[must_use]
+    pub fn with_remote(mut self) -> Self {
+        self.remote = true;
         self
     }
 
-    pub fn initial_commit(&mut self, initial_commit: bool) -> &mut Self {
-        self.initial_commit = initial_commit;
+    #[must_use]
+    pub fn with_installed_hooks(mut self) -> Self {
+        self.installed_hooks = true;
         self
     }
 
-    pub fn build(&self) -> TestContext {
+    #[must_use]
+    pub fn with_initial_commit(mut self) -> Self {
+        self.initial_commit = true;
+        self
+    }
+
+    #[must_use]
+    pub fn with_mock_github(mut self) -> Self {
+        self.mock_github = true;
+        self
+    }
+
+    #[must_use]
+    pub fn with_git_interceptor(mut self) -> Self {
+        self.git_interceptor = true;
+        self
+    }
+
+    pub fn build(self) -> TestContext {
         if std::env::var("GHERRIT_TEST_BUILD").is_err() {
             eprintln!("\n\x1b[31mERROR: You must run these tests with GHERRIT_TEST_BUILD=1\x1b[0m");
             eprintln!("This ensures the binary is compiled with the necessary test hooks.\n");
@@ -137,25 +131,30 @@ impl TestContextBuilder {
         fs::create_dir(&repo_path).unwrap();
 
         let remote_parent = dir.path().join(&self.owner);
-        fs::create_dir_all(&remote_parent).unwrap();
         let remote_path = remote_parent.join(format!("{}.git", self.name));
-        init_git_bare_repo(&test_environment, &system_git, &remote_path);
+        if self.remote {
+            fs::create_dir_all(&remote_parent).unwrap();
+            init_git_bare_repo(&test_environment, &system_git, &remote_path);
+        }
 
-        let is_live = env::var("GHERRIT_LIVE_TEST").is_ok();
-        let live_github_token = is_live.then(resolve_live_github_token);
+        init_git_repo(
+            &test_environment,
+            &system_git,
+            &repo_path,
+            self.remote.then_some(remote_path.as_path()),
+        );
 
-        init_git_repo(&test_environment, &system_git, &repo_path, &remote_path);
-
-        let gherrit_bin = self.gherrit_bin.clone().expect("gherrit binary path must be set");
-        let mock_bin = self.mock_bin.clone().expect("mock binary path must be set");
+        if self.installed_hooks {
+            install_gherrit_binary(dir.path(), &self.gherrit_bin);
+        }
+        if self.git_interceptor {
+            install_git_interceptor(dir.path(), &build_mock_bin());
+        }
 
         let mut mock_server_state = None;
 
-        let mock_server = (!is_live).then(|| {
-            install_mock_binaries(dir.path(), &mock_bin, &gherrit_bin);
-
+        let mock_server = (self.mock_github || self.git_interceptor).then(|| {
             let state = mock_server::MockState::new(self.owner.clone(), self.name.clone());
-
             let state = Arc::new(RwLock::new(state));
             mock_server_state = Some(state.clone());
 
@@ -186,19 +185,20 @@ impl TestContextBuilder {
         let ctx = TestContext {
             dir,
             repo_path,
-            remote_path: remote_path.clone(),
-            is_live,
-            live_github_token,
+            remote_path,
+            has_remote: self.remote,
+            has_mock_github: self.mock_github,
+            has_git_interceptor: self.git_interceptor,
             system_git: system_git.clone(),
-            gherrit_bin_path: gherrit_bin.clone(),
+            gherrit_bin_path: self.gherrit_bin,
             test_environment,
             next_git_timestamp: AtomicU64::new(FIRST_GIT_TIMESTAMP),
             mock_server,
             mock_server_state,
         };
 
-        if self.install_hooks {
-            ctx.install_hooks();
+        if self.installed_hooks {
+            ctx.gherrit_cmd().arg("install").assert().success();
         }
 
         if self.initial_commit {
@@ -212,15 +212,16 @@ impl TestContextBuilder {
 pub struct TestContext {
     pub dir: TempDir,
     pub repo_path: PathBuf,
-    pub remote_path: PathBuf,
-    pub is_live: bool,
-    live_github_token: Option<String>,
     pub system_git: PathBuf,
     pub gherrit_bin_path: PathBuf,
+    remote_path: PathBuf,
+    has_remote: bool,
+    has_mock_github: bool,
+    has_git_interceptor: bool,
     test_environment: TestEnvironment,
     next_git_timestamp: AtomicU64,
-    pub mock_server: Option<MockServerInfo>,
-    pub mock_server_state: Option<Arc<RwLock<mock_server::MockState>>>,
+    mock_server: Option<MockServerInfo>,
+    mock_server_state: Option<Arc<RwLock<mock_server::MockState>>>,
 }
 
 #[derive(Clone)]
@@ -349,42 +350,6 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: &Path) {
     }
 }
 
-fn resolve_live_github_token() -> String {
-    let mut gh_auth_token = Command::new("gh");
-    gh_auth_token.args(["auth", "token"]);
-    resolve_live_github_token_with(env::var_os("GITHUB_TOKEN"), &mut gh_auth_token)
-        .unwrap_or_else(|message| panic!("Live GitHub authentication failed: {message}"))
-}
-
-fn resolve_live_github_token_with(
-    github_token: Option<OsString>,
-    gh_auth_token: &mut Command,
-) -> Result<String, String> {
-    if let Some(token) = github_token.and_then(|token| token.into_string().ok()) {
-        if !token.is_empty() {
-            return Ok(token);
-        }
-    }
-
-    let output = gh_auth_token
-        .output()
-        .map_err(|error| format!("failed to run `gh auth token`: {error}"))?;
-    if !output.status.success() {
-        return Err(
-            "`gh auth token` did not return a token; set GITHUB_TOKEN or run `gh auth login`"
-                .to_string(),
-        );
-    }
-
-    let token = String::from_utf8(output.stdout)
-        .map_err(|_| "`gh auth token` returned non-UTF-8 output".to_string())?;
-    let token = token.trim().to_string();
-    if token.is_empty() {
-        return Err("`gh auth token` returned an empty token".to_string());
-    }
-    Ok(token)
-}
-
 pub struct MockServerInfo {
     pub url: String,
     pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
@@ -417,17 +382,20 @@ impl TestContext {
         cmd.env("GIT_AUTHOR_DATE", &git_date);
         cmd.env("GIT_COMMITTER_DATE", &git_date);
 
-        if !self.is_live {
+        if self.has_git_interceptor {
             cmd.env("SYSTEM_GIT_PATH", &self.system_git);
 
             if let Some(server) = &self.mock_server {
                 cmd.env("GHERRIT_MOCK_SERVER_URL", &server.url);
             }
-        } else {
-            cmd.env(
-                "GITHUB_TOKEN",
-                self.live_github_token.as_ref().expect("live GitHub token was not resolved"),
-            );
+        }
+
+        // These variables belong on the outer Git command too: installed
+        // hooks inherit its environment when Git invokes GHerrit.
+        if self.has_mock_github {
+            let server = self.mock_server.as_ref().expect("mock GitHub server not available");
+            cmd.env("GHERRIT_GITHUB_API_URL", &server.url);
+            cmd.env("GITHUB_TOKEN", "mock-token");
         }
     }
 
@@ -439,18 +407,12 @@ impl TestContext {
 
         self.configure_test_env(&mut cmd);
 
-        if !self.is_live {
-            if let Some(server) = &self.mock_server {
-                cmd.env("GHERRIT_GITHUB_API_URL", &server.url);
-                cmd.env("GITHUB_TOKEN", "mock-token");
-            }
-        }
-
         cmd
     }
 
     #[must_use = "command builders do nothing until executed"]
     pub fn remote_git_cmd(&self) -> assert_cmd::Command {
+        assert!(self.has_remote, "missing test capability: .with_remote()");
         let mut cmd = assert_cmd::Command::new(&self.system_git);
         cmd.current_dir(&self.remote_path);
         self.configure_test_env(&mut cmd);
@@ -469,13 +431,15 @@ impl TestContext {
         cmd
     }
 
-    pub fn read_mock_state(&self) -> mock_server::MockState {
-        self.mock_server_state.as_ref().expect("Mock state not available").read().unwrap().clone()
+    fn mock_state(&self) -> &Arc<RwLock<mock_server::MockState>> {
+        self.mock_server_state
+            .as_ref()
+            .expect("missing test capability: .with_mock_github() or .with_git_interceptor()")
     }
 
-    pub fn install_hooks(&self) {
-        // Use the new install command
-        self.gherrit_cmd().args(["install"]).assert().success();
+    pub fn mock_server_url(&self) -> &str {
+        assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
+        &self.mock_server.as_ref().expect("mock GitHub server not available").url
     }
 
     pub fn commit(&self, msg: &str) {
@@ -532,14 +496,14 @@ impl TestContext {
     }
 
     pub fn inject_failure(&self, kind: FailureKind) {
-        let mut state =
-            self.mock_server_state.as_ref().expect("Mock state not available").write().unwrap();
+        assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
+        let mut state = self.mock_state().write().unwrap();
 
         state.fail_next_request = Some(kind);
     }
 
     pub fn assert_failure_consumed(&self) {
-        self.maybe_inspect_mock_state(|state| {
+        self.inspect_mock_state(|state| {
             assert!(
                 state.fail_next_request.is_none(),
                 "Expected injected failure to be consumed, but {:?} remains",
@@ -548,24 +512,20 @@ impl TestContext {
         });
     }
 
-    pub fn maybe_inspect_mock_state(&self, f: impl FnOnce(&mock_server::MockState)) {
-        if !self.is_live {
-            let state = self.read_mock_state();
-            f(&state);
-        }
+    pub fn inspect_mock_state(&self, f: impl FnOnce(&mock_server::MockState)) {
+        let state = self.mock_state().read().unwrap();
+        f(&state);
     }
 
-    pub fn maybe_mutate_mock_state(&self, f: impl FnOnce(&mut mock_server::MockState)) {
-        if !self.is_live {
-            let mut state =
-                self.mock_server_state.as_ref().expect("Mock state not available").write().unwrap();
-            f(&mut state);
-        }
+    pub fn mutate_mock_state(&self, f: impl FnOnce(&mut mock_server::MockState)) {
+        let mut state = self.mock_state().write().unwrap();
+        f(&mut state);
     }
 
     pub fn formatted_mock_pr_state(&self) -> String {
+        assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
         let mut content = String::new();
-        self.maybe_inspect_mock_state(|state| {
+        self.inspect_mock_state(|state| {
             let json = serde_json::to_string_pretty(&state.prs).expect("Failed to serialize PRs");
             content = self.sanitize(&json);
         });
@@ -603,8 +563,9 @@ impl TestContext {
     }
 
     pub fn count_successfully_pushed_containing(&self, substring: &str) -> usize {
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
         let mut count = 0;
-        self.maybe_inspect_mock_state(|state| {
+        self.inspect_mock_state(|state| {
             count = state
                 .pushes
                 .iter()
@@ -830,62 +791,6 @@ mod tests {
     }
 
     #[test]
-    fn live_github_token_prefers_environment() {
-        let mut unusable_fallback = Command::new("gherrit-command-that-must-not-run");
-
-        let token = resolve_live_github_token_with(
-            Some(OsString::from("environment-token")),
-            &mut unusable_fallback,
-        )
-        .unwrap();
-
-        assert_eq!(token, "environment-token");
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn live_github_token_falls_back_to_gh_login() {
-        let mut gh_auth_token = Command::new("sh");
-        gh_auth_token.args(["-c", "printf 'login-token\\n'"]);
-
-        let token = resolve_live_github_token_with(None, &mut gh_auth_token).unwrap();
-
-        assert_eq!(token, "login-token");
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn live_environment_injects_captured_token_without_restoring_home() {
-        let dir = TempDir::new().unwrap();
-        let repo_path = dir.path().join("local");
-        fs::create_dir(&repo_path).unwrap();
-        let isolated_home = dir.path().join("home");
-        let test_environment = TestEnvironment::new(dir.path(), SYSTEM_GIT.as_path());
-        let ctx = TestContext {
-            remote_path: dir.path().join("remote.git"),
-            dir,
-            repo_path,
-            is_live: true,
-            live_github_token: Some("captured-token".to_string()),
-            system_git: SYSTEM_GIT.clone(),
-            gherrit_bin_path: PathBuf::from("/usr/bin/env"),
-            test_environment,
-            next_git_timestamp: AtomicU64::new(FIRST_GIT_TIMESTAMP),
-            mock_server: None,
-            mock_server_state: None,
-        };
-
-        let assert = ctx.gherrit_cmd().assert().success();
-        let output = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-
-        assert!(output.lines().any(|line| line == "GITHUB_TOKEN=captured-token"));
-        assert!(
-            output.lines().any(|line| line == format!("HOME={}", isolated_home.display())),
-            "live command did not retain the fixture-owned HOME: {output}"
-        );
-    }
-
-    #[test]
     #[cfg(unix)]
     fn test_environment_clears_inherited_values() {
         let root = TempDir::new().unwrap();
@@ -935,11 +840,13 @@ fn run_git_cmd(environment: &TestEnvironment, system_git: &Path, path: &Path, ar
     environment.command(system_git).current_dir(path).args(args).assert().success();
 }
 
-pub fn install_mock_binaries(path: &Path, mock_bin: &Path, gherrit_bin: &Path) {
+fn install_git_interceptor(path: &Path, mock_bin: &Path) {
     let git_dst = path.join(if cfg!(windows) { "git.exe" } else { "git" });
-    let gherrit_dst = path.join(if cfg!(windows) { "gherrit.exe" } else { "gherrit" });
-
     fs::copy(mock_bin, &git_dst).unwrap();
+}
+
+fn install_gherrit_binary(path: &Path, gherrit_bin: &Path) {
+    let gherrit_dst = path.join(if cfg!(windows) { "gherrit.exe" } else { "gherrit" });
     fs::copy(gherrit_bin, &gherrit_dst).unwrap();
 }
 
@@ -952,7 +859,7 @@ fn init_git_repo(
     environment: &TestEnvironment,
     system_git: &Path,
     path: &Path,
-    remote_path: &Path,
+    remote_path: Option<&Path>,
 ) {
     let run = |args| run_git_cmd(environment, system_git, path, args);
     run(&["init"]);
@@ -964,8 +871,9 @@ fn init_git_repo(
     run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
     // Explicitly unmanage main to satisfy strict config checks
     run(&["config", "branch.main.gherritManaged", "false"]);
-    // Add origin remote
-    run(&["remote", "add", "origin", remote_path.to_str().unwrap()]);
+    if let Some(remote_path) = remote_path {
+        run(&["remote", "add", "origin", remote_path.to_str().unwrap()]);
+    }
 }
 
 static SYSTEM_GIT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
