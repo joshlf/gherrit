@@ -16,7 +16,12 @@ println!("Hello, {world}!");
 
 ## Formatting
 
-Maintain consistent formatting by using `cargo fmt`.
+The repository uses unstable rustfmt options. Maintain consistent formatting
+with the nightly toolchain:
+
+```bash
+cargo +nightly fmt --all
+```
 
 ## Comments
 
@@ -29,7 +34,8 @@ Maintain consistent formatting by using `cargo fmt`.
 
 - Wrap paragraphs and bulleted lists at **80 columns** from the left margin,
   taking into account any preceding code or comments.
-- Always put a blank line between a section header and the beginning of the section.
+- Always put a blank line between a section header and the beginning of the
+  section.
 
 ## Pull Requests and Commit Messages
 
