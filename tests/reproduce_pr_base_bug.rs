@@ -9,7 +9,7 @@ fn test_reproduce_pr_base_branch_bug() {
     ctx.checkout_new("feature-branch");
     ctx.commit("Feature Work");
 
-    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
 
     testutil::assert_pr_snapshot!(ctx, "reproduce_pr_base_bug_state");
 }
