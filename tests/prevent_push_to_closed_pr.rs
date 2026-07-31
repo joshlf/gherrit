@@ -16,7 +16,7 @@ fn verify_push_to_non_open_fail(state_arg: &str, expected_msg_part: &str) {
     });
 
     // 3. Amend and Push (Should Fail)
-    ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
+    ctx.amend();
     ctx.hook("pre-push").assert().failure().stderr(predicate::str::contains(expected_msg_part));
 
     // 4. Verify no new push happened
@@ -53,7 +53,7 @@ fn test_push_to_open_pr_succeeds() {
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
     // 2. Amend
-    ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
+    ctx.amend();
 
     // 3. Second Push (Should Succeed)
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
