@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -129,20 +131,19 @@ impl TestContextBuilder {
         }
 
         let dir = TempDir::new().unwrap();
+        let system_git = SYSTEM_GIT.clone();
+        let test_environment = TestEnvironment::new(dir.path(), &system_git);
         let repo_path = dir.path().join("local");
         fs::create_dir(&repo_path).unwrap();
 
         let remote_parent = dir.path().join(&self.owner);
         fs::create_dir_all(&remote_parent).unwrap();
         let remote_path = remote_parent.join(format!("{}.git", self.name));
-        init_git_bare_repo(&remote_path);
+        init_git_bare_repo(&test_environment, &system_git, &remote_path);
 
         let is_live = env::var("GHERRIT_LIVE_TEST").is_ok();
 
-        // Resolve system git before we mess with PATH.
-        let system_git = SYSTEM_GIT.clone();
-
-        init_git_repo(&repo_path, &remote_path);
+        init_git_repo(&test_environment, &system_git, &repo_path, &remote_path);
 
         let gherrit_bin = self.gherrit_bin.clone().expect("gherrit binary path must be set");
         let mock_bin = self.mock_bin.clone().expect("mock binary path must be set");
@@ -188,6 +189,7 @@ impl TestContextBuilder {
             is_live,
             system_git: system_git.clone(),
             gherrit_bin_path: gherrit_bin.clone(),
+            test_environment,
             next_git_timestamp: AtomicU64::new(FIRST_GIT_TIMESTAMP),
             mock_server,
             mock_server_state,
@@ -212,9 +214,136 @@ pub struct TestContext {
     pub is_live: bool,
     pub system_git: PathBuf,
     pub gherrit_bin_path: PathBuf,
+    test_environment: TestEnvironment,
     next_git_timestamp: AtomicU64,
     pub mock_server: Option<MockServerInfo>,
     pub mock_server_state: Option<Arc<RwLock<mock_server::MockState>>>,
+}
+
+#[derive(Clone)]
+struct TestEnvironment {
+    variables: Vec<(OsString, OsString)>,
+}
+
+impl TestEnvironment {
+    fn new(root: &Path, system_git: &Path) -> Self {
+        let home = root.join("home");
+        let temporary_directory = root.join("tmp");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&temporary_directory).unwrap();
+
+        let git_config = home.join("gitconfig");
+        fs::write(
+            &git_config,
+            "[color]\n\tui = false\n[commit]\n\tgpgSign = false\n[tag]\n\tgpgSign = false\n",
+        )
+        .unwrap();
+
+        let mut paths = vec![root.to_path_buf()];
+        if let Some(parent) = system_git.parent() {
+            push_unique_path(&mut paths, parent);
+        }
+
+        #[cfg(unix)]
+        for path in ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+            push_unique_path(&mut paths, Path::new(path));
+        }
+
+        let mut variables = vec![
+            (OsString::from("HOME"), home.clone().into_os_string()),
+            (OsString::from("XDG_CONFIG_HOME"), home.join(".config").into_os_string()),
+            (OsString::from("TMPDIR"), temporary_directory.clone().into_os_string()),
+            (OsString::from("TMP"), temporary_directory.clone().into_os_string()),
+            (OsString::from("TEMP"), temporary_directory.into_os_string()),
+            (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+            (OsString::from("GIT_CONFIG_GLOBAL"), git_config.into_os_string()),
+            (OsString::from("GIT_ATTR_NOSYSTEM"), OsString::from("1")),
+            (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
+            (OsString::from("GCM_INTERACTIVE"), OsString::from("never")),
+            (OsString::from("GIT_PAGER"), OsString::from("cat")),
+            (OsString::from("PAGER"), OsString::from("cat")),
+            (OsString::from("GIT_EDITOR"), OsString::from("true")),
+            (OsString::from("GIT_SEQUENCE_EDITOR"), OsString::from("true")),
+            (OsString::from("LANG"), OsString::from("C")),
+            (OsString::from("LC_ALL"), OsString::from("C")),
+            (OsString::from("TZ"), OsString::from("UTC")),
+            (OsString::from("TERM"), OsString::from("dumb")),
+            (OsString::from("NO_COLOR"), OsString::from("1")),
+            (OsString::from("RUST_LOG"), OsString::from("info")),
+            (OsString::from("RUST_BACKTRACE"), OsString::from("0")),
+            (OsString::from("NO_PROXY"), OsString::from("127.0.0.1,localhost")),
+            (OsString::from("no_proxy"), OsString::from("127.0.0.1,localhost")),
+        ];
+
+        // Preserve only process-instrumentation settings needed to run the
+        // already-built test binaries. These do not provide developer or CI
+        // configuration to GHerrit, but dropping them would make coverage and
+        // sanitizer runs silently incomplete or unable to start.
+        for name in [
+            "LLVM_PROFILE_FILE",
+            "ASAN_OPTIONS",
+            "LSAN_OPTIONS",
+            "MSAN_OPTIONS",
+            "TSAN_OPTIONS",
+            "UBSAN_OPTIONS",
+        ] {
+            if let Some(value) = env::var_os(name) {
+                variables.push((OsString::from(name), value));
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(value) = env::var_os("LD_LIBRARY_PATH") {
+            variables.push((OsString::from("LD_LIBRARY_PATH"), value));
+        }
+
+        #[cfg(target_os = "macos")]
+        for name in ["DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"] {
+            if let Some(value) = env::var_os(name) {
+                variables.push((OsString::from(name), value));
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            if let Some(system_root) = env::var_os("SystemRoot") {
+                let system_root = PathBuf::from(system_root);
+                push_unique_path(&mut paths, &system_root.join("System32"));
+                variables
+                    .push((OsString::from("SystemRoot"), system_root.clone().into_os_string()));
+                variables.push((OsString::from("WINDIR"), system_root.clone().into_os_string()));
+                let command_processor = env::var_os("COMSPEC")
+                    .unwrap_or_else(|| system_root.join("System32/cmd.exe").into_os_string());
+                variables.push((OsString::from("COMSPEC"), command_processor));
+            }
+
+            if let Some(git_root) = system_git.parent().and_then(Path::parent) {
+                push_unique_path(&mut paths, &git_root.join("mingw64/bin"));
+                push_unique_path(&mut paths, &git_root.join("usr/bin"));
+            }
+            variables.push((OsString::from("PATHEXT"), OsString::from(".COM;.EXE;.BAT;.CMD")));
+        }
+
+        variables.push((OsString::from("PATH"), env::join_paths(paths).unwrap()));
+        Self { variables }
+    }
+
+    fn apply_to_assert_cmd(&self, cmd: &mut assert_cmd::Command) {
+        cmd.env_clear();
+        cmd.envs(self.variables.iter().cloned());
+    }
+
+    fn command(&self, program: &Path) -> assert_cmd::Command {
+        let mut cmd = assert_cmd::Command::new(program);
+        self.apply_to_assert_cmd(&mut cmd);
+        cmd
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: &Path) {
+    if !paths.iter().any(|existing| existing == path) {
+        paths.push(path.to_path_buf());
+    }
 }
 
 pub struct MockServerInfo {
@@ -239,7 +368,9 @@ impl Drop for TestContext {
 }
 
 impl TestContext {
-    fn configure_mock_env(&self, cmd: &mut assert_cmd::Command) {
+    fn configure_test_env(&self, cmd: &mut assert_cmd::Command) {
+        self.test_environment.apply_to_assert_cmd(cmd);
+
         // Give each command a deterministic, unique timestamp. In particular,
         // this ensures an otherwise-empty amend creates a distinct Git object.
         let timestamp = self.next_git_timestamp.fetch_add(1, Ordering::Relaxed);
@@ -248,17 +379,13 @@ impl TestContext {
         cmd.env("GIT_COMMITTER_DATE", &git_date);
 
         if !self.is_live {
-            // Prepend temp dir to PATH so 'gh' and 'git' resolve to our mock
-            let mut paths = vec![self.dir.path().to_path_buf()];
-            paths.extend(env::split_paths(&env::var_os("PATH").unwrap()));
-
-            let new_path_str = env::join_paths(paths).unwrap();
-            cmd.env("PATH", new_path_str);
             cmd.env("SYSTEM_GIT_PATH", &self.system_git);
 
             if let Some(server) = &self.mock_server {
                 cmd.env("GHERRIT_MOCK_SERVER_URL", &server.url);
             }
+        } else if let Some(token) = env::var_os("GITHUB_TOKEN") {
+            cmd.env("GITHUB_TOKEN", token);
         }
     }
 
@@ -268,7 +395,7 @@ impl TestContext {
         let mut cmd = assert_cmd::Command::new(&self.gherrit_bin_path);
         cmd.current_dir(&self.repo_path);
 
-        self.configure_mock_env(&mut cmd);
+        self.configure_test_env(&mut cmd);
 
         if !self.is_live {
             if let Some(server) = &self.mock_server {
@@ -284,7 +411,7 @@ impl TestContext {
     pub fn remote_git_cmd(&self) -> assert_cmd::Command {
         let mut cmd = assert_cmd::Command::new(&self.system_git);
         cmd.current_dir(&self.remote_path);
-        self.configure_mock_env(&mut cmd);
+        self.configure_test_env(&mut cmd);
         cmd
     }
 
@@ -296,7 +423,7 @@ impl TestContext {
     pub fn git_cmd(&self) -> assert_cmd::Command {
         let mut cmd = assert_cmd::Command::new("git");
         cmd.current_dir(&self.repo_path);
-        self.configure_mock_env(&mut cmd);
+        self.configure_test_env(&mut cmd);
         cmd
     }
 
@@ -427,6 +554,10 @@ impl TestContext {
             .lines()
             .map(ToString::to_string)
             .collect()
+    }
+
+    pub fn init_bare_repo(&self, path: &Path) {
+        init_git_bare_repo(&self.test_environment, &self.system_git, path);
     }
 
     pub fn count_successfully_pushed_containing(&self, substring: &str) -> usize {
@@ -655,6 +786,22 @@ mod tests {
 
         assert_eq!(output, "[BASE_SHA] [SHA_1] [BASE_SHA]");
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_environment_clears_inherited_values() {
+        let root = TempDir::new().unwrap();
+        let environment = TestEnvironment::new(root.path(), SYSTEM_GIT.as_path());
+        let mut command = assert_cmd::Command::new("/usr/bin/env");
+        command.env("SHOULD_BE_CLEARED", "yes");
+        environment.apply_to_assert_cmd(&mut command);
+
+        let assert = command.assert().success();
+        let output = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        assert!(!output.contains("SHOULD_BE_CLEARED="));
+        assert!(output.lines().any(|line| line == "RUST_LOG=info"));
+        assert!(output.lines().any(|line| line.starts_with("HOME=")));
+    }
 }
 
 #[macro_export]
@@ -686,8 +833,8 @@ macro_rules! assert_pr_snapshot {
     };
 }
 
-fn run_git_cmd(path: &Path, args: &[&str]) {
-    assert_cmd::Command::new("git").current_dir(path).args(args).assert().success();
+fn run_git_cmd(environment: &TestEnvironment, system_git: &Path, path: &Path, args: &[&str]) {
+    environment.command(system_git).current_dir(path).args(args).assert().success();
 }
 
 pub fn install_mock_binaries(path: &Path, mock_bin: &Path, gherrit_bin: &Path) {
@@ -698,23 +845,29 @@ pub fn install_mock_binaries(path: &Path, mock_bin: &Path, gherrit_bin: &Path) {
     fs::copy(gherrit_bin, &gherrit_dst).unwrap();
 }
 
-pub fn init_git_bare_repo(path: &Path) {
+fn init_git_bare_repo(environment: &TestEnvironment, system_git: &Path, path: &Path) {
     fs::create_dir(path).unwrap();
-    run_git_cmd(path, &["init", "--bare"]);
+    run_git_cmd(environment, system_git, path, &["init", "--bare"]);
 }
 
-fn init_git_repo(path: &Path, remote_path: &Path) {
-    run_git_cmd(path, &["init"]);
-    run_git_cmd(path, &["config", "core.hooksPath", ".git/hooks"]);
+fn init_git_repo(
+    environment: &TestEnvironment,
+    system_git: &Path,
+    path: &Path,
+    remote_path: &Path,
+) {
+    let run = |args| run_git_cmd(environment, system_git, path, args);
+    run(&["init"]);
+    run(&["config", "core.hooksPath", ".git/hooks"]);
     // Must config user identity for commits to work
-    run_git_cmd(path, &["config", "user.email", "test@example.com"]);
-    run_git_cmd(path, &["config", "user.name", "Test User"]);
+    run(&["config", "user.email", "test@example.com"]);
+    run(&["config", "user.name", "Test User"]);
     // Ensure default branch is main
-    run_git_cmd(path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
     // Explicitly unmanage main to satisfy strict config checks
-    run_git_cmd(path, &["config", "branch.main.gherritManaged", "false"]);
+    run(&["config", "branch.main.gherritManaged", "false"]);
     // Add origin remote
-    run_git_cmd(path, &["remote", "add", "origin", remote_path.to_str().unwrap()]);
+    run(&["remote", "add", "origin", remote_path.to_str().unwrap()]);
 }
 
 static SYSTEM_GIT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
