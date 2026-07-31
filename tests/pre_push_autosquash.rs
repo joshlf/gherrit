@@ -24,7 +24,11 @@ fn test_autosquash_prefixes() {
     // ensures that even if a user creates these commits manually or via other
     // tools, GHerrit will catch them before they reach the remote.
 
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .build();
 
     let prefixes = ["fixup!", "squash!", "amend!"];
     for prefix in prefixes {
@@ -55,7 +59,11 @@ fn test_buried_autosquash_commit() {
     //
     // Even though HEAD (Commit C) is clean, the push includes Commit B, so it
     // must fail.
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .build();
     ctx.checkout_new("feature-buried");
 
     // 1. Commit A
@@ -81,7 +89,11 @@ fn test_precedence_over_trailer_check() {
     // definition temporary/incomplete, so it doesn't matter if it has a valid
     // ID or not.
 
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .build();
     ctx.checkout_new("feature-precedence");
 
     // Create a fixup commit that ALSO has a valid trailer. Normally, a trailer
@@ -108,7 +120,7 @@ fn test_dynamic_remote_and_branch_suggestion() {
     //
     //   git rebase -i --autosquash upstream/master
 
-    let ctx = testutil::test_context_minimal!().build();
+    let ctx = testutil::test_context!().with_installed_hooks().build();
 
     // Configure default branch to be 'master' to test dynamic branch name
     // detection.
@@ -135,8 +147,6 @@ fn test_dynamic_remote_and_branch_suggestion() {
     ctx.run_git(&["config", "gherrit.remote", "upstream"]);
 
     // Install hooks manually since we didn't use init_and_install_hooks
-    ctx.install_hooks();
-
     ctx.commit("Initial commit");
     ctx.checkout_new("feature-dynamic");
 
@@ -152,7 +162,12 @@ fn test_dynamic_remote_and_branch_suggestion() {
 fn test_valid_stack_passes() {
     // Control group test: standard, valid commits should pass without issues.
 
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .build();
     ctx.checkout_new("feature-valid");
 
     // Stack of 3 normal commits
