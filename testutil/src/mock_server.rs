@@ -761,6 +761,238 @@ fn remote_branch_exists(app_state: &AppState, branch: &str) -> Result<bool, Stri
     }
 }
 
+fn extract_input_field<'a>(
+    field: &'a executable::Field,
+    arg_name: &str,
+) -> Option<&'a Vec<(Name, Node<ast::Value>)>> {
+    field.arguments.iter().find(|arg| arg.name == arg_name).and_then(|arg| {
+        if let ast::Value::Object(obj) = &*arg.value {
+            Some(obj)
+        } else {
+            None
+        }
+    })
+}
+
+fn get_string_field(obj: &[(Name, Node<ast::Value>)], key: &str) -> Option<String> {
+    obj.iter().find(|(k, _)| k == key).and_then(|(_, v)| {
+        if let ast::Value::String(s) = &**v {
+            Some(s.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn required_string_field(
+    input: &[(Name, Node<ast::Value>)],
+    key: &str,
+    path: &str,
+) -> Result<String, String> {
+    get_string_field(input, key)
+        .ok_or_else(|| format!("The mock GitHub API requires string field `{path}.input.{key}`"))
+}
+
+fn handle_update_pr(
+    mock_state: &mut MockState,
+    field: &executable::Field,
+    branch_exists: &dyn Fn(&str) -> Result<bool, String>,
+) -> Result<serde_json::Value, String> {
+    const PATH: &str = "updatePullRequest";
+    let input = input_object(field, PATH)?;
+    let node_id = required_string_field(input, "pullRequestId", PATH)?;
+    let title = get_string_field(input, "title");
+    let body = get_string_field(input, "body");
+    let base = get_string_field(input, "baseRefName");
+
+    if let Some(base) = &base {
+        if !branch_exists(base)? {
+            return Err(format!("Base branch `{base}` does not exist"));
+        }
+    }
+
+    let Some(pr) = mock_state.prs.iter_mut().find(|pr| pr.node_id == node_id) else {
+        return Err(format!("Pull request node `{node_id}` does not exist"));
+    };
+    if base.as_deref() == Some(pr.head.ref_field.as_str()) {
+        return Err("Pull request head and base branches must differ".to_string());
+    }
+    if mock_state.merge_queue.contains(&pr.id) && base.is_some() {
+        return Err("Pull request is in a merge queue and cannot be updated".to_string());
+    }
+
+    if let Some(title) = title {
+        pr.title = Some(title);
+    }
+    if let Some(body) = &body {
+        pr.body = Some(body.clone());
+    }
+    if let Some(base) = base {
+        pr.base.ref_field = base;
+    }
+
+    if body.as_deref().is_some_and(|body| body.contains("TRIGGER_GRAPHQL_NULL")) {
+        return Ok(serde_json::Value::Null);
+    }
+
+    let mut response = serde_json::Map::new();
+    for field in selected_fields(&field.selection_set, PATH)? {
+        match field.name.as_str() {
+            "clientMutationId" => {
+                response.insert(response_key(field), serde_json::Value::Null);
+            }
+            _ => unreachable!("request was checked by validate_update_field"),
+        }
+    }
+    Ok(serde_json::Value::Object(response))
+}
+
+fn handle_create_pr(
+    mock_state: &mut MockState,
+    field: &executable::Field,
+    branch_exists: &dyn Fn(&str) -> Result<bool, String>,
+) -> Result<serde_json::Value, String> {
+    const PATH: &str = "createPullRequest";
+    let input = input_object(field, PATH)?;
+    let repository_id = required_string_field(input, "repositoryId", PATH)?;
+    let base = required_string_field(input, "baseRefName", PATH)?;
+    let head = required_string_field(input, "headRefName", PATH)?;
+    let title = required_string_field(input, "title", PATH)?;
+    let body = get_string_field(input, "body").unwrap_or_default();
+
+    if repository_id != "REPO_NODE_ID" {
+        return Err(format!("Repository node `{repository_id}` does not exist"));
+    }
+    if base == head {
+        return Err("Pull request head and base branches must differ".to_string());
+    }
+    if !branch_exists(&base)? {
+        return Err(format!("Base branch `{base}` does not exist"));
+    }
+    if !branch_exists(&head)? {
+        return Err(format!("Head branch `{head}` does not exist"));
+    }
+    if mock_state.prs.iter().any(|pr| pr.state == "OPEN" && pr.head.ref_field == head) {
+        return Err(format!("An open pull request already exists for head branch `{head}`"));
+    }
+
+    let number = mock_state.prs.iter().map(|pr| pr.number as u64).max().unwrap_or(0) + 1;
+    let owner = mock_state.repo_owner.clone();
+    let repo = mock_state.repo_name.clone();
+    let entry = PrEntry::mock(MockPrArgs {
+        id: number,
+        title,
+        body,
+        head,
+        base,
+        repo_owner: &owner,
+        repo_name: &repo,
+    });
+    let node_id = entry.node_id.clone();
+    let html_url = entry.html_url.clone();
+    mock_state.prs.push(entry);
+
+    let mut response = serde_json::Map::new();
+    for field in selected_fields(&field.selection_set, PATH)? {
+        match field.name.as_str() {
+            "clientMutationId" => {
+                response.insert(response_key(field), serde_json::Value::Null);
+            }
+            "pullRequest" => {
+                let mut pull_request = serde_json::Map::new();
+                for field in selected_fields(&field.selection_set, "createPullRequest.pullRequest")?
+                {
+                    let value = match field.name.as_str() {
+                        "number" => serde_json::json!(number),
+                        "url" => serde_json::json!(html_url),
+                        "id" => serde_json::json!(node_id),
+                        _ => unreachable!("request was checked by validate_create_field"),
+                    };
+                    pull_request.insert(response_key(field), value);
+                }
+                response.insert(response_key(field), serde_json::Value::Object(pull_request));
+            }
+            _ => unreachable!("request was checked by validate_create_field"),
+        }
+    }
+    Ok(serde_json::Value::Object(response))
+}
+
+fn handle_repository_query(
+    mock_state: &MockState,
+    field: &executable::Field,
+    variables: &GraphQlVariables,
+) -> Result<serde_json::Value, String> {
+    const PATH: &str = "repository";
+    let owner = resolve_string_argument(field, "owner", PATH, variables)?;
+    let name = resolve_string_argument(field, "name", PATH, variables)?;
+
+    if owner != mock_state.repo_owner || name != mock_state.repo_name {
+        return Ok(serde_json::Value::Null);
+    }
+
+    let mut repo_data = serde_json::Map::new();
+
+    for field in selected_fields(&field.selection_set, PATH)? {
+        match field.name.as_str() {
+            "pullRequests" => {
+                let head = resolve_string_argument(
+                    field,
+                    "headRefName",
+                    "repository.pullRequests",
+                    variables,
+                )?;
+                let matching_prs: Vec<_> =
+                    mock_state.prs.iter().filter(|pr| pr.head.ref_field == head).take(1).collect();
+
+                let mut connection = serde_json::Map::new();
+                for field in selected_fields(&field.selection_set, "repository.pullRequests")? {
+                    match field.name.as_str() {
+                        "nodes" => {
+                            let nodes = matching_prs
+                                .iter()
+                                .map(|pr| project_pr_node(pr, &field.selection_set))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            connection.insert(response_key(field), serde_json::json!(nodes));
+                        }
+                        _ => unreachable!("request was checked by validate_pull_requests_field"),
+                    }
+                }
+                repo_data.insert(response_key(field), serde_json::Value::Object(connection));
+            }
+            "id" => {
+                repo_data.insert(
+                    response_key(field),
+                    serde_json::Value::String("REPO_NODE_ID".to_string()),
+                );
+            }
+            _ => unreachable!("request was checked by validate_repository_field"),
+        }
+    }
+
+    Ok(serde_json::Value::Object(repo_data))
+}
+
+fn project_pr_node(
+    pr: &PrEntry,
+    selection_set: &executable::SelectionSet,
+) -> Result<serde_json::Value, String> {
+    let mut node = serde_json::Map::new();
+    for field in selected_fields(selection_set, "repository.pullRequests.nodes")? {
+        let value = match field.name.as_str() {
+            "number" => serde_json::json!(pr.number),
+            "id" => serde_json::json!(pr.node_id),
+            "title" => serde_json::json!(pr.title),
+            "body" => serde_json::json!(pr.body),
+            "baseRefName" => serde_json::json!(pr.base.ref_field),
+            "state" => serde_json::json!(pr.state),
+            _ => unreachable!("request was checked by validate_pull_requests_field"),
+        };
+        node.insert(response_key(field), value);
+    }
+    Ok(serde_json::Value::Object(node))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,236 +1246,4 @@ mod tests {
         let error = handle_update_pr(&mut state, root_field(&update), &|_| Ok(true)).unwrap_err();
         assert!(error.contains("head and base branches must differ"));
     }
-}
-
-fn extract_input_field<'a>(
-    field: &'a executable::Field,
-    arg_name: &str,
-) -> Option<&'a Vec<(Name, Node<ast::Value>)>> {
-    field.arguments.iter().find(|arg| arg.name == arg_name).and_then(|arg| {
-        if let ast::Value::Object(obj) = &*arg.value {
-            Some(obj)
-        } else {
-            None
-        }
-    })
-}
-
-fn get_string_field(obj: &[(Name, Node<ast::Value>)], key: &str) -> Option<String> {
-    obj.iter().find(|(k, _)| k == key).and_then(|(_, v)| {
-        if let ast::Value::String(s) = &**v {
-            Some(s.to_string())
-        } else {
-            None
-        }
-    })
-}
-
-fn required_string_field(
-    input: &[(Name, Node<ast::Value>)],
-    key: &str,
-    path: &str,
-) -> Result<String, String> {
-    get_string_field(input, key)
-        .ok_or_else(|| format!("The mock GitHub API requires string field `{path}.input.{key}`"))
-}
-
-fn handle_update_pr(
-    mock_state: &mut MockState,
-    field: &executable::Field,
-    branch_exists: &dyn Fn(&str) -> Result<bool, String>,
-) -> Result<serde_json::Value, String> {
-    const PATH: &str = "updatePullRequest";
-    let input = input_object(field, PATH)?;
-    let node_id = required_string_field(input, "pullRequestId", PATH)?;
-    let title = get_string_field(input, "title");
-    let body = get_string_field(input, "body");
-    let base = get_string_field(input, "baseRefName");
-
-    if let Some(base) = &base {
-        if !branch_exists(base)? {
-            return Err(format!("Base branch `{base}` does not exist"));
-        }
-    }
-
-    let Some(pr) = mock_state.prs.iter_mut().find(|pr| pr.node_id == node_id) else {
-        return Err(format!("Pull request node `{node_id}` does not exist"));
-    };
-    if base.as_deref() == Some(pr.head.ref_field.as_str()) {
-        return Err("Pull request head and base branches must differ".to_string());
-    }
-    if mock_state.merge_queue.contains(&pr.id) && base.is_some() {
-        return Err("Pull request is in a merge queue and cannot be updated".to_string());
-    }
-
-    if let Some(title) = title {
-        pr.title = Some(title);
-    }
-    if let Some(body) = &body {
-        pr.body = Some(body.clone());
-    }
-    if let Some(base) = base {
-        pr.base.ref_field = base;
-    }
-
-    if body.as_deref().is_some_and(|body| body.contains("TRIGGER_GRAPHQL_NULL")) {
-        return Ok(serde_json::Value::Null);
-    }
-
-    let mut response = serde_json::Map::new();
-    for field in selected_fields(&field.selection_set, PATH)? {
-        match field.name.as_str() {
-            "clientMutationId" => {
-                response.insert(response_key(field), serde_json::Value::Null);
-            }
-            _ => unreachable!("request was checked by validate_update_field"),
-        }
-    }
-    Ok(serde_json::Value::Object(response))
-}
-
-fn handle_create_pr(
-    mock_state: &mut MockState,
-    field: &executable::Field,
-    branch_exists: &dyn Fn(&str) -> Result<bool, String>,
-) -> Result<serde_json::Value, String> {
-    const PATH: &str = "createPullRequest";
-    let input = input_object(field, PATH)?;
-    let repository_id = required_string_field(input, "repositoryId", PATH)?;
-    let base = required_string_field(input, "baseRefName", PATH)?;
-    let head = required_string_field(input, "headRefName", PATH)?;
-    let title = required_string_field(input, "title", PATH)?;
-    let body = get_string_field(input, "body").unwrap_or_default();
-
-    if repository_id != "REPO_NODE_ID" {
-        return Err(format!("Repository node `{repository_id}` does not exist"));
-    }
-    if base == head {
-        return Err("Pull request head and base branches must differ".to_string());
-    }
-    if !branch_exists(&base)? {
-        return Err(format!("Base branch `{base}` does not exist"));
-    }
-    if !branch_exists(&head)? {
-        return Err(format!("Head branch `{head}` does not exist"));
-    }
-    if mock_state.prs.iter().any(|pr| pr.state == "OPEN" && pr.head.ref_field == head) {
-        return Err(format!("An open pull request already exists for head branch `{head}`"));
-    }
-
-    let number = mock_state.prs.iter().map(|pr| pr.number as u64).max().unwrap_or(0) + 1;
-    let owner = mock_state.repo_owner.clone();
-    let repo = mock_state.repo_name.clone();
-    let entry = PrEntry::mock(MockPrArgs {
-        id: number,
-        title,
-        body,
-        head,
-        base,
-        repo_owner: &owner,
-        repo_name: &repo,
-    });
-    let node_id = entry.node_id.clone();
-    let html_url = entry.html_url.clone();
-    mock_state.prs.push(entry);
-
-    let mut response = serde_json::Map::new();
-    for field in selected_fields(&field.selection_set, PATH)? {
-        match field.name.as_str() {
-            "clientMutationId" => {
-                response.insert(response_key(field), serde_json::Value::Null);
-            }
-            "pullRequest" => {
-                let mut pull_request = serde_json::Map::new();
-                for field in selected_fields(&field.selection_set, "createPullRequest.pullRequest")?
-                {
-                    let value = match field.name.as_str() {
-                        "number" => serde_json::json!(number),
-                        "url" => serde_json::json!(html_url),
-                        "id" => serde_json::json!(node_id),
-                        _ => unreachable!("request was checked by validate_create_field"),
-                    };
-                    pull_request.insert(response_key(field), value);
-                }
-                response.insert(response_key(field), serde_json::Value::Object(pull_request));
-            }
-            _ => unreachable!("request was checked by validate_create_field"),
-        }
-    }
-    Ok(serde_json::Value::Object(response))
-}
-
-fn handle_repository_query(
-    mock_state: &MockState,
-    field: &executable::Field,
-    variables: &GraphQlVariables,
-) -> Result<serde_json::Value, String> {
-    const PATH: &str = "repository";
-    let owner = resolve_string_argument(field, "owner", PATH, variables)?;
-    let name = resolve_string_argument(field, "name", PATH, variables)?;
-
-    if owner != mock_state.repo_owner || name != mock_state.repo_name {
-        return Ok(serde_json::Value::Null);
-    }
-
-    let mut repo_data = serde_json::Map::new();
-
-    for field in selected_fields(&field.selection_set, PATH)? {
-        match field.name.as_str() {
-            "pullRequests" => {
-                let head = resolve_string_argument(
-                    field,
-                    "headRefName",
-                    "repository.pullRequests",
-                    variables,
-                )?;
-                let matching_prs: Vec<_> =
-                    mock_state.prs.iter().filter(|pr| pr.head.ref_field == head).take(1).collect();
-
-                let mut connection = serde_json::Map::new();
-                for field in selected_fields(&field.selection_set, "repository.pullRequests")? {
-                    match field.name.as_str() {
-                        "nodes" => {
-                            let nodes = matching_prs
-                                .iter()
-                                .map(|pr| project_pr_node(pr, &field.selection_set))
-                                .collect::<Result<Vec<_>, _>>()?;
-                            connection.insert(response_key(field), serde_json::json!(nodes));
-                        }
-                        _ => unreachable!("request was checked by validate_pull_requests_field"),
-                    }
-                }
-                repo_data.insert(response_key(field), serde_json::Value::Object(connection));
-            }
-            "id" => {
-                repo_data.insert(
-                    response_key(field),
-                    serde_json::Value::String("REPO_NODE_ID".to_string()),
-                );
-            }
-            _ => unreachable!("request was checked by validate_repository_field"),
-        }
-    }
-
-    Ok(serde_json::Value::Object(repo_data))
-}
-
-fn project_pr_node(
-    pr: &PrEntry,
-    selection_set: &executable::SelectionSet,
-) -> Result<serde_json::Value, String> {
-    let mut node = serde_json::Map::new();
-    for field in selected_fields(selection_set, "repository.pullRequests.nodes")? {
-        let value = match field.name.as_str() {
-            "number" => serde_json::json!(pr.number),
-            "id" => serde_json::json!(pr.node_id),
-            "title" => serde_json::json!(pr.title),
-            "body" => serde_json::json!(pr.body),
-            "baseRefName" => serde_json::json!(pr.base.ref_field),
-            "state" => serde_json::json!(pr.state),
-            _ => unreachable!("request was checked by validate_pull_requests_field"),
-        };
-        node.insert(response_key(field), value);
-    }
-    Ok(serde_json::Value::Object(node))
 }

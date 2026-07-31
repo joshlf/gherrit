@@ -824,79 +824,6 @@ fn apply_literal_redactions<'a>(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn identity_redaction_preserves_equality_and_order() {
-        let regex = Regex::new(r"G[a-z0-9]+").unwrap();
-        let output = redact_identities("Galpha Gbeta Galpha Ggamma Gbeta", &regex, "ID");
-
-        assert_eq!(output, "[ID_1] [ID_2] [ID_1] [ID_3] [ID_2]");
-    }
-
-    #[test]
-    fn identity_namespaces_are_independent() {
-        let sha_regex = Regex::new(r"[0-9a-f]{40}").unwrap();
-        let id_regex = Regex::new(r"G[a-z0-9]+").unwrap();
-        let first_sha = "1111111111111111111111111111111111111111";
-        let second_sha = "2222222222222222222222222222222222222222";
-        let output = format!("{first_sha} Gone {second_sha} Gtwo {first_sha} Gtwo");
-        let output = redact_identities(&output, &sha_regex, "SHA");
-        let output = redact_identities(&output, &id_regex, "GHERRIT_ID");
-
-        assert_eq!(output, "[SHA_1] [GHERRIT_ID_1] [SHA_2] [GHERRIT_ID_2] [SHA_1] [GHERRIT_ID_2]");
-    }
-
-    #[test]
-    fn literal_redactions_take_precedence_over_identity_redaction() {
-        let regex = Regex::new(r"[0-9a-f]{40}").unwrap();
-        let base_sha = "1111111111111111111111111111111111111111";
-        let other_sha = "2222222222222222222222222222222222222222";
-        let output = format!("{base_sha} {other_sha} {base_sha}");
-        let output = apply_literal_redactions(&output, [(base_sha, "[BASE_SHA]")]);
-        let output = redact_identities(&output, &regex, "SHA");
-
-        assert_eq!(output, "[BASE_SHA] [SHA_1] [BASE_SHA]");
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_environment_clears_inherited_values() {
-        let root = TempDir::new().unwrap();
-        let environment = TestEnvironment::new(root.path(), SYSTEM_GIT.as_path());
-        let mut command = assert_cmd::Command::new("/usr/bin/env");
-        command.env("SHOULD_BE_CLEARED", "yes");
-        environment.apply_to_assert_cmd(&mut command);
-
-        let assert = command.assert().success();
-        let output = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-        assert!(!output.contains("SHOULD_BE_CLEARED="));
-        assert!(output.lines().any(|line| line == "RUST_LOG=info"));
-        assert!(output.lines().any(|line| line.starts_with("HOME=")));
-    }
-
-    #[test]
-    fn dropping_mock_server_waits_for_state_release() {
-        let state = Arc::new(RwLock::new(mock_server::MockState::default()));
-        let weak_state = Arc::downgrade(&state);
-        let test_dir = TempDir::new().unwrap();
-        let system_git = SYSTEM_GIT.clone();
-        let test_environment = TestEnvironment::new(test_dir.path(), &system_git);
-        let server = MockServerInfo::start(
-            state,
-            test_dir.path().join("remote.git"),
-            system_git,
-            test_environment,
-        );
-
-        assert!(weak_state.upgrade().is_some());
-        drop(server);
-        assert!(weak_state.upgrade().is_none(), "mock server retained state after teardown");
-    }
-}
-
 #[macro_export]
 macro_rules! assert_success_snapshot {
     ($ctx:expr, $cmd:expr, $name:expr $(,)?) => {
@@ -980,3 +907,76 @@ static SYSTEM_GIT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
     let path = stdout.lines().next().expect("No git path found").trim();
     PathBuf::from(path)
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_redaction_preserves_equality_and_order() {
+        let regex = Regex::new(r"G[a-z0-9]+").unwrap();
+        let output = redact_identities("Galpha Gbeta Galpha Ggamma Gbeta", &regex, "ID");
+
+        assert_eq!(output, "[ID_1] [ID_2] [ID_1] [ID_3] [ID_2]");
+    }
+
+    #[test]
+    fn identity_namespaces_are_independent() {
+        let sha_regex = Regex::new(r"[0-9a-f]{40}").unwrap();
+        let id_regex = Regex::new(r"G[a-z0-9]+").unwrap();
+        let first_sha = "1111111111111111111111111111111111111111";
+        let second_sha = "2222222222222222222222222222222222222222";
+        let output = format!("{first_sha} Gone {second_sha} Gtwo {first_sha} Gtwo");
+        let output = redact_identities(&output, &sha_regex, "SHA");
+        let output = redact_identities(&output, &id_regex, "GHERRIT_ID");
+
+        assert_eq!(output, "[SHA_1] [GHERRIT_ID_1] [SHA_2] [GHERRIT_ID_2] [SHA_1] [GHERRIT_ID_2]");
+    }
+
+    #[test]
+    fn literal_redactions_take_precedence_over_identity_redaction() {
+        let regex = Regex::new(r"[0-9a-f]{40}").unwrap();
+        let base_sha = "1111111111111111111111111111111111111111";
+        let other_sha = "2222222222222222222222222222222222222222";
+        let output = format!("{base_sha} {other_sha} {base_sha}");
+        let output = apply_literal_redactions(&output, [(base_sha, "[BASE_SHA]")]);
+        let output = redact_identities(&output, &regex, "SHA");
+
+        assert_eq!(output, "[BASE_SHA] [SHA_1] [BASE_SHA]");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_environment_clears_inherited_values() {
+        let root = TempDir::new().unwrap();
+        let environment = TestEnvironment::new(root.path(), SYSTEM_GIT.as_path());
+        let mut command = assert_cmd::Command::new("/usr/bin/env");
+        command.env("SHOULD_BE_CLEARED", "yes");
+        environment.apply_to_assert_cmd(&mut command);
+
+        let assert = command.assert().success();
+        let output = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        assert!(!output.contains("SHOULD_BE_CLEARED="));
+        assert!(output.lines().any(|line| line == "RUST_LOG=info"));
+        assert!(output.lines().any(|line| line.starts_with("HOME=")));
+    }
+
+    #[test]
+    fn dropping_mock_server_waits_for_state_release() {
+        let state = Arc::new(RwLock::new(mock_server::MockState::default()));
+        let weak_state = Arc::downgrade(&state);
+        let test_dir = TempDir::new().unwrap();
+        let system_git = SYSTEM_GIT.clone();
+        let test_environment = TestEnvironment::new(test_dir.path(), &system_git);
+        let server = MockServerInfo::start(
+            state,
+            test_dir.path().join("remote.git"),
+            system_git,
+            test_environment,
+        );
+
+        assert!(weak_state.upgrade().is_some());
+        drop(server);
+        assert!(weak_state.upgrade().is_none(), "mock server retained state after teardown");
+    }
+}
