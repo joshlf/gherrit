@@ -1129,12 +1129,33 @@ where
         let data = json_get!(response["data"])?;
 
         for (i, item) in chunk.iter().enumerate() {
-            if let Some(op_data) = data.get(alias(i)) {
-                response_handler(item, op_data)?;
-            }
+            let alias = alias(i);
+            let op_data = graphql_operation(data, &alias)?;
+            response_handler(item, op_data)?;
         }
 
         cursor = end;
     }
     Ok(())
+}
+
+fn graphql_operation<'a>(
+    data: &'a serde_json::Value,
+    alias: &str,
+) -> Result<&'a serde_json::Value> {
+    data.get(alias).ok_or_else(|| eyre!("GraphQL response is missing operation `{alias}`"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_graphql_operation_is_an_error() {
+        let data = serde_json::json!({ "op0": { "clientMutationId": null } });
+
+        assert!(graphql_operation(&data, "op0").is_ok());
+        let error = graphql_operation(&data, "op1").unwrap_err();
+        assert_eq!(error.to_string(), "GraphQL response is missing operation `op1`");
+    }
 }
