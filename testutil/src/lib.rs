@@ -1,20 +1,27 @@
 use std::{
+    any::Any,
     collections::HashMap,
     env,
     ffi::OsString,
-    fs,
+    fmt, fs, panic,
     path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError},
         Arc, LazyLock, RwLock,
     },
+    thread,
+    time::Duration,
 };
 
 use regex::Regex;
 use tempfile::TempDir;
 
+mod command;
 pub mod mock_server;
+
+pub use command::TestCommand;
 
 pub const DEFAULT_OWNER: &str = "owner";
 pub const DEFAULT_REPO: &str = "repo";
@@ -22,6 +29,9 @@ pub const MANAGED_PRIVATE: &str = "managedPrivate";
 pub const MANAGED_PUBLIC: &str = "managedPublic";
 
 const FIRST_GIT_TIMESTAMP: u64 = 946_684_800;
+const MOCK_BIN_BUILD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MOCK_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const MOCK_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[macro_export]
 macro_rules! test_context {
@@ -37,18 +47,15 @@ pub fn build_mock_bin() -> PathBuf {
         let target_dir = manifest_dir.parent().unwrap().join("target").join("mock_bin_build");
 
         eprintln!("Building mock_bin at {:?}", manifest_dir);
-        let status = Command::new("cargo")
+        TestCommand::new("cargo")
             .args(["build", "--bin", "mock_bin"])
             .arg("--manifest-path")
             .arg(manifest_dir.join("Cargo.toml"))
             .arg("--target-dir")
             .arg(&target_dir)
-            .status()
-            .expect("Failed to execute cargo build for mock_bin");
-
-        if !status.success() {
-            panic!("Failed to build mock_bin. See stdout/stderr for details.");
-        }
+            .timeout(MOCK_BIN_BUILD_TIMEOUT)
+            .assert()
+            .success();
 
         target_dir.join("debug").join(if cfg!(windows) { "mock_bin.exe" } else { "mock_bin" })
     });
@@ -124,7 +131,7 @@ impl TestContextBuilder {
             panic!("Missing GHERRIT_TEST_BUILD environment variable");
         }
 
-        let dir = TempDir::new().unwrap();
+        let dir = Arc::new(TempDir::new().unwrap());
         let system_git = SYSTEM_GIT.clone();
         let test_environment = TestEnvironment::new(dir.path(), &system_git);
         let repo_path = dir.path().join("local");
@@ -158,37 +165,13 @@ impl TestContextBuilder {
             let state = Arc::new(RwLock::new(state));
             mock_server_state = Some(state.clone());
 
-            // Spawn the server on a separate thread to avoid blocking the main
-            // test thread. This ensures the runtime persists for the duration
-            // of the test context.
-
-            let (tx, rx) = std::sync::mpsc::channel();
-            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-            let state_for_server = state.clone();
-            let remote_path_for_server = remote_path.clone();
-            let system_git_for_server = system_git.clone();
-            let git_environment_for_server = test_environment.variables.clone();
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("Failed to build runtime");
-
-                rt.block_on(async {
-                    let url = mock_server::start_mock_server(
-                        state_for_server,
-                        remote_path_for_server,
-                        system_git_for_server,
-                        git_environment_for_server,
-                    )
-                    .await;
-                    tx.send(url).expect("Failed to send mock server URL");
-                    let _ = shutdown_rx.await;
-                });
-            });
-
-            MockServerInfo { url: rx.recv().unwrap(), shutdown_tx }
+            MockServerInfo::start(
+                state,
+                remote_path.clone(),
+                system_git.clone(),
+                test_environment.clone(),
+                dir.clone(),
+            )
         });
 
         let ctx = TestContext {
@@ -222,7 +205,7 @@ impl TestContextBuilder {
 }
 
 pub struct TestContext {
-    pub dir: TempDir,
+    pub dir: Arc<TempDir>,
     pub repo_path: PathBuf,
     pub system_git: PathBuf,
     pub gherrit_bin_path: PathBuf,
@@ -344,14 +327,14 @@ impl TestEnvironment {
         Self { variables }
     }
 
-    fn apply_to_assert_cmd(&self, cmd: &mut assert_cmd::Command) {
+    fn apply_to_command(&self, cmd: &mut TestCommand) {
         cmd.env_clear();
         cmd.envs(self.variables.iter().cloned());
     }
 
-    fn command(&self, program: &Path) -> assert_cmd::Command {
-        let mut cmd = assert_cmd::Command::new(program);
-        self.apply_to_assert_cmd(&mut cmd);
+    fn command(&self, program: &Path) -> TestCommand {
+        let mut cmd = TestCommand::new(program);
+        self.apply_to_command(&mut cmd);
         cmd
     }
 }
@@ -364,7 +347,123 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: &Path) {
 
 pub struct MockServerInfo {
     pub url: String,
-    pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    completion_rx: Option<Receiver<thread::Result<()>>>,
+}
+
+enum MockServerStopError {
+    Panicked(Box<dyn Any + Send + 'static>),
+    TimedOut(Duration),
+    Disconnected,
+}
+
+impl fmt::Display for MockServerStopError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Panicked(_) => formatter.write_str("mock server thread panicked"),
+            Self::TimedOut(timeout) => {
+                write!(formatter, "mock server did not stop within {timeout:?}")
+            }
+            Self::Disconnected => {
+                formatter.write_str("mock server thread exited without reporting its result")
+            }
+        }
+    }
+}
+
+impl MockServerInfo {
+    fn start(
+        state: Arc<RwLock<mock_server::MockState>>,
+        remote_path: PathBuf,
+        system_git: PathBuf,
+        test_environment: TestEnvironment,
+        fixture_dir: Arc<TempDir>,
+    ) -> Self {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (completion_tx, completion_rx) = mpsc::channel();
+
+        thread::Builder::new()
+            .name("gherrit-mock-server".to_string())
+            .spawn(move || {
+                let result = panic::catch_unwind(panic::AssertUnwindSafe(move || {
+                    // Keep the fixture directory alive if this thread must be
+                    // detached after a pathological shutdown timeout.
+                    let _fixture_dir = fixture_dir;
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Failed to build mock server runtime");
+                    runtime.block_on(mock_server::run_mock_server(
+                        state,
+                        remote_path,
+                        system_git,
+                        test_environment,
+                        ready_tx,
+                        shutdown_rx,
+                    ));
+                }));
+                let _ = completion_tx.send(result);
+            })
+            .expect("Failed to spawn mock server thread");
+
+        let url = match ready_rx.recv_timeout(MOCK_SERVER_STARTUP_TIMEOUT) {
+            Ok(url) => url,
+            Err(startup_error) => match Self::stop(Some(shutdown_tx), &completion_rx) {
+                Ok(()) => panic!(
+                    "Mock server did not become ready within \
+                     {MOCK_SERVER_STARTUP_TIMEOUT:?}: {startup_error}"
+                ),
+                Err(MockServerStopError::Panicked(server_panic)) => {
+                    panic::resume_unwind(server_panic)
+                }
+                Err(stop_error) => panic!(
+                    "Mock server did not become ready within \
+                     {MOCK_SERVER_STARTUP_TIMEOUT:?}: {startup_error}; {stop_error}"
+                ),
+            },
+        };
+
+        Self { url, shutdown_tx: Some(shutdown_tx), completion_rx: Some(completion_rx) }
+    }
+
+    fn stop(
+        shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        completion_rx: &Receiver<thread::Result<()>>,
+    ) -> Result<(), MockServerStopError> {
+        if let Some(shutdown_tx) = shutdown_tx {
+            let _ = shutdown_tx.send(());
+        }
+
+        wait_for_server_completion(completion_rx, MOCK_SERVER_SHUTDOWN_TIMEOUT)
+    }
+}
+
+fn wait_for_server_completion(
+    completion_rx: &Receiver<thread::Result<()>>,
+    timeout: Duration,
+) -> Result<(), MockServerStopError> {
+    match completion_rx.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(server_panic)) => Err(MockServerStopError::Panicked(server_panic)),
+        Err(RecvTimeoutError::Timeout) => Err(MockServerStopError::TimedOut(timeout)),
+        Err(RecvTimeoutError::Disconnected) => Err(MockServerStopError::Disconnected),
+    }
+}
+
+impl Drop for MockServerInfo {
+    fn drop(&mut self) {
+        let completion_rx = self.completion_rx.take().expect("mock server completion receiver");
+        if let Err(error) = Self::stop(self.shutdown_tx.take(), &completion_rx) {
+            if thread::panicking() {
+                eprintln!("Mock server teardown also failed: {error}");
+            } else if let MockServerStopError::Panicked(server_panic) = error {
+                panic::resume_unwind(server_panic);
+            } else {
+                panic!("Mock server teardown failed: {error}");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -376,15 +475,14 @@ pub enum FailureKind {
 
 impl Drop for TestContext {
     fn drop(&mut self) {
-        if let Some(server) = self.mock_server.take() {
-            let _ = server.shutdown_tx.send(());
-        }
+        // Stop the server before fixture directories and state are released.
+        drop(self.mock_server.take());
     }
 }
 
 impl TestContext {
-    fn configure_test_env(&self, cmd: &mut assert_cmd::Command) {
-        self.test_environment.apply_to_assert_cmd(cmd);
+    fn configure_test_env(&self, cmd: &mut TestCommand) {
+        self.test_environment.apply_to_command(cmd);
 
         // Give each command a deterministic, unique timestamp. In particular,
         // this ensures an otherwise-empty amend creates a distinct Git object.
@@ -411,9 +509,9 @@ impl TestContext {
     }
 
     #[must_use = "command builders do nothing until executed"]
-    pub fn gherrit_cmd(&self) -> assert_cmd::Command {
+    pub fn gherrit_cmd(&self) -> TestCommand {
         // Use injected binary path
-        let mut cmd = assert_cmd::Command::new(&self.gherrit_bin_path);
+        let mut cmd = TestCommand::new(&self.gherrit_bin_path);
         cmd.current_dir(&self.repo_path);
 
         self.configure_test_env(&mut cmd);
@@ -422,9 +520,9 @@ impl TestContext {
     }
 
     #[must_use = "command builders do nothing until executed"]
-    pub fn remote_git_cmd(&self) -> assert_cmd::Command {
+    pub fn remote_git_cmd(&self) -> TestCommand {
         assert!(self.has_remote, "missing test capability: .with_remote()");
-        let mut cmd = assert_cmd::Command::new(&self.system_git);
+        let mut cmd = TestCommand::new(&self.system_git);
         cmd.current_dir(&self.remote_path);
         self.configure_test_env(&mut cmd);
         cmd
@@ -435,8 +533,8 @@ impl TestContext {
     }
 
     #[must_use = "command builders do nothing until executed"]
-    pub fn git_cmd(&self) -> assert_cmd::Command {
-        let mut cmd = assert_cmd::Command::new("git");
+    pub fn git_cmd(&self) -> TestCommand {
+        let mut cmd = TestCommand::new("git");
         cmd.current_dir(&self.repo_path);
         self.configure_test_env(&mut cmd);
         cmd
@@ -634,21 +732,21 @@ impl TestContext {
     }
 
     #[must_use = "command builders do nothing until executed"]
-    pub fn hook_cmd(&self, name: &str) -> assert_cmd::Command {
+    pub fn hook_cmd(&self, name: &str) -> TestCommand {
         let mut cmd = self.gherrit_cmd();
         cmd.args(["hook", name]);
         cmd
     }
 
     #[must_use = "command builders do nothing until executed"]
-    pub fn manage_cmd(&self) -> assert_cmd::Command {
+    pub fn manage_cmd(&self) -> TestCommand {
         let mut cmd = self.gherrit_cmd();
         cmd.arg("manage");
         cmd
     }
 
     #[must_use = "command builders do nothing until executed"]
-    pub fn unmanage_cmd(&self) -> assert_cmd::Command {
+    pub fn unmanage_cmd(&self) -> TestCommand {
         let mut cmd = self.gherrit_cmd();
         cmd.arg("unmanage");
         cmd
@@ -703,17 +801,17 @@ impl TestContext {
 }
 
 pub trait IntoCommandRef {
-    fn as_command_mut(&mut self) -> &mut assert_cmd::Command;
+    fn as_command_mut(&mut self) -> &mut TestCommand;
 }
 
-impl IntoCommandRef for assert_cmd::Command {
-    fn as_command_mut(&mut self) -> &mut assert_cmd::Command {
+impl IntoCommandRef for TestCommand {
+    fn as_command_mut(&mut self) -> &mut TestCommand {
         self
     }
 }
 
-impl IntoCommandRef for &mut assert_cmd::Command {
-    fn as_command_mut(&mut self) -> &mut assert_cmd::Command {
+impl IntoCommandRef for &mut TestCommand {
+    fn as_command_mut(&mut self) -> &mut TestCommand {
         self
     }
 }
@@ -781,6 +879,8 @@ fn apply_literal_redactions<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     #[test]
@@ -821,15 +921,60 @@ mod tests {
     fn test_environment_clears_inherited_values() {
         let root = TempDir::new().unwrap();
         let environment = TestEnvironment::new(root.path(), SYSTEM_GIT.as_path());
-        let mut command = assert_cmd::Command::new("/usr/bin/env");
+        let mut command = TestCommand::new("/usr/bin/env");
         command.env("SHOULD_BE_CLEARED", "yes");
-        environment.apply_to_assert_cmd(&mut command);
+        environment.apply_to_command(&mut command);
 
         let assert = command.assert().success();
         let output = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
         assert!(!output.contains("SHOULD_BE_CLEARED="));
         assert!(output.lines().any(|line| line == "RUST_LOG=info"));
         assert!(output.lines().any(|line| line.starts_with("HOME=")));
+    }
+
+    #[test]
+    fn server_completion_wait_is_bounded() {
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let timeout = Duration::from_millis(20);
+        let started = Instant::now();
+
+        let error = wait_for_server_completion(&completion_rx, timeout).unwrap_err();
+
+        assert!(matches!(error, MockServerStopError::TimedOut(value) if value == timeout));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn server_completion_propagates_panics() {
+        let (completion_tx, completion_rx): (_, Receiver<thread::Result<()>>) = mpsc::channel();
+        assert!(completion_tx.send(Err(Box::new("server panic"))).is_ok());
+
+        let error = wait_for_server_completion(&completion_rx, Duration::from_secs(1)).unwrap_err();
+
+        let MockServerStopError::Panicked(payload) = error else {
+            panic!("expected server panic result");
+        };
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"server panic"));
+    }
+
+    #[test]
+    fn dropping_mock_server_waits_for_state_release() {
+        let state = Arc::new(RwLock::new(mock_server::MockState::default()));
+        let weak_state = Arc::downgrade(&state);
+        let test_dir = Arc::new(TempDir::new().unwrap());
+        let system_git = SYSTEM_GIT.clone();
+        let test_environment = TestEnvironment::new(test_dir.path(), &system_git);
+        let server = MockServerInfo::start(
+            state,
+            test_dir.path().join("remote.git"),
+            system_git,
+            test_environment,
+            test_dir,
+        );
+
+        assert!(weak_state.upgrade().is_some());
+        drop(server);
+        assert!(weak_state.upgrade().is_none(), "mock server retained state after teardown");
     }
 }
 

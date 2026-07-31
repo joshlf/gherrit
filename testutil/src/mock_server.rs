@@ -1,9 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
-    ffi::OsString,
+    future::IntoFuture,
     path::PathBuf,
-    process::Command,
-    sync::{Arc, RwLock},
+    sync::{mpsc::Sender, Arc, RwLock},
 };
 
 use apollo_compiler::{ast, executable, validation::Valid, ExecutableDocument, Name, Node};
@@ -11,7 +10,7 @@ use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::FailureKind;
+use crate::{FailureKind, TestEnvironment};
 
 #[derive(Debug, Clone, Default)]
 pub struct MockState {
@@ -198,22 +197,23 @@ struct AppState {
     state: Arc<RwLock<MockState>>,
     remote_path: PathBuf,
     system_git: PathBuf,
-    git_environment: Vec<(OsString, OsString)>,
+    test_environment: TestEnvironment,
 }
 
-/// Starts a mock GitHub API server on a random local port.
-/// Returns the address of the running server (e.g., `http://127.0.0.1:12345`).
-pub async fn start_mock_server(
+/// Runs a mock GitHub API server until `shutdown_rx` is signaled.
+pub(super) async fn run_mock_server(
     state: Arc<RwLock<MockState>>,
     remote_path: PathBuf,
     system_git: PathBuf,
-    git_environment: Vec<(OsString, OsString)>,
-) -> String {
+    test_environment: TestEnvironment,
+    ready_tx: Sender<String>,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
 
-    let app_state = AppState { state, remote_path, system_git, git_environment };
+    let app_state = AppState { state, remote_path, system_git, test_environment };
 
     let app = Router::new()
         .route("/graphql", post(graphql))
@@ -221,11 +221,14 @@ pub async fn start_mock_server(
         .route("/_internal/git/complete", post(complete_git))
         .with_state(app_state);
 
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    ready_tx.send(url).expect("Failed to send mock server URL");
 
-    url
+    let server = axum::serve(listener, app).into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result.unwrap(),
+        _ = shutdown_rx => {}
+    }
 }
 
 fn check_and_apply_graphql_failure(
@@ -744,15 +747,15 @@ fn graphql_http_error(message: &str) -> (StatusCode, Json<serde_json::Value>) {
 
 fn remote_branch_exists(app_state: &AppState, branch: &str) -> Result<bool, String> {
     let reference = format!("refs/heads/{branch}");
-    let mut command = Command::new(&app_state.system_git);
-    command.env_clear().envs(app_state.git_environment.iter().cloned());
-    let status = command
+    let output = app_state
+        .test_environment
+        .command(&app_state.system_git)
         .arg("--git-dir")
         .arg(&app_state.remote_path)
         .args(["show-ref", "--verify", "--quiet", &reference])
-        .status()
+        .output()
         .map_err(|error| format!("Failed to inspect remote Git ref `{reference}`: {error}"))?;
-    match status.code() {
+    match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
         code => Err(format!("Inspecting remote Git ref `{reference}` exited with {code:?}")),
