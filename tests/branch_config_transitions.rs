@@ -161,7 +161,7 @@ fn test_branch_config_transitions() {
         ]
     };
 
-    let ctx = testutil::test_context_minimal!().build();
+    let ctx = testutil::test_context!().build();
 
     for case in cases {
         println!("Running Case: {}", case.id);
