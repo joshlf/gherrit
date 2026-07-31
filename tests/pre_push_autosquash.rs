@@ -128,7 +128,7 @@ fn test_dynamic_remote_and_branch_suggestion() {
     // generation just calls `default_remote_name`. However, `gherrit` manages
     // `origin` by default. We need to tell it to use `upstream`.
     let upstream_path = ctx.dir.path().join("upstream.git");
-    testutil::init_git_bare_repo(&upstream_path);
+    ctx.init_bare_repo(&upstream_path);
     ctx.run_git(&["remote", "add", "upstream", upstream_path.to_str().unwrap()]);
 
     // Configure gherrit to use upstream
