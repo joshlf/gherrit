@@ -4,16 +4,16 @@ This document covers guidelines for developing code changes.
 
 ## Build and Test
 
-Use standard `cargo` commands to build and test the project.
+Use the commands in [validation.md](./validation.md) before submitting a
+change. They match the checks run in CI, including the required test-build
+configuration.
 
 - `cargo build`: Builds the project.
-- `cargo test`: Runs the test suite.
 
-### Dependencies
+### Test Dependencies
 
-This project relies on the GitHub CLI (`gh`) for PR management. Ensure it is
-installed and authenticated (`gh auth login`) when running integration tests or
-using the tool.
+The integration tests use local Git repositories and a local GitHub API stub.
+They do not require GitHub credentials or an authenticated GitHub CLI.
 
 ## Rust Version
 
