@@ -19,8 +19,7 @@ use crate::FailureKind;
 #[derive(Debug, Clone, Default)]
 pub struct MockState {
     pub prs: Vec<PrEntry>,
-    pub pushed_refs: Vec<String>,
-    pub push_count: usize,
+    pub pushes: Vec<GitPush>,
     pub graphql_requests: Vec<Vec<GraphQlOperation>>,
     pub repo_owner: String,
     pub repo_name: String,
@@ -175,6 +174,26 @@ pub struct GitResponse {
     pub stderr: String,
     pub exit_code: i32,
     pub passthrough: bool,
+    pub report_exit_status: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GitCompletion {
+    pub args: Vec<String>,
+    pub exit_code: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPush {
+    pub args: Vec<String>,
+    pub refspecs: Vec<String>,
+    pub exit_code: i32,
+}
+
+impl GitPush {
+    pub fn succeeded(&self) -> bool {
+        self.exit_code == 0
+    }
 }
 
 #[derive(Clone)]
@@ -196,6 +215,7 @@ pub async fn start_mock_server(state: Arc<RwLock<MockState>>) -> String {
         .route("/repos/{owner}/{repo}/pulls", get(list_prs))
         .route("/graphql", post(graphql))
         .route("/_internal/git", post(handle_git))
+        .route("/_internal/git/complete", post(complete_git))
         .with_state(app_state);
 
     tokio::spawn(async move {
@@ -265,6 +285,8 @@ async fn handle_git(
     State(app_state): State<AppState>,
     Json(req): Json<GitRequest>,
 ) -> Json<GitResponse> {
+    let is_push = req.args.get(1).is_some_and(|arg| arg == "push");
+
     // Check for simulated failure
     if let Some(subcommand) = req.args.get(1) {
         if req
@@ -272,28 +294,22 @@ async fn handle_git(
             .get("MOCK_BIN_FAIL_CMD")
             .is_some_and(|fail_cmd| fail_cmd == &format!("git:{}", subcommand))
         {
+            if is_push {
+                record_push(&app_state, req.args.clone(), 1);
+            }
             return Json(GitResponse {
                 stdout: "".to_string(),
                 stderr: format!("Simulated failure for git {}", subcommand),
                 exit_code: 1,
                 passthrough: false,
+                report_exit_status: false,
             });
         }
     }
 
     // Spy on "push" logic
-    if req.args.contains(&"push".to_string()) {
-        let mut state = app_state.state.write().unwrap();
-        let refspecs: Vec<String> = req
-            .args
-            .iter()
-            .skip(1)
-            .filter(|arg| arg.starts_with("refs/") || arg.contains(":"))
-            .cloned()
-            .collect();
-
-        state.pushed_refs.extend(refspecs);
-        state.push_count += 1;
+    if is_push {
+        let state = app_state.state.read().unwrap();
         let repo_owner = state.repo_owner.clone();
         let repo_name = state.repo_name.clone();
 
@@ -309,6 +325,7 @@ async fn handle_git(
             stderr,
             exit_code: 0,
             passthrough: true,
+            report_exit_status: true,
         });
     }
 
@@ -318,7 +335,37 @@ async fn handle_git(
         stderr: "".to_string(),
         exit_code: 0,
         passthrough: true,
+        report_exit_status: false,
     })
+}
+
+async fn complete_git(
+    State(app_state): State<AppState>,
+    Json(completion): Json<GitCompletion>,
+) -> StatusCode {
+    if completion.args.get(1).is_none_or(|arg| arg != "push") {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    record_push(&app_state, completion.args, completion.exit_code);
+    StatusCode::NO_CONTENT
+}
+
+fn record_push(app_state: &AppState, args: Vec<String>, exit_code: i32) {
+    let refspecs = args
+        .iter()
+        .skip(2)
+        .filter(|arg| !arg.starts_with('-'))
+        .filter(|arg| {
+            let refspec = arg.trim_start_matches('+');
+            refspec.starts_with("refs/")
+                || refspec
+                    .split_once(':')
+                    .is_some_and(|(_, destination)| destination.starts_with("refs/"))
+        })
+        .cloned()
+        .collect();
+    app_state.state.write().unwrap().pushes.push(GitPush { args, refspecs, exit_code });
 }
 
 async fn list_prs(

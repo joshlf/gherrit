@@ -7,6 +7,7 @@ fn verify_push_to_non_open_fail(state_arg: &str, expected_msg_part: &str) {
     // 1. Initial Push (Creates PR)
     ctx.commit("Initial Work");
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+    let refs_before_rejected_push = ctx.remote_refs("refs");
 
     // 2. Simulate PR State Change on GitHub
     ctx.maybe_mutate_mock_state(|state| {
@@ -23,8 +24,13 @@ fn verify_push_to_non_open_fail(state_arg: &str, expected_msg_part: &str) {
     testutil::assert_pr_snapshot!(ctx, name.as_str());
 
     ctx.maybe_inspect_mock_state(|state| {
-        assert_eq!(state.push_count, 1, "Should not have pushed to {state_arg} PR");
+        assert_eq!(
+            state.pushes.iter().filter(|push| push.succeeded()).count(),
+            1,
+            "Should not have pushed to {state_arg} PR"
+        );
     });
+    assert_eq!(ctx.remote_refs("refs"), refs_before_rejected_push);
 }
 
 #[test]
