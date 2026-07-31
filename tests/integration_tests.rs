@@ -188,7 +188,7 @@ fn test_version_increment() {
     assert!(v1_count > 0, "Expected v1 tag to be pushed");
 
     // Amend commit (modifies SHA, keeps Change-ID)
-    ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
+    ctx.amend();
 
     // Push 2 (v2)
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "version_increment_v2");
@@ -240,7 +240,7 @@ fn test_optimistic_locking_conflict() {
     // quickly. We MUST preserve the Change-ID to simulate an update to the SAME
     // stack.
     let new_msg = format!("Commit V1 (Amended)\n\ngherrit-pr-id: {}", gherrit_id);
-    ctx.run_git(&["commit", "--amend", "--allow-empty", "-m", &new_msg]);
+    ctx.amend_with_message(&new_msg);
 
     // Attempt push - should fail due to atomic lock
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "optimistic_locking_v2_fail");
@@ -281,7 +281,7 @@ fn test_pr_body_generation() {
     ctx.run_git(&["checkout", "feature-stack"]); // Ensure we are on the branch
 
     // Amend "Commit B" (via tip Commit C) to create v2
-    ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
+    ctx.amend();
 
     // Sync again
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "pr_body_generation_v2");
@@ -365,7 +365,7 @@ fn test_public_stack_links() {
     ctx.run_git(&["config", "branch.public-feature.pushRemote", "origin"]);
 
     // Force an update so the body regenerates (amend commit)
-    ctx.run_git(&["commit", "--amend", "--allow-empty", "--no-edit"]);
+    ctx.amend();
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "public_stack_links_public");
 
     testutil::assert_pr_snapshot!(ctx, "public_stack_links_public_state");

@@ -13,13 +13,7 @@ fn test_regression_batch_update_silent_failure() {
     //
     // Simulate failure by appending special token "TRIGGER_GRAPHQL_NULL" to the
     // body.
-    ctx.run_git(&[
-        "commit",
-        "--amend",
-        "--allow-empty",
-        "-m",
-        "Initial Work\n\nTRIGGER_GRAPHQL_NULL",
-    ]);
+    ctx.amend_with_message("Initial Work\n\nTRIGGER_GRAPHQL_NULL");
 
     // 3. Push again - Expect Failure due to null response
     let assert = ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
