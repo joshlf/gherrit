@@ -4,7 +4,12 @@ fn test_reproduce_pr_base_branch_bug() {
     // are always created with the repository's default branch (e.g., "main") as
     // the base, rather than using the local feature branch name.
 
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .build();
 
     ctx.checkout_new("feature-branch");
     ctx.commit("Feature Work");

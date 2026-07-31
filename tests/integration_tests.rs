@@ -1,6 +1,6 @@
 #[test]
 fn test_commit_msg_hook() {
-    let ctx = testutil::test_context_minimal!().build();
+    let ctx = testutil::test_context!().build();
     let msg_file = ctx.repo_path.join("COMMIT_EDITMSG");
     std::fs::write(&msg_file, "feat: my cool feature").unwrap();
 
@@ -21,7 +21,13 @@ fn test_commit_msg_hook() {
 
 #[test]
 fn test_full_stack_lifecycle_mocked() {
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
 
     // Setup: Create 'main' and a feature branch
     ctx.checkout_new("feature-stack");
@@ -42,7 +48,7 @@ fn test_full_stack_lifecycle_mocked() {
     // Verify Side Effects (Mock Only)
     testutil::assert_pr_snapshot!(ctx, "full_stack_lifecycle_state");
 
-    ctx.maybe_inspect_mock_state(|state| {
+    ctx.inspect_mock_state(|state| {
         assert!(state.pushes.iter().any(|push| push.succeeded()), "Expected a successful push");
     });
     assert!(!ctx.remote_refs("refs/heads").is_empty(), "Expected remote branches to be updated");
@@ -50,7 +56,7 @@ fn test_full_stack_lifecycle_mocked() {
 
 #[test]
 fn test_branch_management() {
-    let ctx = testutil::test_context_minimal!().install_hooks(true).build();
+    let ctx = testutil::test_context!().build();
 
     // Create a branch to manage
     ctx.checkout_new("feature-A");
@@ -95,7 +101,11 @@ fn test_branch_management() {
 
 #[test]
 fn test_post_checkout_hook() {
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .build();
 
     // Scenario A: New Feature Branch
 
@@ -122,7 +132,7 @@ fn test_post_checkout_hook() {
 
 #[test]
 fn test_commit_msg_edge_cases() {
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!().with_initial_commit().build();
     // Ensure we are managed so the hook is active
     testutil::assert_success_snapshot!(ctx, ctx.manage_cmd(), "commit_msg_edge_manage");
 
@@ -158,7 +168,7 @@ fn test_commit_msg_edge_cases() {
 
 #[test]
 fn test_pre_push_ancestry_check() {
-    let ctx = testutil::test_context_minimal!().install_hooks(true).build();
+    let ctx = testutil::test_context!().with_installed_hooks().build();
 
     // Setup: Create a normal history first (common init)
     ctx.commit("Initial Root");
@@ -174,7 +184,13 @@ fn test_pre_push_ancestry_check() {
 
 #[test]
 fn test_version_increment() {
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
 
     // Create feature branch
     ctx.checkout_new("feat-versioning");
@@ -201,17 +217,21 @@ fn test_version_increment() {
     let v1_count_final = ctx.count_successfully_pushed_containing("/v1");
     assert_eq!(v1_count_final, v1_count, "v1 tag should NOT be pushed again in the second push.");
 
-    if !ctx.is_live {
-        // Verify that tags actually exist on the remote
-        let tags = ctx.remote_refs("refs/tags/gherrit");
-        assert!(tags.iter().any(|tag| tag.ends_with("/v1")), "Remote should contain v1 tag");
-        assert!(tags.iter().any(|tag| tag.ends_with("/v2")), "Remote should contain v2 tag");
-    }
+    // Verify that tags actually exist on the remote.
+    let tags = ctx.remote_refs("refs/tags/gherrit");
+    assert!(tags.iter().any(|tag| tag.ends_with("/v1")), "Remote should contain v1 tag");
+    assert!(tags.iter().any(|tag| tag.ends_with("/v2")), "Remote should contain v2 tag");
 }
 
 #[test]
 fn test_optimistic_locking_conflict() {
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
 
     // Initial setup
     ctx.checkout_new("feature-conflict");
@@ -245,7 +265,7 @@ fn test_optimistic_locking_conflict() {
     // Attempt push - should fail due to atomic lock
     testutil::assert_failure_snapshot!(ctx, ctx.hook_cmd("pre-push"), "optimistic_locking_v2_fail");
 
-    ctx.maybe_inspect_mock_state(|state| {
+    ctx.inspect_mock_state(|state| {
         assert_eq!(state.pushes.len(), 2, "Expected one successful and one failed push");
         assert!(state.pushes[0].succeeded(), "Initial push should succeed");
         assert!(!state.pushes[1].succeeded(), "Conflicting push should fail");
@@ -259,7 +279,12 @@ fn test_optimistic_locking_conflict() {
 
 #[test]
 fn test_pr_body_generation() {
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .build();
 
     // Setup: Stack of 3 commits: A -> B -> C
     // Must be on a feature branch (not main) for gherrit to sync them
@@ -291,7 +316,13 @@ fn test_pr_body_generation() {
 
 #[test]
 fn test_large_stack_batching() {
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
 
     // Create feature branch
     ctx.checkout_new("large-stack");
@@ -305,7 +336,7 @@ fn test_large_stack_batching() {
     // Using simple pre-push hook invocation.
     testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "large_stack_batching");
 
-    ctx.maybe_inspect_mock_state(|state| {
+    ctx.inspect_mock_state(|state| {
         // Assert: Push was split into 2 batches (80 + 5)
         assert_eq!(
             state.pushes.iter().filter(|push| push.succeeded()).count(),
@@ -327,7 +358,7 @@ fn test_large_stack_batching() {
 
 #[test]
 fn test_rebase_detection() {
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!().with_installed_hooks().with_initial_commit().build();
 
     ctx.checkout_new("feature-rebase");
     ctx.commit("Feature Work");
@@ -349,7 +380,8 @@ fn test_rebase_detection() {
 
 #[test]
 fn test_public_stack_links() {
-    let ctx = testutil::test_context_minimal!().install_hooks(true).build();
+    let ctx =
+        testutil::test_context!().with_remote().with_installed_hooks().with_mock_github().build();
 
     ctx.commit("Init");
     // 1. Private Mode (Default)
@@ -373,7 +405,7 @@ fn test_public_stack_links() {
 
 #[test]
 fn test_install_command_edge_cases() {
-    let ctx = testutil::test_context_minimal!().build();
+    let ctx = testutil::test_context!().build();
 
     let hooks_dir = ctx.repo_path.join(".git/hooks");
     std::fs::create_dir_all(&hooks_dir).unwrap();
@@ -425,7 +457,11 @@ fn test_install_command_edge_cases() {
 
 #[test]
 fn test_installed_pre_push_hook_accepts_git_arguments() {
-    let ctx = testutil::test_context_minimal!().install_hooks(true).initial_commit(true).build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .build();
 
     // Git invokes the pre-push hook with the remote name and location.
     ctx.git_cmd().args(["push", "origin", "main"]).assert().success();
@@ -433,7 +469,7 @@ fn test_installed_pre_push_hook_accepts_git_arguments() {
 
 #[test]
 fn test_install_configuration_and_security() {
-    let ctx = testutil::test_context_minimal!().build();
+    let ctx = testutil::test_context!().build();
 
     // Scenario A: Automatic Directory Creation (Default Path)
     // -------------------------------------------------------
@@ -499,8 +535,7 @@ fn test_install_configuration_and_security() {
 
 #[test]
 fn test_manage_detached_head() {
-    let ctx = testutil::test_context_minimal!().build();
-    ctx.commit("Init");
+    let ctx = testutil::test_context!().with_initial_commit().build();
 
     // Enter detached HEAD state
     ctx.run_git(&["checkout", "--detach"]);
@@ -517,8 +552,7 @@ fn test_manage_detached_head() {
 
 #[test]
 fn test_unmanage_cleanup_logic() {
-    let ctx = testutil::test_context_minimal!().build();
-    ctx.commit("Init");
+    let ctx = testutil::test_context!().with_initial_commit().build();
     ctx.checkout_new("feature-cleanup");
 
     // Manually configure the state to exact values that trigger the deep cleanup logic
@@ -539,7 +573,7 @@ fn test_unmanage_cleanup_logic() {
 
 #[test]
 fn test_pre_push_failure() {
-    let ctx = testutil::test_context_minimal!().install_hooks(true).build();
+    let ctx = testutil::test_context!().with_installed_hooks().with_mock_github().build();
     ctx.commit("Init");
 
     ctx.checkout_new("feature-fail");
@@ -567,7 +601,7 @@ fn test_install_read_only_fs() {
         return;
     }
 
-    let ctx = testutil::test_context_minimal!().build();
+    let ctx = testutil::test_context!().build();
     let hooks_dir = ctx.repo_path.join(".git/hooks");
     std::fs::create_dir_all(&hooks_dir).unwrap();
 
@@ -591,7 +625,7 @@ fn test_install_read_only_fs() {
 
 #[test]
 fn test_manage_drift_detection() {
-    let ctx = testutil::test_context_minimal!().build();
+    let ctx = testutil::test_context!().build();
     ctx.checkout_new("drift-feature");
 
     // 1. Initialize managed private branch
@@ -631,7 +665,7 @@ fn test_manage_drift_detection() {
 
 #[test]
 fn test_manage_toggle_visibility() {
-    let ctx = testutil::test_context_minimal!().build();
+    let ctx = testutil::test_context!().build();
     ctx.checkout_new("visibility-feature");
 
     // 1. Private
@@ -661,7 +695,7 @@ fn test_manage_toggle_visibility() {
 
 #[test]
 fn test_manage_mutually_exclusive_flags() {
-    let ctx = testutil::test_context_minimal!().build();
+    let ctx = testutil::test_context!().build();
     ctx.checkout_new("conflict-feature");
 
     // Attempt to set both flags
@@ -674,7 +708,7 @@ fn test_manage_mutually_exclusive_flags() {
 
 #[test]
 fn test_manage_invalid_config() {
-    let ctx = testutil::test_context_minimal!().build();
+    let ctx = testutil::test_context!().build();
     ctx.checkout_new("invalid-config-feature");
 
     // Manually set invalid config
@@ -686,7 +720,11 @@ fn test_manage_invalid_config() {
 
 #[test]
 fn test_post_checkout_drift_detection() {
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .build();
 
     // Condition A: Shared Branch Drift (Unmanaged vs Upstream Config)
     ctx.run_git(&["checkout", "main"]);

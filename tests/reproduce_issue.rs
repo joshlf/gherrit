@@ -18,7 +18,13 @@ fn test_special_characters_in_repo_url() {
 
     for (user, repo) in scenarios {
         println!("Testing scenario: {user}/{repo}");
-        let ctx = testutil::test_context!().owner(user).name(repo).build();
+        let ctx = testutil::test_context!()
+            .repository(user, repo)
+            .with_remote()
+            .with_installed_hooks()
+            .with_initial_commit()
+            .with_mock_github()
+            .build();
 
         ctx.checkout_new("feature-stack");
 
