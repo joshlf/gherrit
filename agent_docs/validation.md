@@ -3,25 +3,30 @@
 This document covers the procedures and requirements for validating changes to
 the project, including linting and testing.
 
-## Linting
+## Toolchains
 
-Run Clippy to catch common mistakes and improve code quality.
-
-```bash
-cargo clippy --tests
-```
-
-## Validating Changes
-
-Ensure the project builds and passes checks.
+The project builds with the stable toolchain declared in `Cargo.toml`. Its
+rustfmt configuration requires nightly, which can be installed with:
 
 ```bash
-cargo check --tests
-GHERRIT_TEST_BUILD=1 cargo test
+rustup toolchain install nightly --profile minimal --component rustfmt
 ```
 
-`GHERRIT_TEST_BUILD=1` is **required** in order to enable test-only behavior. If
-it is not set when building the binary under test, some tests will fail.
+## Validation
+
+Run the same formatting, linting, test, and task-marker checks as CI:
+
+```bash
+cargo +nightly fmt --all -- --check
+GHERRIT_TEST_BUILD=1 cargo clippy \
+  --workspace --all-targets --locked -- -D warnings
+GHERRIT_TEST_BUILD=1 cargo test --workspace --all-targets --locked
+ci/check_todo.sh
+```
+
+`GHERRIT_TEST_BUILD=1` is **required** for Clippy and tests so the binary under
+test includes the necessary test-only behavior. Do not use a binary built with
+this setting on sensitive repositories or with real credentials.
 
 ## Testing Strategy
 
@@ -34,7 +39,8 @@ When tests fail due to snapshot mismatches (e.g., changed CLI output), you can
 force update all snapshots to match the new output:
 
 ```bash
-GHERRIT_TEST_BUILD=1 INSTA_UPDATE=always cargo test
+GHERRIT_TEST_BUILD=1 INSTA_UPDATE=always cargo test \
+  --workspace --all-targets --locked
 ```
 
 **Note:** This will update ALL snapshots for executed tests. You should use `git
