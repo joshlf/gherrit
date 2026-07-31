@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -474,9 +475,11 @@ impl TestContext {
     }
 
     pub fn sanitize_with_redactions(&self, output: &str, redactions: &[(&str, &str)]) -> String {
+        let repo_path = self.repo_path.to_str().unwrap();
+        let remote_path = self.remote_path.to_str().unwrap();
         let redactions = redactions.iter().cloned().chain([
-            (self.repo_path.to_str().unwrap(), "[REPO_PATH]"),
-            (self.remote_path.to_str().unwrap(), "[REMOTE_PATH]"),
+            (repo_path, "[REPO_PATH]"),
+            (remote_path, "[REMOTE_PATH]"),
             // On macOS, the system may report paths starting with /private/var,
             // while the test harness sees /var. After the redaction above, we
             // get "/private[REPO_PATH]". This line strips that prefix. On
@@ -487,10 +490,7 @@ impl TestContext {
             ("fatal: the remote end hung up unexpectedly\n", ""),
         ]);
 
-        let mut output = output.to_string();
-        for (target, replacement) in redactions {
-            output = output.replace(target, replacement);
-        }
+        let output = apply_literal_redactions(output, redactions);
 
         static SHA_REGEX: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r"\b[0-9a-f]{40}\b").expect("Invalid regex"));
@@ -501,8 +501,8 @@ impl TestContext {
         static GHERRIT_ID_REGEX: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r"\bG[a-zA-Z0-9]{16,}\b").expect("Invalid regex"));
 
-        let output = SHA_REGEX.replace_all(&output, "[SHA]");
-        let output = GHERRIT_ID_REGEX.replace_all(&output, "[GHERRIT_ID]");
+        let output = redact_identities(&output, &SHA_REGEX, "SHA");
+        let output = redact_identities(&output, &GHERRIT_ID_REGEX, "GHERRIT_ID");
         MOCK_URL_REGEX.replace_all(&output, "[MOCK_SERVER_URL]").to_string()
     }
 }
@@ -532,19 +532,76 @@ impl TestContext {
         let cmd = cmd.as_command_mut();
         let output = cmd.output().expect("Failed to execute command");
 
-        let stdout =
-            self.sanitize_with_redactions(&String::from_utf8_lossy(&output.stdout), redactions);
-        let stderr =
-            self.sanitize_with_redactions(&String::from_utf8_lossy(&output.stderr), redactions);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         let exit_code = output.status.code().unwrap_or(-1);
 
         // This output will be stored verbatim in the filesystem.
-        format!(
+        let output = format!(
             "EXIT_CODE: {}\n\nSTDOUT:\n{}\n\nSTDERR:\n{}\n",
             exit_code,
             if stdout.is_empty() { "(empty)" } else { &stdout },
             if stderr.is_empty() { "(empty)" } else { &stderr }
-        )
+        );
+        self.sanitize_with_redactions(&output, redactions)
+    }
+}
+
+fn redact_identities(output: &str, regex: &Regex, namespace: &str) -> String {
+    let mut identities = HashMap::new();
+    regex
+        .replace_all(output, |captures: &regex::Captures<'_>| {
+            let next_index = identities.len() + 1;
+            let index = identities.entry(captures[0].to_string()).or_insert(next_index);
+            format!("[{namespace}_{index}]")
+        })
+        .into_owned()
+}
+
+fn apply_literal_redactions<'a>(
+    output: &str,
+    redactions: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> String {
+    redactions.into_iter().fold(output.to_string(), |output, (target, replacement)| {
+        output.replace(target, replacement)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_redaction_preserves_equality_and_order() {
+        let regex = Regex::new(r"G[a-z0-9]+").unwrap();
+        let output = redact_identities("Galpha Gbeta Galpha Ggamma Gbeta", &regex, "ID");
+
+        assert_eq!(output, "[ID_1] [ID_2] [ID_1] [ID_3] [ID_2]");
+    }
+
+    #[test]
+    fn identity_namespaces_are_independent() {
+        let sha_regex = Regex::new(r"[0-9a-f]{40}").unwrap();
+        let id_regex = Regex::new(r"G[a-z0-9]+").unwrap();
+        let first_sha = "1111111111111111111111111111111111111111";
+        let second_sha = "2222222222222222222222222222222222222222";
+        let output = format!("{first_sha} Gone {second_sha} Gtwo {first_sha} Gtwo");
+        let output = redact_identities(&output, &sha_regex, "SHA");
+        let output = redact_identities(&output, &id_regex, "GHERRIT_ID");
+
+        assert_eq!(output, "[SHA_1] [GHERRIT_ID_1] [SHA_2] [GHERRIT_ID_2] [SHA_1] [GHERRIT_ID_2]");
+    }
+
+    #[test]
+    fn literal_redactions_take_precedence_over_identity_redaction() {
+        let regex = Regex::new(r"[0-9a-f]{40}").unwrap();
+        let base_sha = "1111111111111111111111111111111111111111";
+        let other_sha = "2222222222222222222222222222222222222222";
+        let output = format!("{base_sha} {other_sha} {base_sha}");
+        let output = apply_literal_redactions(&output, [(base_sha, "[BASE_SHA]")]);
+        let output = redact_identities(&output, &regex, "SHA");
+
+        assert_eq!(output, "[BASE_SHA] [SHA_1] [BASE_SHA]");
     }
 }
 
