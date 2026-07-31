@@ -1,6 +1,7 @@
 #[test]
 fn test_pagination_bug() {
-    let ctx = testutil::test_context!().build();
+    let ctx =
+        testutil::test_context!().with_remote().with_installed_hooks().with_mock_github().build();
 
     // 1. Setup base commit on main
     ctx.commit("Init");
@@ -15,7 +16,7 @@ fn test_pagination_bug() {
     ctx.commit(&msg);
 
     // 4. Generate 110 PRs in the mock server state
-    ctx.maybe_mutate_mock_state(|state| {
+    ctx.mutate_mock_state(|state| {
         for i in 1..=110 {
             let is_target = i == 105;
             let head_ref =
