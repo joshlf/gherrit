@@ -380,10 +380,13 @@ fn test_rebase_detection() {
 
 #[test]
 fn test_public_stack_links() {
-    let ctx =
-        testutil::test_context!().with_remote().with_installed_hooks().with_mock_github().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .build();
 
-    ctx.commit("Init");
     // 1. Private Mode (Default)
     ctx.checkout_new("public-feature");
     ctx.commit("Public Commit");
