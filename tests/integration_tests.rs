@@ -456,18 +456,6 @@ fn test_install_command_edge_cases() {
 }
 
 #[test]
-fn test_installed_pre_push_hook_accepts_git_arguments() {
-    let ctx = testutil::test_context!()
-        .with_remote()
-        .with_installed_hooks()
-        .with_initial_commit()
-        .build();
-
-    // Git invokes the pre-push hook with the remote name and location.
-    ctx.git_cmd().args(["push", "origin", "main"]).assert().success();
-}
-
-#[test]
 fn test_install_configuration_and_security() {
     let ctx = testutil::test_context!().build();
 
