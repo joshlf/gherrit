@@ -166,6 +166,9 @@ impl TestContextBuilder {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
             let state_for_server = state.clone();
+            let remote_path_for_server = remote_path.clone();
+            let system_git_for_server = system_git.clone();
+            let git_environment_for_server = test_environment.variables.clone();
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -173,7 +176,13 @@ impl TestContextBuilder {
                     .expect("Failed to build runtime");
 
                 rt.block_on(async {
-                    let url = mock_server::start_mock_server(state_for_server).await;
+                    let url = mock_server::start_mock_server(
+                        state_for_server,
+                        remote_path_for_server,
+                        system_git_for_server,
+                        git_environment_for_server,
+                    )
+                    .await;
                     tx.send(url).expect("Failed to send mock server URL");
                     let _ = shutdown_rx.await;
                 });
@@ -203,6 +212,9 @@ impl TestContextBuilder {
 
         if self.initial_commit {
             ctx.commit("Initial commit");
+            if self.remote {
+                ctx.seed_remote_main();
+            }
         }
 
         ctx
@@ -360,7 +372,6 @@ pub enum FailureKind {
     GraphQl,
     CreatePr,
     UpdatePr,
-    Named(String),
 }
 
 impl Drop for TestContext {
@@ -489,6 +500,21 @@ impl TestContext {
     pub fn head_oid(&self) -> String {
         let assert = self.git_cmd().args(["rev-parse", "HEAD"]).assert().success();
         String::from_utf8(assert.get_output().stdout.clone()).unwrap().trim().to_string()
+    }
+
+    fn seed_remote_main(&self) {
+        self.test_environment
+            .command(&self.system_git)
+            .current_dir(&self.repo_path)
+            .args(["push", "--quiet", "--no-verify", "origin", "refs/heads/main:refs/heads/main"])
+            .assert()
+            .success();
+        self.test_environment
+            .command(&self.system_git)
+            .current_dir(&self.remote_path)
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+            .assert()
+            .success();
     }
 
     pub fn checkout_new(&self, branch_name: &str) {
