@@ -21,12 +21,19 @@ pub struct MockState {
     pub prs: Vec<PrEntry>,
     pub pushed_refs: Vec<String>,
     pub push_count: usize,
+    pub graphql_requests: Vec<Vec<GraphQlOperation>>,
     pub repo_owner: String,
     pub repo_name: String,
     pub fail_next_request: Option<FailureKind>,
-    pub fail_remaining: usize,
     pub merge_queue: HashSet<u64>,
     pub schema: Option<Valid<apollo_compiler::Schema>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphQlOperation {
+    Query,
+    CreatePr,
+    UpdatePr,
 }
 
 impl MockState {
@@ -211,14 +218,47 @@ fn check_and_apply_failure(mock_state: &mut MockState, action: FailureKind) -> b
         return false;
     }
 
-    if mock_state.fail_remaining > 0 {
-        mock_state.fail_remaining -= 1;
-    }
-    if mock_state.fail_remaining == 0 {
-        mock_state.fail_next_request = None;
-    }
+    mock_state.fail_next_request = None;
 
     true
+}
+
+fn check_and_apply_graphql_failure(
+    mock_state: &mut MockState,
+    operations: &[GraphQlOperation],
+) -> Option<FailureKind> {
+    use FailureKind::*;
+
+    let fail_action = mock_state.fail_next_request.as_ref()?;
+    let matches = match fail_action {
+        GraphQl => true,
+        CreatePr => operations.contains(&GraphQlOperation::CreatePr),
+        UpdatePr => operations.contains(&GraphQlOperation::UpdatePr),
+        Named(_) => false,
+    };
+
+    if !matches {
+        return None;
+    }
+
+    mock_state.fail_next_request.take()
+}
+
+fn graphql_operations(document: &ExecutableDocument) -> Vec<GraphQlOperation> {
+    document
+        .operations
+        .iter()
+        .flat_map(|operation| operation.selection_set.selections.iter())
+        .filter_map(|selection| {
+            let executable::Selection::Field(field) = selection else { return None };
+            match field.name.as_str() {
+                "repository" => Some(GraphQlOperation::Query),
+                "createPullRequest" => Some(GraphQlOperation::CreatePr),
+                "updatePullRequest" => Some(GraphQlOperation::UpdatePr),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 async fn handle_git(
@@ -335,17 +375,6 @@ async fn graphql(
 
     let mut mock_state = state.state.write().unwrap();
 
-    if check_and_apply_failure(&mut mock_state, FailureKind::UpdatePr)
-        || check_and_apply_failure(&mut mock_state, FailureKind::CreatePr)
-        || check_and_apply_failure(&mut mock_state, FailureKind::GraphQl)
-    {
-        return Ok(Json(serde_json::json!({
-            "errors": [
-                { "message": "Injected failure" }
-            ]
-        })));
-    }
-
     let schema = mock_state.schema.as_ref().expect("Schema not initialized");
     let document = match ExecutableDocument::parse_and_validate(schema, query, "query.graphql") {
         Ok(doc) => doc,
@@ -354,6 +383,16 @@ async fn graphql(
             return Err(StatusCode::BAD_REQUEST);
         }
     };
+
+    let operations = graphql_operations(&document);
+    mock_state.graphql_requests.push(operations.clone());
+    if let Some(failure) = check_and_apply_graphql_failure(&mut mock_state, &operations) {
+        return Ok(Json(serde_json::json!({
+            "errors": [
+                { "message": format!("Injected {failure:?} failure") }
+            ]
+        })));
+    }
 
     let mut response_data = serde_json::Map::new();
 
@@ -402,6 +441,43 @@ async fn graphql(
     }
 
     Ok(Json(serde_json::Value::Object(response_json)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_failure_only_matches_the_requested_operation() {
+        let mut state =
+            MockState { fail_next_request: Some(FailureKind::UpdatePr), ..Default::default() };
+
+        assert_eq!(check_and_apply_graphql_failure(&mut state, &[GraphQlOperation::Query]), None);
+        assert_eq!(state.fail_next_request, Some(FailureKind::UpdatePr));
+
+        assert_eq!(
+            check_and_apply_graphql_failure(&mut state, &[GraphQlOperation::CreatePr]),
+            None
+        );
+
+        assert_eq!(
+            check_and_apply_graphql_failure(&mut state, &[GraphQlOperation::UpdatePr]),
+            Some(FailureKind::UpdatePr)
+        );
+        assert_eq!(state.fail_next_request, None);
+    }
+
+    #[test]
+    fn generic_graphql_failure_matches_any_operation() {
+        let mut state =
+            MockState { fail_next_request: Some(FailureKind::GraphQl), ..Default::default() };
+
+        assert_eq!(
+            check_and_apply_graphql_failure(&mut state, &[GraphQlOperation::Query]),
+            Some(FailureKind::GraphQl)
+        );
+        assert_eq!(state.fail_next_request, None);
+    }
 }
 
 fn extract_input_field<'a>(
