@@ -2,8 +2,8 @@
 fn test_mixed_stack_backward_compatibility() {
     let ctx = testutil::test_context!().build();
 
-    ctx.manage(); // Ensure hooks are active
-    ctx.checkout_new("mixed-stack"); // Checkout new to enable management on this branch
+    // Checking out a new branch enables management through the installed hook.
+    ctx.checkout_new("mixed-stack");
 
     // 1. Create a commit with a manual Hex ID (legacy format)
     let legacy_id = "G0000000000000000000000000000000000000001";
@@ -17,7 +17,11 @@ fn test_mixed_stack_backward_compatibility() {
     // We expect this to succeed and identify 2 commits to sync.
     // The "snapshot" will serve as verification of the output containing both IDs if we were looking at it,
     // but here we mainly care that it doesn't crash and processes both.
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "mixed_stack_backward_compatibility");
+    testutil::assert_success_snapshot!(
+        ctx,
+        ctx.hook_cmd("pre-push"),
+        "mixed_stack_backward_compatibility"
+    );
 
     let legacy_ref = format!("refs/heads/{legacy_id}");
     assert!(ctx.remote_ref_oid(&legacy_ref).is_some(), "Expected legacy ID to be pushed");
@@ -26,12 +30,11 @@ fn test_mixed_stack_backward_compatibility() {
 #[test]
 fn test_base32_format_compliance() {
     let ctx = testutil::test_context!().build();
-    ctx.manage();
     ctx.checkout_new("base32-format");
     ctx.commit("Base32 Commit");
 
     // Read the commit message
-    let output = ctx.git().args(["log", "-1", "--format=%B"]).output().unwrap();
+    let output = ctx.git_cmd().args(["log", "-1", "--format=%B"]).output().unwrap();
     let msg = String::from_utf8(output.stdout).unwrap();
 
     // extract ID

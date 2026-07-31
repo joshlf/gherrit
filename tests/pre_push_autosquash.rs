@@ -38,7 +38,7 @@ fn test_autosquash_prefixes() {
         // Prefix commit
         ctx.commit(&format!("{} Work in progress", prefix));
 
-        let output = ctx.gherrit().args(["hook", "pre-push"]).assert();
+        let output = ctx.gherrit_cmd().args(["hook", "pre-push"]).assert();
         assert_autosquash_error(output, "origin", "main");
     }
 }
@@ -67,7 +67,7 @@ fn test_buried_autosquash_commit() {
     // 3. Commit C (Normal)
     ctx.commit("Commit C");
 
-    let output = ctx.gherrit().args(["hook", "pre-push"]).assert();
+    let output = ctx.gherrit_cmd().args(["hook", "pre-push"]).assert();
     assert_autosquash_error(output, "origin", "main");
 }
 
@@ -90,7 +90,7 @@ fn test_precedence_over_trailer_check() {
     let msg = "fixup! Some feature\n\ngherrit-pr-id: G12345";
     ctx.commit(msg);
 
-    let output = ctx.gherrit().args(["hook", "pre-push"]).assert();
+    let output = ctx.gherrit_cmd().args(["hook", "pre-push"]).assert();
 
     // Must fail with autosquash error, NOT missing trailer error
     assert_autosquash_error(output, "origin", "main")
@@ -143,7 +143,7 @@ fn test_dynamic_remote_and_branch_suggestion() {
     // Create fixup
     ctx.commit("fixup! Work");
 
-    let output = ctx.gherrit().args(["hook", "pre-push"]).assert();
+    let output = ctx.gherrit_cmd().args(["hook", "pre-push"]).assert();
 
     assert_autosquash_error(output, "upstream", "master");
 }
@@ -160,5 +160,5 @@ fn test_valid_stack_passes() {
     ctx.commit("Commit B");
     ctx.commit("Commit C");
 
-    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
 }
