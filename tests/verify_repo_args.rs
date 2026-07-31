@@ -3,13 +3,14 @@ use testutil::test_context;
 
 #[test]
 fn test_repository_query_arguments() {
-    let ctx = test_context!().build();
-    let url = &ctx.mock_server.as_ref().expect("Mock server not started").url;
-    let graphql_url = format!("{}/graphql", url);
+    let ctx = test_context!().with_mock_github().build();
+    let graphql_url = format!("{}/graphql", ctx.mock_server_url());
 
-    let state = ctx.read_mock_state();
-    let owner = state.repo_owner;
-    let name = state.repo_name;
+    let mut repository = None;
+    ctx.inspect_mock_state(|state| {
+        repository = Some((state.repo_owner.clone(), state.repo_name.clone()));
+    });
+    let (owner, name) = repository.unwrap();
 
     // Query with correct arguments (should succeed)
     let query = format!("query {{ repository(owner: \"{owner}\", name: \"{name}\") {{ id }} }}");
