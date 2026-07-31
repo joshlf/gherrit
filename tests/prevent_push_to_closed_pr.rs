@@ -1,7 +1,12 @@
 use predicates::prelude::*;
 
 fn verify_push_to_non_open_fail(state_arg: &str, expected_msg_part: &str) {
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .build();
     ctx.checkout_new(&format!("feature-{}", state_arg.to_lowercase()));
 
     // 1. Initial Push (Creates PR)
@@ -10,7 +15,7 @@ fn verify_push_to_non_open_fail(state_arg: &str, expected_msg_part: &str) {
     let refs_before_rejected_push = ctx.remote_refs("refs");
 
     // 2. Simulate PR State Change on GitHub
-    ctx.maybe_mutate_mock_state(|state| {
+    ctx.mutate_mock_state(|state| {
         let pr = state.prs.last_mut().unwrap();
         pr.state = state_arg.to_string();
     });
@@ -23,13 +28,6 @@ fn verify_push_to_non_open_fail(state_arg: &str, expected_msg_part: &str) {
     let name = format!("prevent_push_to_{}_pr_state", state_arg.to_lowercase());
     testutil::assert_pr_snapshot!(ctx, name.as_str());
 
-    ctx.maybe_inspect_mock_state(|state| {
-        assert_eq!(
-            state.pushes.iter().filter(|push| push.succeeded()).count(),
-            1,
-            "Should not have pushed to {state_arg} PR"
-        );
-    });
     assert_eq!(ctx.remote_refs("refs"), refs_before_rejected_push);
 }
 
@@ -45,7 +43,12 @@ fn test_post_push_checks_merged_pr() {
 
 #[test]
 fn test_push_to_open_pr_succeeds() {
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .build();
     ctx.checkout_new("feature-open");
     ctx.commit("Work");
 

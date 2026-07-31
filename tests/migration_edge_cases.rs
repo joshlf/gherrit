@@ -1,6 +1,11 @@
 #[test]
 fn test_mixed_stack_backward_compatibility() {
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .build();
 
     // Checking out a new branch enables management through the installed hook.
     ctx.checkout_new("mixed-stack");
@@ -29,7 +34,7 @@ fn test_mixed_stack_backward_compatibility() {
 
 #[test]
 fn test_base32_format_compliance() {
-    let ctx = testutil::test_context!().build();
+    let ctx = testutil::test_context!().with_installed_hooks().with_initial_commit().build();
     ctx.checkout_new("base32-format");
     ctx.commit("Base32 Commit");
 
