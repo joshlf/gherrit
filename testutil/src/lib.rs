@@ -262,7 +262,8 @@ impl TestContext {
         }
     }
 
-    pub fn gherrit(&self) -> assert_cmd::Command {
+    #[must_use = "command builders do nothing until executed"]
+    pub fn gherrit_cmd(&self) -> assert_cmd::Command {
         // Use injected binary path
         let mut cmd = assert_cmd::Command::new(&self.gherrit_bin_path);
         cmd.current_dir(&self.repo_path);
@@ -279,7 +280,8 @@ impl TestContext {
         cmd
     }
 
-    pub fn remote_git(&self) -> assert_cmd::Command {
+    #[must_use = "command builders do nothing until executed"]
+    pub fn remote_git_cmd(&self) -> assert_cmd::Command {
         let mut cmd = assert_cmd::Command::new(&self.system_git);
         cmd.current_dir(&self.remote_path);
         self.configure_mock_env(&mut cmd);
@@ -287,10 +289,11 @@ impl TestContext {
     }
 
     pub fn run_git(&self, args: &[&str]) {
-        self.git().args(args).assert().success();
+        self.git_cmd().args(args).assert().success();
     }
 
-    pub fn git(&self) -> assert_cmd::Command {
+    #[must_use = "command builders do nothing until executed"]
+    pub fn git_cmd(&self) -> assert_cmd::Command {
         let mut cmd = assert_cmd::Command::new("git");
         cmd.current_dir(&self.repo_path);
         self.configure_mock_env(&mut cmd);
@@ -303,7 +306,7 @@ impl TestContext {
 
     pub fn install_hooks(&self) {
         // Use the new install command
-        self.gherrit().args(["install"]).assert().success();
+        self.gherrit_cmd().args(["install"]).assert().success();
     }
 
     pub fn commit(&self, msg: &str) {
@@ -331,7 +334,13 @@ impl TestContext {
         let previous_oid = self.head_oid();
         let previous_id = self.gherrit_id("HEAD").ok();
 
-        self.git().arg("commit").arg("--amend").args(args).arg("--allow-empty").assert().success();
+        self.git_cmd()
+            .arg("commit")
+            .arg("--amend")
+            .args(args)
+            .arg("--allow-empty")
+            .assert()
+            .success();
 
         let amended_oid = self.head_oid();
         assert_ne!(previous_oid, amended_oid, "Amend must create a distinct commit object");
@@ -345,7 +354,7 @@ impl TestContext {
     }
 
     pub fn head_oid(&self) -> String {
-        let assert = self.git().args(["rev-parse", "HEAD"]).assert().success();
+        let assert = self.git_cmd().args(["rev-parse", "HEAD"]).assert().success();
         String::from_utf8(assert.get_output().stdout.clone()).unwrap().trim().to_string()
     }
 
@@ -358,6 +367,16 @@ impl TestContext {
             self.mock_server_state.as_ref().expect("Mock state not available").write().unwrap();
 
         state.fail_next_request = Some(kind);
+    }
+
+    pub fn assert_failure_consumed(&self) {
+        self.maybe_inspect_mock_state(|state| {
+            assert!(
+                state.fail_next_request.is_none(),
+                "Expected injected failure to be consumed, but {:?} remains",
+                state.fail_next_request
+            );
+        });
     }
 
     pub fn maybe_inspect_mock_state(&self, f: impl FnOnce(&mock_server::MockState)) {
@@ -386,7 +405,7 @@ impl TestContext {
 
     pub fn remote_ref_oid(&self, ref_name: &str) -> Option<String> {
         let output = self
-            .remote_git()
+            .remote_git_cmd()
             .args(["rev-parse", "--verify", "--quiet", ref_name])
             .output()
             .expect("Failed to inspect remote ref");
@@ -399,7 +418,7 @@ impl TestContext {
 
     pub fn remote_refs(&self, prefix: &str) -> Vec<String> {
         let assert = self
-            .remote_git()
+            .remote_git_cmd()
             .args(["for-each-ref", "--format=%(refname)", prefix])
             .assert()
             .success();
@@ -426,41 +445,57 @@ impl TestContext {
 
     pub fn set_config(&self, key: &str, value: Option<&str>) {
         if let Some(val) = value {
-            self.git().args(["config", key, val]).assert().success();
+            self.git_cmd().args(["config", key, val]).assert().success();
         } else {
-            // Ignore error if key doesn't exist when unsetting
-            let _ = self.git().args(["config", "--unset", key]).output();
+            let output = self
+                .git_cmd()
+                .args(["config", "--get-all", key])
+                .output()
+                .expect("Failed to inspect Git config");
+            match output.status.code() {
+                Some(0) => {
+                    self.git_cmd().args(["config", "--unset-all", key]).assert().success();
+                }
+                Some(1) => {}
+                code => panic!(
+                    "Failed to inspect Git config {key:?} with exit code {code:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            }
         }
     }
 
     pub fn assert_config(&self, key: &str, expected_value: Option<&str>) {
         if let Some(val) = expected_value {
-            self.git().args(["config", key]).assert().success().stdout(format!("{}\n", val));
+            self.git_cmd().args(["config", key]).assert().success().stdout(format!("{}\n", val));
         } else {
-            self.git().args(["config", key]).assert().failure();
+            self.git_cmd().args(["config", key]).assert().code(1).stdout("");
         }
     }
 
-    pub fn hook(&self, name: &str) -> assert_cmd::Command {
-        let mut cmd = self.gherrit();
+    #[must_use = "command builders do nothing until executed"]
+    pub fn hook_cmd(&self, name: &str) -> assert_cmd::Command {
+        let mut cmd = self.gherrit_cmd();
         cmd.args(["hook", name]);
         cmd
     }
 
-    pub fn manage(&self) -> assert_cmd::Command {
-        let mut cmd = self.gherrit();
+    #[must_use = "command builders do nothing until executed"]
+    pub fn manage_cmd(&self) -> assert_cmd::Command {
+        let mut cmd = self.gherrit_cmd();
         cmd.arg("manage");
         cmd
     }
 
-    pub fn unmanage(&self) -> assert_cmd::Command {
-        let mut cmd = self.gherrit();
+    #[must_use = "command builders do nothing until executed"]
+    pub fn unmanage_cmd(&self) -> assert_cmd::Command {
+        let mut cmd = self.gherrit_cmd();
         cmd.arg("unmanage");
         cmd
     }
 
     pub fn gherrit_id(&self, ref_name: &str) -> Result<String, Box<dyn std::error::Error>> {
-        let assert = self.git().args(["log", "-1", "--format=%B", ref_name]).assert().success();
+        let assert = self.git_cmd().args(["log", "-1", "--format=%B", ref_name]).assert().success();
         let stdout = String::from_utf8(assert.get_output().stdout.clone())?;
 
         stdout
@@ -528,12 +563,14 @@ impl TestContext {
         &self,
         mut cmd: impl IntoCommandRef,
         redactions: &[(&str, &str)],
+        expected_exit: ExpectedExit,
     ) -> String {
         let cmd = cmd.as_command_mut();
         let output = cmd.output().expect("Failed to execute command");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let succeeded = output.status.success();
         let exit_code = output.status.code().unwrap_or(-1);
 
         // This output will be stored verbatim in the filesystem.
@@ -543,8 +580,23 @@ impl TestContext {
             if stdout.is_empty() { "(empty)" } else { &stdout },
             if stderr.is_empty() { "(empty)" } else { &stderr }
         );
-        self.sanitize_with_redactions(&output, redactions)
+        let output = self.sanitize_with_redactions(&output, redactions);
+        match expected_exit {
+            ExpectedExit::Success => {
+                assert!(succeeded, "Expected command to succeed:\n{output}");
+            }
+            ExpectedExit::Failure => {
+                assert!(!succeeded, "Expected command to fail:\n{output}");
+            }
+        }
+        output
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedExit {
+    Success,
+    Failure,
 }
 
 fn redact_identities(output: &str, regex: &Regex, namespace: &str) -> String {
@@ -606,12 +658,23 @@ mod tests {
 }
 
 #[macro_export]
-macro_rules! assert_snapshot {
+macro_rules! assert_success_snapshot {
     ($ctx:expr, $cmd:expr, $name:expr $(,)?) => {
-        $crate::assert_snapshot!($ctx, $cmd, $name, &[])
+        $crate::assert_success_snapshot!($ctx, $cmd, $name, &[])
     };
     ($ctx:expr, $cmd:expr, $name:expr, $redactions:expr $(,)?) => {
-        let content = $ctx.execute_and_format($cmd, $redactions);
+        let content = $ctx.execute_and_format($cmd, $redactions, $crate::ExpectedExit::Success);
+        insta::assert_snapshot!($name, content);
+    };
+}
+
+#[macro_export]
+macro_rules! assert_failure_snapshot {
+    ($ctx:expr, $cmd:expr, $name:expr $(,)?) => {
+        $crate::assert_failure_snapshot!($ctx, $cmd, $name, &[])
+    };
+    ($ctx:expr, $cmd:expr, $name:expr, $redactions:expr $(,)?) => {
+        let content = $ctx.execute_and_format($cmd, $redactions, $crate::ExpectedExit::Failure);
         insta::assert_snapshot!($name, content);
     };
 }
