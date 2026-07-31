@@ -877,6 +877,90 @@ fn apply_literal_redactions<'a>(
     })
 }
 
+#[macro_export]
+macro_rules! assert_success_snapshot {
+    ($ctx:expr, $cmd:expr, $name:expr $(,)?) => {
+        $crate::assert_success_snapshot!($ctx, $cmd, $name, &[])
+    };
+    ($ctx:expr, $cmd:expr, $name:expr, $redactions:expr $(,)?) => {
+        let content = $ctx.execute_and_format($cmd, $redactions, $crate::ExpectedExit::Success);
+        insta::assert_snapshot!($name, content);
+    };
+}
+
+#[macro_export]
+macro_rules! assert_failure_snapshot {
+    ($ctx:expr, $cmd:expr, $name:expr $(,)?) => {
+        $crate::assert_failure_snapshot!($ctx, $cmd, $name, &[])
+    };
+    ($ctx:expr, $cmd:expr, $name:expr, $redactions:expr $(,)?) => {
+        let content = $ctx.execute_and_format($cmd, $redactions, $crate::ExpectedExit::Failure);
+        insta::assert_snapshot!($name, content);
+    };
+}
+
+#[macro_export]
+macro_rules! assert_pr_snapshot {
+    ($ctx:expr, $name:expr $(,)?) => {
+        insta::assert_snapshot!($name, $ctx.formatted_mock_pr_state());
+    };
+}
+
+fn run_git_cmd(environment: &TestEnvironment, system_git: &Path, path: &Path, args: &[&str]) {
+    environment.command(system_git).current_dir(path).args(args).assert().success();
+}
+
+fn install_git_interceptor(path: &Path, mock_bin: &Path) {
+    let git_dst = path.join(if cfg!(windows) { "git.exe" } else { "git" });
+    fs::copy(mock_bin, &git_dst).unwrap();
+}
+
+fn install_gherrit_binary(path: &Path, gherrit_bin: &Path) {
+    let gherrit_dst = path.join(if cfg!(windows) { "gherrit.exe" } else { "gherrit" });
+    fs::copy(gherrit_bin, &gherrit_dst).unwrap();
+}
+
+fn init_git_bare_repo(environment: &TestEnvironment, system_git: &Path, path: &Path) {
+    fs::create_dir(path).unwrap();
+    run_git_cmd(environment, system_git, path, &["init", "--bare"]);
+}
+
+fn init_git_repo(
+    environment: &TestEnvironment,
+    system_git: &Path,
+    path: &Path,
+    remote_path: Option<&Path>,
+) {
+    let run = |args| run_git_cmd(environment, system_git, path, args);
+    run(&["init"]);
+    run(&["config", "core.hooksPath", ".git/hooks"]);
+    // Must config user identity for commits to work
+    run(&["config", "user.email", "test@example.com"]);
+    run(&["config", "user.name", "Test User"]);
+    // Ensure default branch is main
+    run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+    // Explicitly unmanage main to satisfy strict config checks
+    run(&["config", "branch.main.gherritManaged", "false"]);
+    if let Some(remote_path) = remote_path {
+        run(&["remote", "add", "origin", remote_path.to_str().unwrap()]);
+    }
+}
+
+static SYSTEM_GIT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
+    let output = if cfg!(windows) {
+        Command::new("where").arg("git").output()
+    } else {
+        Command::new("which").arg("git").output()
+    };
+    let output = output.expect("Failed to find system git");
+    if !output.status.success() {
+        panic!("Failed to find git using 'which/where': {:?}", output);
+    }
+    let stdout = String::from_utf8(output.stdout).expect("Invalid utf8 from which git");
+    let path = stdout.lines().next().expect("No git path found").trim();
+    PathBuf::from(path)
+});
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -977,87 +1061,3 @@ mod tests {
         assert!(weak_state.upgrade().is_none(), "mock server retained state after teardown");
     }
 }
-
-#[macro_export]
-macro_rules! assert_success_snapshot {
-    ($ctx:expr, $cmd:expr, $name:expr $(,)?) => {
-        $crate::assert_success_snapshot!($ctx, $cmd, $name, &[])
-    };
-    ($ctx:expr, $cmd:expr, $name:expr, $redactions:expr $(,)?) => {
-        let content = $ctx.execute_and_format($cmd, $redactions, $crate::ExpectedExit::Success);
-        insta::assert_snapshot!($name, content);
-    };
-}
-
-#[macro_export]
-macro_rules! assert_failure_snapshot {
-    ($ctx:expr, $cmd:expr, $name:expr $(,)?) => {
-        $crate::assert_failure_snapshot!($ctx, $cmd, $name, &[])
-    };
-    ($ctx:expr, $cmd:expr, $name:expr, $redactions:expr $(,)?) => {
-        let content = $ctx.execute_and_format($cmd, $redactions, $crate::ExpectedExit::Failure);
-        insta::assert_snapshot!($name, content);
-    };
-}
-
-#[macro_export]
-macro_rules! assert_pr_snapshot {
-    ($ctx:expr, $name:expr $(,)?) => {
-        insta::assert_snapshot!($name, $ctx.formatted_mock_pr_state());
-    };
-}
-
-fn run_git_cmd(environment: &TestEnvironment, system_git: &Path, path: &Path, args: &[&str]) {
-    environment.command(system_git).current_dir(path).args(args).assert().success();
-}
-
-fn install_git_interceptor(path: &Path, mock_bin: &Path) {
-    let git_dst = path.join(if cfg!(windows) { "git.exe" } else { "git" });
-    fs::copy(mock_bin, &git_dst).unwrap();
-}
-
-fn install_gherrit_binary(path: &Path, gherrit_bin: &Path) {
-    let gherrit_dst = path.join(if cfg!(windows) { "gherrit.exe" } else { "gherrit" });
-    fs::copy(gherrit_bin, &gherrit_dst).unwrap();
-}
-
-fn init_git_bare_repo(environment: &TestEnvironment, system_git: &Path, path: &Path) {
-    fs::create_dir(path).unwrap();
-    run_git_cmd(environment, system_git, path, &["init", "--bare"]);
-}
-
-fn init_git_repo(
-    environment: &TestEnvironment,
-    system_git: &Path,
-    path: &Path,
-    remote_path: Option<&Path>,
-) {
-    let run = |args| run_git_cmd(environment, system_git, path, args);
-    run(&["init"]);
-    run(&["config", "core.hooksPath", ".git/hooks"]);
-    // Must config user identity for commits to work
-    run(&["config", "user.email", "test@example.com"]);
-    run(&["config", "user.name", "Test User"]);
-    // Ensure default branch is main
-    run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
-    // Explicitly unmanage main to satisfy strict config checks
-    run(&["config", "branch.main.gherritManaged", "false"]);
-    if let Some(remote_path) = remote_path {
-        run(&["remote", "add", "origin", remote_path.to_str().unwrap()]);
-    }
-}
-
-static SYSTEM_GIT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
-    let output = if cfg!(windows) {
-        Command::new("where").arg("git").output()
-    } else {
-        Command::new("which").arg("git").output()
-    };
-    let output = output.expect("Failed to find system git");
-    if !output.status.success() {
-        panic!("Failed to find git using 'which/where': {:?}", output);
-    }
-    let stdout = String::from_utf8(output.stdout).expect("Invalid utf8 from which git");
-    let path = stdout.lines().next().expect("No git path found").trim();
-    PathBuf::from(path)
-});
