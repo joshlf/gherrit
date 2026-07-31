@@ -1,6 +1,6 @@
 use std::{collections::HashMap, env, path::PathBuf, process::Command};
 
-use testutil::mock_server::{GitRequest, GitResponse};
+use testutil::mock_server::{GitCompletion, GitRequest, GitResponse};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -32,14 +32,18 @@ fn handle_git(args: &[String]) {
         eprint!("{}", resp.stderr);
     }
 
-    if resp.passthrough {
-        run_real_git(args);
-    } else {
+    if !resp.passthrough {
         std::process::exit(resp.exit_code);
     }
+
+    let exit_code = run_real_git(args);
+    if resp.report_exit_status {
+        report_exit_status(&server_url, args, exit_code);
+    }
+    std::process::exit(exit_code);
 }
 
-fn run_real_git(args: &[String]) {
+fn run_real_git(args: &[String]) -> i32 {
     // Pass through to real `git` command
     let real_git = env::var("SYSTEM_GIT_PATH").unwrap_or_else(|_| "git".to_string());
 
@@ -48,5 +52,12 @@ fn run_real_git(args: &[String]) {
         .status()
         .expect("Failed to run real git from mock shim");
 
-    std::process::exit(status.code().unwrap_or(1));
+    status.code().unwrap_or(1)
+}
+
+fn report_exit_status(server_url: &str, args: &[String], exit_code: i32) {
+    let completion = GitCompletion { args: args.to_vec(), exit_code };
+    ureq::post(&format!("{}/_internal/git/complete", server_url))
+        .send_json(completion)
+        .expect("Failed to report real git exit status to mock server");
 }
