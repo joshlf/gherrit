@@ -5,13 +5,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
-  GHERRIT_TEST_BUILD: 1
 
 jobs:
   validate:
     name: Validate and Test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,7 +25,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.rust-version.outputs.version }}
-          components: clippy, rustfmt
+          components: clippy
 
       - name: Cache intermediate build artifacts
         uses: Swatinem/rust-cache@v2
@@ -37,29 +36,17 @@ jobs:
         run: |
           set -eo pipefail
           rustup component add --toolchain nightly rustfmt
-          cargo +nightly fmt -- --check
+          cargo +nightly fmt --all -- --check
 
-      - name: Clippy (Library & Binaries)
-        run: cargo clippy
-
-      - name: Clippy (Tests)
-        run: cargo clippy --tests
+      - name: Clippy
+        run: |
+          GHERRIT_TEST_BUILD=1 cargo clippy \
+            --workspace --all-targets --locked -- -D warnings
 
       - name: Run Tests
-        run: cargo test
-
-      - name: Check for TODO comments
         run: |
-          set -eo pipefail
+          GHERRIT_TEST_BUILD=1 cargo test \
+            --workspace --all-targets --locked
 
-          # Install in the background so it runs in parallel with `curl`.
-          sudo apt-get install -y ripgrep &
-
-          # Fetch the check_todo.sh script from the google/zerocopy repository
-          curl -sL https://raw.githubusercontent.com/google/zerocopy/main/ci/check_todo.sh -o check_todo.sh
-          chmod +x check_todo.sh
-
-          # Wait for the background installation to finish
-          wait
-
-          ./check_todo.sh .
+      - name: Check task markers
+        run: ci/check_todo.sh
