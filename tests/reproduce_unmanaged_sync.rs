@@ -14,7 +14,11 @@ fn test_reproduce_unmanaged_sync() {
     ctx.set_config("branch.explicit-unmanaged.gherritManaged", Some("false"));
     ctx.commit("Explicit Commit");
 
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "reproduce_unmanaged_sync_explicit");
+    testutil::assert_success_snapshot!(
+        ctx,
+        ctx.hook_cmd("pre-push"),
+        "reproduce_unmanaged_sync_explicit"
+    );
 
     testutil::assert_pr_snapshot!(ctx, "reproduce_unmanaged_sync_explicit_state");
 
@@ -23,7 +27,11 @@ fn test_reproduce_unmanaged_sync() {
     ctx.set_config("branch.implicit-unmanaged.gherritManaged", None);
     ctx.run_git(&["commit", "--allow-empty", "-m", "Implicit Commit", "--no-verify"]);
 
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "reproduce_unmanaged_sync_implicit");
+    testutil::assert_failure_snapshot!(
+        ctx,
+        ctx.hook_cmd("pre-push"),
+        "reproduce_unmanaged_sync_implicit"
+    );
 
     testutil::assert_pr_snapshot!(ctx, "reproduce_unmanaged_sync_implicit_state");
 }

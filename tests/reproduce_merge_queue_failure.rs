@@ -10,7 +10,7 @@ fn test_reproduce_merge_queue_failure() {
     // 1. Create a PR
     ctx.checkout_new("feature-branch");
     ctx.commit("Initial Feature Work");
-    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
 
     // Get the PR ID
     let mut pr_id = 0;
@@ -27,5 +27,5 @@ fn test_reproduce_merge_queue_failure() {
     ctx.commit("Initial Feature Work (Amended)");
 
     // 4. Push again
-    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
 }

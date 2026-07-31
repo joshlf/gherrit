@@ -5,12 +5,12 @@ fn test_commit_msg_hook() {
     std::fs::write(&msg_file, "feat: my cool feature").unwrap();
 
     // Must manage the branch first so the hook runs
-    testutil::assert_snapshot!(ctx, ctx.manage(), "commit_msg_hook_manage");
+    testutil::assert_success_snapshot!(ctx, ctx.manage_cmd(), "commit_msg_hook_manage");
 
     // Run hook
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["hook", "commit-msg", msg_file.to_str().unwrap()]),
+        ctx.gherrit_cmd().args(["hook", "commit-msg", msg_file.to_str().unwrap()]),
         "commit_msg_hook_run"
     );
 
@@ -33,9 +33,9 @@ fn test_full_stack_lifecycle_mocked() {
     // Trigger Pre-Push Hook (Simulate 'git push'). We call the hook directly
     // because simulating a real 'git push' that calls the hook recursively is
     // complex in a test env.
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["hook", "pre-push"]),
+        ctx.gherrit_cmd().args(["hook", "pre-push"]),
         "full_stack_lifecycle_push"
     );
 
@@ -59,13 +59,13 @@ fn test_branch_management() {
     ctx.run_git(&["config", "branch.feature-A.pushRemote", "origin"]);
 
     // Attempt manage - should fail (drift)
-    testutil::assert_snapshot!(ctx, ctx.manage(), "branch_management_drift_warning"); // Logs warning, no change
+    testutil::assert_success_snapshot!(ctx, ctx.manage_cmd(), "branch_management_drift_warning"); // Logs warning, no change
     // Assert still unmanaged (missing key)
-    ctx.git().args(["config", "branch.feature-A.gherritManaged"]).assert().failure();
+    ctx.assert_config("branch.feature-A.gherritManaged", None);
 
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["manage", "--force"]),
+        ctx.gherrit_cmd().args(["manage", "--force"]),
         "branch_management_force_manage",
     );
 
@@ -80,17 +80,17 @@ fn test_branch_management() {
     ctx.assert_config("branch.feature-A.merge", Some("refs/heads/feature-A"));
 
     // Scenario B: Unmanage Cleanup
-    testutil::assert_snapshot!(ctx, ctx.unmanage(), "branch_management_unmanage");
+    testutil::assert_success_snapshot!(ctx, ctx.unmanage_cmd(), "branch_management_unmanage");
 
     // Assert unmanaged (key exists but is false)
     ctx.assert_config("branch.feature-A.gherritManaged", Some("false"));
 
     // Assert cleanup (keys should be unset)
-    ctx.git().args(["config", "branch.feature-A.remote"]).assert().failure();
-    ctx.git().args(["config", "branch.feature-A.merge"]).assert().failure();
+    ctx.assert_config("branch.feature-A.remote", None);
+    ctx.assert_config("branch.feature-A.merge", None);
 
     // Assert pushRemote unset
-    ctx.git().args(["config", "branch.feature-A.pushRemote"]).assert().failure();
+    ctx.assert_config("branch.feature-A.pushRemote", None);
 }
 
 #[test]
@@ -124,16 +124,16 @@ fn test_post_checkout_hook() {
 fn test_commit_msg_edge_cases() {
     let ctx = testutil::test_context!().build();
     // Ensure we are managed so the hook is active
-    testutil::assert_snapshot!(ctx, ctx.manage(), "commit_msg_edge_manage");
+    testutil::assert_success_snapshot!(ctx, ctx.manage_cmd(), "commit_msg_edge_manage");
 
     // Scenario A: Squash Commit
     let squash_msg_file = ctx.repo_path.join("SQUASH_MSG");
     let squash_content = "squash! some other commit";
     std::fs::write(&squash_msg_file, squash_content).unwrap();
 
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["hook", "commit-msg", squash_msg_file.to_str().unwrap()]),
+        ctx.gherrit_cmd().args(["hook", "commit-msg", squash_msg_file.to_str().unwrap()]),
         "commit_msg_squash",
     );
 
@@ -146,9 +146,9 @@ fn test_commit_msg_edge_cases() {
     let detached_content = "feat: detached work";
     std::fs::write(&detached_msg_file, detached_content).unwrap();
 
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["hook", "commit-msg", detached_msg_file.to_str().unwrap()]),
+        ctx.gherrit_cmd().args(["hook", "commit-msg", detached_msg_file.to_str().unwrap()]),
         "commit_msg_detached"
     );
 
@@ -169,7 +169,7 @@ fn test_pre_push_ancestry_check() {
 
     // Trigger pre-push hook; it should fail because it can't find the merge
     // base with 'main'
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "pre_push_ancestry_failure");
+    testutil::assert_failure_snapshot!(ctx, ctx.hook_cmd("pre-push"), "pre_push_ancestry_failure");
 }
 
 #[test]
@@ -181,7 +181,7 @@ fn test_version_increment() {
     ctx.commit("Feature Commit");
 
     // Push 1 (v1)
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "version_increment_v1");
+    testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "version_increment_v1");
 
     // Verify v1 pushed
     let v1_count = ctx.count_successfully_pushed_containing("/v1");
@@ -191,7 +191,7 @@ fn test_version_increment() {
     ctx.amend();
 
     // Push 2 (v2)
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "version_increment_v2");
+    testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "version_increment_v2");
 
     // Verify v2 pushed
     let v2_count = ctx.count_successfully_pushed_containing("/v2");
@@ -218,7 +218,7 @@ fn test_optimistic_locking_conflict() {
     ctx.commit("Commit V1");
 
     // Push V1
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "optimistic_locking_v1");
+    testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "optimistic_locking_v1");
 
     let gherrit_id = ctx.gherrit_id("HEAD").unwrap();
     let managed_ref = format!("refs/heads/{gherrit_id}");
@@ -230,7 +230,7 @@ fn test_optimistic_locking_conflict() {
     let tag_name = format!("gherrit/{}/v2", gherrit_id);
 
     // Create tag pointing to the branch we just pushed
-    ctx.remote_git()
+    ctx.remote_git_cmd()
         .args(["tag", &tag_name, &format!("refs/heads/{}", gherrit_id)])
         .assert()
         .success();
@@ -243,7 +243,7 @@ fn test_optimistic_locking_conflict() {
     ctx.amend_with_message(&new_msg);
 
     // Attempt push - should fail due to atomic lock
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "optimistic_locking_v2_fail");
+    testutil::assert_failure_snapshot!(ctx, ctx.hook_cmd("pre-push"), "optimistic_locking_v2_fail");
 
     ctx.maybe_inspect_mock_state(|state| {
         assert_eq!(state.pushes.len(), 2, "Expected one successful and one failed push");
@@ -272,7 +272,7 @@ fn test_pr_body_generation() {
     // We can verify this implicitly by checking the PR bodies later.
 
     // Sync
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "pr_body_generation_v1");
+    testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "pr_body_generation_v1");
 
     // Verify
     testutil::assert_pr_snapshot!(ctx, "pr_body_generation_v1_state");
@@ -284,7 +284,7 @@ fn test_pr_body_generation() {
     ctx.amend();
 
     // Sync again
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "pr_body_generation_v2");
+    testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "pr_body_generation_v2");
 
     testutil::assert_pr_snapshot!(ctx, "pr_body_generation_v2_state");
 }
@@ -303,7 +303,7 @@ fn test_large_stack_batching() {
 
     // Sync - should succeed without error
     // Using simple pre-push hook invocation.
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "large_stack_batching");
+    testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "large_stack_batching");
 
     ctx.maybe_inspect_mock_state(|state| {
         // Assert: Push was split into 2 batches (80 + 5)
@@ -341,7 +341,7 @@ fn test_rebase_detection() {
     std::fs::write(rebase_dir.join("head-name"), "refs/heads/feature-rebase").unwrap();
 
     // Run manage - should succeed by detecting 'feature-rebase'
-    testutil::assert_snapshot!(ctx, ctx.manage(), "rebase_detection_manage");
+    testutil::assert_success_snapshot!(ctx, ctx.manage_cmd(), "rebase_detection_manage");
 
     // Verify config was applied to 'feature-rebase'
     ctx.assert_config("branch.feature-rebase.gherritManaged", Some(testutil::MANAGED_PRIVATE));
@@ -356,7 +356,7 @@ fn test_public_stack_links() {
     ctx.checkout_new("public-feature");
     ctx.commit("Public Commit");
 
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "public_stack_links_private");
+    testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "public_stack_links_private");
 
     testutil::assert_pr_snapshot!(ctx, "public_stack_links_private_state");
 
@@ -366,7 +366,7 @@ fn test_public_stack_links() {
 
     // Force an update so the body regenerates (amend commit)
     ctx.amend();
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "public_stack_links_public");
+    testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "public_stack_links_public");
 
     testutil::assert_pr_snapshot!(ctx, "public_stack_links_public_state");
 }
@@ -382,14 +382,18 @@ fn test_install_command_edge_cases() {
     // Scenario A: Conflict
     std::fs::write(&pre_push, "foo").unwrap();
 
-    testutil::assert_snapshot!(ctx, ctx.gherrit().args(["install"]), "install_edge_cases_conflict");
+    testutil::assert_failure_snapshot!(
+        ctx,
+        ctx.gherrit_cmd().args(["install"]),
+        "install_edge_cases_conflict"
+    );
 
     assert_eq!(std::fs::read_to_string(&pre_push).unwrap(), "foo");
 
     // Scenario B: Force Overwrite
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["install", "--force"]),
+        ctx.gherrit_cmd().args(["install", "--force"]),
         "install_edge_cases_force"
     );
 
@@ -397,9 +401,9 @@ fn test_install_command_edge_cases() {
     assert!(content.contains("# gherrit-installer: managed"));
 
     // Scenario C: Idempotency (Safe to run again)
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["install"]),
+        ctx.gherrit_cmd().args(["install"]),
         "install_edge_cases_idempotent"
     );
 
@@ -407,7 +411,11 @@ fn test_install_command_edge_cases() {
     let modified = content + "\n# Some custom comment";
     std::fs::write(&pre_push, modified).unwrap();
 
-    testutil::assert_snapshot!(ctx, ctx.gherrit().args(["install"]), "install_edge_cases_upgrade");
+    testutil::assert_success_snapshot!(
+        ctx,
+        ctx.gherrit_cmd().args(["install"]),
+        "install_edge_cases_upgrade"
+    );
 
     // Content should be reset to standard shim (losing custom comment, which is expected behavior for managed hooks)
     let reset_content = std::fs::read_to_string(&pre_push).unwrap();
@@ -420,7 +428,7 @@ fn test_installed_pre_push_hook_accepts_git_arguments() {
     let ctx = testutil::test_context_minimal!().install_hooks(true).initial_commit(true).build();
 
     // Git invokes the pre-push hook with the remote name and location.
-    ctx.git().args(["push", "origin", "main"]).assert().success();
+    ctx.git_cmd().args(["push", "origin", "main"]).assert().success();
 }
 
 #[test]
@@ -435,7 +443,11 @@ fn test_install_configuration_and_security() {
         std::fs::remove_dir_all(&default_hooks).unwrap();
     }
 
-    testutil::assert_snapshot!(ctx, ctx.gherrit().args(["install"]), "install_security_default");
+    testutil::assert_success_snapshot!(
+        ctx,
+        ctx.gherrit_cmd().args(["install"]),
+        "install_security_default"
+    );
     assert!(default_hooks.join("pre-push").exists(), "Should create directory and install hook");
 
     // Scenario B: Custom core.hooksPath (Internal)
@@ -443,9 +455,9 @@ fn test_install_configuration_and_security() {
     let custom_internal = ctx.repo_path.join(".githooks");
     ctx.run_git(&["config", "core.hooksPath", ".githooks"]);
 
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["install"]),
+        ctx.gherrit_cmd().args(["install"]),
         "install_security_custom_internal"
     );
     assert!(custom_internal.join("pre-push").exists(), "Should respect core.hooksPath within repo");
@@ -458,9 +470,9 @@ fn test_install_configuration_and_security() {
     // We must use absolute path for git config to ensure gherrit sees it as external
     ctx.run_git(&["config", "core.hooksPath", ext_path]);
 
-    testutil::assert_snapshot!(
+    testutil::assert_failure_snapshot!(
         ctx,
-        ctx.gherrit().args(["install"]), // Should fail
+        ctx.gherrit_cmd().args(["install"]), // Should fail
         "install_security_custom_external_block",
         &[(ext_path, "[EXTERNAL_HOOKS_PATH]")]
     );
@@ -472,9 +484,9 @@ fn test_install_configuration_and_security() {
 
     // Scenario D: Custom core.hooksPath (External) - Allow Global
     // -----------------------------------------------------------
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["install", "--allow-global"]),
+        ctx.gherrit_cmd().args(["install", "--allow-global"]),
         "install_security_custom_external_allow",
         &[(ext_path, "[EXTERNAL_HOOKS_PATH]")],
     );
@@ -494,7 +506,7 @@ fn test_manage_detached_head() {
     ctx.run_git(&["checkout", "--detach"]);
 
     let test = |args: &[_], name| {
-        testutil::assert_snapshot!(ctx, ctx.gherrit().args(args), name);
+        testutil::assert_failure_snapshot!(ctx, ctx.gherrit_cmd().args(args), name);
     };
 
     test(&["manage"], "manage_detached_head");
@@ -516,11 +528,11 @@ fn test_unmanage_cleanup_logic() {
     ctx.run_git(&["config", "branch.feature-cleanup.merge", "refs/heads/feature-cleanup"]);
 
     // Run unmanage
-    testutil::assert_snapshot!(ctx, ctx.unmanage(), "unmanage_cleanup");
+    testutil::assert_success_snapshot!(ctx, ctx.unmanage_cmd(), "unmanage_cleanup");
 
     // Verify cleanup: remote and merge keys should be removed
-    ctx.git().args(["config", "branch.feature-cleanup.remote"]).assert().failure();
-    ctx.git().args(["config", "branch.feature-cleanup.merge"]).assert().failure();
+    ctx.assert_config("branch.feature-cleanup.remote", None);
+    ctx.assert_config("branch.feature-cleanup.merge", None);
     // gherritManaged should be false
     ctx.assert_config("branch.feature-cleanup.gherritManaged", Some("false"));
 }
@@ -537,7 +549,11 @@ fn test_pre_push_failure() {
     ctx.run_git(&["remote", "add", "broken-remote", "/path/to/nowhere"]);
     ctx.run_git(&["config", "gherrit.remote", "broken-remote"]);
 
-    testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "pre_push_failure_broken_remote");
+    testutil::assert_failure_snapshot!(
+        ctx,
+        ctx.hook_cmd("pre-push"),
+        "pre_push_failure_broken_remote"
+    );
 }
 
 #[test]
@@ -561,7 +577,11 @@ fn test_install_read_only_fs() {
     std::fs::set_permissions(&hooks_dir, perms).unwrap();
 
     // Attempt installation, verifying failure due to permission denied
-    testutil::assert_snapshot!(ctx, ctx.gherrit().args(["install"]), "install_read_only_fs");
+    testutil::assert_failure_snapshot!(
+        ctx,
+        ctx.gherrit_cmd().args(["install"]),
+        "install_read_only_fs"
+    );
 
     // Cleanup: Restore permissions so TempDir cleanup doesn't panic
     let mut perms = std::fs::metadata(&hooks_dir).unwrap().permissions();
@@ -575,9 +595,9 @@ fn test_manage_drift_detection() {
     ctx.checkout_new("drift-feature");
 
     // 1. Initialize managed private branch
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["manage", "--private"]),
+        ctx.gherrit_cmd().args(["manage", "--private"]),
         "manage_drift_init"
     );
 
@@ -586,9 +606,9 @@ fn test_manage_drift_detection() {
 
     // 3. Attempt Switch to Public (without force)
     // The command should exit with 0 but log a warning and NOT apply changes.
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["manage", "--public"]),
+        ctx.gherrit_cmd().args(["manage", "--public"]),
         "manage_drift_attempt_switch"
     );
 
@@ -596,9 +616,9 @@ fn test_manage_drift_detection() {
     ctx.assert_config("branch.drift-feature.gherritManaged", Some(testutil::MANAGED_PRIVATE));
 
     // 4. Force Switch
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["manage", "--public", "--force"]),
+        ctx.gherrit_cmd().args(["manage", "--public", "--force"]),
         "manage_drift_force_switch",
     );
 
@@ -615,25 +635,25 @@ fn test_manage_toggle_visibility() {
     ctx.checkout_new("visibility-feature");
 
     // 1. Private
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["manage", "--private"]),
+        ctx.gherrit_cmd().args(["manage", "--private"]),
         "manage_toggle_init_private"
     );
     ctx.assert_config("branch.visibility-feature.pushRemote", Some("."));
 
     // 2. Public
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["manage", "--public"]),
+        ctx.gherrit_cmd().args(["manage", "--public"]),
         "manage_toggle_switch_public"
     );
     ctx.assert_config("branch.visibility-feature.pushRemote", Some("origin"));
 
     // 3. Private again
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.gherrit().args(["manage", "--private"]),
+        ctx.gherrit_cmd().args(["manage", "--private"]),
         "manage_toggle_switch_private",
     );
     ctx.assert_config("branch.visibility-feature.pushRemote", Some("."));
@@ -645,9 +665,9 @@ fn test_manage_mutually_exclusive_flags() {
     ctx.checkout_new("conflict-feature");
 
     // Attempt to set both flags
-    testutil::assert_snapshot!(
+    testutil::assert_failure_snapshot!(
         ctx,
-        ctx.gherrit().args(["manage", "--public", "--private"]),
+        ctx.gherrit_cmd().args(["manage", "--public", "--private"]),
         "manage_mutually_exclusive",
     );
 }
@@ -661,7 +681,7 @@ fn test_manage_invalid_config() {
     ctx.run_git(&["config", "branch.invalid-config-feature.gherritManaged", "bad-value"]);
 
     // Attempt to manage; should fail
-    testutil::assert_snapshot!(ctx, ctx.manage(), "manage_invalid_config");
+    testutil::assert_failure_snapshot!(ctx, ctx.manage_cmd(), "manage_invalid_config");
 }
 
 #[test]
@@ -673,9 +693,9 @@ fn test_post_checkout_drift_detection() {
     ctx.run_git(&["update-ref", "refs/remotes/origin/drift-shared", "HEAD"]);
 
     // Switch to new tracking branch - this triggers post-checkout
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.git().args(["checkout", "-b", "drift-shared", "--track", "origin/drift-shared"]),
+        ctx.git_cmd().args(["checkout", "-b", "drift-shared", "--track", "origin/drift-shared"]),
         "post_checkout_drift_shared",
     );
 
@@ -686,9 +706,9 @@ fn test_post_checkout_drift_detection() {
     ctx.run_git(&["config", "branch.drift-stack.remote", "origin"]);
 
     // Switch to it
-    testutil::assert_snapshot!(
+    testutil::assert_success_snapshot!(
         ctx,
-        ctx.git().args(["checkout", "drift-stack"]),
+        ctx.git_cmd().args(["checkout", "drift-stack"]),
         "post_checkout_drift_stack"
     );
 }
