@@ -1,16 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsString,
+    path::PathBuf,
+    process::Command,
     sync::{Arc, RwLock},
 };
 
 use apollo_compiler::{ast, executable, validation::Valid, ExecutableDocument, Name, Node};
-use axum::{
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
-};
+use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
@@ -199,20 +196,26 @@ impl GitPush {
 #[derive(Clone)]
 struct AppState {
     state: Arc<RwLock<MockState>>,
-    base_url: String,
+    remote_path: PathBuf,
+    system_git: PathBuf,
+    git_environment: Vec<(OsString, OsString)>,
 }
 
 /// Starts a mock GitHub API server on a random local port.
 /// Returns the address of the running server (e.g., `http://127.0.0.1:12345`).
-pub async fn start_mock_server(state: Arc<RwLock<MockState>>) -> String {
+pub async fn start_mock_server(
+    state: Arc<RwLock<MockState>>,
+    remote_path: PathBuf,
+    system_git: PathBuf,
+    git_environment: Vec<(OsString, OsString)>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
 
-    let app_state = AppState { state, base_url: url.clone() };
+    let app_state = AppState { state, remote_path, system_git, git_environment };
 
     let app = Router::new()
-        .route("/repos/{owner}/{repo}/pulls", get(list_prs))
         .route("/graphql", post(graphql))
         .route("/_internal/git", post(handle_git))
         .route("/_internal/git/complete", post(complete_git))
@@ -223,24 +226,6 @@ pub async fn start_mock_server(state: Arc<RwLock<MockState>>) -> String {
     });
 
     url
-}
-
-fn check_and_apply_failure(mock_state: &mut MockState, action: FailureKind) -> bool {
-    use FailureKind::*;
-
-    let Some(fail_action) = &mock_state.fail_next_request else { return false };
-    let matches = match (fail_action, action) {
-        (GraphQl, GraphQl | CreatePr | UpdatePr) => true,
-        (f, a) => f == &a,
-    };
-
-    if !matches {
-        return false;
-    }
-
-    mock_state.fail_next_request = None;
-
-    true
 }
 
 fn check_and_apply_graphql_failure(
@@ -254,7 +239,6 @@ fn check_and_apply_graphql_failure(
         GraphQl => true,
         CreatePr => operations.contains(&GraphQlOperation::CreatePr),
         UpdatePr => operations.contains(&GraphQlOperation::UpdatePr),
-        Named(_) => false,
     };
 
     if !matches {
@@ -279,6 +263,304 @@ fn graphql_operations(document: &ExecutableDocument) -> Vec<GraphQlOperation> {
             }
         })
         .collect()
+}
+
+type GraphQlVariables = Option<serde_json::Map<String, serde_json::Value>>;
+
+fn graphql_variables(payload: &serde_json::Value) -> Result<GraphQlVariables, String> {
+    match payload.get("variables") {
+        None => Ok(None),
+        Some(serde_json::Value::Object(variables)) => Ok(Some(variables.clone())),
+        Some(_) => Err("Invalid GraphQL payload: `variables` must be an object".to_string()),
+    }
+}
+
+fn response_key(field: &executable::Field) -> String {
+    field
+        .alias
+        .as_ref()
+        .map(|alias| alias.as_str())
+        .unwrap_or_else(|| field.name.as_str())
+        .to_string()
+}
+
+fn selected_fields<'a>(
+    selection_set: &'a executable::SelectionSet,
+    path: &str,
+) -> Result<Vec<&'a executable::Field>, String> {
+    let fields: Vec<_> = selection_set
+        .selections
+        .iter()
+        .map(|selection| {
+            let executable::Selection::Field(field) = selection else {
+                return Err(format!("The mock GitHub API does not support fragments at `{path}`"));
+            };
+            if !field.directives.is_empty() {
+                return Err(format!(
+                    "The mock GitHub API does not support directives at `{path}.{}`",
+                    field.name
+                ));
+            }
+            Ok(field.as_ref())
+        })
+        .collect::<Result<_, _>>()?;
+    let mut response_keys = HashSet::new();
+    for field in &fields {
+        let key = response_key(field);
+        if !response_keys.insert(key.clone()) {
+            return Err(format!(
+                "The mock GitHub API does not support duplicate response key `{key}` at `{path}`"
+            ));
+        }
+    }
+    Ok(fields)
+}
+
+fn validate_argument_names(
+    field: &executable::Field,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    for argument in &field.arguments {
+        if !allowed.contains(&argument.name.as_str()) {
+            return Err(format!(
+                "The mock GitHub API does not support argument `{path}({}: ...)`",
+                argument.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_scalar_fields(
+    selection_set: &executable::SelectionSet,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    for field in selected_fields(selection_set, path)? {
+        if !allowed.contains(&field.name.as_str()) {
+            return Err(format!(
+                "The mock GitHub API does not support field `{path}.{}`",
+                field.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn input_object<'a>(
+    field: &'a executable::Field,
+    path: &str,
+) -> Result<&'a [(Name, Node<ast::Value>)], String> {
+    extract_input_field(field, "input")
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("The mock GitHub API requires an inline object at `{path}(input:)`"))
+}
+
+fn validate_input_fields(
+    input: &[(Name, Node<ast::Value>)],
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    for (name, value) in input {
+        if !allowed.contains(&name.as_str()) {
+            return Err(format!(
+                "The mock GitHub API does not support input field `{path}.input.{name}`"
+            ));
+        }
+        if !matches!(&**value, ast::Value::String(_)) {
+            return Err(format!(
+                "The mock GitHub API only supports inline string values at `{path}.input.{name}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn argument<'a>(field: &'a executable::Field, name: &str) -> Option<&'a ast::Value> {
+    field.arguments.iter().find(|argument| argument.name == name).map(|argument| &*argument.value)
+}
+
+fn resolve_string_argument(
+    field: &executable::Field,
+    name: &str,
+    path: &str,
+    variables: &GraphQlVariables,
+) -> Result<String, String> {
+    let value = argument(field, name)
+        .ok_or_else(|| format!("Missing GraphQL argument `{path}({name}: ...)`"))?;
+    match value {
+        ast::Value::String(value) => Ok(value.clone()),
+        ast::Value::Variable(variable) => variables
+            .as_ref()
+            .and_then(|variables| variables.get(variable.as_str()))
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+            .ok_or_else(|| {
+                format!("Missing or non-string GraphQL variable `${variable}` for `{path}.{name}`")
+            }),
+        _ => Err(format!("The mock GitHub API requires a string at `{path}({name}: ...)`")),
+    }
+}
+
+fn validate_pull_requests_field(field: &executable::Field) -> Result<(), String> {
+    const PATH: &str = "repository.pullRequests";
+    validate_argument_names(field, PATH, &["headRefName", "first", "states"])?;
+
+    let first = argument(field, "first")
+        .and_then(|value| match value {
+            ast::Value::Int(value) => Some(value.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| format!("The mock GitHub API requires `{PATH}(first: 1)`"))?;
+    if first != "1" {
+        return Err(format!("The mock GitHub API only supports `{PATH}(first: 1)`"));
+    }
+
+    let states = argument(field, "states")
+        .and_then(|value| match value {
+            ast::Value::List(values) => Some(values),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            format!("The mock GitHub API requires `{PATH}(states: [OPEN, CLOSED, MERGED])`")
+        })?;
+    let state_count = states.len();
+    let states: HashSet<_> = states
+        .iter()
+        .filter_map(|value| match &**value {
+            ast::Value::Enum(value) => Some(value.as_str()),
+            _ => None,
+        })
+        .collect();
+    if state_count != 3 || states != HashSet::from(["OPEN", "CLOSED", "MERGED"]) {
+        return Err(format!(
+            "The mock GitHub API only supports `{PATH}(states: [OPEN, CLOSED, MERGED])`"
+        ));
+    }
+
+    for field in selected_fields(&field.selection_set, PATH)? {
+        if field.name != "nodes" {
+            return Err(format!(
+                "The mock GitHub API does not support field `{PATH}.{}`",
+                field.name
+            ));
+        }
+        validate_scalar_fields(
+            &field.selection_set,
+            "repository.pullRequests.nodes",
+            &["number", "id", "title", "body", "baseRefName", "state"],
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_repository_field(
+    field: &executable::Field,
+    variables: &GraphQlVariables,
+) -> Result<(), String> {
+    const PATH: &str = "repository";
+    validate_argument_names(field, PATH, &["owner", "name"])?;
+    resolve_string_argument(field, "owner", PATH, variables)?;
+    resolve_string_argument(field, "name", PATH, variables)?;
+
+    for field in selected_fields(&field.selection_set, PATH)? {
+        match field.name.as_str() {
+            "id" => {}
+            "pullRequests" => {
+                validate_pull_requests_field(field)?;
+                resolve_string_argument(
+                    field,
+                    "headRefName",
+                    "repository.pullRequests",
+                    variables,
+                )?;
+            }
+            _ => {
+                return Err(format!(
+                    "The mock GitHub API does not support field `{PATH}.{}`",
+                    field.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_create_field(field: &executable::Field) -> Result<(), String> {
+    const PATH: &str = "createPullRequest";
+    validate_argument_names(field, PATH, &["input"])?;
+    let input = input_object(field, PATH)?;
+    validate_input_fields(
+        input,
+        PATH,
+        &["repositoryId", "baseRefName", "headRefName", "title", "body"],
+    )?;
+    for required in ["repositoryId", "baseRefName", "headRefName", "title"] {
+        required_string_field(input, required, PATH)?;
+    }
+
+    for field in selected_fields(&field.selection_set, PATH)? {
+        match field.name.as_str() {
+            "clientMutationId" => {}
+            "pullRequest" => validate_scalar_fields(
+                &field.selection_set,
+                "createPullRequest.pullRequest",
+                &["number", "url", "id"],
+            )?,
+            _ => {
+                return Err(format!(
+                    "The mock GitHub API does not support field `{PATH}.{}`",
+                    field.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_update_field(field: &executable::Field) -> Result<(), String> {
+    const PATH: &str = "updatePullRequest";
+    validate_argument_names(field, PATH, &["input"])?;
+    let input = input_object(field, PATH)?;
+    validate_input_fields(input, PATH, &["pullRequestId", "baseRefName", "title", "body"])?;
+    required_string_field(input, "pullRequestId", PATH)?;
+    if !["baseRefName", "title", "body"].iter().any(|name| get_string_field(input, name).is_some())
+    {
+        return Err("The mock GitHub API requires at least one pull request update".to_string());
+    }
+    validate_scalar_fields(&field.selection_set, PATH, &["clientMutationId"])
+}
+
+fn validate_supported_document(
+    document: &ExecutableDocument,
+    variables: &GraphQlVariables,
+) -> Result<(), String> {
+    if document.operations.len() != 1 {
+        return Err("The mock GitHub API supports exactly one GraphQL operation".to_string());
+    }
+    if !document.fragments.is_empty() {
+        return Err("The mock GitHub API does not support GraphQL fragments".to_string());
+    }
+
+    let operation = document.operations.iter().next().unwrap();
+    if !operation.directives.is_empty() {
+        return Err("The mock GitHub API does not support operation directives".to_string());
+    }
+    for field in selected_fields(&operation.selection_set, "operation")? {
+        match field.name.as_str() {
+            "repository" => validate_repository_field(field, variables)?,
+            "createPullRequest" => validate_create_field(field)?,
+            "updatePullRequest" => validate_update_field(field)?,
+            _ => {
+                return Err(format!(
+                    "The mock GitHub API does not support root field `{}`",
+                    field.name
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn handle_git(
@@ -368,77 +650,43 @@ fn record_push(app_state: &AppState, args: Vec<String>, exit_code: i32) {
     app_state.state.write().unwrap().pushes.push(GitPush { args, refspecs, exit_code });
 }
 
-async fn list_prs(
-    State(state): State<AppState>,
-    Path((owner, repo)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let mut mock_state = state.state.write().unwrap();
-    if check_and_apply_failure(&mut mock_state, FailureKind::Named("list_prs".to_string())) {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    let page = params.get("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
-    let per_page = params.get("per_page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(30);
-
-    let start = (page - 1) * per_page;
-    let total = mock_state.prs.len();
-    let end = start + per_page;
-
-    let items = if start >= total {
-        Vec::new()
-    } else {
-        mock_state.prs[start..std::cmp::min(end, total)].to_vec()
+async fn graphql(
+    State(app_state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(query) = payload.get("query").and_then(|value| value.as_str()) else {
+        return graphql_http_error("Invalid GraphQL payload: missing string field `query`");
+    };
+    let variables = match graphql_variables(&payload) {
+        Ok(variables) => variables,
+        Err(message) => return graphql_http_error(&message),
     };
 
-    let mut headers = HeaderMap::new();
-    if end < total {
-        let next_page = page + 1;
-        let last_page = total.div_ceil(per_page);
-        let next_url = format!(
-            "{}/repos/{}/{}/pulls?page={}&per_page={}",
-            state.base_url, owner, repo, next_page, per_page
-        );
-        let last_url = format!(
-            "{}/repos/{}/{}/pulls?page={}&per_page={}",
-            state.base_url, owner, repo, last_page, per_page
-        );
-        let link = format!(r#"<{}>; rel="next", <{}>; rel="last""#, next_url, last_url);
-        headers.insert("Link", link.parse().unwrap());
-    }
-
-    Ok((headers, Json(items)))
-}
-
-async fn graphql(
-    State(state): State<AppState>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let query = payload.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
-        eprintln!("DEBUG: Invalid GraphQL payload (missing 'query'): {}", payload);
-        StatusCode::BAD_REQUEST
-    })?;
-    let variables = payload.get("variables").and_then(|v| v.as_object()).cloned();
-
-    let mut mock_state = state.state.write().unwrap();
+    let mut mock_state = app_state.state.write().unwrap();
 
     let schema = mock_state.schema.as_ref().expect("Schema not initialized");
     let document = match ExecutableDocument::parse_and_validate(schema, query, "query.graphql") {
         Ok(doc) => doc,
         Err(e) => {
             eprintln!("DEBUG: GraphQL validation errors: {:?}", e.errors);
-            return Err(StatusCode::BAD_REQUEST);
+            return graphql_http_error("GraphQL request failed schema validation");
         }
     };
+    if let Err(message) = validate_supported_document(&document, &variables) {
+        return graphql_http_error(&message);
+    }
 
     let operations = graphql_operations(&document);
     mock_state.graphql_requests.push(operations.clone());
     if let Some(failure) = check_and_apply_graphql_failure(&mut mock_state, &operations) {
-        return Ok(Json(serde_json::json!({
-            "errors": [
-                { "message": format!("Injected {failure:?} failure") }
-            ]
-        })));
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "errors": [
+                    { "message": format!("Injected {failure:?} failure") }
+                ]
+            })),
+        );
     }
 
     let mut response_data = serde_json::Map::new();
@@ -448,34 +696,29 @@ async fn graphql(
     for operation in document.operations.iter() {
         for selection in operation.selection_set.selections.iter() {
             if let executable::Selection::Field(field) = selection {
-                let alias = field
-                    .alias
-                    .as_ref()
-                    .map(|a| a.as_str())
-                    .unwrap_or_else(|| field.name.as_str())
-                    .to_string();
+                let alias = response_key(field);
 
-                match field.name.as_str() {
-                    "updatePullRequest" => {
-                        if let Err(msg) =
-                            handle_update_pr(&mut mock_state, field, &alias, &mut response_data)
-                        {
-                            errors.push(serde_json::json!({ "message": msg }));
-                        }
+                let result = match field.name.as_str() {
+                    "updatePullRequest" => handle_update_pr(&mut mock_state, field, &|branch| {
+                        remote_branch_exists(&app_state, branch)
+                    }),
+                    "createPullRequest" => handle_create_pr(&mut mock_state, field, &|branch| {
+                        remote_branch_exists(&app_state, branch)
+                    }),
+                    "repository" => handle_repository_query(&mock_state, field, &variables),
+                    _ => unreachable!("request was checked by validate_supported_document"),
+                };
+                match result {
+                    Ok(value) => {
+                        response_data.insert(alias, value);
                     }
-                    "createPullRequest" => {
-                        handle_create_pr(&mut mock_state, field, &alias, &mut response_data);
+                    Err(message) => {
+                        response_data.insert(alias.clone(), serde_json::Value::Null);
+                        errors.push(serde_json::json!({
+                            "message": message,
+                            "path": [alias],
+                        }));
                     }
-                    "repository" => {
-                        handle_repository_query(
-                            &mock_state,
-                            field,
-                            &alias,
-                            &variables,
-                            &mut response_data,
-                        );
-                    }
-                    _ => {}
                 }
             }
         }
@@ -487,12 +730,57 @@ async fn graphql(
         response_json.insert("errors".to_string(), serde_json::Value::Array(errors));
     }
 
-    Ok(Json(serde_json::Value::Object(response_json)))
+    (StatusCode::OK, Json(serde_json::Value::Object(response_json)))
+}
+
+fn graphql_http_error(message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "errors": [{ "message": message }],
+        })),
+    )
+}
+
+fn remote_branch_exists(app_state: &AppState, branch: &str) -> Result<bool, String> {
+    let reference = format!("refs/heads/{branch}");
+    let mut command = Command::new(&app_state.system_git);
+    command.env_clear().envs(app_state.git_environment.iter().cloned());
+    let status = command
+        .arg("--git-dir")
+        .arg(&app_state.remote_path)
+        .args(["show-ref", "--verify", "--quiet", &reference])
+        .status()
+        .map_err(|error| format!("Failed to inspect remote Git ref `{reference}`: {error}"))?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        code => Err(format!("Inspecting remote Git ref `{reference}` exited with {code:?}")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_document(query: &str) -> ExecutableDocument {
+        let state = MockState::new("owner".to_string(), "repo".to_string());
+        ExecutableDocument::parse_and_validate(
+            state.schema.as_ref().unwrap(),
+            query,
+            "test.graphql",
+        )
+        .unwrap()
+        .into_inner()
+    }
+
+    fn root_field(document: &ExecutableDocument) -> &executable::Field {
+        let operation = document.operations.iter().next().unwrap();
+        let executable::Selection::Field(field) = &operation.selection_set.selections[0] else {
+            panic!("expected a root field");
+        };
+        field
+    }
 
     #[test]
     fn operation_failure_only_matches_the_requested_operation() {
@@ -525,6 +813,205 @@ mod tests {
         );
         assert_eq!(state.fail_next_request, None);
     }
+
+    #[test]
+    fn accepts_the_production_request_shapes() {
+        let variables = Some(serde_json::Map::from_iter([
+            ("owner".to_string(), serde_json::json!("owner")),
+            ("name".to_string(), serde_json::json!("repo")),
+        ]));
+        let repository_id = parse_document(
+            "query RepositoryID($owner: String!, $name: String!) { \
+             repository(owner: $owner, name: $name) { id } }",
+        );
+        validate_supported_document(&repository_id, &variables).unwrap();
+
+        let lookup = parse_document(
+            "query { op0: repository(owner: \"owner\", name: \"repo\") { \
+             pullRequests(headRefName: \"Ghead\", first: 1, \
+             states: [OPEN, CLOSED, MERGED]) { nodes { number, id, title, body, \
+             baseRefName, state } } } }",
+        );
+        validate_supported_document(&lookup, &None).unwrap();
+
+        let create = parse_document(
+            "mutation { op0: createPullRequest(input: { repositoryId: \
+             \"REPO_NODE_ID\", baseRefName: \"main\", headRefName: \"Ghead\", \
+             title: \"Title\", body: \"Body\" }) { pullRequest { number, url, id } } }",
+        );
+        validate_supported_document(&create, &None).unwrap();
+
+        let update = parse_document(
+            "mutation { op0: updatePullRequest(input: { pullRequestId: \"PR_1\", \
+             title: \"Updated\" }) { clientMutationId } }",
+        );
+        validate_supported_document(&update, &None).unwrap();
+    }
+
+    #[test]
+    fn rejects_valid_but_unsupported_graphql() {
+        let viewer = parse_document("query { viewer { login } }");
+        assert!(validate_supported_document(&viewer, &None)
+            .unwrap_err()
+            .contains("root field `viewer`"));
+
+        let repository_name =
+            parse_document("query { repository(owner: \"owner\", name: \"repo\") { name } }");
+        assert!(validate_supported_document(&repository_name, &None)
+            .unwrap_err()
+            .contains("field `repository.name`"));
+
+        let fragment = parse_document(
+            "query { repository(owner: \"owner\", name: \"repo\") { ...Fields } } \
+             fragment Fields on Repository { id }",
+        );
+        assert!(validate_supported_document(&fragment, &None).unwrap_err().contains("fragments"));
+
+        let multiple_operations = parse_document(
+            "query One { repository(owner: \"owner\", name: \"repo\") { id } } \
+             query Two { repository(owner: \"owner\", name: \"repo\") { id } }",
+        );
+        assert!(validate_supported_document(&multiple_operations, &None)
+            .unwrap_err()
+            .contains("exactly one"));
+
+        let duplicate_mutation = parse_document(
+            "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
+             baseRefName: \"main\", headRefName: \"Ghead\", title: \"Title\" }) { \
+             pullRequest { number } } createPullRequest(input: { repositoryId: \
+             \"REPO_NODE_ID\", baseRefName: \"main\", headRefName: \"Ghead\", \
+             title: \"Title\" }) { pullRequest { number } } }",
+        );
+        assert!(validate_supported_document(&duplicate_mutation, &None)
+            .unwrap_err()
+            .contains("duplicate response key `createPullRequest`"));
+
+        let duplicate_states = parse_document(
+            "query { repository(owner: \"owner\", name: \"repo\") { \
+             pullRequests(headRefName: \"Ghead\", first: 1, \
+             states: [OPEN, CLOSED, MERGED, OPEN]) { nodes { number } } } }",
+        );
+        assert!(validate_supported_document(&duplicate_states, &None)
+            .unwrap_err()
+            .contains("only supports `repository.pullRequests(states:"));
+    }
+
+    #[test]
+    fn rejects_non_object_variables_payload() {
+        let payload = serde_json::json!({ "variables": null });
+        let error = graphql_variables(&payload).unwrap_err();
+        assert_eq!(error, "Invalid GraphQL payload: `variables` must be an object");
+    }
+
+    #[test]
+    fn rejects_missing_runtime_variables() {
+        let document = parse_document(
+            "query RepositoryID($owner: String!, $name: String!) { \
+             repository(owner: $owner, name: $name) { id } }",
+        );
+        let error = validate_supported_document(&document, &None).unwrap_err();
+        assert!(error.contains("variable `$owner`"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn repository_response_contains_only_selected_fields() {
+        let document = parse_document(
+            "query { repository(owner: \"owner\", name: \"repo\") { \
+             pullRequests(headRefName: \"Ghead\", first: 1, \
+             states: [OPEN, CLOSED, MERGED]) { nodes { number } } } }",
+        );
+        validate_supported_document(&document, &None).unwrap();
+
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
+        state.add_pr(PrEntry::mock(MockPrArgs {
+            id: 1,
+            title: "Title".to_string(),
+            body: "Body".to_string(),
+            head: "Ghead".to_string(),
+            base: "main".to_string(),
+            repo_owner: "owner",
+            repo_name: "repo",
+        }));
+        let response = handle_repository_query(&state, root_field(&document), &None).unwrap();
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "pullRequests": {
+                    "nodes": [{ "number": 1 }]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn create_validates_refs_uniqueness_and_numbering() {
+        let document = parse_document(
+            "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
+             baseRefName: \"main\", headRefName: \"Gnew\", title: \"Title\" }) { \
+             pullRequest { number } } }",
+        );
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
+        state.add_pr(PrEntry::mock(MockPrArgs {
+            id: 7,
+            title: "Old".to_string(),
+            body: String::new(),
+            head: "Gold".to_string(),
+            base: "main".to_string(),
+            repo_owner: "owner",
+            repo_name: "repo",
+        }));
+
+        let response = handle_create_pr(&mut state, root_field(&document), &|_| Ok(true)).unwrap();
+        assert_eq!(response.pointer("/pullRequest/number"), Some(&serde_json::json!(8)));
+        assert_eq!(state.prs.len(), 2);
+
+        let error = handle_create_pr(&mut state, root_field(&document), &|_| Ok(true)).unwrap_err();
+        assert!(error.contains("already exists"));
+        assert_eq!(state.prs.len(), 2);
+
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
+        let error =
+            handle_create_pr(&mut state, root_field(&document), &|branch| Ok(branch == "main"))
+                .unwrap_err();
+        assert!(error.contains("Head branch `Gnew` does not exist"));
+        assert!(state.prs.is_empty());
+    }
+
+    #[test]
+    fn mutations_reject_unknown_repository_and_pull_request_ids() {
+        let create = parse_document(
+            "mutation { createPullRequest(input: { repositoryId: \"WRONG\", \
+             baseRefName: \"main\", headRefName: \"Ghead\", title: \"Title\" }) { \
+             pullRequest { number } } }",
+        );
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
+        let error = handle_create_pr(&mut state, root_field(&create), &|_| Ok(true)).unwrap_err();
+        assert!(error.contains("Repository node `WRONG` does not exist"));
+        assert!(state.prs.is_empty());
+
+        let update = parse_document(
+            "mutation { updatePullRequest(input: { pullRequestId: \"PR_missing\", \
+             title: \"Updated\" }) { clientMutationId } }",
+        );
+        let error = handle_update_pr(&mut state, root_field(&update), &|_| Ok(true)).unwrap_err();
+        assert!(error.contains("Pull request node `PR_missing` does not exist"));
+
+        state.add_pr(PrEntry::mock(MockPrArgs {
+            id: 1,
+            title: "Title".to_string(),
+            body: String::new(),
+            head: "Ghead".to_string(),
+            base: "main".to_string(),
+            repo_owner: "owner",
+            repo_name: "repo",
+        }));
+        let update = parse_document(
+            "mutation { updatePullRequest(input: { pullRequestId: \"PR_1\", \
+             baseRefName: \"Ghead\" }) { clientMutationId } }",
+        );
+        let error = handle_update_pr(&mut state, root_field(&update), &|_| Ok(true)).unwrap_err();
+        assert!(error.contains("head and base branches must differ"));
+    }
 }
 
 fn extract_input_field<'a>(
@@ -550,183 +1037,211 @@ fn get_string_field(obj: &[(Name, Node<ast::Value>)], key: &str) -> Option<Strin
     })
 }
 
+fn required_string_field(
+    input: &[(Name, Node<ast::Value>)],
+    key: &str,
+    path: &str,
+) -> Result<String, String> {
+    get_string_field(input, key)
+        .ok_or_else(|| format!("The mock GitHub API requires string field `{path}.input.{key}`"))
+}
+
 fn handle_update_pr(
     mock_state: &mut MockState,
     field: &executable::Field,
-    alias: &str,
-    response_data: &mut serde_json::Map<String, serde_json::Value>,
-) -> Result<(), String> {
-    if let Some(input) = extract_input_field(field, "input") {
-        let node_id = get_string_field(input, "pullRequestId").unwrap();
-        let title = get_string_field(input, "title");
-        let body = get_string_field(input, "body");
-        let base = get_string_field(input, "baseRefName");
+    branch_exists: &dyn Fn(&str) -> Result<bool, String>,
+) -> Result<serde_json::Value, String> {
+    const PATH: &str = "updatePullRequest";
+    let input = input_object(field, PATH)?;
+    let node_id = required_string_field(input, "pullRequestId", PATH)?;
+    let title = get_string_field(input, "title");
+    let body = get_string_field(input, "body");
+    let base = get_string_field(input, "baseRefName");
 
-        if let Some(pr) = mock_state.prs.iter_mut().find(|p| p.node_id == node_id) {
-            if mock_state.merge_queue.contains(&pr.id) && base.is_some() {
-                return Err("Pull request is in a merge queue and cannot be updated".to_string());
-            }
-
-            if let Some(t) = title {
-                pr.title = Some(t);
-            }
-            if let Some(b) = &body {
-                pr.body = Some(b.clone());
-            }
-            if let Some(base_ref) = base {
-                pr.base.ref_field = base_ref;
-            }
-        }
-
-        if body.as_deref().map(|b| b.contains("TRIGGER_GRAPHQL_NULL")).unwrap_or(false) {
-            response_data.insert(alias.to_string(), serde_json::Value::Null);
-        } else {
-            response_data.insert(
-                alias.to_string(),
-                serde_json::json!({
-                    "clientMutationId": null
-                }),
-            );
+    if let Some(base) = &base {
+        if !branch_exists(base)? {
+            return Err(format!("Base branch `{base}` does not exist"));
         }
     }
-    Ok(())
+
+    let Some(pr) = mock_state.prs.iter_mut().find(|pr| pr.node_id == node_id) else {
+        return Err(format!("Pull request node `{node_id}` does not exist"));
+    };
+    if base.as_deref() == Some(pr.head.ref_field.as_str()) {
+        return Err("Pull request head and base branches must differ".to_string());
+    }
+    if mock_state.merge_queue.contains(&pr.id) && base.is_some() {
+        return Err("Pull request is in a merge queue and cannot be updated".to_string());
+    }
+
+    if let Some(title) = title {
+        pr.title = Some(title);
+    }
+    if let Some(body) = &body {
+        pr.body = Some(body.clone());
+    }
+    if let Some(base) = base {
+        pr.base.ref_field = base;
+    }
+
+    if body.as_deref().is_some_and(|body| body.contains("TRIGGER_GRAPHQL_NULL")) {
+        return Ok(serde_json::Value::Null);
+    }
+
+    let mut response = serde_json::Map::new();
+    for field in selected_fields(&field.selection_set, PATH)? {
+        match field.name.as_str() {
+            "clientMutationId" => {
+                response.insert(response_key(field), serde_json::Value::Null);
+            }
+            _ => unreachable!("request was checked by validate_update_field"),
+        }
+    }
+    Ok(serde_json::Value::Object(response))
 }
 
 fn handle_create_pr(
     mock_state: &mut MockState,
     field: &executable::Field,
-    alias: &str,
-    response_data: &mut serde_json::Map<String, serde_json::Value>,
-) {
-    if let Some(input) = extract_input_field(field, "input") {
-        let base = get_string_field(input, "baseRefName").unwrap();
-        let head = get_string_field(input, "headRefName").unwrap();
-        let title_val = get_string_field(input, "title").unwrap();
-        let body_val = get_string_field(input, "body").unwrap();
+    branch_exists: &dyn Fn(&str) -> Result<bool, String>,
+) -> Result<serde_json::Value, String> {
+    const PATH: &str = "createPullRequest";
+    let input = input_object(field, PATH)?;
+    let repository_id = required_string_field(input, "repositoryId", PATH)?;
+    let base = required_string_field(input, "baseRefName", PATH)?;
+    let head = required_string_field(input, "headRefName", PATH)?;
+    let title = required_string_field(input, "title", PATH)?;
+    let body = get_string_field(input, "body").unwrap_or_default();
 
-        let num = mock_state.prs.len() as u64 + 1;
-        let owner = mock_state.repo_owner.clone();
-        let repo = mock_state.repo_name.clone();
-
-        let entry = PrEntry::mock(MockPrArgs {
-            id: num,
-            title: title_val,
-            body: body_val,
-            head,
-            base,
-            repo_owner: &owner,
-            repo_name: &repo,
-        });
-        let node_id = entry.node_id.clone();
-        let html_url = entry.html_url.clone();
-
-        mock_state.prs.push(entry);
-
-        response_data.insert(
-            alias.to_string(),
-            serde_json::json!({
-                "clientMutationId": null,
-                "pullRequest": {
-                    "id": node_id,
-                    "number": num,
-                    "url": html_url,
-                }
-            }),
-        );
+    if repository_id != "REPO_NODE_ID" {
+        return Err(format!("Repository node `{repository_id}` does not exist"));
     }
+    if base == head {
+        return Err("Pull request head and base branches must differ".to_string());
+    }
+    if !branch_exists(&base)? {
+        return Err(format!("Base branch `{base}` does not exist"));
+    }
+    if !branch_exists(&head)? {
+        return Err(format!("Head branch `{head}` does not exist"));
+    }
+    if mock_state.prs.iter().any(|pr| pr.state == "OPEN" && pr.head.ref_field == head) {
+        return Err(format!("An open pull request already exists for head branch `{head}`"));
+    }
+
+    let number = mock_state.prs.iter().map(|pr| pr.number as u64).max().unwrap_or(0) + 1;
+    let owner = mock_state.repo_owner.clone();
+    let repo = mock_state.repo_name.clone();
+    let entry = PrEntry::mock(MockPrArgs {
+        id: number,
+        title,
+        body,
+        head,
+        base,
+        repo_owner: &owner,
+        repo_name: &repo,
+    });
+    let node_id = entry.node_id.clone();
+    let html_url = entry.html_url.clone();
+    mock_state.prs.push(entry);
+
+    let mut response = serde_json::Map::new();
+    for field in selected_fields(&field.selection_set, PATH)? {
+        match field.name.as_str() {
+            "clientMutationId" => {
+                response.insert(response_key(field), serde_json::Value::Null);
+            }
+            "pullRequest" => {
+                let mut pull_request = serde_json::Map::new();
+                for field in selected_fields(&field.selection_set, "createPullRequest.pullRequest")?
+                {
+                    let value = match field.name.as_str() {
+                        "number" => serde_json::json!(number),
+                        "url" => serde_json::json!(html_url),
+                        "id" => serde_json::json!(node_id),
+                        _ => unreachable!("request was checked by validate_create_field"),
+                    };
+                    pull_request.insert(response_key(field), value);
+                }
+                response.insert(response_key(field), serde_json::Value::Object(pull_request));
+            }
+            _ => unreachable!("request was checked by validate_create_field"),
+        }
+    }
+    Ok(serde_json::Value::Object(response))
 }
 
 fn handle_repository_query(
     mock_state: &MockState,
     field: &executable::Field,
-    alias: &str,
-    variables: &Option<serde_json::Map<String, serde_json::Value>>,
-    response_data: &mut serde_json::Map<String, serde_json::Value>,
-) {
-    let get_string_arg = |name| -> Option<String> {
-        let arg = field.arguments.iter().find(|arg| arg.name == name)?;
-        match &*arg.value {
-            ast::Value::String(s) => Some(s.to_string()),
-            ast::Value::Variable(var_name) => {
-                variables.as_ref()?.get(var_name.as_str())?.as_str().map(|s| s.to_string())
-            }
-            _ => None,
-        }
-    };
+    variables: &GraphQlVariables,
+) -> Result<serde_json::Value, String> {
+    const PATH: &str = "repository";
+    let owner = resolve_string_argument(field, "owner", PATH, variables)?;
+    let name = resolve_string_argument(field, "name", PATH, variables)?;
 
-    let owner = get_string_arg("owner");
-    let name = get_string_arg("name");
-
-    if owner.as_deref() != Some(mock_state.repo_owner.as_str())
-        || name.as_deref() != Some(mock_state.repo_name.as_str())
-    {
-        response_data.insert(alias.to_string(), serde_json::Value::Null);
-        return;
+    if owner != mock_state.repo_owner || name != mock_state.repo_name {
+        return Ok(serde_json::Value::Null);
     }
 
     let mut repo_data = serde_json::Map::new();
 
-    for selection in field.selection_set.selections.iter() {
-        if let executable::Selection::Field(sub_field) = selection {
-            match sub_field.name.as_str() {
-                "pullRequests" => {
-                    let head = sub_field.arguments.iter().find_map(|arg| {
-                        match (&*arg.name, &*arg.value) {
-                            ("headRefName", ast::Value::String(s)) => Some(s.to_string()),
-                            ("headRefName", ast::Value::Variable(var_name)) => variables
-                                .as_ref()?
-                                .get(var_name.as_str())?
-                                .as_str()
-                                .map(|s| s.to_string()),
-                            _ => None,
+    for field in selected_fields(&field.selection_set, PATH)? {
+        match field.name.as_str() {
+            "pullRequests" => {
+                let head = resolve_string_argument(
+                    field,
+                    "headRefName",
+                    "repository.pullRequests",
+                    variables,
+                )?;
+                let matching_prs: Vec<_> =
+                    mock_state.prs.iter().filter(|pr| pr.head.ref_field == head).take(1).collect();
+
+                let mut connection = serde_json::Map::new();
+                for field in selected_fields(&field.selection_set, "repository.pullRequests")? {
+                    match field.name.as_str() {
+                        "nodes" => {
+                            let nodes = matching_prs
+                                .iter()
+                                .map(|pr| project_pr_node(pr, &field.selection_set))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            connection.insert(response_key(field), serde_json::json!(nodes));
                         }
-                    });
-
-                    // Filter PRs
-                    let prs: Vec<_> = mock_state
-                        .prs
-                        .iter()
-                        .filter(|pr| match &head {
-                            Some(h) => pr.head.ref_field == *h,
-                            None => true,
-                        })
-                        .collect();
-
-                    let nodes: Vec<_> = prs
-                        .into_iter()
-                        .map(|pr| {
-                            serde_json::json!({
-                                "number": pr.number,
-                                "id": pr.node_id,
-                                "title": pr.title,
-                                "body": pr.body,
-                                "baseRefName": pr.base.ref_field,
-                                "state": pr.state,
-                                "url": pr.html_url,
-                                "headRefName": pr.head.ref_field,
-                            })
-                        })
-                        .collect();
-
-                    repo_data.insert(
-                        "pullRequests".to_string(),
-                        serde_json::json!({
-                            "nodes": nodes
-                        }),
-                    );
+                        _ => unreachable!("request was checked by validate_pull_requests_field"),
+                    }
                 }
-                "id" => {
-                    repo_data.insert(
-                        "id".to_string(),
-                        serde_json::Value::String("REPO_NODE_ID".to_string()),
-                    );
-                }
-                _ => {}
+                repo_data.insert(response_key(field), serde_json::Value::Object(connection));
             }
+            "id" => {
+                repo_data.insert(
+                    response_key(field),
+                    serde_json::Value::String("REPO_NODE_ID".to_string()),
+                );
+            }
+            _ => unreachable!("request was checked by validate_repository_field"),
         }
     }
 
-    if !repo_data.is_empty() {
-        response_data.insert(alias.to_string(), serde_json::Value::Object(repo_data));
+    Ok(serde_json::Value::Object(repo_data))
+}
+
+fn project_pr_node(
+    pr: &PrEntry,
+    selection_set: &executable::SelectionSet,
+) -> Result<serde_json::Value, String> {
+    let mut node = serde_json::Map::new();
+    for field in selected_fields(selection_set, "repository.pullRequests.nodes")? {
+        let value = match field.name.as_str() {
+            "number" => serde_json::json!(pr.number),
+            "id" => serde_json::json!(pr.node_id),
+            "title" => serde_json::json!(pr.title),
+            "body" => serde_json::json!(pr.body),
+            "baseRefName" => serde_json::json!(pr.base.ref_field),
+            "state" => serde_json::json!(pr.state),
+            _ => unreachable!("request was checked by validate_pull_requests_field"),
+        };
+        node.insert(response_key(field), value);
     }
+    Ok(serde_json::Value::Object(node))
 }
