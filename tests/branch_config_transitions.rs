@@ -37,7 +37,7 @@ const BRANCH: &str = "feature";
 /// Helper to force the repo into a specific state
 fn setup_state(ctx: &TestContext, state: StartState) {
     // Always start with a clean branch
-    let _ = ctx.git().args(["branch", "-D", BRANCH]).output();
+    let _ = ctx.git_cmd().args(["branch", "-D", BRANCH]).output();
     ctx.checkout_new(BRANCH);
 
     let key_managed = format!("branch.{BRANCH}.gherritManaged");
@@ -170,18 +170,18 @@ fn test_branch_config_transitions() {
         let mut cmd;
         match case.cmd {
             Command::ManageDefault => {
-                cmd = ctx.manage();
+                cmd = ctx.manage_cmd();
             }
             Command::ManagePrivate => {
-                cmd = ctx.manage();
+                cmd = ctx.manage_cmd();
                 cmd.arg("--private");
             }
             Command::ManagePublic => {
-                cmd = ctx.manage();
+                cmd = ctx.manage_cmd();
                 cmd.arg("--public");
             }
             Command::Unmanage => {
-                cmd = ctx.unmanage();
+                cmd = ctx.unmanage_cmd();
             }
         }
 
@@ -189,7 +189,7 @@ fn test_branch_config_transitions() {
             cmd.arg("--force");
         }
 
-        testutil::assert_snapshot!(ctx, cmd, format!("transition_case_{}", case.id));
+        testutil::assert_success_snapshot!(ctx, cmd, format!("transition_case_{}", case.id));
 
         verify_state(&ctx, case.expected_final_state);
     }
