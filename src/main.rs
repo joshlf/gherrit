@@ -54,7 +54,14 @@ enum Commands {
 #[derive(Subcommand)]
 enum HookCommands {
     /// Git pre-push hook.
-    PrePush,
+    PrePush {
+        /// Name of the remote being pushed to.
+        #[arg(requires = "remote_location")]
+        remote_name: Option<String>,
+        /// Location of the remote being pushed to.
+        #[arg(requires = "remote_name")]
+        remote_location: Option<String>,
+    },
     /// Git post-checkout hook.
     PostCheckout { prev: String, new: String, flag: String },
     /// Git commit-msg hook.
@@ -115,7 +122,7 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Hook(cmd) => match cmd {
-            HookCommands::PrePush => {
+            HookCommands::PrePush { .. } => {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?
