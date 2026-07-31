@@ -2,7 +2,10 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, LazyLock, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, LazyLock, RwLock,
+    },
 };
 
 use regex::Regex;
@@ -14,6 +17,8 @@ pub const DEFAULT_OWNER: &str = "owner";
 pub const DEFAULT_REPO: &str = "repo";
 pub const MANAGED_PRIVATE: &str = "managedPrivate";
 pub const MANAGED_PUBLIC: &str = "managedPublic";
+
+const FIRST_GIT_TIMESTAMP: u64 = 946_684_800;
 
 #[macro_export]
 macro_rules! test_context {
@@ -182,6 +187,7 @@ impl TestContextBuilder {
             is_live,
             system_git: system_git.clone(),
             gherrit_bin_path: gherrit_bin.clone(),
+            next_git_timestamp: AtomicU64::new(FIRST_GIT_TIMESTAMP),
             mock_server,
             mock_server_state,
         };
@@ -205,6 +211,7 @@ pub struct TestContext {
     pub is_live: bool,
     pub system_git: PathBuf,
     pub gherrit_bin_path: PathBuf,
+    next_git_timestamp: AtomicU64,
     pub mock_server: Option<MockServerInfo>,
     pub mock_server_state: Option<Arc<RwLock<mock_server::MockState>>>,
 }
@@ -232,9 +239,12 @@ impl Drop for TestContext {
 
 impl TestContext {
     fn configure_mock_env(&self, cmd: &mut assert_cmd::Command) {
-        // Enforce deterministic timestamps for git commits to ensure stable IDs in snapshots
-        cmd.env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z");
-        cmd.env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z");
+        // Give each command a deterministic, unique timestamp. In particular,
+        // this ensures an otherwise-empty amend creates a distinct Git object.
+        let timestamp = self.next_git_timestamp.fetch_add(1, Ordering::Relaxed);
+        let git_date = format!("@{timestamp} +0000");
+        cmd.env("GIT_AUTHOR_DATE", &git_date);
+        cmd.env("GIT_COMMITTER_DATE", &git_date);
 
         if !self.is_live {
             // Prepend temp dir to PATH so 'gh' and 'git' resolve to our mock
@@ -297,6 +307,45 @@ impl TestContext {
 
     pub fn commit(&self, msg: &str) {
         self.run_git(&["commit", "--allow-empty", "-m", msg]);
+    }
+
+    pub fn amend(&self) {
+        self.amend_inner(&["--no-edit"]);
+    }
+
+    pub fn amend_with_message(&self, message: &str) {
+        let previous_id = self.gherrit_id("HEAD").ok();
+        let message = if message.lines().any(|line| line.starts_with("gherrit-pr-id: ")) {
+            message.to_string()
+        } else if let Some(id) = &previous_id {
+            format!("{message}\n\ngherrit-pr-id: {id}")
+        } else {
+            message.to_string()
+        };
+
+        self.amend_inner(&["-m", &message]);
+    }
+
+    fn amend_inner(&self, args: &[&str]) {
+        let previous_oid = self.head_oid();
+        let previous_id = self.gherrit_id("HEAD").ok();
+
+        self.git().arg("commit").arg("--amend").args(args).arg("--allow-empty").assert().success();
+
+        let amended_oid = self.head_oid();
+        assert_ne!(previous_oid, amended_oid, "Amend must create a distinct commit object");
+        if let Some(previous_id) = previous_id {
+            assert_eq!(
+                self.gherrit_id("HEAD").unwrap(),
+                previous_id,
+                "Amend must preserve the GHerrit ID"
+            );
+        }
+    }
+
+    pub fn head_oid(&self) -> String {
+        let assert = self.git().args(["rev-parse", "HEAD"]).assert().success();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap().trim().to_string()
     }
 
     pub fn checkout_new(&self, branch_name: &str) {

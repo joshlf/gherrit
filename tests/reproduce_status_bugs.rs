@@ -31,7 +31,7 @@ fn test_pre_push_edit_failure() {
     ctx.gherrit().args(["hook", "pre-push"]).assert().success();
 
     // Amend commit to trigger update (edit)
-    ctx.run_git(&["commit", "--amend", "--allow-empty", "-m", "Initial Work (Updated)"]);
+    ctx.amend_with_message("Initial Work (Updated)");
 
     // Run hook with failure injection
     ctx.inject_failure(testutil::FailureKind::UpdatePr);
