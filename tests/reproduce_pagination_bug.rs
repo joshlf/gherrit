@@ -1,21 +1,22 @@
 #[test]
 fn test_pagination_bug() {
-    let ctx =
-        testutil::test_context!().with_remote().with_installed_hooks().with_mock_github().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .build();
 
-    // 1. Setup base commit on main
-    ctx.commit("Init");
-
-    // 2. Checkout feature branch and manage it
+    // 1. Checkout feature branch and manage it
     ctx.checkout_new("feature");
     ctx.gherrit_cmd().args(["manage", "--force"]).assert().success();
 
-    // 3. Create a commit with a known Change-Id
+    // 2. Create a commit with a known Change-Id
     let change_id = "I0000000000000000000000000000000000000105";
     let msg = format!("Commit 105\n\ngherrit-pr-id: {}", change_id);
     ctx.commit(&msg);
 
-    // 4. Generate 110 PRs in the mock server state
+    // 3. Generate 110 PRs in the mock server state
     ctx.mutate_mock_state(|state| {
         for i in 1..=110 {
             let is_target = i == 105;
@@ -35,7 +36,7 @@ fn test_pagination_bug() {
         }
     });
 
-    // 5. Run gherrit hook pre-push
+    // 4. Run gherrit hook pre-push
     let assert =
         ctx.gherrit_cmd().args(["hook", "pre-push"]).env("RUST_LOG", "debug").assert().success();
 
