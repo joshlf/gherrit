@@ -43,8 +43,9 @@ fn test_full_stack_lifecycle_mocked() {
     testutil::assert_pr_snapshot!(ctx, "full_stack_lifecycle_state");
 
     ctx.maybe_inspect_mock_state(|state| {
-        assert!(!state.pushed_refs.is_empty(), "Expected some refs to be pushed");
+        assert!(state.pushes.iter().any(|push| push.succeeded()), "Expected a successful push");
     });
+    assert!(!ctx.remote_refs("refs/heads").is_empty(), "Expected remote branches to be updated");
 }
 
 #[test]
@@ -183,7 +184,7 @@ fn test_version_increment() {
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "version_increment_v1");
 
     // Verify v1 pushed
-    let v1_count = ctx.count_pushed_containing("/v1");
+    let v1_count = ctx.count_successfully_pushed_containing("/v1");
     assert!(v1_count > 0, "Expected v1 tag to be pushed");
 
     // Amend commit (modifies SHA, keeps Change-ID)
@@ -193,19 +194,18 @@ fn test_version_increment() {
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "version_increment_v2");
 
     // Verify v2 pushed
-    let v2_count = ctx.count_pushed_containing("/v2");
+    let v2_count = ctx.count_successfully_pushed_containing("/v2");
     assert!(v2_count > 0, "Expected v2 tag to be pushed");
 
     // Verify v1 NOT pushed AGAIN.
-    let v1_count_final = ctx.count_pushed_containing("/v1");
+    let v1_count_final = ctx.count_successfully_pushed_containing("/v1");
     assert_eq!(v1_count_final, v1_count, "v1 tag should NOT be pushed again in the second push.");
 
     if !ctx.is_live {
         // Verify that tags actually exist on the remote
-        let output = ctx.remote_git().args(["tag", "-l"]).output().unwrap();
-        let tags = std::str::from_utf8(&output.stdout).unwrap();
-        assert!(tags.contains("/v1"), "Remote should contain v1 tag");
-        assert!(tags.contains("/v2"), "Remote should contain v2 tag");
+        let tags = ctx.remote_refs("refs/tags/gherrit");
+        assert!(tags.iter().any(|tag| tag.ends_with("/v1")), "Remote should contain v1 tag");
+        assert!(tags.iter().any(|tag| tag.ends_with("/v2")), "Remote should contain v2 tag");
     }
 }
 
@@ -221,6 +221,8 @@ fn test_optimistic_locking_conflict() {
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "optimistic_locking_v1");
 
     let gherrit_id = ctx.gherrit_id("HEAD").unwrap();
+    let managed_ref = format!("refs/heads/{gherrit_id}");
+    let pushed_oid = ctx.remote_ref_oid(&managed_ref).expect("Managed ref was not pushed");
 
     // Simulate race condition: Create v2 tag on REMOTE manually. The next
     // version should be v2 (since v1 exists). Note that in a bare repo, we can
@@ -242,6 +244,17 @@ fn test_optimistic_locking_conflict() {
 
     // Attempt push - should fail due to atomic lock
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "optimistic_locking_v2_fail");
+
+    ctx.maybe_inspect_mock_state(|state| {
+        assert_eq!(state.pushes.len(), 2, "Expected one successful and one failed push");
+        assert!(state.pushes[0].succeeded(), "Initial push should succeed");
+        assert!(!state.pushes[1].succeeded(), "Conflicting push should fail");
+    });
+    assert_eq!(
+        ctx.remote_ref_oid(&managed_ref).as_deref(),
+        Some(pushed_oid.as_str()),
+        "Failed atomic push must not update the managed ref"
+    );
 }
 
 #[test]
@@ -295,16 +308,20 @@ fn test_large_stack_batching() {
     ctx.maybe_inspect_mock_state(|state| {
         // Assert: Push was split into 2 batches (80 + 5)
         assert_eq!(
-            state.push_count, 2,
+            state.pushes.iter().filter(|push| push.succeeded()).count(),
+            2,
             "Expected 2 push invocations for 85 commits (batch size 80)"
         );
     });
 
     testutil::assert_pr_snapshot!(ctx, "large_stack_batching_state");
 
-    // Assert: 85 refs pushed (actually more, since tags are also pushed)
-    // Check refs/gherrit/<ID>/v1 count.
-    let v1_refs = ctx.count_pushed_containing("/v1");
+    // Verify that every version tag exists on the authoritative remote.
+    let v1_refs = ctx
+        .remote_refs("refs/tags/gherrit")
+        .into_iter()
+        .filter(|ref_name| ref_name.ends_with("/v1"))
+        .count();
     assert_eq!(v1_refs, 85, "Expected 85 v1 specific refs pushed");
 }
 

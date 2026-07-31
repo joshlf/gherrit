@@ -19,14 +19,8 @@ fn test_mixed_stack_backward_compatibility() {
     // but here we mainly care that it doesn't crash and processes both.
     testutil::assert_snapshot!(ctx, ctx.hook("pre-push"), "mixed_stack_backward_compatibility");
 
-    // Verify mock state has 2 pushed refs
-    ctx.maybe_inspect_mock_state(|state| {
-        // We expect push of legacy ID and new ID
-        // Note: The legacy ID commit might not look like a "new" PR if the mock logic splits it,
-        // but let's just check that we pushed *something* related to the legacy ID.
-        let pushed_legacy = state.pushed_refs.iter().any(|r| r.contains(legacy_id));
-        assert!(pushed_legacy, "Expected legacy ID to be pushed");
-    });
+    let legacy_ref = format!("refs/heads/{legacy_id}");
+    assert!(ctx.remote_ref_oid(&legacy_ref).is_some(), "Expected legacy ID to be pushed");
 }
 
 #[test]
