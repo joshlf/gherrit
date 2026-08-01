@@ -303,12 +303,11 @@ impl TestContext {
         self.run_git(&["checkout", "-b", branch_name]);
     }
 
-    pub fn inject_failure(&self, kind: FailureKind, remaining: usize) {
+    pub fn inject_failure(&self, kind: FailureKind) {
         let mut state =
             self.mock_server_state.as_ref().expect("Mock state not available").write().unwrap();
 
         state.fail_next_request = Some(kind);
-        state.fail_remaining = remaining;
     }
 
     pub fn maybe_inspect_mock_state(&self, f: impl FnOnce(&mock_server::MockState)) {

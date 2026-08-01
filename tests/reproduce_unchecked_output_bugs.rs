@@ -23,7 +23,7 @@ fn test_pre_push_pr_list_failure() {
     ctx.commit("Work");
 
     // Trigger hook
-    ctx.inject_failure(testutil::FailureKind::GraphQl, 5);
+    ctx.inject_failure(testutil::FailureKind::GraphQl);
 
     ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
 }
@@ -35,7 +35,7 @@ fn test_pre_push_pr_create_failure() {
     ctx.commit("Work");
 
     // Trigger hook
-    ctx.inject_failure(testutil::FailureKind::CreatePr, 5);
+    ctx.inject_failure(testutil::FailureKind::CreatePr);
 
     ctx.gherrit().args(["hook", "pre-push"]).assert().failure();
 }
