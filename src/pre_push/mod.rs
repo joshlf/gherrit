@@ -571,33 +571,43 @@ async fn sync_prs(
         .iter()
         .map(|entry| {
             let c = &entry.item;
-            let pr_info = prs.iter().find(|pr| pr.head_branch == c.gherrit_id);
 
-            if let Some(pr) = pr_info {
-                log::debug!("Found existing PR #{} for {}", pr.number.green().bold(), c.gherrit_id);
-                Ok(PrResolution::Existing(pr.clone()))
-            } else {
-                log::debug!("No GitHub PR exists for {}; queuing creation...", c.gherrit_id);
-                Ok(PrResolution::ToCreate(BatchCreate {
-                    title: c.message_title.clone(),
-                    body: c.message_body.clone(),
-                    base_branch: entry.base_branch.clone(),
-                    head_branch: c.gherrit_id.clone(),
-                }))
-            }
+            prs.iter().find(|pr| pr.head_branch == c.gherrit_id).map_or_else(
+                || {
+                    log::debug!("No GitHub PR exists for {}; queuing creation...", c.gherrit_id);
+                    PrResolution::ToCreate(BatchCreate {
+                        title: c.message_title.clone(),
+                        body: c.message_body.clone(),
+                        base_branch: entry.base_branch.clone(),
+                        head_branch: c.gherrit_id.clone(),
+                    })
+                },
+                |pr| {
+                    log::debug!(
+                        "Found existing PR #{} for {}",
+                        pr.number.green().bold(),
+                        c.gherrit_id
+                    );
+                    PrResolution::Existing(pr.clone())
+                },
+            )
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect();
 
     // 2. Batch create missing PRs
-    let creations = resolutions.iter().filter_map(|r| match r {
-        PrResolution::ToCreate(c) => Some(c),
-        _ => None,
-    });
-    let num_creations = creations.clone().count();
-    let new_prs = if num_creations > 0 {
+    let creations = resolutions
+        .iter()
+        .filter_map(|resolution| match resolution {
+            PrResolution::ToCreate(create) => Some(create),
+            PrResolution::Existing(_) => None,
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let num_creations = creations.len();
+    let new_prs = if !creations.is_empty() {
         log::info!("Creating {num_creations} PRs...");
         let repo_id = fetch_repo_id(octocrab, &remote).await?;
-        let created = batch_create_prs(octocrab, &repo_id, creations.cloned()).await?;
+        let created = batch_create_prs(octocrab, &repo_id, creations).await?;
         assert_eq!(created.len(), num_creations);
         log::info!("Created {num_creations} PRs.");
         created
