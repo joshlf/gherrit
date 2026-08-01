@@ -11,27 +11,26 @@ pub(super) struct StackEntry<T> {
 pub(super) fn link_stack<T>(
     base_branch: &str,
     items: impl IntoIterator<Item = T>,
-    id_of: impl Fn(&T) -> String,
+    mut id_of: impl FnMut(&T) -> String,
 ) -> Vec<StackEntry<T>> {
-    let mut items = items.into_iter().peekable();
-    let mut parent_id = None;
-    let mut parent_branch = base_branch.to_string();
-    let mut stack = Vec::new();
+    let mut items = items
+        .into_iter()
+        .map(|item| {
+            let id = id_of(&item);
+            (item, id)
+        })
+        .peekable();
+    let mut previous_id = None;
 
-    while let Some(item) = items.next() {
-        let id = id_of(&item);
-        let child_id = items.peek().map(&id_of);
-        stack.push(StackEntry {
-            item,
-            base_branch: parent_branch,
-            parent_id: parent_id.clone(),
-            child_id,
-        });
-        parent_branch = id.clone();
-        parent_id = Some(id);
-    }
+    std::iter::from_fn(|| {
+        let (item, id) = items.next()?;
+        let child_id = items.peek().map(|(_, id)| id.clone());
+        let parent_id = previous_id.replace(id);
+        let base_branch = parent_id.as_deref().unwrap_or(base_branch).to_owned();
 
-    stack
+        Some(StackEntry { item, base_branch, parent_id, child_id })
+    })
+    .collect()
 }
 
 /// Metadata currently stored on a PR.
@@ -64,9 +63,10 @@ pub(super) struct PrUpdate {
 /// Returns the minimal update needed to make `current` match `desired`.
 pub(super) fn plan_update(current: CurrentPr<'_>, desired: DesiredPr<'_>) -> Option<PrUpdate> {
     let title = (current.title != Some(desired.title)).then(|| desired.title.to_string());
-    let body_changed =
-        current.body.is_none_or(|body| normalize_body(body) != normalize_body(desired.body));
-    let body = body_changed.then(|| desired.body.to_string());
+    let body = current
+        .body
+        .is_none_or(|body| normalize_body(body) != normalize_body(desired.body))
+        .then(|| desired.body.to_string());
     let base_branch =
         (current.base_branch != desired.base_branch).then(|| desired.base_branch.to_string());
 
@@ -87,7 +87,7 @@ mod tests {
     use super::*;
 
     fn link_ids(base_branch: &str, ids: &[&str]) -> Vec<StackEntry<String>> {
-        link_stack(base_branch, ids.iter().map(|id| (*id).to_string()), Clone::clone)
+        link_stack(base_branch, ids.iter().copied().map(str::to_owned), Clone::clone)
     }
 
     #[test]
@@ -173,6 +173,17 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn extracts_each_id_once() {
+        let mut calls = 0;
+        let _ = link_stack("main", ["A", "B", "C"], |id| {
+            calls += 1;
+            (*id).to_owned()
+        });
+
+        assert_eq!(calls, 3);
     }
 
     fn current<'a>(

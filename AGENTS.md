@@ -35,7 +35,8 @@ It achieves this by:
 
 - `src/`: Core CLI source code.
     - `main.rs`: Entry point and CLI definition.
-    - `pre_push.rs`: **CORE LOGIC**. Handles the commit analysis, ref creation, pushing, and PR syncing.
+    - `pre_push/mod.rs`: **CORE LOGIC**. Handles commit analysis, ref creation,
+      pushing, and PR syncing.
     - `manage.rs`: Handles the state of branches (Managed vs Unmanaged) via `git config`.
     - `commit_msg.rs`: Ensures commits have `gherrit-pr-id` trailers.
 - `hooks/`: Git hooks (`pre-push`, `commit-msg`, `post-checkout`) that shell out to the `gherrit` binary.
