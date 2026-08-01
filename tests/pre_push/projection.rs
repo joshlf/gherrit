@@ -3,6 +3,32 @@ mod base;
 #[path = "projection/pagination.rs"]
 mod pagination;
 
+fn assert_valid_gherrit_metadata(ctx: &testutil::TestContext) {
+    const PREFIX: &str = "<!-- gherrit-meta: ";
+    const SUFFIX: &str = " -->";
+
+    ctx.inspect_mock_state(|state| {
+        state.prs.iter().enumerate().for_each(|(index, pr)| {
+            let body = pr.body.as_deref().expect("PR body");
+            let (_, metadata) = body.rsplit_once(PREFIX).expect("GHerrit metadata marker");
+            let metadata = metadata.strip_suffix(SUFFIX).expect("metadata must end the PR body");
+            let metadata: serde_json::Value =
+                serde_json::from_str(metadata).expect("GHerrit metadata must be valid JSON");
+            let parent = index.checked_sub(1).map(|index| &state.prs[index].head.ref_field);
+            let child = state.prs.get(index + 1).map(|pr| &pr.head.ref_field);
+
+            assert_eq!(
+                metadata,
+                serde_json::json!({
+                    "id": &pr.head.ref_field,
+                    "parent": parent,
+                    "child": child,
+                })
+            );
+        });
+    });
+}
+
 #[test]
 fn test_pr_body_generation() {
     let ctx = testutil::test_context!()
@@ -27,6 +53,7 @@ fn test_pr_body_generation() {
 
     // Verify
     testutil::assert_pr_snapshot!(ctx, "pr_body_generation_v1_state");
+    assert_valid_gherrit_metadata(&ctx);
 
     // 4. Update to v2 to verify the Patch History Table appears
     ctx.run_git(&["checkout", "feature-stack"]); // Ensure we are on the branch
@@ -38,6 +65,7 @@ fn test_pr_body_generation() {
     testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "pr_body_generation_v2");
 
     testutil::assert_pr_snapshot!(ctx, "pr_body_generation_v2_state");
+    assert_valid_gherrit_metadata(&ctx);
 }
 
 #[test]
