@@ -129,7 +129,7 @@ fn test_optimistic_locking_conflict() {
 }
 
 #[test]
-fn test_large_stack_batching() {
+fn test_graphql_batch_backoff() {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_installed_hooks()
@@ -138,34 +138,33 @@ fn test_large_stack_batching() {
         .with_git_interceptor()
         .build();
 
-    // Create feature branch
-    ctx.checkout_new("large-stack");
+    ctx.limit_graphql_operations_per_request(2);
+    ctx.checkout_new("batch-backoff");
 
-    // Create 85 commits (exceeds batch limit of 80)
-    for i in 1..=85 {
+    for i in 1..=4 {
         ctx.commit(&format!("Commit {}", i));
     }
 
-    // Sync - should succeed without error
-    // Using simple pre-push hook invocation.
-    testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "large_stack_batching");
+    testutil::assert_success_snapshot!(
+        ctx,
+        ctx.hook_cmd("pre-push").env("GHERRIT_TEST_PUSH_BATCH_LEN", "2"),
+        "graphql_batch_backoff"
+    );
 
     ctx.inspect_mock_state(|state| {
-        // Assert: Push was split into 2 batches (80 + 5)
         assert_eq!(
             state.pushes.iter().filter(|push| push.succeeded()).count(),
             2,
-            "Expected 2 push invocations for 85 commits (batch size 80)"
+            "Expected two pushes at the test batch size"
         );
+        assert_eq!(state.prs.len(), 4, "Expected every commit to have a PR");
+        insta::assert_debug_snapshot!("graphql_batch_backoff_trace", state.graphql_requests);
     });
 
-    testutil::assert_pr_snapshot!(ctx, "large_stack_batching_state");
-
-    // Verify that every version tag exists on the authoritative remote.
     let v1_refs = ctx
         .remote_refs("refs/tags/gherrit")
         .into_iter()
         .filter(|ref_name| ref_name.ends_with("/v1"))
         .count();
-    assert_eq!(v1_refs, 85, "Expected 85 v1 specific refs pushed");
+    assert_eq!(v1_refs, 4, "Expected every v1 tag on the remote");
 }
