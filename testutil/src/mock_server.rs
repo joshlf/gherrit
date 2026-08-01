@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::IntoFuture,
     path::PathBuf,
-    sync::{mpsc::Sender, Arc, RwLock},
+    sync::{mpsc::Sender, Arc, LazyLock, RwLock},
 };
 
 use apollo_compiler::{ast, executable, validation::Valid, ExecutableDocument, Name, Node};
@@ -11,6 +11,14 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::{FailureKind, TestEnvironment};
+
+static GITHUB_SCHEMA: LazyLock<Valid<apollo_compiler::Schema>> = LazyLock::new(|| {
+    apollo_compiler::Schema::parse_and_validate(
+        include_str!("../data/github_schema.graphql"),
+        "github_schema.graphql",
+    )
+    .expect("Failed to parse and validate embedded GitHub schema")
+});
 
 #[derive(Debug, Clone, Default)]
 pub struct MockState {
@@ -21,7 +29,6 @@ pub struct MockState {
     pub repo_name: String,
     pub fail_next_request: Option<FailureKind>,
     pub merge_queue: HashSet<u64>,
-    pub schema: Option<Valid<apollo_compiler::Schema>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,12 +40,7 @@ pub enum GraphQlOperation {
 
 impl MockState {
     pub fn new(owner: String, name: String) -> Self {
-        let schema_src = include_str!("../data/github_schema.graphql");
-        let schema =
-            apollo_compiler::Schema::parse_and_validate(schema_src, "github_schema.graphql")
-                .expect("Failed to parse and validate embedded GitHub schema");
-
-        Self { repo_owner: owner, repo_name: name, schema: Some(schema), ..Default::default() }
+        Self { repo_owner: owner, repo_name: name, ..Default::default() }
     }
 
     pub fn add_pr(&mut self, pr: PrEntry) {
@@ -855,21 +857,20 @@ async fn graphql(
         Err(message) => return graphql_http_error(&message),
     };
 
-    let mut mock_state = app_state.state.write().unwrap();
-
-    let schema = mock_state.schema.as_ref().expect("Schema not initialized");
-    let document = match ExecutableDocument::parse_and_validate(schema, query, "query.graphql") {
-        Ok(doc) => doc,
-        Err(e) => {
-            eprintln!("DEBUG: GraphQL validation errors: {:?}", e.errors);
-            return graphql_http_error("GraphQL request failed schema validation");
-        }
-    };
+    let document =
+        match ExecutableDocument::parse_and_validate(&GITHUB_SCHEMA, query, "query.graphql") {
+            Ok(doc) => doc,
+            Err(e) => {
+                eprintln!("DEBUG: GraphQL validation errors: {:?}", e.errors);
+                return graphql_http_error("GraphQL request failed schema validation");
+            }
+        };
     if let Err(message) = validate_supported_document(&document, &variables) {
         return graphql_http_error(&message);
     }
 
     let operations = graphql_operations(&document);
+    let mut mock_state = app_state.state.write().unwrap();
     mock_state.graphql_requests.push(operations.clone());
     if let Some(failure) = check_and_apply_graphql_failure(&mut mock_state, &operations) {
         return (
@@ -1189,14 +1190,9 @@ mod tests {
     use super::*;
 
     fn parse_document(query: &str) -> ExecutableDocument {
-        let state = MockState::new("owner".to_string(), "repo".to_string());
-        ExecutableDocument::parse_and_validate(
-            state.schema.as_ref().unwrap(),
-            query,
-            "test.graphql",
-        )
-        .unwrap()
-        .into_inner()
+        ExecutableDocument::parse_and_validate(&GITHUB_SCHEMA, query, "test.graphql")
+            .unwrap()
+            .into_inner()
     }
 
     fn root_field(document: &ExecutableDocument) -> &executable::Field {
