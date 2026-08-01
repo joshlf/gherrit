@@ -604,6 +604,12 @@ impl TestContext {
         state.fail_next_request = Some(kind);
     }
 
+    pub fn limit_graphql_operations_per_request(&self, limit: usize) {
+        assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
+        assert_ne!(limit, 0, "GraphQL operation limit must be nonzero");
+        self.mock_state().write().unwrap().max_graphql_operations_per_request = Some(limit);
+    }
+
     pub fn assert_failure_consumed(&self) {
         self.inspect_mock_state(|state| {
             assert!(
