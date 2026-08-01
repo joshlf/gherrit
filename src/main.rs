@@ -2,6 +2,8 @@ mod commit_msg;
 mod install;
 mod manage;
 mod pre_push;
+#[cfg(gherrit_test)]
+mod test_git;
 mod util;
 
 use clap::{Parser, Subcommand};
@@ -74,6 +76,11 @@ enum HookCommands {
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    #[cfg(gherrit_test)]
+    if test_git::is_invocation() {
+        return test_git::run();
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format({
             use std::io::Write as _;
