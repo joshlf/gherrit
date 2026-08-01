@@ -17,6 +17,10 @@ use crate::{
     util::{self, CommandExt as _, HeadState, Remote},
 };
 
+mod reconcile;
+
+use reconcile::{CurrentPr, DesiredPr, PrUpdate, link_stack, plan_update};
+
 pub async fn run(repo: &util::Repo) -> Result<()> {
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
@@ -555,14 +559,7 @@ async fn sync_prs(
 ) -> Result<()> {
     let remote = repo.default_remote()?;
 
-    let commits = commits
-        .into_iter()
-        .scan(base_branch.to_string(), |parent_branch, c| {
-            let parent = parent_branch.clone();
-            *parent_branch = c.gherrit_id.clone();
-            Some((c, parent))
-        })
-        .collect::<Vec<_>>();
+    let commits = link_stack(base_branch, commits, |commit| commit.gherrit_id.clone());
 
     enum PrResolution {
         Existing(PrState),
@@ -572,7 +569,8 @@ async fn sync_prs(
     // 1. Identify existing PRs or queue for creation
     let resolutions: Vec<_> = commits
         .iter()
-        .map(|(c, parent_branch)| {
+        .map(|entry| {
+            let c = &entry.item;
             let pr_info = prs.iter().find(|pr| pr.head_branch == c.gherrit_id);
 
             if let Some(pr) = pr_info {
@@ -583,7 +581,7 @@ async fn sync_prs(
                 Ok(PrResolution::ToCreate(BatchCreate {
                     title: c.message_title.clone(),
                     body: c.message_body.clone(),
-                    base_branch: parent_branch.clone(),
+                    base_branch: entry.base_branch.clone(),
                     head_branch: c.gherrit_id.clone(),
                 }))
             }
@@ -614,7 +612,7 @@ async fn sync_prs(
     let commit_pr_states = commits
         .iter()
         .zip(resolutions)
-        .map(|((c, parent_branch), resolution)| {
+        .map(|(entry, resolution)| {
             let pr_state = match resolution {
                 PrResolution::Existing(state) => state,
                 PrResolution::ToCreate(create) => {
@@ -636,7 +634,7 @@ async fn sync_prs(
                     }
                 }
             };
-            Ok((c, parent_branch, pr_state))
+            Ok((entry, pr_state))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -649,14 +647,15 @@ async fn sync_prs(
         })
         .flatten();
 
-    let updates: Vec<BatchUpdate> = commit_pr_states
+    let repo_url = remote.repo_url_relative();
+    let updates: Vec<PrUpdate> = commit_pr_states
         .iter()
-        .enumerate()
-        .filter_map(|(i, (c, parent_branch, pr_state))| {
+        .filter_map(|(entry, pr_state)| {
+            let c = &entry.item;
             let gh_pr_ids_markdown = commit_pr_states
                 .iter()
                 .rev()
-                .map(|(_, _, state)| {
+                .map(|(_, state)| {
                     let prefix =
                         if state.number == pr_state.number { "👉" } else { "\u{3000}\u{2009}" };
                     format!("- {} #{}", prefix, state.number)
@@ -666,46 +665,39 @@ async fn sync_prs(
 
             let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
 
-            let parent_gherrit_id = (i > 0).then(|| commit_pr_states[i - 1].0.gherrit_id.clone());
-            let child_gherrit_id = (i < commit_pr_states.len() - 1)
-                .then(|| commit_pr_states[i + 1].0.gherrit_id.clone());
-
             let body = (PrBodyBuilder {
                 c,
-                repo_url: &remote.repo_url_relative(),
+                repo_url: &repo_url,
                 head_branch_markdown: head_branch_markdown.as_deref(),
                 gh_pr_ids_markdown: &gh_pr_ids_markdown,
                 latest_version,
-                base_branch: parent_branch,
-                parent_id: parent_gherrit_id.as_deref(),
-                child_id: child_gherrit_id.as_deref(),
+                base_branch: &entry.base_branch,
+                parent_id: entry.parent_id.as_deref(),
+                child_id: entry.child_id.as_deref(),
             })
             .build();
 
             let pr_num = pr_state.number.green().bold().to_string();
             let pr_url = remote.pr_url(pr_state.number).blue().underline().to_string();
 
-            let title =
-                (pr_state.title != Some(c.message_title.clone())).then(|| c.message_title.clone());
-            let body = {
-                let body_changed = pr_state.body.as_ref().is_none_or(|b| {
-                    b.replace("\r\n", "\n").trim() != body.replace("\r\n", "\n").trim()
-                });
-                body_changed.then(|| body.clone())
-            };
-            let base_branch =
-                (pr_state.base_branch != parent_branch.as_str()).then(|| parent_branch.to_string());
+            let update = plan_update(
+                CurrentPr {
+                    node_id: &pr_state.node_id,
+                    title: pr_state.title.as_deref(),
+                    body: pr_state.body.as_deref(),
+                    base_branch: &pr_state.base_branch,
+                },
+                DesiredPr { title: &c.message_title, body: &body, base_branch: &entry.base_branch },
+            );
 
-            let changed = base_branch.is_some() || title.is_some() || body.is_some();
-
-            if changed {
+            if update.is_some() {
                 log::debug!("Queuing update for PR #{}", pr_num);
                 log::info!("Queued update for PR #{}: {}", pr_num, pr_url);
-                Some(BatchUpdate { node_id: pr_state.node_id.clone(), title, body, base_branch })
             } else {
                 log::info!("PR #{} is up to date: {}", pr_num, pr_url);
-                None
             }
+
+            update
         })
         .collect();
 
@@ -754,20 +746,6 @@ impl TryFrom<gix::Commit<'_>> for Commit {
 }
 
 re!(gherrit_pr_id_re, r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$");
-
-/// A request to update an existing PR in a batch.
-struct BatchUpdate {
-    /// The global Node ID of the Pull Request (required for GraphQL mutations).
-    node_id: String,
-    title: Option<String>,
-    body: Option<String>,
-    // NOTE: Omitting updates to the base branch is not just an optimization -
-    // when a PR is in the merge queue, updating the base branch will cause
-    // GitHub to reject the update (even if it's a no-op update which updates
-    // the base to a value identical to its current value). Omitting the base
-    // branch field in that case allows the update to succeed. See #271.
-    base_branch: Option<String>,
-}
 
 /// A request to create a new PR in a batch.
 #[derive(Clone)]
@@ -862,7 +840,7 @@ async fn fetch_repo_id(octocrab: &Octocrab, remote: &Remote) -> Result<String> {
 ///
 /// This avoids rate limits and network latency by grouping updates into chunks
 /// (default 50) and sending them as a single GraphQL operation.
-async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<BatchUpdate>) -> Result<()> {
+async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<PrUpdate>) -> Result<()> {
     run_batched_graphql(
         octocrab,
         GraphQlOp::Mutation,
