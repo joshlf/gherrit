@@ -1,5 +1,4 @@
 use std::{
-    cmp,
     collections::HashMap,
     fmt::{self, Write},
     process::Stdio,
@@ -17,8 +16,13 @@ use crate::{
     util::{self, CommandExt as _, HeadState, Remote},
 };
 
+mod batching;
 mod reconcile;
 
+use batching::{
+    BatchPlan, INITIAL_GRAPHQL_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
+    classify_response, query_exceeds_limit,
+};
 use reconcile::{CurrentPr, DesiredPr, PrUpdate, link_stack, plan_update};
 
 pub async fn run(repo: &util::Repo) -> Result<()> {
@@ -841,8 +845,8 @@ async fn fetch_repo_id(octocrab: &Octocrab, remote: &Remote) -> Result<String> {
 
 /// Performs batched updates of PRs using GitHub's GraphQL API.
 ///
-/// This avoids rate limits and network latency by grouping updates into chunks
-/// (default 50) and sending them as a single GraphQL operation.
+/// This avoids rate limits and network latency by grouping updates into
+/// adaptive batches and sending each batch as one GraphQL operation.
 async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<PrUpdate>) -> Result<()> {
     run_batched_graphql(
         octocrab,
@@ -874,8 +878,8 @@ async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<PrUpdate>) -> Result
 
 /// Performs batched creation of PRs using GitHub's GraphQL API.
 ///
-/// This avoids rate limits and network latency by grouping creations into chunks
-/// (default 50) and sending them as a single GraphQL operation.
+/// This avoids rate limits and network latency by grouping creations into
+/// adaptive batches and sending each batch as one GraphQL operation.
 ///
 /// Returns a map of head branch name -> (number, url, node_id) for the newly
 /// created PRs.
@@ -986,8 +990,8 @@ enum GraphQlOp {
 
 /// Executes batched GraphQL operations (queries or mutations).
 ///
-/// Iterates over items in chunks of 50, builds a combined query string using
-/// `query_builder`, and processes the response using `response_handler`.
+/// Builds a combined query for each adaptive batch and processes each
+/// operation in a successful response with `response_handler`.
 async fn run_batched_graphql<T, M, H>(
     octocrab: &Octocrab,
     operation_type: GraphQlOp,
@@ -1004,24 +1008,22 @@ where
         return Ok(());
     }
 
-    let alias = |i| format!("op{i}");
+    let alias = |index| format!("op{index}");
 
     // GitHub imposes a limit on the number of nodes that can be processed in a
     // single GraphQL query (500,000 as of this writing [1]), and also imposes
     // limits on the amount of computation resources required to process the
     // query [2]. In order to avoid hitting these limits while still processing
-    // large batches in the optimistic case, we start with a large match size
+    // large batches in the optimistic case, we start with a large batch size
     // and perform exponential backoff if we hit the limits. This also ensures
     // that we are resilient in the face of GitHub changing these limits in the
     // future.
     //
     // [1] https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit
     // [2] https://github.blog/changelog/2025-09-01-graphql-api-resource-limits/
-    let mut batch_size = cmp::min(64, items.len());
-    let mut cursor = 0;
-    while cursor < items.len() {
-        let end = cmp::min(cursor + batch_size, items.len());
-        let chunk = &items[cursor..end];
+    let mut batches = BatchPlan::new(items.len(), INITIAL_GRAPHQL_BATCH_LEN);
+    while let Some(range) = batches.current() {
+        let chunk = &items[range];
 
         let query_body: String = chunk
             .iter()
@@ -1047,12 +1049,11 @@ where
             // requests larger than ~600KB, leading to confusing "missing query
             // attribute" errors. We preemptively backoff if we exceed a
             // conservative limit (256KB).
-            const MAX_QUERY_SIZE: usize = 256 * 1024; // 256 KB
-            if query.len() > MAX_QUERY_SIZE {
+            if query_exceeds_limit(&query) {
                 log::warn!(
                     "GraphQL query size ({} bytes) exceeds heuristic limit ({} bytes).",
                     query.len(),
-                    MAX_QUERY_SIZE
+                    MAX_GRAPHQL_QUERY_BYTES
                 );
                 return Ok(None);
             }
@@ -1064,46 +1065,38 @@ where
                 .await
                 .wrap_err("GraphQL batched operation failed")?;
 
-            if let Some(errors) = response.get("errors") {
-                let is_resource_limit = errors.as_array().is_some_and(|errs| {
-                    errs.iter().any(|e| {
-                        let type_str = e.get("type").and_then(|t| t.as_str());
-                        let msg_str = e.get("message").and_then(|m| m.as_str());
-
-                        matches!(type_str, Some("RESOURCE_LIMITS_EXCEEDED" | "MAX_NODE_LIMIT_EXCEEDED"))
-                        // HEURISTIC: We've seen this specific error message in
-                        // practice, likely due to the middleware issue
-                        // described above. We assume it's as a result of an
-                        // overly-large query.
-                        || matches!(msg_str, Some("A query attribute must be specified and must be a string."))
-                    })
-                });
-
-                if is_resource_limit {
-                    log::warn!("Hit GitHub resource limit with GraphQL batch update of size {batch_size}");
+            match classify_response(&response) {
+                ResponseDisposition::Success => {}
+                ResponseDisposition::RetryLimit => {
+                    log::warn!(
+                        "Hit GitHub resource limit with GraphQL batch of size {}",
+                        chunk.len()
+                    );
                     return Ok(None);
                 }
-
-                log::error!("GraphQL errors: {}", errors);
-                bail!("GraphQL errors: {:?}", errors);
+                ResponseDisposition::Fatal => {
+                    let errors = response.get("errors").expect("fatal response has errors");
+                    log::error!("GraphQL errors: {errors}");
+                    bail!("GraphQL errors: {errors:?}");
+                }
             }
 
             Ok(Some(response))
-        }.await?;
+        }
+        .await?;
 
         let Some(response) = response else {
-            let new_batch_size = batch_size / 2;
-            log::warn!("Backing off batch size from {batch_size} to {new_batch_size}.");
-
-            if new_batch_size == 0 {
-                // NOTE: Since we always divide by 2, we're guaranteed to never
-                // skip 1 (4 -> 2 -> 1 and 3 -> 1), so we know that if we reach
-                // this point, a single PR update exceeds GitHub's limits.
-                //
-                // FIXME: In this case, fall back to the REST API.
-                bail!("Single PR update exceeds GitHub resource limits. Cannot sync.");
+            match batches.reject() {
+                Ok(backoff) => log::warn!(
+                    "Backing off GraphQL batch size from {} to {}.",
+                    backoff.attempted,
+                    backoff.retry
+                ),
+                Err(item) => bail!(
+                    "GraphQL operation at item {} exceeds GitHub resource limits. Cannot sync.",
+                    item.index
+                ),
             }
-            batch_size = new_batch_size;
             continue;
         };
 
@@ -1115,7 +1108,7 @@ where
             response_handler(item, op_data)?;
         }
 
-        cursor = end;
+        batches.accept();
     }
     Ok(())
 }
