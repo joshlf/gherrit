@@ -17,12 +17,14 @@ use crate::{
 };
 
 mod batching;
+mod publication;
 mod reconcile;
 
 use batching::{
     BatchPlan, INITIAL_GRAPHQL_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
     classify_response, query_exceeds_limit,
 };
+use publication::{PushTarget, plan_push, push_batches, remote_query_batches};
 use reconcile::{CurrentPr, DesiredPr, PrUpdate, link_stack, plan_update};
 
 pub async fn run(repo: &util::Repo) -> Result<()> {
@@ -164,14 +166,8 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
 
     let mut next_versions = HashMap::new();
 
-    // Windows command line limit is ~32k chars. Each commit generates ~200
-    // chars of refspecs (1 branch ref + 1 tag ref).
-    // 80 * 200 = 16,000 chars, leaving plenty of headroom.
-    const BATCH_SIZE: usize = 80;
-
-    for chunk in commits.chunks(BATCH_SIZE) {
-        let mut refspecs = Vec::new();
-        let mut refs_to_persist = Vec::new();
+    for chunk in push_batches(commits) {
+        let mut targets = Vec::with_capacity(chunk.len());
 
         for c in chunk {
             // Determine the next version based on local tags (Optimistic
@@ -188,38 +184,18 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
                 .map(|s| s.as_deref().unwrap_or(""))
                 .unwrap_or("");
 
-            refspecs.push(format!("{}:refs/heads/{}", c.id, c.gherrit_id));
-            refspecs.push(format!("--force-with-lease=refs/heads/{}:{expected_sha}", c.gherrit_id));
-
-            // Lock the next version tag to prevent concurrent pushes of the
-            // same version. `--force-with-lease=<ref>:` means "expect the ref
-            // to NOT exist", and causes the server to fail the operation if it
-            // does exist. This prevents overwriting if someone else pushed
-            // next_ver already.
-            refspecs.push(format!("{}:refs/tags/gherrit/{}/v{}", c.id, c.gherrit_id, next_ver));
-            refspecs.push(format!(
-                "--force-with-lease=refs/tags/gherrit/{}/v{next_ver}:",
-                c.gherrit_id
-            ));
-
-            refs_to_persist.push((c.id, c.gherrit_id.clone(), next_ver));
+            targets.push(PushTarget {
+                object_id: c.id,
+                gherrit_id: &c.gherrit_id,
+                version: next_ver,
+                expected_remote_sha: expected_sha,
+            });
         }
 
-        if refspecs.is_empty() {
-            continue;
-        }
-
-        let mut args = vec![
-            "push".to_string(),
-            "--quiet".to_string(),
-            "--no-verify".to_string(),
-            "--atomic".to_string(), // Critical for the lock to work
-            repo.default_remote_name(),
-        ];
-        args.extend(refspecs);
+        let plan = plan_push(&repo.default_remote_name(), &targets);
 
         log::info!("Pushing chunk to remote...");
-        let mut child = util::cmd("git", args)
+        let mut child = util::cmd("git", plan.arguments)
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
             .spawn()
@@ -269,10 +245,10 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
         }
 
         // Persist the local tags now that the push succeeded.
-        for (id, gherrit_id, ver) in refs_to_persist {
+        for tag in plan.persisted_tags {
             let _ = repo.reference(
-                format!("refs/tags/gherrit/{gherrit_id}/v{ver}"),
-                id,
+                format!("refs/tags/gherrit/{}/v{}", tag.gherrit_id, tag.version),
+                tag.object_id,
                 PreviousValue::Any,
                 "gherrit: persist local version state",
             );
@@ -287,13 +263,8 @@ fn get_remote_branch_states(
     repo: &util::Repo,
     gherrit_ids: &[String],
 ) -> Result<HashMap<String, Option<String>>> {
-    // Batch size is limited to avoid exceeding command line limits (e.g.,
-    // Windows 32k chars). Each refspec is ~62 chars. 250 * 62 = 15,500
-    // chars (safe).
-    const BATCH_SIZE: usize = 250;
-
     let mut states: HashMap<String, Option<String>> = HashMap::new();
-    for chunk in gherrit_ids.chunks(BATCH_SIZE) {
+    for chunk in remote_query_batches(gherrit_ids) {
         let mut args = vec!["ls-remote".to_string(), repo.default_remote_name()];
         args.extend(chunk.iter().map(|id| format!("refs/heads/{id}")));
 
