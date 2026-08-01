@@ -754,20 +754,32 @@ impl TestContext {
     pub fn sanitize_with_redactions(&self, output: &str, redactions: &[(&str, &str)]) -> String {
         let repo_path = self.repo_path.to_str().unwrap();
         let remote_path = self.remote_path.to_str().unwrap();
-        let redactions = redactions.iter().cloned().chain([
-            (repo_path, "[REPO_PATH]"),
-            (remote_path, "[REMOTE_PATH]"),
-            // On macOS, the system may report paths starting with /private/var,
-            // while the test harness sees /var. After the redaction above, we
-            // get "/private[REPO_PATH]". This line strips that prefix. On
-            // Linux, this string won't exist, so it does nothing.
-            ("/private[", "["),
-            // This git error message only appears on some platforms/git
-            // versions.
-            ("fatal: the remote end hung up unexpectedly\n", ""),
-        ]);
+        let redactions = redactions
+            .iter()
+            .cloned()
+            .chain([
+                (repo_path, "[REPO_PATH]"),
+                (remote_path, "[REMOTE_PATH]"),
+                // On macOS, the system may report paths starting with
+                // /private/var, while the test harness sees /var. After the
+                // redaction above, we get "/private[REPO_PATH]". This line
+                // strips that prefix. On Linux, this string won't exist, so it
+                // does nothing.
+                ("/private[", "["),
+                // This git error message only appears on some platforms/git
+                // versions.
+                ("fatal: the remote end hung up unexpectedly\n", ""),
+            ])
+            .collect::<Vec<_>>();
 
-        let output = apply_literal_redactions(output, redactions);
+        let output = apply_literal_redactions(output, redactions.iter().copied());
+        #[cfg(windows)]
+        let output = {
+            let output = normalize_windows_output(&output);
+            redactions.iter().fold(output, |output, (target, replacement)| {
+                output.replace(&normalize_windows_output(target), replacement)
+            })
+        };
         let output = normalize_git_diagnostic_separators(&output);
 
         static SHA_REGEX: LazyLock<Regex> =
@@ -783,6 +795,15 @@ impl TestContext {
         let output = redact_identities(&output, &GHERRIT_ID_REGEX, "GHERRIT_ID");
         MOCK_URL_REGEX.replace_all(&output, "[MOCK_SERVER_URL]").to_string()
     }
+}
+
+#[cfg(any(test, windows))]
+fn normalize_windows_output(output: &str) -> String {
+    output
+        .replace(r"\\?\UNC\", r"\\")
+        .replace(r"\\?\", "")
+        .replace('\\', "/")
+        .replace("Usage: gherrit.exe", "Usage: gherrit")
 }
 
 fn normalize_git_diagnostic_separators(output: &str) -> String {
@@ -1003,6 +1024,18 @@ mod tests {
         let output = redact_identities(&output, &regex, "SHA");
 
         assert_eq!(output, "[BASE_SHA] [SHA_1] [BASE_SHA]");
+    }
+
+    #[test]
+    fn normalizes_windows_snapshot_output() {
+        let output = r"Usage: gherrit.exe manage
+\\?\C:\repo\.git\hooks\pre-push
+\\?\UNC\server\share\hook";
+
+        assert_eq!(
+            normalize_windows_output(output),
+            "Usage: gherrit manage\nC:/repo/.git/hooks/pre-push\n//server/share/hook"
+        );
     }
 
     #[test]
