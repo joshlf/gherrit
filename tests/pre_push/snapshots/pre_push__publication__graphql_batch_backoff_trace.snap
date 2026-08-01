@@ -1,0 +1,51 @@
+---
+source: tests/pre_push/publication.rs
+expression: state.graphql_requests
+---
+[
+    [
+        Query,
+        Query,
+        Query,
+        Query,
+    ],
+    [
+        Query,
+        Query,
+    ],
+    [
+        Query,
+        Query,
+    ],
+    [
+        Query,
+    ],
+    [
+        CreatePr,
+        CreatePr,
+        CreatePr,
+        CreatePr,
+    ],
+    [
+        CreatePr,
+        CreatePr,
+    ],
+    [
+        CreatePr,
+        CreatePr,
+    ],
+    [
+        UpdatePr,
+        UpdatePr,
+        UpdatePr,
+        UpdatePr,
+    ],
+    [
+        UpdatePr,
+        UpdatePr,
+    ],
+    [
+        UpdatePr,
+        UpdatePr,
+    ],
+]
