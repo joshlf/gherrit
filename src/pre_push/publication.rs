@@ -29,7 +29,22 @@ pub(super) struct PushPlan {
 }
 
 pub(super) fn push_batches<T>(items: &[T]) -> slice::Chunks<'_, T> {
-    items.chunks(PUSH_BATCH_LEN)
+    items.chunks(push_batch_len())
+}
+
+#[cfg(not(gherrit_test))]
+const fn push_batch_len() -> usize {
+    PUSH_BATCH_LEN
+}
+
+#[cfg(gherrit_test)]
+fn push_batch_len() -> usize {
+    std::env::var("GHERRIT_TEST_PUSH_BATCH_LEN").map_or(PUSH_BATCH_LEN, |value| {
+        value
+            .parse::<std::num::NonZeroUsize>()
+            .expect("GHERRIT_TEST_PUSH_BATCH_LEN must be a positive integer")
+            .get()
+    })
 }
 
 pub(super) fn remote_query_batches<T>(items: &[T]) -> slice::Chunks<'_, T> {
