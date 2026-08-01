@@ -29,37 +29,19 @@ pub const MANAGED_PRIVATE: &str = "managedPrivate";
 pub const MANAGED_PUBLIC: &str = "managedPublic";
 
 const FIRST_GIT_TIMESTAMP: u64 = 946_684_800;
-const MOCK_BIN_BUILD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MOCK_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MOCK_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(unix)]
+const GIT_INTERCEPTOR_NAME: &str = "git";
+#[cfg(windows)]
+const GIT_INTERCEPTOR_NAME: &str = "git.cmd";
 
 #[macro_export]
 macro_rules! test_context {
     () => {
         $crate::TestContextBuilder::new(assert_cmd::cargo::cargo_bin!("gherrit"))
     };
-}
-
-#[doc(hidden)]
-pub fn build_mock_bin() -> PathBuf {
-    static MOCK_BIN: LazyLock<PathBuf> = LazyLock::new(|| {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let target_dir = manifest_dir.parent().unwrap().join("target").join("mock_bin_build");
-
-        eprintln!("Building mock_bin at {:?}", manifest_dir);
-        TestCommand::new("cargo")
-            .args(["build", "--bin", "mock_bin"])
-            .arg("--manifest-path")
-            .arg(manifest_dir.join("Cargo.toml"))
-            .arg("--target-dir")
-            .arg(&target_dir)
-            .timeout(MOCK_BIN_BUILD_TIMEOUT)
-            .assert()
-            .success();
-
-        target_dir.join("debug").join(if cfg!(windows) { "mock_bin.exe" } else { "mock_bin" })
-    });
-    MOCK_BIN.clone()
 }
 
 pub struct TestContextBuilder {
@@ -155,7 +137,7 @@ impl TestContextBuilder {
             install_gherrit_binary(dir.path(), &self.gherrit_bin);
         }
         if self.git_interceptor {
-            install_git_interceptor(dir.path(), &build_mock_bin());
+            install_git_interceptor(dir.path());
         }
 
         let mut mock_server_state = None;
@@ -493,6 +475,7 @@ impl TestContext {
 
         if self.has_git_interceptor {
             cmd.env("SYSTEM_GIT_PATH", &self.system_git);
+            cmd.env("GHERRIT_TEST_BINARY", &self.gherrit_bin_path);
 
             if let Some(server) = &self.mock_server {
                 cmd.env("GHERRIT_MOCK_SERVER_URL", &server.url);
@@ -920,9 +903,19 @@ fn run_git_cmd(environment: &TestEnvironment, system_git: &Path, path: &Path, ar
     environment.command(system_git).current_dir(path).args(args).assert().success();
 }
 
-fn install_git_interceptor(path: &Path, mock_bin: &Path) {
-    let git_dst = path.join(if cfg!(windows) { "git.exe" } else { "git" });
-    fs::copy(mock_bin, &git_dst).unwrap();
+fn install_git_interceptor(path: &Path) {
+    let git = path.join(GIT_INTERCEPTOR_NAME);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::write(&git, "#!/bin/sh\nexec \"$GHERRIT_TEST_BINARY\" __test-git \"$@\"\n").unwrap();
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(windows)]
+    fs::write(git, "@echo off\r\n\"%GHERRIT_TEST_BINARY%\" __test-git %*\r\n").unwrap();
 }
 
 fn install_gherrit_binary(path: &Path, gherrit_bin: &Path) {
