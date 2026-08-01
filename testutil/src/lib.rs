@@ -754,20 +754,25 @@ impl TestContext {
     pub fn sanitize_with_redactions(&self, output: &str, redactions: &[(&str, &str)]) -> String {
         let repo_path = self.repo_path.to_str().unwrap();
         let remote_path = self.remote_path.to_str().unwrap();
-        let redactions = redactions.iter().cloned().chain([
+        let redactions = expand_literal_redactions(redactions.iter().copied().chain([
             (repo_path, "[REPO_PATH]"),
             (remote_path, "[REMOTE_PATH]"),
-            // On macOS, the system may report paths starting with /private/var,
-            // while the test harness sees /var. After the redaction above, we
-            // get "/private[REPO_PATH]". This line strips that prefix. On
-            // Linux, this string won't exist, so it does nothing.
-            ("/private[", "["),
             // This git error message only appears on some platforms/git
             // versions.
             ("fatal: the remote end hung up unexpectedly\n", ""),
-        ]);
+        ]));
 
-        let output = apply_literal_redactions(output, redactions);
+        let output = apply_literal_redactions(
+            output,
+            redactions.iter().map(|(target, replacement)| (target.as_str(), replacement.as_str())),
+        );
+        #[cfg(windows)]
+        let output = {
+            let output = normalize_windows_output(&output);
+            redactions.iter().fold(output, |output, (target, replacement)| {
+                output.replace(&normalize_windows_output(target), replacement.as_str())
+            })
+        };
         let output = normalize_git_diagnostic_separators(&output);
 
         static SHA_REGEX: LazyLock<Regex> =
@@ -783,6 +788,23 @@ impl TestContext {
         let output = redact_identities(&output, &GHERRIT_ID_REGEX, "GHERRIT_ID");
         MOCK_URL_REGEX.replace_all(&output, "[MOCK_SERVER_URL]").to_string()
     }
+}
+
+#[cfg(any(test, windows))]
+fn normalize_windows_output(output: &str) -> String {
+    const UNC_ROOT: &str = "\0GHERRIT_UNC_ROOT\0";
+    static SEPARATOR_REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\\+").expect("Invalid regex"));
+
+    let output = output
+        .replace(r"\\\\?\\UNC\\", UNC_ROOT)
+        .replace(r"\\?\UNC\", UNC_ROOT)
+        .replace(r"\\\\?\\", "")
+        .replace(r"\\?\", "")
+        .replace("Usage: gherrit.exe", "Usage: gherrit")
+        .replace("exit code: ", "exit status: ");
+    let output = SEPARATOR_REGEX.replace_all(&output, "/");
+    output.replace(UNC_ROOT, "//")
 }
 
 fn normalize_git_diagnostic_separators(output: &str) -> String {
@@ -871,6 +893,29 @@ fn apply_literal_redactions<'a>(
     })
 }
 
+fn expand_literal_redactions<'a>(
+    redactions: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<(String, String)> {
+    redactions
+        .into_iter()
+        .flat_map(|(target, replacement)| {
+            let mut targets = vec![target.to_string()];
+            if let Ok(canonical) = fs::canonicalize(target) {
+                targets.push(canonical.to_string_lossy().into_owned());
+
+                let debug = format!("{canonical:?}");
+                let debug = debug
+                    .strip_prefix('"')
+                    .and_then(|debug| debug.strip_suffix('"'))
+                    .unwrap_or(&debug);
+                targets.push(debug.to_string());
+            }
+            targets.sort_by_key(|target| std::cmp::Reverse(target.len()));
+            targets.into_iter().map(move |target| (target, replacement.to_string()))
+        })
+        .collect()
+}
+
 #[macro_export]
 macro_rules! assert_success_snapshot {
     ($ctx:expr, $cmd:expr, $name:expr $(,)?) => {
@@ -947,7 +992,8 @@ fn init_git_repo(
     // Explicitly unmanage main to satisfy strict config checks
     run(&["config", "branch.main.gherritManaged", "false"]);
     if let Some(remote_path) = remote_path {
-        run(&["remote", "add", "origin", remote_path.to_str().unwrap()]);
+        let remote_url = remote_path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        run(&["remote", "add", "origin", &remote_url]);
     }
 }
 
@@ -1003,6 +1049,42 @@ mod tests {
         let output = redact_identities(&output, &regex, "SHA");
 
         assert_eq!(output, "[BASE_SHA] [SHA_1] [BASE_SHA]");
+    }
+
+    #[test]
+    fn normalizes_windows_snapshot_output() {
+        let output = r"Usage: gherrit.exe manage
+Command failed with status: exit code: 128
+\\?\C:\repo\.git\hooks\pre-push
+\\?\UNC\server\share\hook
+\\\\?\\C:\\repo\\.git\\hooks\\pre-push
+\\\\?\\UNC\\server\\share\\hook";
+
+        assert_eq!(
+            normalize_windows_output(output),
+            "Usage: gherrit manage\nCommand failed with status: exit status: 128\nC:/repo/.git/hooks/pre-push\n//server/share/hook\nC:/repo/.git/hooks/pre-push\n//server/share/hook"
+        );
+    }
+
+    #[test]
+    fn expands_canonical_and_debug_path_redactions() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().to_str().unwrap();
+        let canonical = fs::canonicalize(path).unwrap();
+        let debug = format!("{canonical:?}");
+        let debug = debug.trim_matches('"');
+        let redactions = expand_literal_redactions([(path, "[ROOT]")]);
+
+        let redact = |output| {
+            apply_literal_redactions(
+                output,
+                redactions
+                    .iter()
+                    .map(|(target, replacement)| (target.as_str(), replacement.as_str())),
+            )
+        };
+        assert_eq!(redact(canonical.to_str().unwrap()), "[ROOT]");
+        assert_eq!(redact(debug), "[ROOT]");
     }
 
     #[test]
