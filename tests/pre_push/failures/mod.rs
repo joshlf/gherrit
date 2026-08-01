@@ -11,7 +11,7 @@ fn test_pre_push_failure() {
     ctx.commit("Work to push");
 
     // Configure an invalid remote to trigger `git push` failure
-    ctx.run_git(&["remote", "add", "broken-remote", "/path/to/nowhere"]);
+    ctx.run_git(&["remote", "add", "broken-remote", "missing/repo.git"]);
     ctx.run_git(&["config", "gherrit.remote", "broken-remote"]);
 
     testutil::assert_failure_snapshot!(
