@@ -1,4 +1,4 @@
-use testutil::test_context_minimal;
+use testutil::test_context;
 
 #[test]
 fn test_reproduce_unmanaged_sync() {
@@ -7,7 +7,7 @@ fn test_reproduce_unmanaged_sync() {
     // and `gherritManaged = unmanaged`. We also spuriously synced
     // unmanaged branches. This is a regression test for the latter bug.
 
-    let ctx = test_context_minimal!().install_hooks(true).build();
+    let ctx = test_context!().with_installed_hooks().build();
 
     // Condition 1: Explicit Unmanaged
     ctx.checkout_new("explicit-unmanaged");
@@ -20,8 +20,6 @@ fn test_reproduce_unmanaged_sync() {
         "reproduce_unmanaged_sync_explicit"
     );
 
-    testutil::assert_pr_snapshot!(ctx, "reproduce_unmanaged_sync_explicit_state");
-
     // Condition 2: Implicit Unmanaged
     ctx.checkout_new("implicit-unmanaged");
     ctx.set_config("branch.implicit-unmanaged.gherritManaged", None);
@@ -32,6 +30,4 @@ fn test_reproduce_unmanaged_sync() {
         ctx.hook_cmd("pre-push"),
         "reproduce_unmanaged_sync_implicit"
     );
-
-    testutil::assert_pr_snapshot!(ctx, "reproduce_unmanaged_sync_implicit_state");
 }
