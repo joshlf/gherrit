@@ -25,6 +25,7 @@ pub struct MockState {
     pub prs: Vec<PrEntry>,
     pub pushes: Vec<GitPush>,
     pub graphql_requests: Vec<Vec<GraphQlOperation>>,
+    pub max_graphql_operations_per_request: Option<usize>,
     pub repo_owner: String,
     pub repo_name: String,
     pub fail_next_request: Option<FailureKind>,
@@ -872,6 +873,17 @@ async fn graphql(
     let operations = graphql_operations(&document);
     let mut mock_state = app_state.state.write().unwrap();
     mock_state.graphql_requests.push(operations.clone());
+    if mock_state.max_graphql_operations_per_request.is_some_and(|limit| operations.len() > limit) {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "errors": [{
+                    "type": "RESOURCE_LIMITS_EXCEEDED",
+                    "message": "Request exceeds the mock GraphQL operation limit",
+                }]
+            })),
+        );
+    }
     if let Some(failure) = check_and_apply_graphql_failure(&mut mock_state, &operations) {
         return (
             StatusCode::OK,
