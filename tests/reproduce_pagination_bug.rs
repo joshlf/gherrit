@@ -7,7 +7,7 @@ fn test_pagination_bug() {
 
     // 2. Checkout feature branch and manage it
     ctx.checkout_new("feature");
-    ctx.gherrit().args(["manage", "--force"]).assert().success();
+    ctx.gherrit_cmd().args(["manage", "--force"]).assert().success();
 
     // 3. Create a commit with a known Change-Id
     let change_id = "I0000000000000000000000000000000000000105";
@@ -35,14 +35,14 @@ fn test_pagination_bug() {
     });
 
     // 5. Run gherrit hook pre-push
-    let assert = ctx.gherrit().args(["hook", "pre-push"]).env("RUST_LOG", "debug").assert();
+    let assert =
+        ctx.gherrit_cmd().args(["hook", "pre-push"]).env("RUST_LOG", "debug").assert().success();
 
     let output = assert.get_output();
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    println!("Stderr: {}", stderr);
-
-    if !stderr.contains("Found existing PR #105") {
-        panic!("Regression: Failed to find PR #105 (likely pagination bug). Logs:\n{}", stderr);
-    }
+    assert!(
+        stderr.contains("Found existing PR #105"),
+        "Regression: Failed to find PR #105 (likely pagination bug). Logs:\n{stderr}"
+    );
 }

@@ -6,7 +6,7 @@ fn verify_push_to_non_open_fail(state_arg: &str, expected_msg_part: &str) {
 
     // 1. Initial Push (Creates PR)
     ctx.commit("Initial Work");
-    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
     let refs_before_rejected_push = ctx.remote_refs("refs");
 
     // 2. Simulate PR State Change on GitHub
@@ -17,7 +17,7 @@ fn verify_push_to_non_open_fail(state_arg: &str, expected_msg_part: &str) {
 
     // 3. Amend and Push (Should Fail)
     ctx.amend();
-    ctx.hook("pre-push").assert().failure().stderr(predicate::str::contains(expected_msg_part));
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(expected_msg_part));
 
     // 4. Verify no new push happened
     let name = format!("prevent_push_to_{}_pr_state", state_arg.to_lowercase());
@@ -50,11 +50,11 @@ fn test_push_to_open_pr_succeeds() {
     ctx.commit("Work");
 
     // 1. First Push
-    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
 
     // 2. Amend
     ctx.amend();
 
     // 3. Second Push (Should Succeed)
-    ctx.gherrit().args(["hook", "pre-push"]).assert().success();
+    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
 }
