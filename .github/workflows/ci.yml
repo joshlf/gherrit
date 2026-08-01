@@ -50,3 +50,35 @@ jobs:
 
       - name: Check task markers
         run: ci/check_todo.sh
+
+  windows-tests:
+    name: Windows Tests
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get Rust Version
+        id: rust-version
+        shell: pwsh
+        run: |
+          $match = Select-String -Path Cargo.toml `
+            -Pattern '^rust-version\s*=\s*"([^"]+)"$'
+          $version = $match.Matches[0].Groups[1].Value
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-version.outputs.version }}
+
+      - name: Cache intermediate build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+
+      - name: Run tests
+        env:
+          GHERRIT_TEST_BUILD: "1"
+        run: cargo test --workspace --all-targets --locked
