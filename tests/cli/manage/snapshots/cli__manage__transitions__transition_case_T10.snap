@@ -1,0 +1,11 @@
+---
+source: tests/cli/manage/transitions.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] Branch feature is now unmanaged by GHerrit.
