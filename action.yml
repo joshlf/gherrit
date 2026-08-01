@@ -13,14 +13,16 @@ runs:
   steps:
     - shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         GH_TOKEN: ${{ inputs.token }}
         MERGED_PR_BODY: ${{ inputs.pr_body }}
       run: |
-        # Extract the Child ID from the merged PR's metadata by parsing the
-        # JSON inside the HTML comment.
-        CHILD_ID=$(echo "$MERGED_PR_BODY" | grep -oP '(?<=gherrit-meta: ).*?(?= -->)' | jq -r .child)
+        CHILD_ID=$(
+          printf '%s\n' "$MERGED_PR_BODY" |
+            bash "$ACTION_PATH/ci/extract_stack_child.sh"
+        )
 
-        if [ -z "$CHILD_ID" ] || [ "$CHILD_ID" == "null" ]; then
+        if [ -z "$CHILD_ID" ]; then
           echo "Merged PR has no child defined in metadata. Reached top of stack."
           exit 0
         fi
