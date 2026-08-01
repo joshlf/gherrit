@@ -19,8 +19,7 @@ use crate::FailureKind;
 #[derive(Debug, Clone, Default)]
 pub struct MockState {
     pub prs: Vec<PrEntry>,
-    pub pushed_refs: Vec<String>,
-    pub push_count: usize,
+    pub pushes: Vec<GitPush>,
     pub graphql_requests: Vec<Vec<GraphQlOperation>>,
     pub repo_owner: String,
     pub repo_name: String,
@@ -175,6 +174,26 @@ pub struct GitResponse {
     pub stderr: String,
     pub exit_code: i32,
     pub passthrough: bool,
+    pub report_exit_status: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GitCompletion {
+    pub args: Vec<String>,
+    pub exit_code: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPush {
+    pub args: Vec<String>,
+    pub refspecs: Vec<String>,
+    pub exit_code: i32,
+}
+
+impl GitPush {
+    pub fn succeeded(&self) -> bool {
+        self.exit_code == 0
+    }
 }
 
 #[derive(Clone)]
@@ -196,6 +215,7 @@ pub async fn start_mock_server(state: Arc<RwLock<MockState>>) -> String {
         .route("/repos/{owner}/{repo}/pulls", get(list_prs))
         .route("/graphql", post(graphql))
         .route("/_internal/git", post(handle_git))
+        .route("/_internal/git/complete", post(complete_git))
         .with_state(app_state);
 
     tokio::spawn(async move {
@@ -261,39 +281,106 @@ fn graphql_operations(document: &ExecutableDocument) -> Vec<GraphQlOperation> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GitCommand<'a> {
+    name: &'a str,
+    args: &'a [String],
+}
+
+/// Parses the command portion of a Git invocation.
+///
+/// Git accepts global options between the executable and subcommand. Keep this
+/// list in sync with the public options documented by `git(1)`, and fail
+/// closed for unknown or incomplete options rather than mistaking one of their
+/// arguments for a subcommand.
+fn parse_git_command(args: &[String]) -> Option<GitCommand<'_>> {
+    let mut remaining = args.get(1..)?;
+
+    loop {
+        let (arg, rest) = remaining.split_first()?;
+        match arg.as_str() {
+            // These options consume the following argument.
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+            | "--attr-source" => {
+                remaining = rest.get(1..)?;
+            }
+
+            // These options affect how Git dispatches the eventual command.
+            "-p"
+            | "--paginate"
+            | "-P"
+            | "--no-pager"
+            | "--bare"
+            | "--no-replace-objects"
+            | "--no-lazy-fetch"
+            | "--no-optional-locks"
+            | "--no-advice"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs" => {
+                remaining = rest;
+            }
+
+            // These forms carry their value in the same argument.
+            _ if [
+                "--exec-path=",
+                "--git-dir=",
+                "--work-tree=",
+                "--namespace=",
+                "--config-env=",
+                "--attr-source=",
+            ]
+            .iter()
+            .any(|prefix| arg.starts_with(prefix)) =>
+            {
+                remaining = rest;
+            }
+
+            // These are complete Git requests, not options preceding a
+            // subcommand. Any following argument is data for the request.
+            "-v" | "--version" | "-h" | "--help" | "--exec-path" | "--html-path" | "--man-path"
+            | "--info-path" => return None,
+            _ if arg.starts_with("--list-cmds=") => return None,
+
+            // Git does not support `--` before its subcommand. Unknown global
+            // options are likewise not safe to parse through.
+            _ if arg.starts_with('-') => return None,
+            name => return Some(GitCommand { name, args: rest }),
+        }
+    }
+}
+
 async fn handle_git(
     State(app_state): State<AppState>,
     Json(req): Json<GitRequest>,
 ) -> Json<GitResponse> {
+    let command = parse_git_command(&req.args);
+    let is_push = command.is_some_and(|command| command.name == "push");
+
     // Check for simulated failure
-    if let Some(subcommand) = req.args.get(1) {
+    if let Some(command) = command {
         if req
             .env
             .get("MOCK_BIN_FAIL_CMD")
-            .is_some_and(|fail_cmd| fail_cmd == &format!("git:{}", subcommand))
+            .is_some_and(|fail_cmd| fail_cmd == &format!("git:{}", command.name))
         {
+            if is_push {
+                record_push(&app_state, req.args.clone(), 1);
+            }
             return Json(GitResponse {
                 stdout: "".to_string(),
-                stderr: format!("Simulated failure for git {}", subcommand),
+                stderr: format!("Simulated failure for git {}", command.name),
                 exit_code: 1,
                 passthrough: false,
+                report_exit_status: false,
             });
         }
     }
 
     // Spy on "push" logic
-    if req.args.contains(&"push".to_string()) {
-        let mut state = app_state.state.write().unwrap();
-        let refspecs: Vec<String> = req
-            .args
-            .iter()
-            .skip(1)
-            .filter(|arg| arg.starts_with("refs/") || arg.contains(":"))
-            .cloned()
-            .collect();
-
-        state.pushed_refs.extend(refspecs);
-        state.push_count += 1;
+    if is_push {
+        let state = app_state.state.read().unwrap();
         let repo_owner = state.repo_owner.clone();
         let repo_name = state.repo_name.clone();
 
@@ -309,6 +396,7 @@ async fn handle_git(
             stderr,
             exit_code: 0,
             passthrough: true,
+            report_exit_status: true,
         });
     }
 
@@ -318,7 +406,154 @@ async fn handle_git(
         stderr: "".to_string(),
         exit_code: 0,
         passthrough: true,
+        report_exit_status: false,
     })
+}
+
+async fn complete_git(
+    State(app_state): State<AppState>,
+    Json(completion): Json<GitCompletion>,
+) -> StatusCode {
+    if parse_git_command(&completion.args).is_none_or(|command| command.name != "push") {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    record_push(&app_state, completion.args, completion.exit_code);
+    StatusCode::NO_CONTENT
+}
+
+fn record_push(app_state: &AppState, args: Vec<String>, exit_code: i32) {
+    let command = parse_git_command(&args)
+        .filter(|command| command.name == "push")
+        .expect("record_push requires a parsed Git push");
+    let refspecs = command
+        .args
+        .iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .filter(|arg| {
+            let refspec = arg.trim_start_matches('+');
+            refspec.starts_with("refs/")
+                || refspec
+                    .split_once(':')
+                    .is_some_and(|(_, destination)| destination.starts_with("refs/"))
+        })
+        .cloned()
+        .collect();
+    app_state.state.write().unwrap().pushes.push(GitPush { args, refspecs, exit_code });
+}
+
+#[cfg(test)]
+mod git_tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn app_state() -> AppState {
+        AppState {
+            state: Arc::new(RwLock::new(MockState::new("owner".to_string(), "repo".to_string()))),
+            base_url: "http://example.test".to_string(),
+        }
+    }
+
+    #[test]
+    fn parses_subcommand_after_documented_git_global_options() {
+        let invocation = args(&[
+            "git",
+            "-C",
+            "repo",
+            "-c",
+            "color.ui=false",
+            "--git-dir=.git",
+            "--work-tree",
+            ".",
+            "--namespace=tests",
+            "--config-env",
+            "user.name=TEST_USER",
+            "--exec-path=/git-core",
+            "--no-pager",
+            "--literal-pathspecs",
+            "--attr-source=HEAD",
+            "push",
+            "origin",
+            "HEAD:refs/heads/main",
+        ]);
+
+        let command = parse_git_command(&invocation).unwrap();
+        assert_eq!(command.name, "push");
+        assert_eq!(command.args, args(&["origin", "HEAD:refs/heads/main"]));
+    }
+
+    #[test]
+    fn does_not_find_push_outside_the_subcommand_position() {
+        for invocation in [
+            args(&["git", "show", "push"]),
+            args(&["git", "--help", "push"]),
+            args(&["git", "--list-cmds=main", "push"]),
+            args(&["git", "--unknown", "push"]),
+            args(&["git", "-c", "push"]),
+        ] {
+            assert_ne!(parse_git_command(&invocation).map(|command| command.name), Some("push"));
+        }
+    }
+
+    #[tokio::test]
+    async fn records_completed_push_after_git_global_options() {
+        let app_state = app_state();
+        let invocation = args(&[
+            "git",
+            "-c",
+            "remote.origin.push=refs/fake:refs/heads/fake",
+            "push",
+            "origin",
+            "+HEAD:refs/heads/main",
+        ]);
+        let request =
+            GitRequest { args: invocation.clone(), cwd: "/repo".to_string(), env: HashMap::new() };
+
+        let Json(response) = handle_git(State(app_state.clone()), Json(request)).await;
+        assert!(response.passthrough);
+        assert!(response.report_exit_status);
+        assert!(app_state.state.read().unwrap().pushes.is_empty());
+
+        let status = complete_git(
+            State(app_state.clone()),
+            Json(GitCompletion { args: invocation.clone(), exit_code: 0 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let state = app_state.state.read().unwrap();
+        assert_eq!(
+            state.pushes,
+            [GitPush {
+                args: invocation,
+                refspecs: vec!["+HEAD:refs/heads/main".to_string()],
+                exit_code: 0,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_injection_uses_parsed_git_subcommand() {
+        let app_state = app_state();
+        let invocation = args(&["git", "-c", "color.ui=false", "push", "origin", "main"]);
+        let request = GitRequest {
+            args: invocation.clone(),
+            cwd: "/repo".to_string(),
+            env: HashMap::from([("MOCK_BIN_FAIL_CMD".to_string(), "git:push".to_string())]),
+        };
+
+        let Json(response) = handle_git(State(app_state.clone()), Json(request)).await;
+        assert!(!response.passthrough);
+        assert!(!response.report_exit_status);
+        assert_eq!(response.exit_code, 1);
+        assert_eq!(
+            app_state.state.read().unwrap().pushes,
+            [GitPush { args: invocation, refspecs: Vec::new(), exit_code: 1 }]
+        );
+    }
 }
 
 async fn list_prs(

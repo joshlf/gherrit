@@ -269,7 +269,7 @@ impl TestContext {
     }
 
     pub fn remote_git(&self) -> assert_cmd::Command {
-        let mut cmd = assert_cmd::Command::new("git");
+        let mut cmd = assert_cmd::Command::new(&self.system_git);
         cmd.current_dir(&self.remote_path);
         self.configure_mock_env(&mut cmd);
         cmd
@@ -334,25 +334,41 @@ impl TestContext {
         content
     }
 
-    pub fn assert_pushed(&self, ref_name: &str) {
-        self.maybe_inspect_mock_state(|state| {
-            let found = state.pushed_refs.iter().any(|r| r == ref_name);
-            assert!(
-                found,
-                "Expected ref '{}' to be pushed. Refs: {:?}",
-                ref_name, state.pushed_refs
-            );
-        });
+    pub fn remote_ref_oid(&self, ref_name: &str) -> Option<String> {
+        let output = self
+            .remote_git()
+            .args(["rev-parse", "--verify", "--quiet", ref_name])
+            .output()
+            .expect("Failed to inspect remote ref");
+        match output.status.code() {
+            Some(0) => Some(String::from_utf8(output.stdout).unwrap().trim().to_string()),
+            Some(1) => None,
+            code => panic!("git rev-parse failed with exit code {code:?}"),
+        }
     }
 
-    pub fn count_pushed_containing(&self, substring: &str) -> usize {
+    pub fn remote_refs(&self, prefix: &str) -> Vec<String> {
+        let assert = self
+            .remote_git()
+            .args(["for-each-ref", "--format=%(refname)", prefix])
+            .assert()
+            .success();
+        String::from_utf8(assert.get_output().stdout.clone())
+            .unwrap()
+            .lines()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    pub fn count_successfully_pushed_containing(&self, substring: &str) -> usize {
         let mut count = 0;
         self.maybe_inspect_mock_state(|state| {
             count = state
-                .pushed_refs
+                .pushes
                 .iter()
-                .filter(|r| !r.starts_with("--"))
-                .filter(|r| r.contains(substring))
+                .filter(|push| push.succeeded())
+                .flat_map(|push| &push.refspecs)
+                .filter(|refspec| refspec.contains(substring))
                 .count();
         });
         count
@@ -426,6 +442,7 @@ impl TestContext {
         for (target, replacement) in redactions {
             output = output.replace(target, replacement);
         }
+        let output = normalize_git_diagnostic_separators(&output);
 
         static SHA_REGEX: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r"\b[0-9a-f]{40}\b").expect("Invalid regex"));
@@ -440,6 +457,15 @@ impl TestContext {
         let output = GHERRIT_ID_REGEX.replace_all(&output, "[GHERRIT_ID]");
         MOCK_URL_REGEX.replace_all(&output, "[MOCK_SERVER_URL]").to_string()
     }
+}
+
+fn normalize_git_diagnostic_separators(output: &str) -> String {
+    static ATOMIC_PUSH_SEPARATOR_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^(error: atomic push failed[^\r\n]*\r?\n)(?:\r?\n)+(To )")
+            .expect("Invalid regex")
+    });
+
+    ATOMIC_PUSH_SEPARATOR_REGEX.replace_all(output, "${1}${2}").into_owned()
 }
 
 pub trait IntoCommandRef {
@@ -546,3 +572,30 @@ static SYSTEM_GIT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
     let path = stdout.lines().next().expect("No git path found").trim();
     PathBuf::from(path)
 });
+
+#[cfg(test)]
+mod git_diagnostic_tests {
+    use super::normalize_git_diagnostic_separators;
+
+    #[test]
+    fn normalizes_only_atomic_push_separator_lines() {
+        let canonical = concat!(
+            "before\n",
+            "error: atomic push failed for ref refs/tags/v2. status: 7\n",
+            "To remote\n",
+            "after\n",
+        );
+        let with_separator = concat!(
+            "before\n",
+            "error: atomic push failed for ref refs/tags/v2. status: 7\n",
+            "\n",
+            "To remote\n",
+            "after\n",
+        );
+        assert_eq!(normalize_git_diagnostic_separators(canonical), canonical);
+        assert_eq!(normalize_git_diagnostic_separators(with_separator), canonical);
+
+        let unrelated = "error: another failure\n\nTo remote\n";
+        assert_eq!(normalize_git_diagnostic_separators(unrelated), unrelated);
+    }
+}
