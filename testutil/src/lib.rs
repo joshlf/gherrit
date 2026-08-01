@@ -754,22 +754,17 @@ impl TestContext {
     pub fn sanitize_with_redactions(&self, output: &str, redactions: &[(&str, &str)]) -> String {
         let repo_path = self.repo_path.to_str().unwrap();
         let remote_path = self.remote_path.to_str().unwrap();
-        let redactions = redactions.iter().cloned().chain([
-            (repo_path, "[REPO_PATH]"),
-            (remote_path, "[REMOTE_PATH]"),
-            // On macOS, the system may report paths starting with /private/var,
-            // while the test harness sees /var. After the redaction above, we
-            // get "/private[REPO_PATH]". This line strips that prefix. On
-            // Linux, this string won't exist, so it does nothing.
-            ("/private[", "["),
-            // This git error message only appears on some platforms/git
-            // versions.
-            ("fatal: the remote end hung up unexpectedly\n", ""),
-        ]);
+        let redactions = expand_literal_redactions(
+            redactions
+                .iter()
+                .copied()
+                .chain([(repo_path, "[REPO_PATH]"), (remote_path, "[REMOTE_PATH]")]),
+        );
 
-        let output = apply_literal_redactions(output, redactions);
-        let output = normalize_git_diagnostic_separators(&output);
-
+        let output = apply_literal_redactions(
+            output,
+            redactions.iter().map(|(target, replacement)| (target.as_str(), replacement.as_str())),
+        );
         static SHA_REGEX: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r"\b[0-9a-f]{40}\b").expect("Invalid regex"));
 
@@ -783,6 +778,49 @@ impl TestContext {
         let output = redact_identities(&output, &GHERRIT_ID_REGEX, "GHERRIT_ID");
         MOCK_URL_REGEX.replace_all(&output, "[MOCK_SERVER_URL]").to_string()
     }
+}
+
+fn normalize_command_output(output: &str) -> String {
+    // This Git error message only appears on some platforms/versions.
+    let output = output.replace("fatal: the remote end hung up unexpectedly\n", "");
+    normalize_git_diagnostic_separators(&output)
+}
+
+#[cfg(any(test, windows))]
+fn normalize_windows_stderr(stderr: &str) -> String {
+    static CLAP_USAGE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^Usage: gherrit\.exe(?P<suffix>[ \t\r]|$)").expect("Invalid regex")
+    });
+    static COMMAND_STATUS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?m)^(?P<prefix>\[gherrit\](?: \[[A-Z]+\])? [^\r\n]*\bCommand(?: [^\r\n]*)? failed with status: )exit code: ",
+        )
+        .expect("Invalid regex")
+    });
+    static MISSING_TMP_WARNING_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^bash\.exe: warning: could not find /tmp, please create!(?:\r?\n|$)")
+            .expect("Invalid regex")
+    });
+
+    let stderr = MISSING_TMP_WARNING_REGEX.replace_all(stderr, "");
+    let stderr = CLAP_USAGE_REGEX.replace_all(&stderr, "Usage: gherrit${suffix}");
+    COMMAND_STATUS_REGEX.replace_all(&stderr, "${prefix}exit status: ").into_owned()
+}
+
+#[cfg(any(test, windows))]
+fn normalize_windows_redacted_paths(output: &str) -> String {
+    static REDACTED_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"\[(?:REPO_PATH|REMOTE_PATH|EXTERNAL_HOOKS_PATH)\](?:\\+[^\\\s"']+)*"#)
+            .expect("Invalid regex")
+    });
+    static WINDOWS_SEPARATOR_REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\\+").expect("Invalid regex"));
+
+    REDACTED_PATH_REGEX
+        .replace_all(output, |path: &regex::Captures<'_>| {
+            WINDOWS_SEPARATOR_REGEX.replace_all(&path[0], "/").into_owned()
+        })
+        .into_owned()
 }
 
 fn normalize_git_diagnostic_separators(output: &str) -> String {
@@ -822,6 +860,9 @@ impl TestContext {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = normalize_command_output(&stderr);
+        #[cfg(windows)]
+        let stderr = normalize_windows_stderr(&stderr);
         let succeeded = output.status.success();
         let exit_code = output.status.code().unwrap_or(-1);
 
@@ -833,6 +874,8 @@ impl TestContext {
             if stderr.is_empty() { "(empty)" } else { &stderr }
         );
         let output = self.sanitize_with_redactions(&output, redactions);
+        #[cfg(windows)]
+        let output = normalize_windows_redacted_paths(&output);
         match expected_exit {
             ExpectedExit::Success => {
                 assert!(succeeded, "Expected command to succeed:\n{output}");
@@ -869,6 +912,43 @@ fn apply_literal_redactions<'a>(
     redactions.into_iter().fold(output.to_string(), |output, (target, replacement)| {
         output.replace(target, replacement)
     })
+}
+
+fn expand_literal_redactions<'a>(
+    redactions: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<(String, String)> {
+    let mut redactions = redactions
+        .into_iter()
+        .flat_map(|(target, replacement)| {
+            let mut targets = vec![target.to_string()];
+            let debug = format!("{target:?}");
+            let debug =
+                debug.strip_prefix('"').and_then(|debug| debug.strip_suffix('"')).unwrap_or(&debug);
+            targets.push(debug.to_string());
+            if let Ok(canonical) = fs::canonicalize(target) {
+                targets.push(canonical.to_string_lossy().into_owned());
+
+                let debug = format!("{canonical:?}");
+                let debug = debug
+                    .strip_prefix('"')
+                    .and_then(|debug| debug.strip_suffix('"'))
+                    .unwrap_or(&debug);
+                targets.push(debug.to_string());
+            }
+            let forward_slash_targets = targets
+                .iter()
+                .filter(|target| target.contains('\\'))
+                .map(|target| target.replace('\\', "/"))
+                .collect::<Vec<_>>();
+            targets.extend(forward_slash_targets);
+            targets.sort();
+            targets.dedup();
+            targets.sort_by_key(|target| std::cmp::Reverse(target.len()));
+            targets.into_iter().map(move |target| (target, replacement.to_string()))
+        })
+        .collect::<Vec<_>>();
+    redactions.sort_by_key(|(target, _)| std::cmp::Reverse(target.len()));
+    redactions
 }
 
 #[macro_export]
@@ -947,7 +1027,8 @@ fn init_git_repo(
     // Explicitly unmanage main to satisfy strict config checks
     run(&["config", "branch.main.gherritManaged", "false"]);
     if let Some(remote_path) = remote_path {
-        run(&["remote", "add", "origin", remote_path.to_str().unwrap()]);
+        let remote_url = remote_path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        run(&["remote", "add", "origin", &remote_url]);
     }
 }
 
@@ -1003,6 +1084,105 @@ mod tests {
         let output = redact_identities(&output, &regex, "SHA");
 
         assert_eq!(output, "[BASE_SHA] [SHA_1] [BASE_SHA]");
+    }
+
+    #[test]
+    fn normalizes_windows_stderr_without_rewriting_payloads() {
+        let stderr = concat!(
+            "Usage: gherrit.exe manage\r\n",
+            "[gherrit] [WARN] Failed: Command \"git\" failed with status: exit code: 128\r\n",
+            "bash.exe: warning: could not find /tmp, please create!\r\n",
+            "payload: Usage: gherrit.exe manage\r\n",
+            "payload: Command failed with status: exit code: 2\r\n",
+            "payload: bash.exe: warning: could not find /tmp, please create!\r\n",
+            r#"payload: {"title":"Usage: gherrit.exe","body":"line\n{\"key\":\"value\"}"}"#,
+        );
+
+        assert_eq!(
+            normalize_windows_stderr(stderr),
+            concat!(
+                "Usage: gherrit manage\r\n",
+                "[gherrit] [WARN] Failed: Command \"git\" failed with status: exit status: 128\r\n",
+                "payload: Usage: gherrit.exe manage\r\n",
+                "payload: Command failed with status: exit code: 2\r\n",
+                "payload: bash.exe: warning: could not find /tmp, please create!\r\n",
+                r#"payload: {"title":"Usage: gherrit.exe","body":"line\n{\"key\":\"value\"}"}"#,
+            )
+        );
+    }
+
+    #[test]
+    fn normalizes_only_redacted_windows_paths() {
+        let output = concat!(
+            "[REPO_PATH]\\.git\\hooks\\pre-push\n",
+            "[REMOTE_PATH]\\\\objects\\\\pack\n",
+            r#"{"body":"line\n{\"path\":\"C:\\unredacted\"}"}"#,
+        );
+
+        assert_eq!(
+            normalize_windows_redacted_paths(output),
+            concat!(
+                "[REPO_PATH]/.git/hooks/pre-push\n",
+                "[REMOTE_PATH]/objects/pack\n",
+                r#"{"body":"line\n{\"path\":\"C:\\unredacted\"}"}"#,
+            )
+        );
+    }
+
+    #[test]
+    fn expands_path_redaction_spellings() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().to_str().unwrap();
+        let canonical = fs::canonicalize(path).unwrap();
+        let debug = format!("{canonical:?}");
+        let debug = debug.trim_matches('"');
+        let redactions = expand_literal_redactions([(path, "[ROOT]")]);
+
+        let redact = |output| {
+            apply_literal_redactions(
+                output,
+                redactions
+                    .iter()
+                    .map(|(target, replacement)| (target.as_str(), replacement.as_str())),
+            )
+        };
+        assert_eq!(redact(canonical.to_str().unwrap()), "[ROOT]");
+        assert_eq!(redact(debug), "[ROOT]");
+
+        let windows_path = r"C:\root";
+        let debug = format!("{windows_path:?}");
+        let debug = debug.trim_matches('"');
+        let redactions = expand_literal_redactions([(windows_path, "[ROOT]")]);
+        let redact = |output| {
+            apply_literal_redactions(
+                output,
+                redactions
+                    .iter()
+                    .map(|(target, replacement)| (target.as_str(), replacement.as_str())),
+            )
+        };
+        assert_eq!(redact(debug), "[ROOT]");
+        assert_eq!(redact("C:/root/child"), "[ROOT]/child");
+    }
+
+    #[test]
+    fn applies_longest_literal_redactions_first() {
+        let root = TempDir::new().unwrap();
+        let child = root.path().join("child");
+        fs::create_dir(&child).unwrap();
+        let root = root.path().to_str().unwrap();
+        let child = child.to_str().unwrap();
+        let redactions = expand_literal_redactions([(root, "[ROOT]"), (child, "[CHILD]")]);
+
+        assert_eq!(
+            apply_literal_redactions(
+                child,
+                redactions
+                    .iter()
+                    .map(|(target, replacement)| (target.as_str(), replacement.as_str())),
+            ),
+            "[CHILD]"
+        );
     }
 
     #[test]
