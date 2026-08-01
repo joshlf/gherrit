@@ -51,6 +51,9 @@ jobs:
       - name: Check task markers
         run: ci/check_todo.sh
 
+      - name: Test stack metadata parser
+        run: bash ci/test_extract_stack_child.sh
+
   windows-tests:
     name: Windows Tests
     runs-on: windows-latest
