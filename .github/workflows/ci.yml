@@ -43,12 +43,15 @@ jobs:
 
       - name: Clippy
         run: |
+          set -eo pipefail
           cargo clippy --workspace --all-targets --all-features \
             --locked -- -D warnings
 
       - name: Run Tests
         run: |
+          set -eo pipefail
           cargo test --workspace --all-targets --all-features --locked
+          cargo test --workspace --doc --all-features --locked
 
       - name: Check task markers
         run: ci/check_todo.sh
