@@ -583,17 +583,6 @@ impl MockGithub<'_> {
             pr.state = new_state.as_str().to_string();
         });
     }
-
-    pub fn add_to_merge_queue(&self, number: usize) {
-        self.context.mutate_mock_state(|state| {
-            let pr = state
-                .prs
-                .iter()
-                .find(|pr| pr.number == number)
-                .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
-            state.merge_queue.insert(pr.id);
-        });
-    }
 }
 
 impl Drop for TestContext {
