@@ -2,7 +2,7 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::reconcile::PullRequestState;
+use super::{batching::ReplaySafety, reconcile::PullRequestState};
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -62,6 +62,7 @@ pub(super) trait BatchedOperation {
     type Output;
 
     const TYPE: OperationType;
+    const REPLAY_SAFETY: ReplaySafety;
 
     fn document(&self) -> String;
     fn decode(&self, response: Value) -> Result<Self::Output>;
@@ -169,6 +170,7 @@ impl BatchedOperation for FindPullRequest {
     type Output = Option<PullRequest>;
 
     const TYPE: OperationType = OperationType::Query;
+    const REPLAY_SAFETY: ReplaySafety = ReplaySafety::Idempotent;
 
     fn document(&self) -> String {
         format!(
@@ -256,6 +258,7 @@ impl BatchedOperation for CreatePullRequest {
     type Output = CreatedPullRequest;
 
     const TYPE: OperationType = OperationType::Mutation;
+    const REPLAY_SAFETY: ReplaySafety = ReplaySafety::RequiresReobservation;
 
     fn document(&self) -> String {
         let fields = [
@@ -326,6 +329,7 @@ impl BatchedOperation for UpdatePullRequest {
     type Output = ();
 
     const TYPE: OperationType = OperationType::Mutation;
+    const REPLAY_SAFETY: ReplaySafety = ReplaySafety::Idempotent;
 
     fn document(&self) -> String {
         let fields = std::iter::once(("pullRequestId", &self.node_id))
@@ -352,6 +356,13 @@ impl BatchedOperation for UpdatePullRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_idempotent_operations_are_safe_to_replay() {
+        assert_eq!(FindPullRequest::REPLAY_SAFETY, ReplaySafety::Idempotent);
+        assert_eq!(UpdatePullRequest::REPLAY_SAFETY, ReplaySafety::Idempotent);
+        assert_eq!(CreatePullRequest::REPLAY_SAFETY, ReplaySafety::RequiresReobservation);
+    }
 
     #[test]
     fn repository_id_query_uses_an_exact_document_and_variables() {

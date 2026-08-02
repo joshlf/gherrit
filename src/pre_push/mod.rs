@@ -575,7 +575,7 @@ where
                 .await
                 .wrap_err("GraphQL batched operation failed")?;
 
-            match classify_response(&response) {
+            match classify_response(&response, O::REPLAY_SAFETY) {
                 ResponseDisposition::Success => {}
                 ResponseDisposition::RetryLimit => {
                     log::warn!(
@@ -584,6 +584,9 @@ where
                     );
                     return Ok(None);
                 }
+                ResponseDisposition::Reobserve => bail!(
+                    "GitHub stopped a non-idempotent GraphQL batch after it may have applied some operations. Rerun GHerrit to reobserve GitHub before retrying."
+                ),
                 ResponseDisposition::Fatal => {
                     let errors = response.get("errors").expect("fatal response has errors");
                     log::error!("GraphQL errors: {errors}");

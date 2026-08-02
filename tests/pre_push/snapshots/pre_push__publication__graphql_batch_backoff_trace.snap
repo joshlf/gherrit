@@ -1,6 +1,6 @@
 ---
 source: tests/pre_push/publication.rs
-expression: state.graphql_requests
+expression: ctx.github().requests()
 ---
 [
     [
@@ -16,23 +16,6 @@ expression: state.graphql_requests
     [
         Query,
         Query,
-    ],
-    [
-        Query,
-    ],
-    [
-        CreatePr,
-        CreatePr,
-        CreatePr,
-        CreatePr,
-    ],
-    [
-        CreatePr,
-        CreatePr,
-    ],
-    [
-        CreatePr,
-        CreatePr,
     ],
     [
         UpdatePr,

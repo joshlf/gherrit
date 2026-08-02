@@ -145,9 +145,26 @@ fn test_graphql_batch_backoff() {
     ctx.limit_graphql_operations_per_request(2);
     ctx.checkout_managed_private("batch-backoff");
 
-    for i in 1..=4 {
-        ctx.commit_with_gherrit_id(&format!("Commit {i}"));
-    }
+    let commits = (1..=4)
+        .map(|i| {
+            let title = format!("Commit {i}");
+            let id = ctx.commit_with_gherrit_id(&title);
+            (id, title)
+        })
+        .collect::<Vec<_>>();
+
+    commits.iter().enumerate().for_each(|(index, (head, title))| {
+        let base = index
+            .checked_sub(1)
+            .map_or_else(|| "main".to_string(), |parent| commits[parent].0.clone());
+        ctx.github().seed_pull_request(testutil::PullRequestSeed {
+            number: index + 1,
+            title: title.clone(),
+            body: "stale".to_string(),
+            head: head.clone(),
+            base,
+        });
+    });
 
     testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "graphql_batch_backoff");
 
@@ -157,6 +174,10 @@ fn test_graphql_batch_backoff() {
         "GraphQL backoff must not alter the independent Git publication batch"
     );
     assert_eq!(ctx.github().pull_requests().len(), 4, "Expected every commit to have a PR");
+    assert!(
+        ctx.github().pull_requests().iter().all(|pr| pr.body.as_deref() != Some("stale")),
+        "Expected every existing PR to be reconciled"
+    );
     insta::assert_debug_snapshot!("graphql_batch_backoff_trace", ctx.github().requests());
 
     let v1_refs = ctx
