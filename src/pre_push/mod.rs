@@ -1,4 +1,4 @@
-use std::{collections::HashMap, process::Stdio, str};
+use std::{collections::HashMap, num::NonZeroUsize, ops::Range, process::Stdio, str};
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
 use gix::{ObjectId, reference::Category, refs::transaction::PreviousValue};
@@ -307,17 +307,8 @@ async fn sync_prs(
             commit_body: commit.message_body,
         })
         .collect();
-    let mut pull_requests = prs
-        .into_iter()
-        .map(|pr| ObservedPr {
-            number: pr.number,
-            node_id: pr.node_id,
-            title: pr.title,
-            body: pr.body,
-            base_branch: pr.base_branch,
-            head_branch: pr.head_branch,
-        })
-        .collect::<Vec<_>>();
+    let mut pull_requests = observed_pull_requests(prs);
+    let mut creation_batch_len = INITIAL_GRAPHQL_BATCH_LEN;
     commits.iter().for_each(|commit| {
         match pull_requests.iter().find(|pr| pr.head_branch == commit.gherrit_id) {
             Some(pr) => {
@@ -344,8 +335,37 @@ async fn sync_prs(
                 let num_creations = creations.len();
                 log::info!("Creating {num_creations} PRs...");
                 let repo_id = fetch_repo_id(octocrab, &remote).await?;
-                let mut created =
-                    batch_create_prs(octocrab, &repo_id, creations.iter().cloned()).await?;
+                let creation = batch_create_prs(
+                    octocrab,
+                    &repo_id,
+                    creations.iter().cloned(),
+                    creation_batch_len,
+                )
+                .await?;
+                let mut created = match creation {
+                    CreateBatchOutcome::Complete(created) => created,
+                    CreateBatchOutcome::Reobserve { retry_batch_len, singleton_head } => {
+                        log::warn!(
+                            "GitHub may have applied part of the PR creation batch; reobserving before continuing."
+                        );
+                        let head_refs = commits
+                            .iter()
+                            .map(|commit| commit.gherrit_id.clone())
+                            .collect::<Vec<_>>();
+                        let prs = batch_fetch_prs(repo, octocrab, &head_refs).await?;
+                        ensure_pull_requests_open(prs.iter().map(|pr| (pr.number, pr.state)))?;
+                        pull_requests = observed_pull_requests(prs);
+                        if let Some(head) = singleton_head
+                            .filter(|head| pull_requests.iter().all(|pr| pr.head_branch != *head))
+                        {
+                            bail!(
+                                "GitHub reported a resource limit while creating the PR for head branch '{head}', and the PR was still absent after reobservation. GHerrit cannot safely retry the ambiguous operation in this invocation."
+                            );
+                        }
+                        creation_batch_len = retry_batch_len;
+                        continue;
+                    }
+                };
                 if created.len() != num_creations {
                     bail!(
                         "GitHub returned {} unique PRs for {num_creations} creation actions",
@@ -387,6 +407,19 @@ async fn sync_prs(
             }
         }
     }
+}
+
+fn observed_pull_requests(prs: Vec<PrState>) -> Vec<ObservedPr> {
+    prs.into_iter()
+        .map(|pr| ObservedPr {
+            number: pr.number,
+            node_id: pr.node_id,
+            title: pr.title,
+            body: pr.body,
+            base_branch: pr.base_branch,
+            head_branch: pr.head_branch,
+        })
+        .collect()
 }
 
 fn log_projection_updates(
@@ -482,8 +515,10 @@ async fn batch_create_prs(
     octocrab: &Octocrab,
     repo_id: &str,
     creations: impl IntoIterator<Item = CreatePr>,
-) -> Result<HashMap<String, CreatedPullRequest>> {
-    let creations = creations.into_iter().map(|create| {
+    max_batch_len: NonZeroUsize,
+) -> Result<CreateBatchOutcome> {
+    let creations = creations.into_iter().collect::<Vec<_>>();
+    let operations = creations.iter().cloned().map(|create| {
         CreatePullRequest::new(
             repo_id.to_string(),
             create.base_branch,
@@ -492,11 +527,21 @@ async fn batch_create_prs(
             create.body,
         )
     });
-    Ok(run_batched_graphql(octocrab, creations)
-        .await?
-        .into_iter()
-        .map(|created| (created.head_branch.clone(), created))
-        .collect())
+    Ok(match run_batched_graphql_with_limit(octocrab, operations, max_batch_len).await? {
+        BatchExecution::Complete(created) => CreateBatchOutcome::Complete(
+            created.into_iter().map(|created| (created.head_branch.clone(), created)).collect(),
+        ),
+        BatchExecution::Reobserve { attempted, retry_batch_len } => CreateBatchOutcome::Reobserve {
+            retry_batch_len,
+            singleton_head: (attempted.len() == 1)
+                .then(|| creations[attempted.start].head_branch.clone()),
+        },
+    })
+}
+
+enum CreateBatchOutcome {
+    Complete(HashMap<String, CreatedPullRequest>),
+    Reobserve { retry_batch_len: NonZeroUsize, singleton_head: Option<String> },
 }
 
 async fn batch_fetch_prs(
@@ -526,9 +571,30 @@ async fn run_batched_graphql<O>(
 where
     O: BatchedOperation,
 {
+    match run_batched_graphql_with_limit(octocrab, operations, INITIAL_GRAPHQL_BATCH_LEN).await? {
+        BatchExecution::Complete(outputs) => Ok(outputs),
+        BatchExecution::Reobserve { .. } => bail!(
+            "GitHub stopped a non-idempotent GraphQL batch after it may have applied some operations. Reobserve GitHub before retrying."
+        ),
+    }
+}
+
+enum BatchExecution<T> {
+    Complete(Vec<T>),
+    Reobserve { attempted: Range<usize>, retry_batch_len: NonZeroUsize },
+}
+
+async fn run_batched_graphql_with_limit<O>(
+    octocrab: &Octocrab,
+    operations: impl IntoIterator<Item = O>,
+    max_batch_len: NonZeroUsize,
+) -> Result<BatchExecution<O::Output>>
+where
+    O: BatchedOperation,
+{
     let operations: Vec<O> = operations.into_iter().collect();
     if operations.is_empty() {
-        return Ok(Vec::new());
+        return Ok(BatchExecution::Complete(Vec::new()));
     }
 
     let mut outputs = Vec::with_capacity(operations.len());
@@ -544,30 +610,24 @@ where
     //
     // [1] https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit
     // [2] https://github.blog/changelog/2025-09-01-graphql-api-resource-limits/
-    let mut batches = BatchPlan::new(operations.len(), INITIAL_GRAPHQL_BATCH_LEN);
+    let mut batches = BatchPlan::new(operations.len(), max_batch_len);
     while let Some(range) = batches.current() {
-        let chunk = &operations[range];
+        let chunk = &operations[range.clone()];
         let query = batch_document(chunk);
 
-        // Attempt to perform the query. Returns:
-        // - Ok(Some(response)): Success
-        // - Ok(None): Heuristic or API limit hit (needs backoff)
-        // - Err(e): Fatal error (bail)
-        let response = async {
-            // HEURISTIC: Check query size before sending. GitHub's WAF/load
-            // balancer/some other middleware seems to silently drop or truncate
-            // requests larger than ~600KB, leading to confusing "missing query
-            // attribute" errors. We preemptively backoff if we exceed a
-            // conservative limit (256KB).
-            if query_exceeds_limit(&query) {
-                log::warn!(
-                    "GraphQL query size ({} bytes) exceeds heuristic limit ({} bytes).",
-                    query.len(),
-                    MAX_GRAPHQL_QUERY_BYTES
-                );
-                return Ok(None);
-            }
-
+        // HEURISTIC: Check query size before sending. GitHub's WAF/load
+        // balancer/some other middleware seems to silently drop or truncate
+        // requests larger than ~600KB, leading to confusing "missing query
+        // attribute" errors. We preemptively backoff if we exceed a
+        // conservative limit (256KB).
+        let response = if query_exceeds_limit(&query) {
+            log::warn!(
+                "GraphQL query size ({} bytes) exceeds heuristic limit ({} bytes).",
+                query.len(),
+                MAX_GRAPHQL_QUERY_BYTES
+            );
+            None
+        } else {
             log::trace!("Sending GraphQL Query (Length: {}): {}", query.len(), query);
             let request_payload = serde_json::json!({ "query": query });
             let response: serde_json::Value = octocrab
@@ -575,14 +635,32 @@ where
                 .await
                 .wrap_err("GraphQL batched operation failed")?;
 
-            match classify_response(&response) {
-                ResponseDisposition::Success => {}
+            match classify_response(&response, O::REPLAY_SAFETY) {
+                ResponseDisposition::Success => Some(response),
                 ResponseDisposition::RetryLimit => {
                     log::warn!(
                         "Hit GitHub resource limit with GraphQL batch of size {}",
                         chunk.len()
                     );
-                    return Ok(None);
+                    None
+                }
+                ResponseDisposition::Reobserve => {
+                    log::warn!(
+                        "Hit GitHub resource limit with non-idempotent GraphQL batch of size {}",
+                        chunk.len()
+                    );
+                    let retry_batch_len = match batches.reject() {
+                        Ok(backoff) => {
+                            log::warn!(
+                                "Backing off GraphQL batch size from {} to {}.",
+                                backoff.attempted,
+                                backoff.retry
+                            );
+                            NonZeroUsize::new(backoff.retry).expect("backoff is nonzero")
+                        }
+                        Err(_) => NonZeroUsize::MIN,
+                    };
+                    return Ok(BatchExecution::Reobserve { attempted: range, retry_batch_len });
                 }
                 ResponseDisposition::Fatal => {
                     let errors = response.get("errors").expect("fatal response has errors");
@@ -590,10 +668,7 @@ where
                     bail!("GraphQL errors: {errors:?}");
                 }
             }
-
-            Ok(Some(response))
-        }
-        .await?;
+        };
 
         let Some(response) = response else {
             match batches.reject() {
@@ -614,5 +689,5 @@ where
 
         batches.accept();
     }
-    Ok(outputs)
+    Ok(BatchExecution::Complete(outputs))
 }

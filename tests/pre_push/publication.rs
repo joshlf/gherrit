@@ -153,9 +153,26 @@ fn test_graphql_batch_backoff() {
     ctx.limit_graphql_operations_per_request(2);
     ctx.checkout_managed_private("batch-backoff");
 
-    for i in 1..=4 {
-        ctx.commit_with_gherrit_id(&format!("Commit {i}"));
-    }
+    let commits = (1..=4)
+        .map(|i| {
+            let title = format!("Commit {i}");
+            let id = ctx.commit_with_gherrit_id(&title);
+            (id, title)
+        })
+        .collect::<Vec<_>>();
+
+    commits.iter().enumerate().for_each(|(index, (head, title))| {
+        let base = index
+            .checked_sub(1)
+            .map_or_else(|| "main".to_string(), |parent| commits[parent].0.clone());
+        ctx.github().seed_pull_request(testutil::PullRequestSeed {
+            number: index + 1,
+            title: title.clone(),
+            body: "stale".to_string(),
+            head: head.clone(),
+            base,
+        });
+    });
 
     testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "graphql_batch_backoff");
 
@@ -165,6 +182,10 @@ fn test_graphql_batch_backoff() {
         "GraphQL backoff must not alter the independent Git publication batch"
     );
     assert_eq!(ctx.github().pull_requests().len(), 4, "Expected every commit to have a PR");
+    assert!(
+        ctx.github().pull_requests().iter().all(|pr| pr.body.as_deref() != Some("stale")),
+        "Expected every existing PR to be reconciled"
+    );
     insta::assert_debug_snapshot!("graphql_batch_backoff_trace", ctx.github().requests());
 
     let v1_refs = ctx
@@ -173,4 +194,62 @@ fn test_graphql_batch_backoff() {
         .filter(|ref_name| ref_name.ends_with("/v1"))
         .count();
     assert_eq!(v1_refs, 4, "Expected every v1 tag on the remote");
+}
+
+#[test]
+fn test_creation_batch_reobserves_before_backoff_retry() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+
+    ctx.limit_graphql_operations_per_request(2);
+    ctx.checkout_managed_private("create-batch-backoff");
+    (1..=4).for_each(|index| {
+        ctx.commit_with_gherrit_id(&format!("Commit {index}"));
+    });
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    assert_eq!(ctx.github().pull_requests().len(), 4);
+    let requests = ctx.github().requests();
+    let creation_batch_lengths = requests
+        .iter()
+        .filter(|operations| operations.first() == Some(&testutil::GraphQlOperation::CreatePr))
+        .map(|operations| operations.len())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        creation_batch_lengths,
+        [4, 2, 2],
+        "the rejected all-missing batch must be reobserved and retried at the reduced ceiling"
+    );
+
+    let rejected_create = requests
+        .iter()
+        .position(|operations| {
+            operations.len() == 4
+                && operations.first() == Some(&testutil::GraphQlOperation::CreatePr)
+        })
+        .unwrap();
+    let first_retry = requests
+        .iter()
+        .enumerate()
+        .skip(rejected_create + 1)
+        .find(|(_, operations)| {
+            operations.len() == 2
+                && operations.first() == Some(&testutil::GraphQlOperation::CreatePr)
+        })
+        .map(|(index, _)| index)
+        .unwrap();
+    assert!(
+        requests[rejected_create + 1..first_retry].iter().any(|operations| {
+            operations.len() == 4
+                && operations
+                    .iter()
+                    .all(|operation| *operation == testutil::GraphQlOperation::Query)
+        }),
+        "GHerrit must reobserve the complete stack between an ambiguous create and its retry: {requests:?}"
+    );
 }
