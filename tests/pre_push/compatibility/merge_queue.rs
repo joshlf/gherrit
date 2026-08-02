@@ -18,15 +18,10 @@ fn test_reproduce_merge_queue_failure() {
     ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
 
     // Get the PR ID
-    let mut pr_id = 0;
-    ctx.inspect_mock_state(|state| {
-        pr_id = state.prs[0].id;
-    });
+    let pr_number = ctx.github().pull_requests()[0].number;
 
     // 2. Add the PR to the merge queue
-    ctx.mutate_mock_state(move |state| {
-        state.merge_queue.insert(pr_id);
-    });
+    ctx.github().add_to_merge_queue(pr_number);
 
     // 3. Amend the commit (update title/body) but NOT the base
     ctx.commit("Initial Feature Work (Amended)");
