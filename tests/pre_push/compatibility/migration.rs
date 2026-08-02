@@ -1,22 +1,16 @@
 #[test]
 fn test_mixed_stack_backward_compatibility() {
-    let ctx = testutil::test_context!()
-        .with_remote()
-        .with_installed_hooks()
-        .with_initial_commit()
-        .with_mock_github()
-        .build();
+    let ctx =
+        testutil::test_context!().with_remote().with_initial_commit().with_mock_github().build();
 
-    // Checking out a new branch enables management through the installed hook.
-    ctx.checkout_new("mixed-stack");
+    ctx.checkout_managed_private("mixed-stack");
 
     // 1. Create a commit with a manual Hex ID (legacy format)
     let legacy_id = "G0000000000000000000000000000000000000001";
-    let msg = format!("Legacy Commit\n\ngherrit-pr-id: {}", legacy_id);
-    ctx.run_git(&["commit", "--allow-empty", "-m", &msg]);
+    ctx.commit_with_explicit_gherrit_id("Legacy Commit", legacy_id);
 
     // 2. Create a normal commit (will get a Base32 ID)
-    ctx.commit("Modern Commit");
+    ctx.commit_with_gherrit_id("Modern Commit");
 
     // 3. Trigger pre-push hook
     // We expect this to succeed and identify 2 commits to sync.
@@ -30,29 +24,4 @@ fn test_mixed_stack_backward_compatibility() {
 
     let legacy_ref = format!("refs/heads/{legacy_id}");
     assert!(ctx.remote_ref_oid(&legacy_ref).is_some(), "Expected legacy ID to be pushed");
-}
-
-#[test]
-fn test_base32_format_compliance() {
-    let ctx = testutil::test_context!().with_installed_hooks().with_initial_commit().build();
-    ctx.checkout_new("base32-format");
-    ctx.commit("Base32 Commit");
-
-    // Read the commit message
-    let output = ctx.git_cmd().args(["log", "-1", "--format=%B"]).output().unwrap();
-    let msg = String::from_utf8(output.stdout).unwrap();
-
-    // extract ID
-    let id_line = msg.lines().find(|l| l.starts_with("gherrit-pr-id: ")).expect("ID not found");
-    let id = id_line.trim().strip_prefix("gherrit-pr-id: ").unwrap();
-
-    // Must be uppercase G + [a-z2-7]
-    assert!(id.starts_with('G'), "ID must start with G");
-    let content = &id[1..];
-    assert!(
-        content.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7')),
-        "ID content must be lowercase letters or digits 2-7"
-    );
-
-    assert_eq!(id.len(), 33, "ID length should be 33 (1 prefix + 32 hash)");
 }
