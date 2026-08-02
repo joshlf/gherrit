@@ -452,7 +452,6 @@ pub enum FailureKind {
     GraphQl,
     CreatePr,
     UpdatePr,
-    UpdatePrNull,
     Git(GitOperation),
 }
 
