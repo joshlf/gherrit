@@ -455,6 +455,12 @@ mod tests {
             ("/tmp/test/owner/repo.git", ("owner", "repo")),
             ("/tmp/owner/repo", ("owner", "repo")),
             ("owner/repo", ("owner", "repo")),
+            ("https://github.com/user-name/repo", ("user-name", "repo")),
+            ("https://github.com/user_name/repo", ("user_name", "repo")),
+            ("https://github.com/user.name/repo", ("user.name", "repo")),
+            ("https://github.com/user/repo-name", ("user", "repo-name")),
+            ("https://github.com/user/repo_name", ("user", "repo_name")),
+            ("https://github.com/user/repo.name", ("user", "repo.name")),
         ] {
             let expect = (owner.to_string(), repo.to_string());
             assert_eq!(get_repo_owner_name(url).unwrap(), expect);
