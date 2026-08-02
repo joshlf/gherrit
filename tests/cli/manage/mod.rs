@@ -1,5 +1,3 @@
-mod transitions;
-
 #[test]
 fn test_branch_management() {
     let ctx = testutil::test_context!().build();
