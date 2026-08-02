@@ -1,6 +1,6 @@
 ---
 source: tests/pre_push/publication.rs
-expression: state.graphql_requests
+expression: "&requests"
 ---
 [
     [
@@ -18,27 +18,24 @@ expression: state.graphql_requests
         Query,
     ],
     [
+        UpdatePr,
+        UpdatePr,
+        UpdatePr,
+        UpdatePr,
+    ],
+    [
+        Query,
+        Query,
+        Query,
         Query,
     ],
     [
-        CreatePr,
-        CreatePr,
-        CreatePr,
-        CreatePr,
+        Query,
+        Query,
     ],
     [
-        CreatePr,
-        CreatePr,
-    ],
-    [
-        CreatePr,
-        CreatePr,
-    ],
-    [
-        UpdatePr,
-        UpdatePr,
-        UpdatePr,
-        UpdatePr,
+        Query,
+        Query,
     ],
     [
         UpdatePr,
