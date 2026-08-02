@@ -40,13 +40,12 @@ jobs:
 
       - name: Clippy
         run: |
-          GHERRIT_TEST_BUILD=1 cargo clippy \
-            --workspace --all-targets --locked -- -D warnings
+          cargo clippy --workspace --all-targets --all-features \
+            --locked -- -D warnings
 
       - name: Run Tests
         run: |
-          GHERRIT_TEST_BUILD=1 cargo test \
-            --workspace --all-targets --locked
+          cargo test --workspace --all-targets --all-features --locked
 
       - name: Check task markers
         run: ci/check_todo.sh
@@ -82,6 +81,4 @@ jobs:
           cache-on-failure: "true"
 
       - name: Run tests
-        env:
-          GHERRIT_TEST_BUILD: "1"
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --all-features --locked
