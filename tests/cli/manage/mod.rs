@@ -1,5 +1,3 @@
-mod transitions;
-
 #[test]
 fn test_branch_management() {
     let ctx = testutil::test_context!().build();
@@ -85,23 +83,31 @@ fn test_manage_detached_head() {
 }
 
 #[test]
-fn test_unmanage_cleanup_logic() {
+fn test_unmanage_preserves_drift_unless_forced() {
     let ctx = testutil::test_context!().with_initial_commit().build();
     ctx.checkout_new("feature-cleanup");
 
-    // Manually configure the state to exact values that trigger the deep cleanup logic
+    // Configure a private branch whose push remote has drifted. Without
+    // `--force`, GHerrit must preserve this state.
     ctx.run_git(&["config", "branch.feature-cleanup.gherritManaged", testutil::MANAGED_PRIVATE]);
-    ctx.run_git(&["config", "branch.feature-cleanup.pushRemote", "."]);
+    ctx.run_git(&["config", "branch.feature-cleanup.pushRemote", "drifted-remote"]);
     ctx.run_git(&["config", "branch.feature-cleanup.remote", "."]);
     ctx.run_git(&["config", "branch.feature-cleanup.merge", "refs/heads/feature-cleanup"]);
 
-    // Run unmanage
-    testutil::assert_success_snapshot!(ctx, ctx.unmanage_cmd(), "unmanage_cleanup");
+    testutil::assert_success_snapshot!(ctx, ctx.unmanage_cmd(), "unmanage_preserve_drift",);
 
-    // Verify cleanup: remote and merge keys should be removed
+    ctx.assert_config("branch.feature-cleanup.gherritManaged", Some(testutil::MANAGED_PRIVATE));
+    ctx.assert_config("branch.feature-cleanup.pushRemote", Some("drifted-remote"));
+    ctx.assert_config("branch.feature-cleanup.remote", Some("."));
+    ctx.assert_config("branch.feature-cleanup.merge", Some("refs/heads/feature-cleanup"));
+
+    let mut command = ctx.unmanage_cmd();
+    command.arg("--force");
+    testutil::assert_success_snapshot!(ctx, command, "unmanage_force_cleanup");
+
+    ctx.assert_config("branch.feature-cleanup.pushRemote", None);
     ctx.assert_config("branch.feature-cleanup.remote", None);
     ctx.assert_config("branch.feature-cleanup.merge", None);
-    // gherritManaged should be false
     ctx.assert_config("branch.feature-cleanup.gherritManaged", Some("false"));
 }
 
