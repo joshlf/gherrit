@@ -1,8 +1,8 @@
 //! Git command interceptor for the hermetic test harness.
 //!
-//! This module is compiled only when `GHERRIT_TEST_BUILD` is set. The test
-//! harness places this binary on `PATH` as `git`. On Unix, a small wrapper
-//! invokes the binary with [`INVOCATION`]; on Windows, the binary is copied to
+//! This module is compiled only into the feature-gated test driver. The
+//! harness places that binary on `PATH` as `git`. On Unix, a small wrapper
+//! invokes the driver with [`INVOCATION`]; on Windows, the driver is copied to
 //! `git.exe` and recognized by its executable name.
 
 use std::{
