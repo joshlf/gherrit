@@ -458,6 +458,7 @@ pub enum GraphQlOperation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PullRequestState {
     Open,
     Closed,
@@ -930,11 +931,13 @@ fn normalize_windows_stderr(stderr: &str) -> String {
         .expect("Invalid regex")
     });
     static MISSING_TMP_WARNING_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?m)^bash\.exe: warning: could not find /tmp, please create!(?:\r?\n|$)")
-            .expect("Invalid regex")
+        Regex::new(
+            r"(?m)(?P<prefix>^| Stderr: )bash\.exe: warning: could not find /tmp, please create!(?:\r?\n|$)",
+        )
+        .expect("Invalid regex")
     });
 
-    let stderr = MISSING_TMP_WARNING_REGEX.replace_all(stderr, "");
+    let stderr = MISSING_TMP_WARNING_REGEX.replace_all(stderr, "${prefix}");
     let stderr = CLAP_USAGE_REGEX.replace_all(&stderr, "Usage: gherrit${suffix}");
     COMMAND_STATUS_REGEX.replace_all(&stderr, "${prefix}exit status: ").into_owned()
 }
@@ -1224,6 +1227,8 @@ mod tests {
             "Usage: gherrit.exe manage\r\n",
             "[gherrit] [WARN] Failed: Command \"git\" failed with status: exit code: 128\r\n",
             "bash.exe: warning: could not find /tmp, please create!\r\n",
+            "[gherrit] [WARN] Nested command failed. Stderr: bash.exe: warning: could not find /tmp, please create!\r\n",
+            "fatal: repository missing\r\n",
             "payload: Usage: gherrit.exe manage\r\n",
             "payload: Command failed with status: exit code: 2\r\n",
             "payload: bash.exe: warning: could not find /tmp, please create!\r\n",
@@ -1235,6 +1240,7 @@ mod tests {
             concat!(
                 "Usage: gherrit manage\r\n",
                 "[gherrit] [WARN] Failed: Command \"git\" failed with status: exit status: 128\r\n",
+                "[gherrit] [WARN] Nested command failed. Stderr: fatal: repository missing\r\n",
                 "payload: Usage: gherrit.exe manage\r\n",
                 "payload: Command failed with status: exit code: 2\r\n",
                 "payload: bash.exe: warning: could not find /tmp, please create!\r\n",
