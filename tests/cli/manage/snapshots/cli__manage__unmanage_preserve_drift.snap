@@ -1,5 +1,5 @@
 ---
-source: tests/cli/manage/transitions.rs
+source: tests/cli/manage/mod.rs
 expression: content
 ---
 EXIT_CODE: 0
@@ -8,7 +8,7 @@ STDOUT:
 (empty)
 
 STDERR:
-[gherrit] [WARN] Configuration drift detected for branch feature.
+[gherrit] [WARN] Configuration drift detected for branch feature-cleanup.
 [gherrit] [WARN] The current git configuration does not match the expected state for a private branch.
 [gherrit] [WARN]   - pushRemote: current='drifted-remote', expected='.'
 [gherrit] [WARN] Use --force to overwrite manual changes.
