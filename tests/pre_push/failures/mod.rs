@@ -3,14 +3,14 @@ mod batch_update;
 use predicates::prelude::*;
 
 #[test]
-fn test_pre_push_failure() {
+fn test_unavailable_remote_observation_failure() {
     let ctx = testutil::test_context!().repository("missing", "repo").with_mock_github().build();
     ctx.commit("Init");
 
     ctx.checkout_managed_private("feature-fail");
     ctx.commit_with_gherrit_id("Work to push");
 
-    // Configure an invalid remote to trigger `git push` failure
+    // Exercise the production Git adapter against a real unavailable remote.
     ctx.run_git(&["remote", "add", "broken-remote", "missing/repo.git"]);
     ctx.run_git(&["config", "gherrit.remote", "broken-remote"]);
 
@@ -67,14 +67,19 @@ fn test_pre_push_ls_remote_failure() {
     ctx.checkout_managed_private("feature-ls-remote-fail");
     ctx.commit_with_gherrit_id("Work");
 
-    // Hook should succeed but warn about ls-remote failure
+    let refs_before = ctx.remote_refs("refs");
     ctx.expect_git_failure(testutil::GitOperation::LsRemote);
-    ctx.gherrit_cmd()
-        .args(["hook", "pre-push"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("Failed to fetch remote branch states"));
+    testutil::assert_failure_snapshot!(
+        ctx,
+        ctx.hook_cmd("pre-push"),
+        "ls_remote_observation_failure"
+    );
+
     ctx.assert_failure_consumed();
+    assert_eq!(ctx.remote_refs("refs"), refs_before);
+    assert!(ctx.recorded_pushes().is_empty());
+    assert!(ctx.github().pull_requests().is_empty());
+    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]]);
 }
 
 #[test]
