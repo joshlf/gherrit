@@ -19,6 +19,7 @@ use regex::Regex;
 use tempfile::TempDir;
 
 mod command;
+mod git_interceptor;
 mod mock_server;
 
 pub use command::TestCommand;
@@ -511,7 +512,6 @@ pub struct PullRequestSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushRecord {
-    pub arguments: Vec<String>,
     pub exit_code: i32,
 }
 
@@ -859,9 +859,10 @@ impl TestContext {
         assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
         self.inspect_mock_state(|state| {
             state
-                .pushes
+                .git
+                .pushes()
                 .iter()
-                .map(|push| PushRecord { arguments: push.args.clone(), exit_code: push.exit_code })
+                .map(|push| PushRecord { exit_code: push.exit_code() })
                 .collect()
         })
     }
