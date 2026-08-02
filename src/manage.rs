@@ -332,70 +332,113 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
     Ok(())
 }
 
-pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> Result<()> {
-    // Only run on branch switches (flag=1)
-    if flag != "1" {
-        return Ok(());
+fn checked_out_branch<'a>(flag: &str, head: &'a HeadState) -> Option<&'a str> {
+    match (flag, head) {
+        ("1", HeadState::Attached(branch_name)) => Some(branch_name),
+        _ => None,
     }
+}
 
-    let branch_name = repo.current_branch();
-    let branch_name = match branch_name {
-        HeadState::Attached(bn) => bn,
-        HeadState::Pending(_) | HeadState::Detached => return Ok(()),
-    };
-
-    // Idempotency check: Bail if the branch management state is explicitly managed.
-    let current_state =
-        State::read_from(repo, branch_name).wrap_err("Failed to parse gherritState")?;
-    let state_str = match current_state {
-        Some(State::Unmanaged) | None => None,
+fn configured_management_mode(state: Option<State>) -> Option<&'static str> {
+    match state {
         Some(State::Private) => Some("private"),
         Some(State::Public) => Some("public"),
+        Some(State::Unmanaged) | None => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostCheckoutMergeTarget {
+    DefaultBranch,
+    OtherBranch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostCheckoutBranchObservation {
+    Existing,
+    NewlyCreated {
+        has_upstream_remote: bool,
+        upstream_merge_target: Option<PostCheckoutMergeTarget>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostCheckoutBranchKind {
+    Existing,
+    Shared,
+    NewStack,
+}
+
+fn classify_post_checkout_branch(
+    observation: PostCheckoutBranchObservation,
+) -> PostCheckoutBranchKind {
+    match observation {
+        PostCheckoutBranchObservation::Existing => PostCheckoutBranchKind::Existing,
+        PostCheckoutBranchObservation::NewlyCreated {
+            has_upstream_remote: true,
+            upstream_merge_target: Some(PostCheckoutMergeTarget::OtherBranch),
+        } => PostCheckoutBranchKind::Shared,
+        PostCheckoutBranchObservation::NewlyCreated { .. } => PostCheckoutBranchKind::NewStack,
+    }
+}
+
+pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> Result<()> {
+    let Some(branch_name) = checked_out_branch(flag, repo.current_branch()) else {
+        return Ok(());
     };
-    if let Some(state) = state_str {
+
+    let current_state =
+        State::read_from(repo, branch_name).wrap_err("Failed to parse gherritState")?;
+    if let Some(mode) = configured_management_mode(current_state) {
         log::debug!(
             "Branch {} is already configured as {} by GHerrit.",
             branch_name.yellow(),
-            state.yellow()
+            mode.yellow()
         );
         return Ok(());
     }
 
-    // Creation detection: Bail if we're just checking out an already-existing branch.
-    let is_new =
+    let newly_created =
         repo.is_newly_created_branch(branch_name).wrap_err("Failed to check if branch is new")?;
-    if !is_new {
-        log::debug!(" Branch '{}' is not newly created.", branch_name);
-        return Ok(());
-    }
+    let observation = if newly_created {
+        let upstream_remote = repo
+            .config_string(&format!("branch.{branch_name}.remote"))
+            .wrap_err("Failed to read config")?;
+        let upstream_merge = repo
+            .config_string(&format!("branch.{branch_name}.merge"))
+            .wrap_err("Failed to read config")?;
+        let upstream_merge_target = upstream_merge.as_deref().map(|merge| {
+            let merge_branch_name = merge.strip_prefix("refs/heads/").unwrap_or(merge);
+            if repo.is_a_default_branch_on_default_remote(merge_branch_name) {
+                PostCheckoutMergeTarget::DefaultBranch
+            } else {
+                PostCheckoutMergeTarget::OtherBranch
+            }
+        });
 
-    let upstream_remote = repo
-        .config_string(&format!("branch.{branch_name}.remote"))
-        .wrap_err("Failed to read config")?;
-    let upstream_merge = repo
-        .config_string(&format!("branch.{branch_name}.merge"))
-        .wrap_err("Failed to read config")?;
-
-    let is_default_branch = upstream_merge
-        .as_deref()
-        .map(|merge| {
-            let branch_name = merge.strip_prefix("refs/heads/").unwrap_or(merge);
-            repo.is_a_default_branch_on_default_remote(branch_name)
-        })
-        .unwrap_or(false);
-
-    let has_upstream = upstream_remote.is_some() && upstream_merge.is_some();
-    let branch_name_yellow = branch_name.yellow();
-    if has_upstream && !is_default_branch {
-        // Condition A: Shared Branch
-        log::info!("Detected {branch_name_yellow} as a shared branch.");
-        set_state(repo, State::Unmanaged, false)?;
-        log::info!("To have GHerrit manage this branch, run: gherrit manage");
+        PostCheckoutBranchObservation::NewlyCreated {
+            has_upstream_remote: upstream_remote.is_some(),
+            upstream_merge_target,
+        }
     } else {
-        // Condition B: New Stack
-        log::info!("Detected {branch_name_yellow} as a new branch.");
-        set_state(repo, State::Private, false)?;
-        log::info!("To opt-out, run: gherrit unmanage");
+        PostCheckoutBranchObservation::Existing
+    };
+
+    let branch_name_yellow = branch_name.yellow();
+    match classify_post_checkout_branch(observation) {
+        PostCheckoutBranchKind::Existing => {
+            log::debug!(" Branch '{}' is not newly created.", branch_name);
+        }
+        PostCheckoutBranchKind::Shared => {
+            log::info!("Detected {branch_name_yellow} as a shared branch.");
+            set_state(repo, State::Unmanaged, false)?;
+            log::info!("To have GHerrit manage this branch, run: gherrit manage");
+        }
+        PostCheckoutBranchKind::NewStack => {
+            log::info!("Detected {branch_name_yellow} as a new branch.");
+            set_state(repo, State::Private, false)?;
+            log::info!("To opt-out, run: gherrit unmanage");
+        }
     }
 
     Ok(())
@@ -477,6 +520,59 @@ mod tests {
             }
         });
         config
+    }
+
+    #[test]
+    fn post_checkout_only_inspects_attached_branch_switches() {
+        ["0", "1", "unexpected"].into_iter().for_each(|flag| {
+            let attached = HeadState::Attached(BRANCH.to_string());
+            let expected = (flag == "1").then_some(BRANCH);
+            assert_eq!(checked_out_branch(flag, &attached), expected, "flag={flag}");
+            assert_eq!(checked_out_branch(flag, &HeadState::Pending(BRANCH.to_string())), None);
+            assert_eq!(checked_out_branch(flag, &HeadState::Detached), None);
+        });
+    }
+
+    #[test]
+    fn post_checkout_only_reclassifies_unconfigured_or_unmanaged_branches() {
+        assert_eq!(configured_management_mode(None), None);
+        assert_eq!(configured_management_mode(Some(State::Unmanaged)), None);
+        assert_eq!(configured_management_mode(Some(State::Private)), Some("private"));
+        assert_eq!(configured_management_mode(Some(State::Public)), Some("public"));
+    }
+
+    #[test]
+    fn post_checkout_branch_classification_is_exhaustive() {
+        assert_eq!(
+            classify_post_checkout_branch(PostCheckoutBranchObservation::Existing),
+            PostCheckoutBranchKind::Existing
+        );
+
+        let merge_targets = [
+            None,
+            Some(PostCheckoutMergeTarget::DefaultBranch),
+            Some(PostCheckoutMergeTarget::OtherBranch),
+        ];
+        [false, true].into_iter().for_each(|has_upstream_remote| {
+            merge_targets.into_iter().for_each(|upstream_merge_target| {
+                let expected = match (has_upstream_remote, upstream_merge_target) {
+                    (true, Some(PostCheckoutMergeTarget::OtherBranch)) => {
+                        PostCheckoutBranchKind::Shared
+                    }
+                    _ => PostCheckoutBranchKind::NewStack,
+                };
+                let observation = PostCheckoutBranchObservation::NewlyCreated {
+                    has_upstream_remote,
+                    upstream_merge_target,
+                };
+
+                assert_eq!(
+                    classify_post_checkout_branch(observation),
+                    expected,
+                    "observation={observation:?}"
+                );
+            });
+        });
     }
 
     #[test]
