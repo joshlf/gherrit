@@ -19,7 +19,7 @@ use regex::Regex;
 use tempfile::TempDir;
 
 mod command;
-pub mod mock_server;
+mod mock_server;
 
 pub use command::TestCommand;
 
@@ -450,6 +450,158 @@ pub enum FailureKind {
     UpdatePr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphQlOperation {
+    Query,
+    CreatePr,
+    UpdatePr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullRequestState {
+    Open,
+    Closed,
+    Merged,
+}
+
+impl PullRequestState {
+    fn as_str(self) -> &'static str {
+        match self {
+            PullRequestState::Open => "OPEN",
+            PullRequestState::Closed => "CLOSED",
+            PullRequestState::Merged => "MERGED",
+        }
+    }
+
+    fn from_str(state: &str) -> Self {
+        match state {
+            "OPEN" => PullRequestState::Open,
+            "CLOSED" => PullRequestState::Closed,
+            "MERGED" => PullRequestState::Merged,
+            state => panic!("mock pull request has invalid state {state:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestSeed {
+    pub number: usize,
+    pub title: String,
+    pub body: String,
+    pub head: String,
+    pub base: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestSnapshot {
+    pub number: usize,
+    pub node_id: String,
+    pub state: PullRequestState,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub head: String,
+    pub base: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefUpdate {
+    pub source: String,
+    pub destination: String,
+}
+
+impl RefUpdate {
+    fn from_refspec(refspec: &str) -> Self {
+        let refspec = refspec.trim_start_matches('+');
+        let (source, destination) = refspec
+            .split_once(':')
+            .unwrap_or_else(|| panic!("recorded refspec has no destination: {refspec}"));
+        Self { source: source.to_string(), destination: destination.to_string() }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushRecord {
+    pub arguments: Vec<String>,
+    pub ref_updates: Vec<RefUpdate>,
+    pub exit_code: i32,
+}
+
+impl PushRecord {
+    pub fn succeeded(&self) -> bool {
+        self.exit_code == 0
+    }
+}
+
+impl From<&mock_server::PrEntry> for PullRequestSnapshot {
+    fn from(pr: &mock_server::PrEntry) -> Self {
+        Self {
+            number: pr.number,
+            node_id: pr.node_id.clone(),
+            state: PullRequestState::from_str(&pr.state),
+            title: pr.title.clone(),
+            body: pr.body.clone(),
+            head: pr.head.ref_field.clone(),
+            base: pr.base.ref_field.clone(),
+        }
+    }
+}
+
+pub struct MockGithub<'a> {
+    context: &'a TestContext,
+}
+
+impl MockGithub<'_> {
+    pub fn repository(&self) -> (String, String) {
+        self.context.inspect_mock_state(|state| (state.repo_owner.clone(), state.repo_name.clone()))
+    }
+
+    pub fn pull_requests(&self) -> Vec<PullRequestSnapshot> {
+        self.context
+            .inspect_mock_state(|state| state.prs.iter().map(PullRequestSnapshot::from).collect())
+    }
+
+    pub fn requests(&self) -> Vec<Vec<GraphQlOperation>> {
+        self.context.inspect_mock_state(|state| state.graphql_requests.clone())
+    }
+
+    pub fn seed_pull_request(&self, seed: PullRequestSeed) {
+        self.context.mutate_mock_state(|state| {
+            let pr = mock_server::PrEntry::mock(mock_server::MockPrArgs {
+                id: u64::try_from(seed.number).expect("pull request number does not fit in u64"),
+                title: seed.title,
+                body: seed.body,
+                head: seed.head,
+                base: seed.base,
+                repo_owner: &state.repo_owner,
+                repo_name: &state.repo_name,
+            });
+            state.add_pr(pr);
+        });
+    }
+
+    pub fn set_pull_request_state(&self, number: usize, new_state: PullRequestState) {
+        self.context.mutate_mock_state(|state| {
+            let pr = state
+                .prs
+                .iter_mut()
+                .find(|pr| pr.number == number)
+                .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
+            pr.state = new_state.as_str().to_string();
+        });
+    }
+
+    pub fn add_to_merge_queue(&self, number: usize) {
+        self.context.mutate_mock_state(|state| {
+            let pr = state
+                .prs
+                .iter()
+                .find(|pr| pr.number == number)
+                .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
+            state.merge_queue.insert(pr.id);
+        });
+    }
+}
+
 impl Drop for TestContext {
     fn drop(&mut self) {
         // Stop the server before fixture directories and state are released.
@@ -620,14 +772,46 @@ impl TestContext {
         });
     }
 
-    pub fn inspect_mock_state(&self, f: impl FnOnce(&mock_server::MockState)) {
+    fn inspect_mock_state<T>(&self, f: impl FnOnce(&mock_server::MockState) -> T) -> T {
         let state = self.mock_state().read().unwrap();
-        f(&state);
+        f(&state)
     }
 
-    pub fn mutate_mock_state(&self, f: impl FnOnce(&mut mock_server::MockState)) {
+    fn mutate_mock_state<T>(&self, f: impl FnOnce(&mut mock_server::MockState) -> T) -> T {
         let mut state = self.mock_state().write().unwrap();
-        f(&mut state);
+        f(&mut state)
+    }
+
+    pub fn github(&self) -> MockGithub<'_> {
+        assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
+        MockGithub { context: self }
+    }
+
+    pub fn recorded_pushes(&self) -> Vec<PushRecord> {
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        self.inspect_mock_state(|state| {
+            state
+                .pushes
+                .iter()
+                .map(|push| PushRecord {
+                    arguments: push.args.clone(),
+                    ref_updates: push
+                        .refspecs
+                        .iter()
+                        .map(|refspec| RefUpdate::from_refspec(refspec))
+                        .collect(),
+                    exit_code: push.exit_code,
+                })
+                .collect()
+        })
+    }
+
+    pub fn successful_ref_updates(&self) -> Vec<RefUpdate> {
+        self.recorded_pushes()
+            .into_iter()
+            .filter(PushRecord::succeeded)
+            .flat_map(|push| push.ref_updates)
+            .collect()
     }
 
     pub fn formatted_mock_pr_state(&self) -> String {
@@ -668,21 +852,6 @@ impl TestContext {
 
     pub fn init_bare_repo(&self, path: &Path) {
         init_git_bare_repo(&self.test_environment, &self.system_git, path);
-    }
-
-    pub fn count_successfully_pushed_containing(&self, substring: &str) -> usize {
-        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
-        let mut count = 0;
-        self.inspect_mock_state(|state| {
-            count = state
-                .pushes
-                .iter()
-                .filter(|push| push.succeeded())
-                .flat_map(|push| &push.refspecs)
-                .filter(|refspec| refspec.contains(substring))
-                .count();
-        });
-        count
     }
 
     pub fn set_config(&self, key: &str, value: Option<&str>) {

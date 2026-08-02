@@ -10,7 +10,7 @@ use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::{FailureKind, TestEnvironment};
+use crate::{FailureKind, GraphQlOperation, TestEnvironment};
 
 static GITHUB_SCHEMA: LazyLock<Valid<apollo_compiler::Schema>> = LazyLock::new(|| {
     apollo_compiler::Schema::parse_and_validate(
@@ -30,13 +30,6 @@ pub struct MockState {
     pub repo_name: String,
     pub fail_next_request: Option<FailureKind>,
     pub merge_queue: HashSet<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GraphQlOperation {
-    Query,
-    CreatePr,
-    UpdatePr,
 }
 
 impl MockState {
@@ -187,12 +180,6 @@ pub struct GitPush {
     pub args: Vec<String>,
     pub refspecs: Vec<String>,
     pub exit_code: i32,
-}
-
-impl GitPush {
-    pub fn succeeded(&self) -> bool {
-        self.exit_code == 0
-    }
 }
 
 #[derive(Clone)]
