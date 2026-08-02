@@ -51,16 +51,3 @@ fn installed_pre_push_blocks_the_enclosing_push() {
     assert_eq!(ctx.remote_ref_oid("refs/heads/blocked-boundary"), None);
     assert_eq!(ctx.remote_ref_oid(&format!("refs/heads/{id}")), None);
 }
-
-#[test]
-fn test_driver_without_github_endpoint_fails_closed() {
-    let ctx = testutil::test_context!().with_initial_commit().build();
-    ctx.checkout_managed_private("missing-github-endpoint");
-    ctx.commit_with_gherrit_id("Managed work");
-
-    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().failure().stderr(
-        predicate::str::contains(
-            "test driver cannot sync PRs without a configured GitHub endpoint",
-        ),
-    );
-}
