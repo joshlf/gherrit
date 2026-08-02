@@ -104,12 +104,13 @@ fn test_commit_msg_git_var_failure() {
         let msg_file = ctx.repo_path.join("COMMIT_EDITMSG");
         std::fs::write(&msg_file, "feat: broken git var").unwrap();
 
+        ctx.expect_git_failure(testutil::GitOperation::Var);
         ctx.gherrit_cmd()
             .args(["hook", "commit-msg", msg_file.to_str().unwrap()])
-            .env("MOCK_BIN_FAIL_CMD", "git:var")
             .assert()
             .failure()
             .stderr(predicate::str::contains("Simulated failure for git var"));
+        ctx.assert_failure_consumed();
     }
 }
 
@@ -125,11 +126,12 @@ fn test_commit_msg_trailers_failure() {
         let msg_file = ctx.repo_path.join("COMMIT_EDITMSG");
         std::fs::write(&msg_file, "feat: broken trailers parse").unwrap();
 
+        ctx.expect_git_failure(testutil::GitOperation::InterpretTrailers);
         ctx.gherrit_cmd()
             .args(["hook", "commit-msg", msg_file.to_str().unwrap()])
-            .env("MOCK_BIN_FAIL_CMD", "git:interpret-trailers")
             .assert()
             .failure()
             .stderr(predicate::str::contains("Simulated failure for git interpret-trailers"));
+        ctx.assert_failure_consumed();
     }
 }
