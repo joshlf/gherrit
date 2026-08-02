@@ -457,7 +457,8 @@ pub enum GraphQlOperation {
     UpdatePr,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PullRequestState {
     Open,
     Closed,
@@ -492,7 +493,7 @@ pub struct PullRequestSeed {
     pub base: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PullRequestSnapshot {
     pub number: usize,
     pub node_id: String,
@@ -818,14 +819,10 @@ impl TestContext {
             .collect()
     }
 
-    pub fn formatted_mock_pr_state(&self) -> String {
-        assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
-        let mut content = String::new();
-        self.inspect_mock_state(|state| {
-            let json = serde_json::to_string_pretty(&state.prs).expect("Failed to serialize PRs");
-            content = self.sanitize(&json);
-        });
-        content
+    pub fn formatted_github_state(&self) -> String {
+        let state = self.github().pull_requests();
+        let json = serde_json::to_string_pretty(&state).expect("Failed to serialize PRs");
+        self.sanitize(&json)
     }
 
     pub fn remote_ref_oid(&self, ref_name: &str) -> Option<String> {
@@ -1149,7 +1146,7 @@ macro_rules! assert_failure_snapshot {
 #[macro_export]
 macro_rules! assert_pr_snapshot {
     ($ctx:expr, $name:expr $(,)?) => {
-        insta::assert_snapshot!($name, $ctx.formatted_mock_pr_state());
+        insta::assert_snapshot!($name, $ctx.formatted_github_state());
     };
 }
 
