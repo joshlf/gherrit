@@ -259,6 +259,20 @@ pub(super) fn plan_projection(
     if updates.is_empty() { ProjectionPlan::Done } else { ProjectionPlan::Update(updates) }
 }
 
+/// Whether reobservation proves that an ambiguously acknowledged update made
+/// progress.
+///
+/// Replaying an identical patch is unsafe even when assigning the same values
+/// is state-idempotent: GitHub can reject a now-no-op base change for a pull
+/// request in the merge queue. A changed or absent patch was derived from new
+/// state and can be executed as a new action.
+pub(super) fn ambiguous_update_made_progress(
+    attempted: &UpdatePr,
+    replanned: &ProjectionPlan,
+) -> bool {
+    !matches!(replanned, ProjectionPlan::Update(updates) if updates.contains(attempted))
+}
+
 fn normalize_body(body: &str) -> String {
     body.replace("\r\n", "\n").trim().to_string()
 }
@@ -708,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn recovers_idempotently_after_every_committed_update_prefix() {
+    fn replans_after_every_committed_update_prefix() {
         let commits = projection_commits();
         let initial = observed_world(&commits, [ProjectionCase::Drifted; 2]);
         let ProjectionPlan::Update(updates) =
@@ -720,12 +734,6 @@ mod tests {
         (0..=updates.len()).for_each(|committed| {
             let mut pull_requests = initial.clone();
             apply_updates(&mut pull_requests, &updates[..committed]);
-            let after_commit = pull_requests.clone();
-            apply_updates(&mut pull_requests, &updates[..committed]);
-            assert_eq!(
-                pull_requests, after_commit,
-                "replaying a lost-ack update prefix must be idempotent"
-            );
 
             let expected = if committed == updates.len() {
                 ProjectionPlan::Done
@@ -770,6 +778,24 @@ mod tests {
             body: body.map(ToString::to_string),
             base_branch: base_branch.map(ToString::to_string),
         })
+    }
+
+    #[test]
+    fn ambiguous_update_requires_observed_progress_before_retry() {
+        let attempted = update(Some("Title"), Some("Body"), Some("main")).unwrap();
+        assert!(!ambiguous_update_made_progress(
+            &attempted,
+            &ProjectionPlan::Update(vec![attempted.clone()]),
+        ));
+
+        let remaining = update(None, Some("Body"), None).unwrap();
+        for replanned in [
+            ProjectionPlan::Update(vec![remaining]),
+            ProjectionPlan::Create(Vec::new()),
+            ProjectionPlan::Done,
+        ] {
+            assert!(ambiguous_update_made_progress(&attempted, &replanned));
+        }
     }
 
     #[test]
