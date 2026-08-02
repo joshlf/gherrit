@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::IntoFuture,
     path::PathBuf,
     sync::{mpsc::Sender, Arc, LazyLock, RwLock},
@@ -28,7 +28,7 @@ pub struct MockState {
     pub max_graphql_operations_per_request: Option<usize>,
     pub repo_owner: String,
     pub repo_name: String,
-    pub fail_next_request: Option<FailureKind>,
+    pub faults: VecDeque<FailureKind>,
     pub merge_queue: HashSet<u64>,
 }
 
@@ -226,18 +226,19 @@ fn check_and_apply_graphql_failure(
 ) -> Option<FailureKind> {
     use FailureKind::*;
 
-    let fail_action = mock_state.fail_next_request.as_ref()?;
+    let fail_action = mock_state.faults.front()?;
     let matches = match fail_action {
         GraphQl => true,
         CreatePr => operations.contains(&GraphQlOperation::CreatePr),
         UpdatePr => operations.contains(&GraphQlOperation::UpdatePr),
+        UpdatePrNull { .. } => false,
     };
 
     if !matches {
         return None;
     }
 
-    mock_state.fail_next_request.take()
+    mock_state.faults.pop_front()
 }
 
 fn graphql_operations(document: &ExecutableDocument) -> Vec<GraphQlOperation> {
@@ -894,9 +895,12 @@ async fn graphql(
                 let alias = response_key(field);
 
                 let result = match field.name.as_str() {
-                    "updatePullRequest" => handle_update_pr(&mut mock_state, field, &|branch| {
-                        remote_branch_exists(&app_state, branch)
-                    }),
+                    "updatePullRequest" => {
+                        let result = handle_update_pr(&mut mock_state, field, &|branch| {
+                            remote_branch_exists(&app_state, branch)
+                        });
+                        apply_update_pr_null_failure(&mut mock_state, field, result)
+                    }
                     "createPullRequest" => handle_create_pr(&mut mock_state, field, &|branch| {
                         remote_branch_exists(&app_state, branch)
                     }),
@@ -926,6 +930,35 @@ async fn graphql(
     }
 
     (StatusCode::OK, Json(serde_json::Value::Object(response_json)))
+}
+
+fn apply_update_pr_null_failure(
+    mock_state: &mut MockState,
+    field: &executable::Field,
+    result: Result<serde_json::Value, String>,
+) -> Result<serde_json::Value, String> {
+    let value = result?;
+    let Some(FailureKind::UpdatePrNull { number: expected_number }) = mock_state.faults.front()
+    else {
+        return Ok(value);
+    };
+    let expected_number = *expected_number;
+    let Some(node_id) = input_object(field, "updatePullRequest")
+        .ok()
+        .and_then(|input| get_string_field(input, "pullRequestId"))
+    else {
+        return Ok(value);
+    };
+    if !mock_state.prs.iter().any(|pr| pr.number == expected_number && pr.node_id == node_id) {
+        return Ok(value);
+    }
+
+    let Some(FailureKind::UpdatePrNull { number: consumed_number }) = mock_state.faults.pop_front()
+    else {
+        unreachable!("the front fault was just matched as an UpdatePrNull fault")
+    };
+    debug_assert_eq!(consumed_number, expected_number);
+    Ok(serde_json::Value::Null)
 }
 
 fn graphql_http_error(message: &str) -> (StatusCode, Json<serde_json::Value>) {
@@ -1022,10 +1055,6 @@ fn handle_update_pr(
     }
     if let Some(base) = base {
         pr.base.ref_field = base;
-    }
-
-    if body.as_deref().is_some_and(|body| body.contains("TRIGGER_GRAPHQL_NULL")) {
-        return Ok(serde_json::Value::Null);
     }
 
     let mut response = serde_json::Map::new();
@@ -1204,13 +1233,45 @@ mod tests {
         field
     }
 
+    fn root_fields(document: &ExecutableDocument) -> Vec<&executable::Field> {
+        document
+            .operations
+            .iter()
+            .next()
+            .unwrap()
+            .selection_set
+            .selections
+            .iter()
+            .map(|selection| {
+                let executable::Selection::Field(field) = selection else {
+                    panic!("expected a root field");
+                };
+                field.as_ref()
+            })
+            .collect()
+    }
+
+    fn add_pr(state: &mut MockState, number: u64, head: &str) {
+        state.add_pr(PrEntry::mock(MockPrArgs {
+            id: number,
+            title: format!("PR {number}"),
+            body: String::new(),
+            head: head.to_string(),
+            base: "main".to_string(),
+            repo_owner: "owner",
+            repo_name: "repo",
+        }));
+    }
+
     #[test]
     fn operation_failure_only_matches_the_requested_operation() {
-        let mut state =
-            MockState { fail_next_request: Some(FailureKind::UpdatePr), ..Default::default() };
+        let mut state = MockState {
+            faults: VecDeque::from([FailureKind::UpdatePr, FailureKind::CreatePr]),
+            ..Default::default()
+        };
 
         assert_eq!(check_and_apply_graphql_failure(&mut state, &[GraphQlOperation::Query]), None);
-        assert_eq!(state.fail_next_request, Some(FailureKind::UpdatePr));
+        assert_eq!(state.faults, VecDeque::from([FailureKind::UpdatePr, FailureKind::CreatePr]));
 
         assert_eq!(
             check_and_apply_graphql_failure(&mut state, &[GraphQlOperation::CreatePr]),
@@ -1221,19 +1282,78 @@ mod tests {
             check_and_apply_graphql_failure(&mut state, &[GraphQlOperation::UpdatePr]),
             Some(FailureKind::UpdatePr)
         );
-        assert_eq!(state.fail_next_request, None);
+        assert_eq!(state.faults, VecDeque::from([FailureKind::CreatePr]));
     }
 
     #[test]
     fn generic_graphql_failure_matches_any_operation() {
         let mut state =
-            MockState { fail_next_request: Some(FailureKind::GraphQl), ..Default::default() };
+            MockState { faults: VecDeque::from([FailureKind::GraphQl]), ..Default::default() };
 
         assert_eq!(
             check_and_apply_graphql_failure(&mut state, &[GraphQlOperation::Query]),
             Some(FailureKind::GraphQl)
         );
-        assert_eq!(state.fail_next_request, None);
+        assert!(state.faults.is_empty());
+    }
+
+    #[test]
+    fn null_update_failure_targets_exactly_one_successful_selection() {
+        let document = parse_document(
+            "mutation { first: updatePullRequest(input: { pullRequestId: \"PR_1\", \
+             title: \"First\" }) { clientMutationId } second: updatePullRequest(input: { \
+             pullRequestId: \"PR_2\", title: \"Second\" }) { clientMutationId } third: \
+             updatePullRequest(input: { pullRequestId: \"PR_2\", body: \"Third\" }) { \
+             clientMutationId } }",
+        );
+        let fields = root_fields(&document);
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
+        add_pr(&mut state, 1, "Gone");
+        add_pr(&mut state, 2, "Gtwo");
+        state.faults.push_back(FailureKind::UpdatePrNull { number: 2 });
+
+        assert_eq!(
+            check_and_apply_graphql_failure(
+                &mut state,
+                &[GraphQlOperation::UpdatePr, GraphQlOperation::UpdatePr],
+            ),
+            None
+        );
+        let responses = fields
+            .iter()
+            .map(|field| {
+                let result = handle_update_pr(&mut state, field, &|_| Ok(true));
+                apply_update_pr_null_failure(&mut state, field, result).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(responses[0].is_object());
+        assert!(responses[1].is_null());
+        assert!(responses[2].is_object());
+        assert!(state.faults.is_empty());
+    }
+
+    #[test]
+    fn null_update_failure_remains_queued_until_the_target_succeeds() {
+        let document = parse_document(
+            "mutation { rejected: updatePullRequest(input: { pullRequestId: \"PR_2\", \
+             baseRefName: \"Gtwo\" }) { clientMutationId } accepted: updatePullRequest(input: { \
+             pullRequestId: \"PR_2\", title: \"Updated\" }) { clientMutationId } }",
+        );
+        let fields = root_fields(&document);
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
+        add_pr(&mut state, 2, "Gtwo");
+        state.faults.push_back(FailureKind::UpdatePrNull { number: 2 });
+
+        let rejected = handle_update_pr(&mut state, fields[0], &|_| Ok(true));
+        let rejected = apply_update_pr_null_failure(&mut state, fields[0], rejected);
+        assert!(rejected.unwrap_err().contains("head and base branches must differ"));
+        assert_eq!(state.faults, VecDeque::from([FailureKind::UpdatePrNull { number: 2 }]));
+
+        let accepted = handle_update_pr(&mut state, fields[1], &|_| Ok(true));
+        let accepted = apply_update_pr_null_failure(&mut state, fields[1], accepted).unwrap();
+        assert!(accepted.is_null());
+        assert!(state.faults.is_empty());
     }
 
     #[test]
