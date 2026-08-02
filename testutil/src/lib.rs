@@ -448,6 +448,7 @@ pub enum FailureKind {
     GraphQl,
     CreatePr,
     UpdatePr,
+    UpdatePrNull { number: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -594,6 +595,33 @@ impl Drop for TestContext {
     fn drop(&mut self) {
         // Stop the server before fixture directories and state are released.
         drop(self.mock_server.take());
+
+        let (state_poisoned, pending_faults) = self
+            .mock_server_state
+            .as_ref()
+            .map(|state| match state.read() {
+                Ok(state) => (false, state.faults.clone()),
+                Err(poisoned) => (true, poisoned.into_inner().faults.clone()),
+            })
+            .unwrap_or_default();
+        if state_poisoned {
+            let message = format!(
+                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}"
+            );
+            if thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
+            return;
+        }
+        if !pending_faults.is_empty() {
+            if thread::panicking() {
+                eprintln!("Test fixture also has unconsumed faults: {pending_faults:?}");
+            } else {
+                panic!("Test fixture has unconsumed faults: {pending_faults:?}");
+            }
+        }
     }
 }
 
@@ -741,7 +769,7 @@ impl TestContext {
         assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
         let mut state = self.mock_state().write().unwrap();
 
-        state.fail_next_request = Some(kind);
+        state.faults.push_back(kind);
     }
 
     pub fn limit_graphql_operations_per_request(&self, limit: usize) {
@@ -753,9 +781,9 @@ impl TestContext {
     pub fn assert_failure_consumed(&self) {
         self.inspect_mock_state(|state| {
             assert!(
-                state.fail_next_request.is_none(),
-                "Expected injected failure to be consumed, but {:?} remains",
-                state.fail_next_request
+                state.faults.is_empty(),
+                "Expected injected failures to be consumed, but {:?} remain",
+                state.faults
             );
         });
     }
@@ -1191,6 +1219,32 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn poisoned_mock_state_reports_unconsumed_faults() {
+        let driver_dir = TempDir::new().unwrap();
+        let driver = driver_dir.path().join("gherrit-test-driver");
+        fs::write(&driver, "test driver placeholder").unwrap();
+
+        let ctx = TestContextBuilder::new(&driver).with_git_interceptor().build();
+        let state = ctx.mock_server_state.as_ref().unwrap().clone();
+        state.write().unwrap().faults.push_back(FailureKind::CreatePr);
+        let poison = panic::catch_unwind(move || {
+            let _state = state.write().unwrap();
+            panic!("simulated request-handler panic");
+        });
+        assert!(poison.is_err());
+
+        let panic = panic::catch_unwind(panic::AssertUnwindSafe(|| drop(ctx)))
+            .expect_err("dropping the fixture must reject poisoned mock state");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("fixture panic must have a string message");
+        assert!(message.contains("was poisoned"), "unexpected teardown panic: {message}");
+        assert!(message.contains("CreatePr"), "unexpected teardown panic: {message}");
+    }
 
     #[test]
     fn identity_redaction_preserves_equality_and_order() {
