@@ -35,7 +35,7 @@ const MOCK_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[macro_export]
 macro_rules! test_context {
     () => {
-        $crate::TestContextBuilder::new(assert_cmd::cargo::cargo_bin!("gherrit"))
+        $crate::TestContextBuilder::new(assert_cmd::cargo::cargo_bin!("gherrit-test-driver"))
     };
 }
 
@@ -102,12 +102,6 @@ impl TestContextBuilder {
     }
 
     pub fn build(self) -> TestContext {
-        if std::env::var("GHERRIT_TEST_BUILD").is_err() {
-            eprintln!("\n\x1b[31mERROR: You must run these tests with GHERRIT_TEST_BUILD=1\x1b[0m");
-            eprintln!("This ensures the binary is compiled with the necessary test hooks.\n");
-            panic!("Missing GHERRIT_TEST_BUILD environment variable");
-        }
-
         let dir = Arc::new(TempDir::new().unwrap());
         let system_git = SYSTEM_GIT.clone();
         let test_environment = TestEnvironment::new(dir.path(), &system_git);
@@ -645,7 +639,7 @@ impl TestContext {
 
         if self.has_git_interceptor {
             cmd.env("SYSTEM_GIT_PATH", &self.system_git);
-            cmd.env("GHERRIT_TEST_BINARY", &self.gherrit_bin_path);
+            cmd.env("GHERRIT_TEST_DRIVER", &self.gherrit_bin_path);
 
             if let Some(server) = &self.mock_server {
                 cmd.env("GHERRIT_MOCK_SERVER_URL", &server.url);
@@ -1179,7 +1173,7 @@ fn install_git_interceptor(path: &Path, _gherrit_bin: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
 
     let git = path.join("git");
-    fs::write(&git, "#!/bin/sh\nexec \"$GHERRIT_TEST_BINARY\" __test-git \"$@\"\n").unwrap();
+    fs::write(&git, "#!/bin/sh\nexec \"$GHERRIT_TEST_DRIVER\" __test-git \"$@\"\n").unwrap();
     fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
 }
 

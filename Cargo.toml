@@ -6,6 +6,12 @@ rust-version = "1.89.0"
 license = "BSD-2-Clause OR Apache-2.0 OR MIT"
 description = "Gerrit-style stacked diffs for GitHub"
 repository = "https://github.com/joshlf/gherrit"
+default-run = "gherrit"
+
+[features]
+# Builds the non-shipping process adapter used by integration tests. The
+# production binary never reads test endpoints or dispatches the Git shim.
+test-driver = []
 
 [profile.release]
 # Strip full debug info, but keep line tables for backtraces. This makes full
@@ -48,6 +54,30 @@ libc = "0.2"
 [[bin]]
 name = "gherrit"
 path = "src/main.rs"
+
+[[bin]]
+name = "gherrit-test-driver"
+path = "src/test_driver_main.rs"
+required-features = ["test-driver"]
+
+[[test]]
+name = "cli"
+path = "tests/cli/main.rs"
+required-features = ["test-driver"]
+
+[[test]]
+name = "hooks"
+path = "tests/hooks.rs"
+required-features = ["test-driver"]
+
+[[test]]
+name = "pre_push"
+path = "tests/pre_push/main.rs"
+required-features = ["test-driver"]
+
+[[test]]
+name = "production"
+path = "tests/production.rs"
 
 [workspace]
 members = ["testutil"]
