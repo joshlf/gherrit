@@ -6,11 +6,7 @@ fn test_repository_query_arguments() {
     let ctx = test_context!().with_mock_github().build();
     let graphql_url = format!("{}/graphql", ctx.mock_server_url());
 
-    let mut repository = None;
-    ctx.inspect_mock_state(|state| {
-        repository = Some((state.repo_owner.clone(), state.repo_name.clone()));
-    });
-    let (owner, name) = repository.unwrap();
+    let (owner, name) = ctx.github().repository();
 
     // Query with correct arguments (should succeed)
     let query = format!("query {{ repository(owner: \"{owner}\", name: \"{name}\") {{ id }} }}");
