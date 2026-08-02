@@ -1,4 +1,3 @@
-mod autosquash;
 mod pr_state;
 mod unmanaged;
 
