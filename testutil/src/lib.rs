@@ -156,6 +156,7 @@ impl TestContextBuilder {
             gherrit_bin_path: self.gherrit_bin,
             test_environment,
             next_git_timestamp: AtomicU64::new(FIRST_GIT_TIMESTAMP),
+            next_gherrit_id: AtomicU64::new(1),
             mock_server,
             mock_server_state,
         };
@@ -186,6 +187,7 @@ pub struct TestContext {
     has_git_interceptor: bool,
     test_environment: TestEnvironment,
     next_git_timestamp: AtomicU64,
+    next_gherrit_id: AtomicU64,
     mock_server: Option<MockServerInfo>,
     mock_server_state: Option<Arc<RwLock<mock_server::MockState>>>,
 }
@@ -678,6 +680,33 @@ impl TestContext {
         self.run_git(&["commit", "--allow-empty", "-m", msg]);
     }
 
+    /// Creates a commit with a deterministic, syntactically valid GHerrit ID.
+    ///
+    /// This is fixture setup, not a commit-hook boundary. `--no-verify` makes
+    /// that distinction explicit and prevents an installed hook from changing
+    /// the supplied identity.
+    pub fn commit_with_gherrit_id(&self, message: &str) -> String {
+        let sequence = self.next_gherrit_id.fetch_add(1, Ordering::Relaxed);
+        let id = deterministic_gherrit_id(sequence);
+        self.commit_with_explicit_gherrit_id(message, &id);
+        id
+    }
+
+    /// Creates a commit with a caller-supplied legacy or scenario identity.
+    pub fn commit_with_explicit_gherrit_id(&self, message: &str, id: &str) {
+        assert!(
+            !message.lines().any(|line| line.starts_with("gherrit-pr-id: ")),
+            "the explicit GHerrit ID must not also appear in the message"
+        );
+        assert!(
+            !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+            "GHerrit IDs contain only ASCII letters and numbers"
+        );
+
+        let message = format!("{message}\n\ngherrit-pr-id: {id}");
+        self.run_git(&["commit", "--allow-empty", "--no-verify", "-m", &message]);
+    }
+
     pub fn amend(&self) {
         self.amend_inner(&["--no-edit"]);
     }
@@ -740,6 +769,32 @@ impl TestContext {
 
     pub fn checkout_new(&self, branch_name: &str) {
         self.run_git(&["checkout", "-b", branch_name]);
+    }
+
+    pub fn checkout_managed_private(&self, branch_name: &str) {
+        self.checkout_new(branch_name);
+        self.configure_managed_private(branch_name);
+    }
+
+    pub fn checkout_managed_public(&self, branch_name: &str) {
+        self.checkout_new(branch_name);
+        self.configure_managed_public(branch_name);
+    }
+
+    pub fn configure_managed_private(&self, branch_name: &str) {
+        self.configure_managed(branch_name, MANAGED_PRIVATE, ".");
+    }
+
+    pub fn configure_managed_public(&self, branch_name: &str) {
+        self.configure_managed(branch_name, MANAGED_PUBLIC, "origin");
+    }
+
+    fn configure_managed(&self, branch_name: &str, state: &str, push_remote: &str) {
+        let key = |suffix: &str| format!("branch.{branch_name}.{suffix}");
+        self.set_config(&key("gherritManaged"), Some(state));
+        self.set_config(&key("pushRemote"), Some(push_remote));
+        self.set_config(&key("remote"), Some("."));
+        self.set_config(&key("merge"), Some(&format!("refs/heads/{branch_name}")));
     }
 
     pub fn inject_failure(&self, kind: FailureKind) {
@@ -1132,6 +1187,18 @@ macro_rules! assert_pr_snapshot {
     };
 }
 
+fn deterministic_gherrit_id(mut sequence: u64) -> String {
+    const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut encoded = [BASE32[0]; 32];
+    encoded.iter_mut().rev().for_each(|digit| {
+        *digit = BASE32[(sequence % BASE32.len() as u64) as usize];
+        sequence /= BASE32.len() as u64;
+    });
+    assert_eq!(sequence, 0, "GHerrit ID sequence exceeds its 32-digit encoding");
+
+    format!("G{}", core::str::from_utf8(&encoded).expect("base32 alphabet is UTF-8"))
+}
+
 fn run_git_cmd(environment: &TestEnvironment, system_git: &Path, path: &Path, args: &[&str]) {
     environment.command(system_git).current_dir(path).args(args).assert().success();
 }
@@ -1204,6 +1271,61 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn deterministic_ids_use_the_production_alphabet_and_width() {
+        assert_eq!(deterministic_gherrit_id(0), format!("G{}", "a".repeat(32)));
+        assert_eq!(deterministic_gherrit_id(1), format!("G{}b", "a".repeat(31)));
+        assert_eq!(deterministic_gherrit_id(31), format!("G{}7", "a".repeat(31)));
+        assert_eq!(deterministic_gherrit_id(32), format!("G{}ba", "a".repeat(30)));
+    }
+
+    #[test]
+    fn explicit_management_helpers_write_complete_branch_state() {
+        let ctx = TestContextBuilder::new("unused").with_initial_commit().build();
+        let assert_state = |branch: &str, state: &str, push_remote: &str| {
+            ctx.assert_config(&format!("branch.{branch}.gherritManaged"), Some(state));
+            ctx.assert_config(&format!("branch.{branch}.pushRemote"), Some(push_remote));
+            ctx.assert_config(&format!("branch.{branch}.remote"), Some("."));
+            ctx.assert_config(
+                &format!("branch.{branch}.merge"),
+                Some(&format!("refs/heads/{branch}")),
+            );
+        };
+
+        ctx.checkout_managed_private("private-stack");
+        assert_state("private-stack", MANAGED_PRIVATE, ".");
+
+        ctx.run_git(&["checkout", "main"]);
+        ctx.checkout_managed_public("public-stack");
+        assert_state("public-stack", MANAGED_PUBLIC, "origin");
+    }
+
+    #[test]
+    fn normalizes_push_refspec_forms() {
+        assert_eq!(
+            RefUpdate::from_refspec("+HEAD:refs/heads/main", false),
+            RefUpdate {
+                source: Some("HEAD".to_string()),
+                destination: "refs/heads/main".to_string(),
+            }
+        );
+        assert_eq!(
+            RefUpdate::from_refspec("refs/heads/main", false),
+            RefUpdate {
+                source: Some("refs/heads/main".to_string()),
+                destination: "refs/heads/main".to_string(),
+            }
+        );
+        assert_eq!(
+            RefUpdate::from_refspec(":refs/heads/old", false),
+            RefUpdate { source: None, destination: "refs/heads/old".to_string() }
+        );
+        assert_eq!(
+            RefUpdate::from_refspec("refs/heads/old", true),
+            RefUpdate { source: None, destination: "refs/heads/old".to_string() }
+        );
+    }
 
     #[test]
     fn identity_redaction_preserves_equality_and_order() {
