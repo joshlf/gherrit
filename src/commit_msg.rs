@@ -28,6 +28,34 @@ use crate::{
     util::{self, CommandExt as _},
 };
 
+const GHERRIT_ID_BYTES: usize = 20;
+
+fn is_temporary_squash(message: &str) -> bool {
+    message.lines().next().is_some_and(|line| line.starts_with("squash! "))
+}
+
+fn has_gherrit_id(trailers: &str) -> bool {
+    trailers.lines().any(|line| line.starts_with("gherrit-pr-id: "))
+}
+
+fn acquire_id_entropy() -> [u8; GHERRIT_ID_BYTES] {
+    if util::__TESTING { [0; GHERRIT_ID_BYTES] } else { rand::random() }
+}
+
+fn derive_gherrit_id(mut entropy: [u8; GHERRIT_ID_BYTES], object_hash: &[u8]) -> String {
+    assert!(!object_hash.is_empty(), "object hash must not be empty");
+
+    // IDs are collision identifiers, not secrets. Mixing with XOR keeps the
+    // random input uniformly distributed while also incorporating the commit
+    // data represented by `object_hash`.
+    entropy
+        .iter_mut()
+        .zip(object_hash.iter().cycle())
+        .for_each(|(entropy, object_hash)| *entropy ^= object_hash);
+
+    format!("G{}", data_encoding::BASE32.encode(&entropy).to_ascii_lowercase())
+}
+
 pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     let msg_path = Path::new(msg_file);
     if !msg_path.try_exists().wrap_err("Failed to check file existence")? {
@@ -50,7 +78,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     // These commits are transient and shouldn't be part of the persistent
     // managed stack.
     let msg_content = fs::read_to_string(msg_path).wrap_err("Failed to read msg file")?;
-    if msg_content.lines().next().is_some_and(|l| l.starts_with("squash! ")) {
+    if is_temporary_squash(&msg_content) {
         return Ok(());
     }
 
@@ -70,37 +98,21 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
         format!("{}\n{}\n{}", committer_ident, refhash, msg_content)
     };
 
-    // Compute a hash of the object data and a random salt. Combined,
-    // this minimizes the likelihood of collisions.
-    let hash = {
-        let object_id = gix::diff::object::compute_hash(
-            repo.object_hash(),
-            gix::object::Kind::Blob,
-            input_data.as_bytes(),
-        )
-        .wrap_err("Failed to compute hash")?;
-
-        // Initialize the hash with the salt.
-        let mut hash: [u8; 20] = if util::__TESTING { [0; 20] } else { rand::random() };
-
-        // Mix in the object hash using a simple XOR. This isn't
-        // cryptographically secure, but it's good enough for our purposes –
-        // namely, it ensures that the resulting `hash` has entropy from both
-        // the salt and the object hash.
-        for (r, &d) in hash.iter_mut().zip(object_id.as_bytes().iter().cycle()) {
-            *r ^= d;
-        }
-        hash
-    };
-
-    let hash_str = data_encoding::BASE32.encode(&hash).to_ascii_lowercase();
+    // Compute a hash of the object data and mix it with fresh entropy. This
+    // minimizes the likelihood of collisions.
+    let object_id = gix::diff::object::compute_hash(
+        repo.object_hash(),
+        gix::object::Kind::Blob,
+        input_data.as_bytes(),
+    )
+    .wrap_err("Failed to compute hash")?;
+    let gherrit_id = derive_gherrit_id(acquire_id_entropy(), object_id.as_bytes());
 
     // Check if trailer exists
     let output = cmd!("git interpret-trailers --parse", msg_file).checked_output()?;
     let trailers = String::from_utf8_lossy(&output.stdout);
 
-    let re = crate::re!(r"^gherrit-pr-id: .*");
-    if trailers.lines().any(|line| re.is_match(line)) {
+    if has_gherrit_id(&trailers) {
         return Ok(());
     }
 
@@ -109,9 +121,104 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     // --if-exists doNothing: prevents duplicates
     cmd!(
         "git interpret-trailers --in-place --where start --if-exists doNothing --trailer",
-        "gherrit-pr-id: G{hash_str}",
+        "gherrit-pr-id: {gherrit_id}",
         msg_file
     )
     .success()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temporary_squash_classification() {
+        [
+            ("", false),
+            ("ordinary subject", false),
+            ("squash! subject", true),
+            ("squash! ", true),
+            ("squash! subject\n\nbody", true),
+            ("ordinary subject\n\nsquash! body", false),
+            ("squash!", false),
+            ("squash!\tsubject", false),
+            (" squash! subject", false),
+            ("Squash! subject", false),
+            ("fixup! subject", false),
+            ("amend! subject", false),
+        ]
+        .into_iter()
+        .for_each(|(message, expected)| {
+            assert_eq!(is_temporary_squash(message), expected, "message: {message:?}");
+        });
+    }
+
+    #[test]
+    fn existing_id_classification() {
+        [
+            ("", false),
+            ("other-trailer: value", false),
+            ("gherrit-pr-id: Gabc", true),
+            ("gherrit-pr-id: ", true),
+            ("other-trailer: value\ngherrit-pr-id: Gabc", true),
+            ("gherrit-pr-id:Gabc", false),
+            ("Gherrit-pr-id: Gabc", false),
+            (" gherrit-pr-id: Gabc", false),
+            ("not-gherrit-pr-id: Gabc", false),
+        ]
+        .into_iter()
+        .for_each(|(trailers, expected)| {
+            assert_eq!(has_gherrit_id(trailers), expected, "trailers: {trailers:?}");
+        });
+    }
+
+    #[test]
+    fn derives_id_from_object_hash_and_entropy() {
+        assert_eq!(derive_gherrit_id([0; 20], &[0; 20]), format!("G{}", "a".repeat(32)));
+        assert_eq!(derive_gherrit_id([0; 20], &[u8::MAX; 20]), format!("G{}", "7".repeat(32)));
+        assert_eq!(
+            derive_gherrit_id([u8::MAX; 20], &[u8::MAX; 20]),
+            format!("G{}", "a".repeat(32))
+        );
+    }
+
+    #[test]
+    fn mixes_every_entropy_byte() {
+        let entropy = std::array::from_fn(|index| index as u8);
+        let object_hash = std::array::from_fn::<_, 20, _>(|index| (index as u8) << 1);
+        let mixed = std::array::from_fn::<_, 20, _>(|index| entropy[index] ^ object_hash[index]);
+
+        assert_eq!(
+            derive_gherrit_id(entropy, &object_hash),
+            format!("G{}", data_encoding::BASE32.encode(&mixed).to_ascii_lowercase())
+        );
+    }
+
+    #[test]
+    fn preserves_object_hash_cycle_behavior() {
+        let entropy = [0; 20];
+        let object_hash = [0x12, 0x34, 0x56];
+        let mixed = std::array::from_fn::<_, 20, _>(|index| object_hash[index % 3]);
+
+        assert_eq!(
+            derive_gherrit_id(entropy, &object_hash),
+            format!("G{}", data_encoding::BASE32.encode(&mixed).to_ascii_lowercase())
+        );
+    }
+
+    #[test]
+    fn preserves_long_object_hash_behavior() {
+        let entropy = [0; 20];
+        let mut object_hash = [0; 32];
+        object_hash[20..].fill(u8::MAX);
+
+        assert_eq!(derive_gherrit_id(entropy, &object_hash), format!("G{}", "a".repeat(32)));
+    }
+
+    #[test]
+    #[should_panic(expected = "object hash must not be empty")]
+    fn rejects_an_empty_object_hash() {
+        derive_gherrit_id([0; 20], &[]);
+    }
 }
