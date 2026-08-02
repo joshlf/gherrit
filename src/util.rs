@@ -17,7 +17,7 @@ use crate::manage::State;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```text
 /// // - "git" is the command; "config" is an argument.
 /// // - "branch.{branch_name}.gherritManaged" is a single argument (even if it contains spaces when formatted).
 /// // - `state` is a single argument (even if it contains spaces when formatted).
