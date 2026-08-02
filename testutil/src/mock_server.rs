@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     future::IntoFuture,
     path::PathBuf,
     sync::{mpsc::Sender, Arc, LazyLock, RwLock},
@@ -10,7 +10,7 @@ use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::{FailureKind, GraphQlOperation, TestEnvironment};
+use crate::{FailureKind, GitOperation, GraphQlOperation, TestEnvironment};
 
 const MAX_PULL_REQUEST_CANDIDATES: usize = 100;
 
@@ -159,8 +159,6 @@ pub struct RefInfo {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GitRequest {
     pub args: Vec<String>,
-    pub cwd: String,
-    pub env: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -235,6 +233,7 @@ fn check_and_apply_graphql_failure(
         CreatePr => operations.contains(&GraphQlOperation::CreatePr),
         UpdatePr => operations.contains(&GraphQlOperation::UpdatePr),
         UpdatePrNull { .. } => false,
+        Git(_) => false,
     };
 
     if !matches {
@@ -265,6 +264,42 @@ fn graphql_operations(document: &ExecutableDocument) -> Vec<GraphQlOperation> {
 struct GitCommand<'a> {
     name: &'a str,
     args: &'a [String],
+}
+
+impl GitOperation {
+    fn from_subcommand(subcommand: &str) -> Option<Self> {
+        match subcommand {
+            "var" => Some(Self::Var),
+            "interpret-trailers" => Some(Self::InterpretTrailers),
+            "ls-remote" => Some(Self::LsRemote),
+            _ => None,
+        }
+    }
+
+    fn subcommand(self) -> &'static str {
+        match self {
+            Self::Var => "var",
+            Self::InterpretTrailers => "interpret-trailers",
+            Self::LsRemote => "ls-remote",
+        }
+    }
+}
+
+fn check_and_apply_git_failure(
+    mock_state: &mut MockState,
+    operation: GitOperation,
+) -> Option<GitOperation> {
+    let FailureKind::Git(expected) = mock_state.faults.front()? else {
+        return None;
+    };
+    if *expected != operation {
+        return None;
+    }
+
+    let FailureKind::Git(consumed) = mock_state.faults.pop_front().unwrap() else {
+        unreachable!("the front fault was just matched as a Git fault")
+    };
+    Some(consumed)
 }
 
 /// Parses the command portion of a Git invocation.
@@ -647,24 +682,17 @@ async fn handle_git(
     let command = parse_git_command(&req.args);
     let is_push = command.is_some_and(|command| command.name == "push");
 
-    // Check for simulated failure
-    if let Some(command) = command {
-        if req
-            .env
-            .get("MOCK_BIN_FAIL_CMD")
-            .is_some_and(|fail_cmd| fail_cmd == &format!("git:{}", command.name))
-        {
-            if is_push {
-                record_push(&app_state, req.args.clone(), 1);
-            }
-            return Json(GitResponse {
-                stdout: "".to_string(),
-                stderr: format!("Simulated failure for git {}", command.name),
-                exit_code: 1,
-                passthrough: false,
-                report_exit_status: false,
-            });
-        }
+    let failure = command.and_then(|command| GitOperation::from_subcommand(command.name)).and_then(
+        |operation| check_and_apply_git_failure(&mut app_state.state.write().unwrap(), operation),
+    );
+    if let Some(operation) = failure {
+        return Json(GitResponse {
+            stdout: "".to_string(),
+            stderr: format!("Simulated failure for git {}", operation.subcommand()),
+            exit_code: 1,
+            passthrough: false,
+            report_exit_status: false,
+        });
     }
 
     // Spy on "push" logic
@@ -776,6 +804,48 @@ mod git_tests {
         }
     }
 
+    #[test]
+    fn recognizes_typed_git_operations() {
+        for (subcommand, expected) in [
+            ("var", Some(GitOperation::Var)),
+            ("interpret-trailers", Some(GitOperation::InterpretTrailers)),
+            ("ls-remote", Some(GitOperation::LsRemote)),
+            ("push", None),
+            ("status", None),
+        ] {
+            assert_eq!(GitOperation::from_subcommand(subcommand), expected);
+        }
+    }
+
+    #[test]
+    fn git_faults_match_in_script_order() {
+        let expected = VecDeque::from([
+            FailureKind::Git(GitOperation::Var),
+            FailureKind::Git(GitOperation::LsRemote),
+        ]);
+        let mut state = MockState { faults: expected.clone(), ..Default::default() };
+
+        assert_eq!(check_and_apply_git_failure(&mut state, GitOperation::LsRemote), None);
+        assert_eq!(state.faults, expected);
+        assert_eq!(
+            check_and_apply_git_failure(&mut state, GitOperation::Var),
+            Some(GitOperation::Var)
+        );
+        assert_eq!(
+            check_and_apply_git_failure(&mut state, GitOperation::LsRemote),
+            Some(GitOperation::LsRemote)
+        );
+        assert!(state.faults.is_empty());
+
+        let expected = VecDeque::from([
+            FailureKind::CreatePr,
+            FailureKind::Git(GitOperation::InterpretTrailers),
+        ]);
+        let mut state = MockState { faults: expected.clone(), ..Default::default() };
+        assert_eq!(check_and_apply_git_failure(&mut state, GitOperation::InterpretTrailers), None);
+        assert_eq!(state.faults, expected);
+    }
+
     #[tokio::test]
     async fn records_completed_push_after_git_global_options() {
         let app_state = app_state();
@@ -787,8 +857,7 @@ mod git_tests {
             "origin",
             "+HEAD:refs/heads/main",
         ]);
-        let request =
-            GitRequest { args: invocation.clone(), cwd: "/repo".to_string(), env: HashMap::new() };
+        let request = GitRequest { args: invocation.clone() };
 
         let Json(response) = handle_git(State(app_state.clone()), Json(request)).await;
         assert!(response.passthrough);
@@ -809,21 +878,17 @@ mod git_tests {
     #[tokio::test]
     async fn failure_injection_uses_parsed_git_subcommand() {
         let app_state = app_state();
-        let invocation = args(&["git", "-c", "color.ui=false", "push", "origin", "main"]);
-        let request = GitRequest {
-            args: invocation.clone(),
-            cwd: "/repo".to_string(),
-            env: HashMap::from([("MOCK_BIN_FAIL_CMD".to_string(), "git:push".to_string())]),
-        };
+        app_state.state.write().unwrap().faults.push_back(FailureKind::Git(GitOperation::Var));
+        let invocation = args(&["git", "-c", "color.ui=false", "var", "GIT_COMMITTER_IDENT"]);
+        let request = GitRequest { args: invocation };
 
         let Json(response) = handle_git(State(app_state.clone()), Json(request)).await;
         assert!(!response.passthrough);
         assert!(!response.report_exit_status);
         assert_eq!(response.exit_code, 1);
-        assert_eq!(
-            app_state.state.read().unwrap().pushes,
-            [GitPush { args: invocation, exit_code: 1 }]
-        );
+        assert_eq!(response.stderr, "Simulated failure for git var");
+        assert!(app_state.state.read().unwrap().faults.is_empty());
+        assert!(app_state.state.read().unwrap().pushes.is_empty());
     }
 
     #[test]
