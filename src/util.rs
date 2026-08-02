@@ -23,7 +23,6 @@ use crate::manage::State;
 /// // - `state` is a single argument (even if it contains spaces when formatted).
 /// cmd!("git config", "branch.{branch_name}.gherritManaged", state)
 /// ```
-#[macro_export]
 macro_rules! cmd {
     ($bin:literal $(, $($rest:tt)*)?) => {{
         // The first argument is a literal, so we can safely split it by whitespace.
@@ -37,7 +36,7 @@ macro_rules! cmd {
 
         #[allow(unused_mut)]
         let mut args: Vec<String> = pre_args.iter().map(|s| s.to_string()).collect();
-        cmd!(@inner args $(, $($rest)*)?);
+        $crate::cmd!(@inner args $(, $($rest)*)?);
 
         log::debug!("exec: {} {}", bin, args.iter().map(|s| if s.contains(" ") {
             format!("'{}'", s)
@@ -50,19 +49,19 @@ macro_rules! cmd {
     // String literal (treated as a format string, but not broken apart).
     (@inner $vec:ident, $l:literal $(, $($rest:tt)*)?) => {
         $vec.push(format!($l));
-        cmd!(@inner $vec $(, $($rest)*)?);
+        $crate::cmd!(@inner $vec $(, $($rest)*)?);
     };
 
     // Expression (not broken apart).
     (@inner $vec:ident, $e:expr $(, $($rest:tt)*)?) => {
         $vec.push($e.to_string());
-        cmd!(@inner $vec $(, $($rest)*)?);
+        $crate::cmd!(@inner $vec $(, $($rest)*)?);
     };
 
     (@inner $vec:ident $(,)?) => {};
 }
+pub(crate) use cmd as cmd_macro;
 
-#[macro_export]
 macro_rules! re {
     ($name:ident, $re:literal) => {
         fn $name() -> &'static regex::Regex {
@@ -77,6 +76,7 @@ macro_rules! re {
         &*RE
     }};
 }
+pub(crate) use re as re_macro;
 
 pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Command {
     let mut c = Command::new(name);
