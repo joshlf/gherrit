@@ -1,5 +1,3 @@
-mod batch_update;
-
 use predicates::prelude::*;
 
 #[test]
