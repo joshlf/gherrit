@@ -423,8 +423,6 @@ fn get_repo_owner_name(remote_url: &str) -> Result<(String, String)> {
     Ok((owner, repo))
 }
 
-pub const __TESTING: bool = option_env!("GHERRIT_TEST_BUILD").is_some();
-
 #[cfg(test)]
 mod tests {
     use super::*;
