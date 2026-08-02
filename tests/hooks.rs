@@ -23,10 +23,9 @@ fn installed_pre_push_projects_the_feature_commit() {
     ctx.git_cmd().args(["push", "origin", "feature-boundary"]).assert().success();
 
     assert_eq!(ctx.remote_ref_oid(&format!("refs/heads/{id}")).as_deref(), Some(oid.as_str()));
-    ctx.inspect_mock_state(|state| {
-        assert_eq!(state.prs.len(), 1);
-        assert_eq!(state.prs[0].head.ref_field, id);
-    });
+    let prs = ctx.github().pull_requests();
+    assert_eq!(prs.len(), 1);
+    assert_eq!(prs[0].head, id);
     testutil::assert_pr_snapshot!(ctx, "installed_pre_push_pr_state");
 }
 
