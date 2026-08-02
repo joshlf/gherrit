@@ -160,7 +160,7 @@ impl BatchedOperation for FindPullRequest {
 
     fn document(&self) -> String {
         format!(
-            "repository(owner: {}, name: {}) {{ pullRequests(headRefName: {}, first: 1, states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, title, body, baseRefName, state }} }} }}",
+            "repository(owner: {}, name: {}) {{ pullRequests(headRefName: {}, first: 2, states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, title, body, baseRefName, state }} }} }}",
             json!(self.owner),
             json!(self.repository),
             json!(self.head_branch),
@@ -190,9 +190,23 @@ impl BatchedOperation for FindPullRequest {
             state: PullRequestState,
         }
 
-        let response: Response = serde_json::from_value(response)
+        let mut response: Response = serde_json::from_value(response)
             .wrap_err("Failed to decode pull request query response")?;
-        Ok(response.pull_requests.nodes.into_iter().next().map(|node| PullRequest {
+        if response.pull_requests.nodes.len() > 1 {
+            let candidates = response
+                .pull_requests
+                .nodes
+                .iter()
+                .map(|node| format!("#{}", node.number))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "Found multiple pull requests for GHerrit ID '{}': {candidates}. GHerrit cannot safely choose one.",
+                self.head_branch
+            );
+        }
+
+        Ok(response.pull_requests.nodes.pop().map(|node| PullRequest {
             number: node.number,
             node_id: node.id,
             title: node.title,
@@ -353,7 +367,7 @@ mod tests {
 
         assert_eq!(
             query.document(),
-            r#"repository(owner: "o\"wner", name: "repo\nname") { pullRequests(headRefName: "head\\branch", first: 1, states: [OPEN, CLOSED, MERGED]) { nodes { number, id, title, body, baseRefName, state } } }"#
+            r#"repository(owner: "o\"wner", name: "repo\nname") { pullRequests(headRefName: "head\\branch", first: 2, states: [OPEN, CLOSED, MERGED]) { nodes { number, id, title, body, baseRefName, state } } }"#
         );
     }
 
@@ -446,6 +460,30 @@ mod tests {
             })
         );
         assert_eq!(query.decode(json!({ "pullRequests": { "nodes": [] } })).unwrap(), None);
+    }
+
+    #[test]
+    fn duplicate_pull_request_candidates_are_ambiguous() {
+        let query =
+            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
+        let node = |number| {
+            json!({
+                "number": number,
+                "id": format!("PR_{number}"),
+                "title": "Title",
+                "body": "Body",
+                "baseRefName": "main",
+                "state": "OPEN"
+            })
+        };
+
+        let error =
+            query.decode(json!({ "pullRequests": { "nodes": [node(42), node(99)] } })).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Found multiple pull requests for GHerrit ID 'G123': #42, #99. GHerrit cannot safely choose one."
+        );
     }
 
     #[test]
