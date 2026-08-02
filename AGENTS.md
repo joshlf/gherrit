@@ -34,7 +34,8 @@ It achieves this by:
 ### Project Structure
 
 - `src/`: Core CLI source code.
-    - `main.rs`: Entry point and CLI definition.
+    - `main.rs`: Thin executable entry point.
+    - `lib.rs`: CLI definition, process setup, and command dispatch.
     - `pre_push/mod.rs`: **CORE LOGIC**. Handles commit analysis, ref creation,
       pushing, and PR syncing.
     - `manage.rs`: Handles the state of branches (Managed vs Unmanaged) via `git config`.
