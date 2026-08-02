@@ -26,7 +26,12 @@ pub fn run(runtime: gherrit::Runtime) -> ExitCode {
                     log::Level::Trace => &level_style_trace,
                 };
 
-                writeln!(buf, "{prefix}{level_style} {}", record.args())
+                let message = record.args().to_string();
+                if message.is_empty() {
+                    writeln!(buf, "{prefix}{level_style}")
+                } else {
+                    writeln!(buf, "{prefix}{level_style} {message}")
+                }
             }
         })
         .init();
