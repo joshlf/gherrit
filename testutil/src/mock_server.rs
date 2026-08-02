@@ -10,7 +10,7 @@ use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::{FailureKind, TestEnvironment};
+use crate::{FailureKind, GraphQlOperation, TestEnvironment};
 
 static GITHUB_SCHEMA: LazyLock<Valid<apollo_compiler::Schema>> = LazyLock::new(|| {
     apollo_compiler::Schema::parse_and_validate(
@@ -30,13 +30,6 @@ pub struct MockState {
     pub repo_name: String,
     pub fail_next_request: Option<FailureKind>,
     pub merge_queue: HashSet<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GraphQlOperation {
-    Query,
-    CreatePr,
-    UpdatePr,
 }
 
 impl MockState {
@@ -186,13 +179,8 @@ pub struct GitCompletion {
 pub struct GitPush {
     pub args: Vec<String>,
     pub refspecs: Vec<String>,
+    pub delete: bool,
     pub exit_code: i32,
-}
-
-impl GitPush {
-    pub fn succeeded(&self) -> bool {
-        self.exit_code == 0
-    }
 }
 
 #[derive(Clone)]
@@ -714,6 +702,7 @@ fn record_push(app_state: &AppState, args: Vec<String>, exit_code: i32) {
     let command = parse_git_command(&args)
         .filter(|command| command.name == "push")
         .expect("record_push requires a parsed Git push");
+    let delete = push_deletes_refspecs(command.args);
     let refspecs = command
         .args
         .iter()
@@ -727,7 +716,52 @@ fn record_push(app_state: &AppState, args: Vec<String>, exit_code: i32) {
         })
         .cloned()
         .collect();
-    app_state.state.write().unwrap().pushes.push(GitPush { args, refspecs, exit_code });
+    app_state.state.write().unwrap().pushes.push(GitPush { args, refspecs, delete, exit_code });
+}
+
+fn push_deletes_refspecs(arguments: &[String]) -> bool {
+    let mut delete = false;
+    let mut consume_value = false;
+
+    for argument in arguments {
+        if consume_value {
+            consume_value = false;
+            continue;
+        }
+        if argument == "--" {
+            break;
+        }
+
+        match argument.as_str() {
+            "--delete" => delete = true,
+            "--no-delete" => delete = false,
+            // These documented `git push` options consume the next argument.
+            // An option value is opaque even when it resembles another flag.
+            "--repo" | "--receive-pack" | "--exec" | "--recurse-submodules" | "--push-option" => {
+                consume_value = true
+            }
+            argument if !argument.starts_with("--") => {
+                let Some(options) = argument.strip_prefix('-') else {
+                    continue;
+                };
+                for (index, option) in options.char_indices() {
+                    match option {
+                        'd' => delete = true,
+                        // `-o` consumes the remainder of its bundle, or the
+                        // next argument when no inline value remains.
+                        'o' => {
+                            consume_value = index + option.len_utf8() == options.len();
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    delete
 }
 
 #[cfg(test)]
@@ -820,6 +854,7 @@ mod git_tests {
             [GitPush {
                 args: invocation,
                 refspecs: vec!["+HEAD:refs/heads/main".to_string()],
+                delete: false,
                 exit_code: 0,
             }]
         );
@@ -841,8 +876,71 @@ mod git_tests {
         assert_eq!(response.exit_code, 1);
         assert_eq!(
             app_state.state.read().unwrap().pushes,
-            [GitPush { args: invocation, refspecs: Vec::new(), exit_code: 1 }]
+            [GitPush { args: invocation, refspecs: Vec::new(), delete: false, exit_code: 1 }]
         );
+    }
+
+    #[tokio::test]
+    async fn records_long_and_short_delete_options() {
+        for option in ["--delete", "-d"] {
+            let app_state = app_state();
+            let invocation = args(&["git", "push", option, "origin", "refs/heads/old"]);
+
+            record_push(&app_state, invocation.clone(), 0);
+
+            assert_eq!(
+                app_state.state.read().unwrap().pushes,
+                [GitPush {
+                    args: invocation,
+                    refspecs: vec!["refs/heads/old".to_string()],
+                    delete: true,
+                    exit_code: 0,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn records_push_option_values_without_reinterpreting_them() {
+        let app_state = app_state();
+        let invocation = args(&["git", "push", "-o", "-d", "origin", "HEAD:refs/heads/main"]);
+
+        record_push(&app_state, invocation.clone(), 0);
+
+        assert_eq!(
+            app_state.state.read().unwrap().pushes,
+            [GitPush {
+                args: invocation,
+                refspecs: vec!["HEAD:refs/heads/main".to_string()],
+                delete: false,
+                exit_code: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_effective_delete_option_state() {
+        for (arguments, expected) in [
+            (args(&["origin", "refs/heads/old"]), false),
+            (args(&["--delete", "origin", "refs/heads/old"]), true),
+            (args(&["-qd", "origin", "refs/heads/old"]), true),
+            (args(&["-dq", "origin", "refs/heads/old"]), true),
+            (args(&["--delete", "--no-delete", "origin"]), false),
+            (args(&["--no-delete", "-qd", "origin"]), true),
+            (args(&["-qd", "--no-delete", "origin"]), false),
+            (args(&["-odelete", "origin", "refs/heads/old"]), false),
+            (args(&["-o", "-d", "origin", "refs/heads/old"]), false),
+            (args(&["-qo", "-d", "origin", "refs/heads/old"]), false),
+            (args(&["-do", "value", "origin", "refs/heads/old"]), true),
+            (args(&["--push-option", "--delete", "origin"]), false),
+            (args(&["--repo", "-d", "refs/heads/old"]), false),
+            (args(&["--receive-pack", "-d", "origin"]), false),
+            (args(&["--exec", "-d", "origin"]), false),
+            (args(&["--recurse-submodules", "-d", "origin"]), false),
+            (args(&["--", "--delete", "refs/heads/old"]), false),
+        ] {
+            assert_eq!(push_deletes_refspecs(&arguments), expected, "arguments: {arguments:?}");
+        }
     }
 }
 
