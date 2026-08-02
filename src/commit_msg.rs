@@ -28,7 +28,8 @@ use crate::{
     util::{self, CommandExt as _},
 };
 
-const GHERRIT_ID_BYTES: usize = 20;
+pub(crate) const ID_ENTROPY_BYTES: usize = 20;
+pub(crate) type IdEntropy = [u8; ID_ENTROPY_BYTES];
 
 fn is_temporary_squash(message: &str) -> bool {
     message.lines().next().is_some_and(|line| line.starts_with("squash! "))
@@ -38,11 +39,7 @@ fn has_gherrit_id(trailers: &str) -> bool {
     trailers.lines().any(|line| line.starts_with("gherrit-pr-id: "))
 }
 
-fn acquire_id_entropy() -> [u8; GHERRIT_ID_BYTES] {
-    if util::__TESTING { [0; GHERRIT_ID_BYTES] } else { rand::random() }
-}
-
-fn derive_gherrit_id(mut entropy: [u8; GHERRIT_ID_BYTES], object_hash: &[u8]) -> String {
+fn derive_gherrit_id(mut entropy: IdEntropy, object_hash: &[u8]) -> String {
     assert!(!object_hash.is_empty(), "object hash must not be empty");
 
     // IDs are collision identifiers, not secrets. Mixing with XOR keeps the
@@ -56,7 +53,7 @@ fn derive_gherrit_id(mut entropy: [u8; GHERRIT_ID_BYTES], object_hash: &[u8]) ->
     format!("G{}", data_encoding::BASE32.encode(&entropy).to_ascii_lowercase())
 }
 
-pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
+pub fn run(repo: &util::Repo, msg_file: &str, acquire_entropy: fn() -> IdEntropy) -> Result<()> {
     let msg_path = Path::new(msg_file);
     if !msg_path.try_exists().wrap_err("Failed to check file existence")? {
         bail!("File does not exist: {}", msg_path.display().red().bold());
@@ -106,7 +103,7 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
         input_data.as_bytes(),
     )
     .wrap_err("Failed to compute hash")?;
-    let gherrit_id = derive_gherrit_id(acquire_id_entropy(), object_id.as_bytes());
+    let gherrit_id = derive_gherrit_id(acquire_entropy(), object_id.as_bytes());
 
     // Check if trailer exists
     let output = cmd!("git interpret-trailers --parse", msg_file).checked_output()?;
