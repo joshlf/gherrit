@@ -7,7 +7,7 @@ fn test_reproduce_unmanaged_sync() {
     // and `gherritManaged = unmanaged`. We also spuriously synced
     // unmanaged branches. This is a regression test for the latter bug.
 
-    let ctx = test_context!().with_installed_hooks().build();
+    let ctx = test_context!().build();
 
     // Condition 1: Explicit Unmanaged
     ctx.checkout_new("explicit-unmanaged");
@@ -23,7 +23,7 @@ fn test_reproduce_unmanaged_sync() {
     // Condition 2: Implicit Unmanaged
     ctx.checkout_new("implicit-unmanaged");
     ctx.set_config("branch.implicit-unmanaged.gherritManaged", None);
-    ctx.run_git(&["commit", "--allow-empty", "-m", "Implicit Commit", "--no-verify"]);
+    ctx.commit("Implicit Commit");
 
     testutil::assert_failure_snapshot!(
         ctx,
