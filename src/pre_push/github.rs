@@ -2,12 +2,24 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+use super::reconcile::PullRequestState;
+
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(super) enum PullRequestState {
+enum WirePullRequestState {
     Open,
     Closed,
     Merged,
+}
+
+impl From<WirePullRequestState> for PullRequestState {
+    fn from(state: WirePullRequestState) -> Self {
+        match state {
+            WirePullRequestState::Open => PullRequestState::Open,
+            WirePullRequestState::Closed => PullRequestState::Closed,
+            WirePullRequestState::Merged => PullRequestState::Merged,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,7 +199,7 @@ impl BatchedOperation for FindPullRequest {
             title: Option<String>,
             body: Option<String>,
             base_ref_name: String,
-            state: PullRequestState,
+            state: WirePullRequestState,
         }
 
         let mut response: Response = serde_json::from_value(response)
@@ -213,7 +225,7 @@ impl BatchedOperation for FindPullRequest {
             body: node.body,
             base_branch: node.base_ref_name,
             head_branch: self.head_branch.clone(),
-            state: node.state,
+            state: node.state.into(),
         }))
     }
 }
@@ -460,6 +472,41 @@ mod tests {
             })
         );
         assert_eq!(query.decode(json!({ "pullRequests": { "nodes": [] } })).unwrap(), None);
+    }
+
+    #[test]
+    fn pull_request_lifecycle_decoding_is_exhaustive_and_fail_closed() {
+        let query =
+            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
+        let response = |state| {
+            json!({
+                "pullRequests": {
+                    "nodes": [{
+                        "number": 42,
+                        "id": "PR_42",
+                        "title": null,
+                        "body": null,
+                        "baseRefName": "main",
+                        "state": state
+                    }]
+                }
+            })
+        };
+
+        [
+            ("OPEN", PullRequestState::Open),
+            ("CLOSED", PullRequestState::Closed),
+            ("MERGED", PullRequestState::Merged),
+        ]
+        .into_iter()
+        .for_each(|(wire_state, expected)| {
+            let pull_request = query.decode(response(wire_state)).unwrap().unwrap();
+            assert_eq!(pull_request.state, expected, "wire_state={wire_state}");
+        });
+
+        let error = query.decode(response("UNKNOWN")).unwrap_err();
+        assert_eq!(error.to_string(), "Failed to decode pull request query response");
+        assert!(format!("{error:?}").contains("unknown variant `UNKNOWN`"));
     }
 
     #[test]
