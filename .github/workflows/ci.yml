@@ -53,6 +53,9 @@ jobs:
       - name: Test stack metadata parser
         run: bash ci/test_extract_stack_child.sh
 
+      - name: Test stack rebase action
+        run: bash ci/test_rebase_stack_child.sh
+
   windows-tests:
     name: Windows Tests
     runs-on: windows-latest
