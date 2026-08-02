@@ -54,26 +54,35 @@ impl BatchPlan {
 pub(super) enum ResponseDisposition {
     Success,
     RetryLimit,
+    Reobserve,
     Fatal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReplaySafety {
+    Idempotent,
+    RequiresReobservation,
 }
 
 pub(super) fn query_exceeds_limit(query: &str) -> bool {
     query.len() > MAX_GRAPHQL_QUERY_BYTES
 }
 
-pub(super) fn classify_response(response: &Value) -> ResponseDisposition {
+pub(super) fn classify_response(
+    response: &Value,
+    replay_safety: ReplaySafety,
+) -> ResponseDisposition {
     let Some(errors) = response.get("errors") else {
         return ResponseDisposition::Success;
     };
-    let has_no_data = response.get("data").is_none_or(Value::is_null);
     let has_only_resource_errors = errors
         .as_array()
         .is_some_and(|errors| !errors.is_empty() && errors.iter().all(is_resource_limit_error));
 
-    if has_no_data && has_only_resource_errors {
-        ResponseDisposition::RetryLimit
-    } else {
-        ResponseDisposition::Fatal
+    match (has_only_resource_errors, replay_safety) {
+        (true, ReplaySafety::Idempotent) => ResponseDisposition::RetryLimit,
+        (true, ReplaySafety::RequiresReobservation) => ResponseDisposition::Reobserve,
+        (false, _) => ResponseDisposition::Fatal,
     }
 }
 
@@ -181,19 +190,45 @@ mod tests {
                 "message": "A query attribute must be specified and must be a string."
             }),
         ] {
-            assert_eq!(
-                classify_response(&json!({ "errors": [error] })),
-                ResponseDisposition::RetryLimit
-            );
-            assert_eq!(
-                classify_response(&json!({ "data": null, "errors": [error] })),
-                ResponseDisposition::RetryLimit
-            );
+            for response in
+                [json!({ "errors": [error.clone()] }), json!({ "data": null, "errors": [error] })]
+            {
+                assert_eq!(
+                    classify_response(&response, ReplaySafety::Idempotent),
+                    ResponseDisposition::RetryLimit
+                );
+                assert_eq!(
+                    classify_response(&response, ReplaySafety::RequiresReobservation),
+                    ResponseDisposition::Reobserve
+                );
+            }
         }
     }
 
     #[test]
-    fn treats_partial_or_mixed_errors_as_fatal() {
+    fn retries_partial_resource_limit_responses() {
+        let resource_error = json!({
+            "path": ["op1"],
+            "type": "RESOURCE_LIMITS_EXCEEDED"
+        });
+
+        let response = json!({
+            "data": { "op0": { "value": 1 }, "op1": null },
+            "errors": [resource_error]
+        });
+
+        assert_eq!(
+            classify_response(&response, ReplaySafety::Idempotent),
+            ResponseDisposition::RetryLimit
+        );
+        assert_eq!(
+            classify_response(&response, ReplaySafety::RequiresReobservation),
+            ResponseDisposition::Reobserve
+        );
+    }
+
+    #[test]
+    fn treats_mixed_or_malformed_errors_as_fatal() {
         let resource_error = json!({ "type": "RESOURCE_LIMITS_EXCEEDED" });
         let fatal_error = json!({ "type": "FORBIDDEN" });
 
@@ -202,14 +237,20 @@ mod tests {
             json!({ "errors": [resource_error.clone(), fatal_error] }),
             json!({ "errors": [] }),
             json!({ "errors": "not an array" }),
-            json!({ "data": {}, "errors": [resource_error] }),
         ] {
-            assert_eq!(classify_response(&response), ResponseDisposition::Fatal);
+            for safety in [ReplaySafety::Idempotent, ReplaySafety::RequiresReobservation] {
+                assert_eq!(classify_response(&response, safety), ResponseDisposition::Fatal);
+            }
         }
     }
 
     #[test]
     fn accepts_responses_without_errors() {
-        assert_eq!(classify_response(&json!({ "data": {} })), ResponseDisposition::Success);
+        for safety in [ReplaySafety::Idempotent, ReplaySafety::RequiresReobservation] {
+            assert_eq!(
+                classify_response(&json!({ "data": {} }), safety),
+                ResponseDisposition::Success
+            );
+        }
     }
 }
