@@ -1378,6 +1378,25 @@ mod tests {
     }
 
     #[test]
+    fn repository_response_rejects_another_repository() {
+        let state = MockState::new("owner".to_string(), "repo".to_string());
+
+        for query in [
+            "query { repository(owner: \"other\", name: \"repo\") { id } }",
+            "query { repository(owner: \"owner\", name: \"other\") { id } }",
+        ] {
+            let document = parse_document(query);
+            validate_supported_document(&document, &None).unwrap();
+
+            assert_eq!(
+                handle_repository_query(&state, root_field(&document), &None).unwrap(),
+                serde_json::Value::Null,
+                "query: {query}"
+            );
+        }
+    }
+
+    #[test]
     fn create_validates_refs_uniqueness_and_numbering() {
         let document = parse_document(
             "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
