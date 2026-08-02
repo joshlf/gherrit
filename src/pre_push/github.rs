@@ -2,6 +2,8 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+const MAX_PULL_REQUEST_CANDIDATES: usize = 100;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(super) enum PullRequestState {
@@ -159,11 +161,18 @@ impl BatchedOperation for FindPullRequest {
     const TYPE: OperationType = OperationType::Query;
 
     fn document(&self) -> String {
+        let connection = |alias: &str, states: &str| {
+            format!(
+                "{alias}: pullRequests(headRefName: {}, first: {MAX_PULL_REQUEST_CANDIDATES}, states: {states}) {{ nodes {{ number, id, title, body, baseRefName, state, isCrossRepository }} pageInfo {{ hasNextPage }} }}",
+                json!(self.head_branch),
+            )
+        };
         format!(
-            "repository(owner: {}, name: {}) {{ pullRequests(headRefName: {}, first: 1, states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, title, body, baseRefName, state }} }} }}",
+            "repository(owner: {}, name: {}) {{ {} {} }}",
             json!(self.owner),
             json!(self.repository),
-            json!(self.head_branch),
+            connection("open", "[OPEN]"),
+            connection("historical", "[CLOSED, MERGED]"),
         )
     }
 
@@ -171,12 +180,21 @@ impl BatchedOperation for FindPullRequest {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Response {
-            pull_requests: PullRequests,
+            open: PullRequests,
+            historical: PullRequests,
         }
 
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct PullRequests {
             nodes: Vec<Node>,
+            page_info: PageInfo,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PageInfo {
+            has_next_page: bool,
         }
 
         #[derive(Deserialize)]
@@ -188,11 +206,45 @@ impl BatchedOperation for FindPullRequest {
             body: Option<String>,
             base_ref_name: String,
             state: PullRequestState,
+            is_cross_repository: bool,
         }
 
         let response: Response = serde_json::from_value(response)
             .wrap_err("Failed to decode pull request query response")?;
-        Ok(response.pull_requests.nodes.into_iter().next().map(|node| PullRequest {
+        let select = |kind: &str, pull_requests: PullRequests| -> Result<Option<Node>> {
+            let mut candidates = pull_requests
+                .nodes
+                .into_iter()
+                .filter(|node| !node.is_cross_repository)
+                .collect::<Vec<_>>();
+            if candidates.len() > 1 {
+                let candidates = candidates
+                    .iter()
+                    .map(|node| format!("#{}", node.number))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "Found multiple {kind} pull requests for GHerrit ID '{}': {candidates}. GHerrit cannot safely choose one.",
+                    self.head_branch
+                );
+            }
+            if pull_requests.page_info.has_next_page {
+                bail!(
+                    "Found more than {MAX_PULL_REQUEST_CANDIDATES} {kind} pull request candidates for GHerrit ID '{}'. GHerrit cannot safely inspect them all.",
+                    self.head_branch
+                );
+            }
+            Ok(candidates.pop())
+        };
+
+        // A sole open PR is authoritative even when the same managed branch
+        // has closed or merged history. Only consult history when no open PR
+        // from this repository exists.
+        let node = match select("open", response.open)? {
+            Some(open) => Some(open),
+            None => select("historical", response.historical)?,
+        };
+        Ok(node.map(|node| PullRequest {
             number: node.number,
             node_id: node.id,
             title: node.title,
@@ -327,6 +379,33 @@ impl BatchedOperation for UpdatePullRequest {
 mod tests {
     use super::*;
 
+    fn pull_request_node(number: u64, state: &str, is_cross_repository: bool) -> Value {
+        json!({
+            "number": number,
+            "id": format!("PR_{number}"),
+            "title": "Title",
+            "body": null,
+            "baseRefName": "main",
+            "state": state,
+            "isCrossRepository": is_cross_repository,
+        })
+    }
+
+    fn connection(nodes: Vec<Value>, has_next_page: bool) -> Value {
+        json!({
+            "nodes": nodes,
+            "pageInfo": { "hasNextPage": has_next_page },
+        })
+    }
+
+    fn lookup_response(open: Value, historical: Value) -> Value {
+        json!({ "open": open, "historical": historical })
+    }
+
+    fn empty_connection() -> Value {
+        connection(Vec::new(), false)
+    }
+
     #[test]
     fn repository_id_query_uses_an_exact_document_and_variables() {
         let query = RepositoryIdQuery::new("o\"wner".to_string(), "repo\nname".to_string());
@@ -353,7 +432,7 @@ mod tests {
 
         assert_eq!(
             query.document(),
-            r#"repository(owner: "o\"wner", name: "repo\nname") { pullRequests(headRefName: "head\\branch", first: 1, states: [OPEN, CLOSED, MERGED]) { nodes { number, id, title, body, baseRefName, state } } }"#
+            r#"repository(owner: "o\"wner", name: "repo\nname") { open: pullRequests(headRefName: "head\\branch", first: 100, states: [OPEN]) { nodes { number, id, title, body, baseRefName, state, isCrossRepository } pageInfo { hasNextPage } } historical: pullRequests(headRefName: "head\\branch", first: 100, states: [CLOSED, MERGED]) { nodes { number, id, title, body, baseRefName, state, isCrossRepository } pageInfo { hasNextPage } } }"#
         );
     }
 
@@ -422,18 +501,10 @@ mod tests {
 
         assert_eq!(
             query
-                .decode(json!({
-                    "pullRequests": {
-                        "nodes": [{
-                            "number": 42,
-                            "id": "PR_42",
-                            "title": "Title",
-                            "body": null,
-                            "baseRefName": "main",
-                            "state": "OPEN"
-                        }]
-                    }
-                }))
+                .decode(lookup_response(
+                    connection(vec![pull_request_node(42, "OPEN", false)], false),
+                    empty_connection(),
+                ))
                 .unwrap(),
             Some(PullRequest {
                 number: 42,
@@ -445,7 +516,147 @@ mod tests {
                 state: PullRequestState::Open,
             })
         );
-        assert_eq!(query.decode(json!({ "pullRequests": { "nodes": [] } })).unwrap(), None);
+        assert_eq!(
+            query.decode(lookup_response(empty_connection(), empty_connection())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_unique_open_pull_request_wins_over_history() {
+        let query =
+            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
+
+        let selected = query
+            .decode(lookup_response(
+                connection(vec![pull_request_node(42, "OPEN", false)], false),
+                connection(
+                    vec![
+                        pull_request_node(7, "CLOSED", false),
+                        pull_request_node(8, "MERGED", false),
+                    ],
+                    true,
+                ),
+            ))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected.number, 42);
+        assert_eq!(selected.state, PullRequestState::Open);
+    }
+
+    #[test]
+    fn fork_pull_requests_do_not_participate_in_selection() {
+        let query =
+            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
+
+        let selected = query
+            .decode(lookup_response(
+                connection(
+                    vec![pull_request_node(7, "OPEN", true), pull_request_node(42, "OPEN", false)],
+                    false,
+                ),
+                empty_connection(),
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.number, 42);
+
+        assert_eq!(
+            query
+                .decode(lookup_response(
+                    connection(vec![pull_request_node(7, "OPEN", true)], false),
+                    connection(vec![pull_request_node(8, "CLOSED", true)], false),
+                ))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_unique_historical_pull_request_preserves_lifecycle_handling() {
+        let query =
+            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
+
+        let selected = query
+            .decode(lookup_response(
+                connection(vec![pull_request_node(7, "OPEN", true)], false),
+                connection(vec![pull_request_node(42, "MERGED", false)], false),
+            ))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected.number, 42);
+        assert_eq!(selected.state, PullRequestState::Merged);
+    }
+
+    #[test]
+    fn duplicate_same_repository_candidates_are_ambiguous_by_lifecycle() {
+        let query =
+            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
+
+        let open_error = query
+            .decode(lookup_response(
+                connection(
+                    vec![
+                        pull_request_node(42, "OPEN", false),
+                        pull_request_node(99, "OPEN", false),
+                    ],
+                    false,
+                ),
+                empty_connection(),
+            ))
+            .unwrap_err();
+
+        assert_eq!(
+            open_error.to_string(),
+            "Found multiple open pull requests for GHerrit ID 'G123': #42, #99. GHerrit cannot safely choose one."
+        );
+
+        let historical_error = query
+            .decode(lookup_response(
+                empty_connection(),
+                connection(
+                    vec![
+                        pull_request_node(42, "CLOSED", false),
+                        pull_request_node(99, "MERGED", false),
+                    ],
+                    false,
+                ),
+            ))
+            .unwrap_err();
+        assert_eq!(
+            historical_error.to_string(),
+            "Found multiple historical pull requests for GHerrit ID 'G123': #42, #99. GHerrit cannot safely choose one."
+        );
+    }
+
+    #[test]
+    fn incomplete_candidate_pages_fail_closed() {
+        let query =
+            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
+
+        let open_error = query
+            .decode(lookup_response(
+                connection(vec![pull_request_node(7, "OPEN", true)], true),
+                empty_connection(),
+            ))
+            .unwrap_err();
+        assert_eq!(
+            open_error.to_string(),
+            "Found more than 100 open pull request candidates for GHerrit ID 'G123'. GHerrit cannot safely inspect them all."
+        );
+
+        let historical_error = query
+            .decode(lookup_response(
+                empty_connection(),
+                connection(vec![pull_request_node(7, "CLOSED", true)], true),
+            ))
+            .unwrap_err();
+        assert_eq!(
+            historical_error.to_string(),
+            "Found more than 100 historical pull request candidates for GHerrit ID 'G123'. GHerrit cannot safely inspect them all."
+        );
     }
 
     #[test]
@@ -453,15 +664,18 @@ mod tests {
         let query =
             FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
         let error = query
-            .decode(json!({
-                "pullRequests": {
-                    "nodes": [{
+            .decode(lookup_response(
+                connection(
+                    vec![json!({
                         "number": 42,
                         "id": "PR_42",
-                        "state": "OPEN"
-                    }]
-                }
-            }))
+                        "state": "OPEN",
+                        "isCrossRepository": false,
+                    })],
+                    false,
+                ),
+                empty_connection(),
+            ))
             .unwrap_err();
 
         assert_eq!(error.to_string(), "Failed to decode pull request query response");
