@@ -170,16 +170,12 @@ fn test_graphql_batch_backoff() {
         ctx.commit(&format!("Commit {}", i));
     }
 
-    testutil::assert_success_snapshot!(
-        ctx,
-        ctx.hook_cmd("pre-push").env("GHERRIT_TEST_PUSH_BATCH_LEN", "2"),
-        "graphql_batch_backoff"
-    );
+    testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "graphql_batch_backoff");
 
     assert_eq!(
         ctx.recorded_pushes().iter().filter(|push| push.succeeded()).count(),
-        2,
-        "Expected two pushes at the test batch size"
+        1,
+        "GraphQL backoff must not alter the independent Git publication batch"
     );
     assert_eq!(ctx.github().pull_requests().len(), 4, "Expected every commit to have a PR");
     insta::assert_debug_snapshot!("graphql_batch_backoff_trace", ctx.github().requests());

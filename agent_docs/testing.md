@@ -350,8 +350,10 @@ place that driver under the `gherrit` name. The production executable must not
 contain a hidden Git mode, deterministic-ID branch, or test-only endpoint
 enabled by a build environment variable.
 
-The migration is complete when ordinary `cargo test` and Clippy exercise the
-normal production artifact without `GHERRIT_TEST_BUILD`.
+The feature-gated test driver is a separate Cargo binary target. The normal
+production binary remains on the same all-feature test graph, and a dedicated
+regression proves that it rejects the driver protocol. No build environment
+variable changes production control flow.
 
 ## Performance Budget
 
@@ -393,4 +395,3 @@ When adding a behavior:
 When fixing a defect, first add the lowest-layer regression that expresses its
 general rule. Retain a higher-level regression only when it protects a distinct
 boundary.
-
