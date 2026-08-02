@@ -68,12 +68,13 @@ fn test_pre_push_ls_remote_failure() {
     ctx.commit_with_gherrit_id("Work");
 
     // Hook should succeed but warn about ls-remote failure
+    ctx.expect_git_failure(testutil::GitOperation::LsRemote);
     ctx.gherrit_cmd()
         .args(["hook", "pre-push"])
-        .env("MOCK_BIN_FAIL_CMD", "git:ls-remote")
         .assert()
         .success()
         .stderr(predicate::str::contains("Failed to fetch remote branch states"));
+    ctx.assert_failure_consumed();
 }
 
 #[test]
