@@ -12,6 +12,8 @@ use tokio::net::TcpListener;
 
 use crate::{FailureKind, GraphQlOperation, TestEnvironment};
 
+const MAX_PULL_REQUEST_CANDIDATES: usize = 100;
+
 static GITHUB_SCHEMA: LazyLock<Valid<apollo_compiler::Schema>> = LazyLock::new(|| {
     apollo_compiler::Schema::parse_and_validate(
         include_str!("../data/github_schema.graphql"),
@@ -23,6 +25,7 @@ static GITHUB_SCHEMA: LazyLock<Valid<apollo_compiler::Schema>> = LazyLock::new(|
 #[derive(Debug, Clone, Default)]
 pub struct MockState {
     pub prs: Vec<PrEntry>,
+    pub(super) cross_repository_prs: HashSet<usize>,
     pub pushes: Vec<GitPush>,
     pub graphql_requests: Vec<Vec<GraphQlOperation>>,
     pub max_graphql_operations_per_request: Option<usize>,
@@ -475,9 +478,13 @@ fn validate_pull_requests_field(field: &executable::Field) -> Result<(), String>
             ast::Value::Int(value) => Some(value.as_str()),
             _ => None,
         })
-        .ok_or_else(|| format!("The mock GitHub API requires `{PATH}(first: 1)`"))?;
-    if first != "1" {
-        return Err(format!("The mock GitHub API only supports `{PATH}(first: 1)`"));
+        .ok_or_else(|| {
+            format!("The mock GitHub API requires `{PATH}(first: {MAX_PULL_REQUEST_CANDIDATES})`")
+        })?;
+    if first != MAX_PULL_REQUEST_CANDIDATES.to_string() {
+        return Err(format!(
+            "The mock GitHub API only supports `{PATH}(first: {MAX_PULL_REQUEST_CANDIDATES})`"
+        ));
     }
 
     let states = argument(field, "states")
@@ -485,9 +492,7 @@ fn validate_pull_requests_field(field: &executable::Field) -> Result<(), String>
             ast::Value::List(values) => Some(values),
             _ => None,
         })
-        .ok_or_else(|| {
-            format!("The mock GitHub API requires `{PATH}(states: [OPEN, CLOSED, MERGED])`")
-        })?;
+        .ok_or_else(|| format!("The mock GitHub API requires `{PATH}(states: ...)`"))?;
     let state_count = states.len();
     let states: HashSet<_> = states
         .iter()
@@ -496,24 +501,33 @@ fn validate_pull_requests_field(field: &executable::Field) -> Result<(), String>
             _ => None,
         })
         .collect();
-    if state_count != 3 || states != HashSet::from(["OPEN", "CLOSED", "MERGED"]) {
+    let is_open = state_count == 1 && states == HashSet::from(["OPEN"]);
+    let is_historical = state_count == 2 && states == HashSet::from(["CLOSED", "MERGED"]);
+    if !is_open && !is_historical {
         return Err(format!(
-            "The mock GitHub API only supports `{PATH}(states: [OPEN, CLOSED, MERGED])`"
+            "The mock GitHub API only supports `{PATH}(states: [OPEN])` or `{PATH}(states: [CLOSED, MERGED])`"
         ));
     }
 
     for field in selected_fields(&field.selection_set, PATH)? {
-        if field.name != "nodes" {
-            return Err(format!(
-                "The mock GitHub API does not support field `{PATH}.{}`",
-                field.name
-            ));
+        match field.name.as_str() {
+            "nodes" => validate_scalar_fields(
+                &field.selection_set,
+                "repository.pullRequests.nodes",
+                &["number", "id", "title", "body", "baseRefName", "state", "isCrossRepository"],
+            )?,
+            "pageInfo" => validate_scalar_fields(
+                &field.selection_set,
+                "repository.pullRequests.pageInfo",
+                &["hasNextPage"],
+            )?,
+            _ => {
+                return Err(format!(
+                    "The mock GitHub API does not support field `{PATH}.{}`",
+                    field.name
+                ));
+            }
         }
-        validate_scalar_fields(
-            &field.selection_set,
-            "repository.pullRequests.nodes",
-            &["number", "id", "title", "body", "baseRefName", "state"],
-        )?;
     }
     Ok(())
 }
@@ -1094,7 +1108,11 @@ fn handle_create_pr(
     if !branch_exists(&head)? {
         return Err(format!("Head branch `{head}` does not exist"));
     }
-    if mock_state.prs.iter().any(|pr| pr.state == "OPEN" && pr.head.ref_field == head) {
+    if mock_state.prs.iter().any(|pr| {
+        pr.state == "OPEN"
+            && pr.head.ref_field == head
+            && !mock_state.cross_repository_prs.contains(&pr.number)
+    }) {
         return Err(format!("An open pull request already exists for head branch `{head}`"));
     }
 
@@ -1164,8 +1182,25 @@ fn handle_repository_query(
                     "repository.pullRequests",
                     variables,
                 )?;
-                let matching_prs: Vec<_> =
-                    mock_state.prs.iter().filter(|pr| pr.head.ref_field == head).take(1).collect();
+                let states = argument(field, "states")
+                    .and_then(|value| match value {
+                        ast::Value::List(values) => Some(values),
+                        _ => None,
+                    })
+                    .expect("request was checked by validate_pull_requests_field");
+                let states = states
+                    .iter()
+                    .map(|value| match &**value {
+                        ast::Value::Enum(value) => value.as_str(),
+                        _ => unreachable!("request was checked by validate_pull_requests_field"),
+                    })
+                    .collect::<HashSet<_>>();
+                let matching_prs = mock_state
+                    .prs
+                    .iter()
+                    .filter(|pr| pr.head.ref_field == head && states.contains(pr.state.as_str()))
+                    .collect::<Vec<_>>();
+                let has_next_page = matching_prs.len() > MAX_PULL_REQUEST_CANDIDATES;
 
                 let mut connection = serde_json::Map::new();
                 for field in selected_fields(&field.selection_set, "repository.pullRequests")? {
@@ -1173,9 +1208,37 @@ fn handle_repository_query(
                         "nodes" => {
                             let nodes = matching_prs
                                 .iter()
-                                .map(|pr| project_pr_node(pr, &field.selection_set))
+                                .take(MAX_PULL_REQUEST_CANDIDATES)
+                                .map(|pr| {
+                                    project_pr_node(
+                                        pr,
+                                        mock_state.cross_repository_prs.contains(&pr.number),
+                                        &field.selection_set,
+                                    )
+                                })
                                 .collect::<Result<Vec<_>, _>>()?;
                             connection.insert(response_key(field), serde_json::json!(nodes));
+                        }
+                        "pageInfo" => {
+                            let mut page_info = serde_json::Map::new();
+                            for field in selected_fields(
+                                &field.selection_set,
+                                "repository.pullRequests.pageInfo",
+                            )? {
+                                match field.name.as_str() {
+                                    "hasNextPage" => {
+                                        page_info.insert(
+                                            response_key(field),
+                                            serde_json::json!(has_next_page),
+                                        );
+                                    }
+                                    _ => unreachable!(
+                                        "request was checked by validate_pull_requests_field"
+                                    ),
+                                }
+                            }
+                            connection
+                                .insert(response_key(field), serde_json::Value::Object(page_info));
                         }
                         _ => unreachable!("request was checked by validate_pull_requests_field"),
                     }
@@ -1197,6 +1260,7 @@ fn handle_repository_query(
 
 fn project_pr_node(
     pr: &PrEntry,
+    is_cross_repository: bool,
     selection_set: &executable::SelectionSet,
 ) -> Result<serde_json::Value, String> {
     let mut node = serde_json::Map::new();
@@ -1208,6 +1272,7 @@ fn project_pr_node(
             "body" => serde_json::json!(pr.body),
             "baseRefName" => serde_json::json!(pr.base.ref_field),
             "state" => serde_json::json!(pr.state),
+            "isCrossRepository" => serde_json::json!(is_cross_repository),
             _ => unreachable!("request was checked by validate_pull_requests_field"),
         };
         node.insert(response_key(field), value);
@@ -1370,9 +1435,12 @@ mod tests {
 
         let lookup = parse_document(
             "query { op0: repository(owner: \"owner\", name: \"repo\") { \
-             pullRequests(headRefName: \"Ghead\", first: 1, \
-             states: [OPEN, CLOSED, MERGED]) { nodes { number, id, title, body, \
-             baseRefName, state } } } }",
+             open: pullRequests(headRefName: \"Ghead\", first: 100, \
+             states: [OPEN]) { nodes { number, id, title, body, baseRefName, \
+             state, isCrossRepository } pageInfo { hasNextPage } } \
+             historical: pullRequests(headRefName: \"Ghead\", first: 100, \
+             states: [CLOSED, MERGED]) { nodes { number, id, title, body, \
+             baseRefName, state, isCrossRepository } pageInfo { hasNextPage } } } }",
         );
         validate_supported_document(&lookup, &None).unwrap();
 
@@ -1430,7 +1498,7 @@ mod tests {
 
         let duplicate_states = parse_document(
             "query { repository(owner: \"owner\", name: \"repo\") { \
-             pullRequests(headRefName: \"Ghead\", first: 1, \
+             pullRequests(headRefName: \"Ghead\", first: 100, \
              states: [OPEN, CLOSED, MERGED, OPEN]) { nodes { number } } } }",
         );
         assert!(validate_supported_document(&duplicate_states, &None)
@@ -1459,8 +1527,9 @@ mod tests {
     fn repository_response_contains_only_selected_fields() {
         let document = parse_document(
             "query { repository(owner: \"owner\", name: \"repo\") { \
-             pullRequests(headRefName: \"Ghead\", first: 1, \
-             states: [OPEN, CLOSED, MERGED]) { nodes { number } } } }",
+             open: pullRequests(headRefName: \"Ghead\", first: 100, \
+             states: [OPEN]) { nodes { number, isCrossRepository } \
+             pageInfo { hasNextPage } } } }",
         );
         validate_supported_document(&document, &None).unwrap();
 
@@ -1474,12 +1543,14 @@ mod tests {
             repo_owner: "owner",
             repo_name: "repo",
         }));
+        state.cross_repository_prs.insert(1);
         let response = handle_repository_query(&state, root_field(&document), &None).unwrap();
         assert_eq!(
             response,
             serde_json::json!({
-                "pullRequests": {
-                    "nodes": [{ "number": 1 }]
+                "open": {
+                    "nodes": [{ "number": 1, "isCrossRepository": true }],
+                    "pageInfo": { "hasNextPage": false }
                 }
             })
         );
@@ -1505,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn create_validates_refs_uniqueness_and_numbering() {
+    fn create_validates_same_repository_refs_uniqueness_and_numbering() {
         let document = parse_document(
             "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
              baseRefName: \"main\", headRefName: \"Gnew\", title: \"Title\" }) { \
@@ -1516,11 +1587,12 @@ mod tests {
             id: 7,
             title: "Old".to_string(),
             body: String::new(),
-            head: "Gold".to_string(),
+            head: "Gnew".to_string(),
             base: "main".to_string(),
             repo_owner: "owner",
             repo_name: "repo",
         }));
+        state.cross_repository_prs.insert(7);
 
         let response = handle_create_pr(&mut state, root_field(&document), &|_| Ok(true)).unwrap();
         assert_eq!(response.pointer("/pullRequest/number"), Some(&serde_json::json!(8)));
