@@ -18,16 +18,18 @@ Run the same formatting, linting, test, and task-marker checks as CI:
 
 ```bash
 cargo +nightly fmt --all -- --check
-GHERRIT_TEST_BUILD=1 cargo clippy \
-  --workspace --all-targets --locked -- -D warnings
-GHERRIT_TEST_BUILD=1 cargo test --workspace --all-targets --locked
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --all-features \
+  --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
 ci/check_todo.sh
 bash ci/test_extract_stack_child.sh
 ```
 
-`GHERRIT_TEST_BUILD=1` is **required** for Clippy and tests so the binary under
-test includes the necessary test-only behavior. Do not use a binary built with
-this setting on sensitive repositories or with real credentials.
+The `test-driver` feature builds a separate, non-shipping process adapter for
+system tests. The production `gherrit` binary never reads test endpoints,
+generates deterministic IDs, or dispatches the Git interceptor, even when
+Cargo unifies features across the package.
 
 ## Testing Strategy
 
@@ -42,8 +44,8 @@ When tests fail due to snapshot mismatches (e.g., changed CLI output), you can
 force update all snapshots to match the new output:
 
 ```bash
-GHERRIT_TEST_BUILD=1 INSTA_UPDATE=always cargo test \
-  --workspace --all-targets --locked
+INSTA_UPDATE=always cargo test \
+  --workspace --all-targets --all-features --locked
 ```
 
 **Note:** This will update ALL snapshots for executed tests. You should use `git
