@@ -5,16 +5,12 @@ fn verify_push_to_non_open_fail(
     state_name: &str,
     expected_msg_part: &str,
 ) {
-    let ctx = testutil::test_context!()
-        .with_remote()
-        .with_installed_hooks()
-        .with_initial_commit()
-        .with_mock_github()
-        .build();
-    ctx.checkout_new(&format!("feature-{}", state_name.to_lowercase()));
+    let ctx =
+        testutil::test_context!().with_remote().with_initial_commit().with_mock_github().build();
+    ctx.checkout_managed_private(&format!("feature-{}", state_name.to_lowercase()));
 
     // 1. Initial Push (Creates PR)
-    ctx.commit("Initial Work");
+    ctx.commit_with_gherrit_id("Initial Work");
     ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
     let refs_before_rejected_push = ctx.remote_refs("refs");
 
@@ -53,14 +49,10 @@ fn test_post_push_checks_merged_pr() {
 
 #[test]
 fn test_push_to_open_pr_succeeds() {
-    let ctx = testutil::test_context!()
-        .with_remote()
-        .with_installed_hooks()
-        .with_initial_commit()
-        .with_mock_github()
-        .build();
-    ctx.checkout_new("feature-open");
-    ctx.commit("Work");
+    let ctx =
+        testutil::test_context!().with_remote().with_initial_commit().with_mock_github().build();
+    ctx.checkout_managed_private("feature-open");
+    ctx.commit_with_gherrit_id("Work");
 
     // 1. First Push
     ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();

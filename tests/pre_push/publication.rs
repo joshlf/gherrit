@@ -2,20 +2,19 @@
 fn test_full_stack_lifecycle_mocked() {
     let ctx = testutil::test_context!()
         .with_remote()
-        .with_installed_hooks()
         .with_initial_commit()
         .with_mock_github()
         .with_git_interceptor()
         .build();
 
     // Setup: Create 'main' and a feature branch
-    ctx.checkout_new("feature-stack");
+    ctx.checkout_managed_private("feature-stack");
 
-    ctx.commit("Commit A");
+    ctx.commit_with_gherrit_id("Commit A");
     let commit_a_id = ctx.gherrit_id("HEAD").unwrap();
     let commit_a_oid = ctx.head_oid();
 
-    ctx.commit("Commit B");
+    ctx.commit_with_gherrit_id("Commit B");
     let commit_b_id = ctx.gherrit_id("HEAD").unwrap();
     let commit_b_oid = ctx.head_oid();
 
@@ -49,15 +48,14 @@ fn test_full_stack_lifecycle_mocked() {
 fn test_version_increment() {
     let ctx = testutil::test_context!()
         .with_remote()
-        .with_installed_hooks()
         .with_initial_commit()
         .with_mock_github()
         .with_git_interceptor()
         .build();
 
     // Create feature branch
-    ctx.checkout_new("feat-versioning");
-    ctx.commit("Feature Commit");
+    ctx.checkout_managed_private("feat-versioning");
+    ctx.commit_with_gherrit_id("Feature Commit");
     let gherrit_id = ctx.gherrit_id("HEAD").unwrap();
     let v1_oid = ctx.head_oid();
     let managed_ref = format!("refs/heads/{gherrit_id}");
@@ -87,15 +85,14 @@ fn test_version_increment() {
 fn test_optimistic_locking_conflict() {
     let ctx = testutil::test_context!()
         .with_remote()
-        .with_installed_hooks()
         .with_initial_commit()
         .with_mock_github()
         .with_git_interceptor()
         .build();
 
     // Initial setup
-    ctx.checkout_new("feature-conflict");
-    ctx.commit("Commit V1");
+    ctx.checkout_managed_private("feature-conflict");
+    ctx.commit_with_gherrit_id("Commit V1");
 
     // Push V1
     testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "optimistic_locking_v1");
@@ -140,17 +137,16 @@ fn test_optimistic_locking_conflict() {
 fn test_graphql_batch_backoff() {
     let ctx = testutil::test_context!()
         .with_remote()
-        .with_installed_hooks()
         .with_initial_commit()
         .with_mock_github()
         .with_git_interceptor()
         .build();
 
     ctx.limit_graphql_operations_per_request(2);
-    ctx.checkout_new("batch-backoff");
+    ctx.checkout_managed_private("batch-backoff");
 
     for i in 1..=4 {
-        ctx.commit(&format!("Commit {}", i));
+        ctx.commit_with_gherrit_id(&format!("Commit {i}"));
     }
 
     testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "graphql_batch_backoff");

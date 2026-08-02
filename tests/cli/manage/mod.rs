@@ -45,7 +45,7 @@ fn test_branch_management() {
 
 #[test]
 fn test_rebase_detection() {
-    let ctx = testutil::test_context!().with_installed_hooks().with_initial_commit().build();
+    let ctx = testutil::test_context!().with_initial_commit().build();
 
     ctx.checkout_new("feature-rebase");
     ctx.commit("Feature Work");
