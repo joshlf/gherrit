@@ -100,7 +100,7 @@ fn test_pre_push_edit_failure() {
     assert_eq!(requests.last(), Some(&vec![testutil::GraphQlOperation::UpdatePr]));
     let prs = ctx.github().pull_requests();
     assert_eq!(prs.len(), 1);
-    assert_eq!(prs[0].title.as_deref(), Some("Initial Work"));
+    assert_eq!(prs[0].title, "Initial Work");
 
     let gherrit_id = ctx.gherrit_id("HEAD").unwrap();
     let remote_ref = format!("refs/heads/{gherrit_id}");

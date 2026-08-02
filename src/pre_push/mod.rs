@@ -26,16 +26,15 @@ use batching::{
     BatchPlan, INITIAL_GRAPHQL_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
     classify_response, query_exceeds_limit,
 };
-use body::{PrBody, gherrit_pr_id_re};
+use body::gherrit_pr_id_re;
 use github::{
-    BatchedOperation, CreatePullRequest, CreatedPullRequest, FindPullRequest,
-    PullRequest as PrState, RepositoryIdQuery, UpdatePullRequest, batch_document,
-    decode_batch_response,
+    BatchedOperation, CreatePullRequest, FindPullRequest, PullRequest as PrState,
+    RepositoryIdQuery, UpdatePullRequest, batch_document, decode_batch_response,
 };
 use publication::{PushTarget, plan_push, push_batches};
 use reconcile::{
-    CurrentPr, DesiredPr, PrUpdate, PullRequestState, ensure_pull_requests_open, link_stack,
-    plan_update,
+    CreatePr, KnownPr, ProjectionCommit, ProjectionContext, ProjectionEntry, ProjectionStep,
+    UpdatePr, ensure_pull_requests_open, plan_projection,
 };
 use remote::observe_managed_branches;
 
@@ -112,7 +111,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
 
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
     let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
-    ensure_pull_requests_open(prs.iter().map(|pr| (pr.number, pr.state)))?;
+    ensure_pull_requests_open(prs.iter().flatten().map(|pr| (pr.number, pr.state)))?;
 
     let latest_versions = push_to_origin(repo, &commits)?;
     let default_branch = repo.find_default_branch_on_default_remote();
@@ -308,95 +307,9 @@ async fn sync_prs(
     base_branch: &str,
     commits: Vec<Commit>,
     latest_versions: HashMap<String, usize>,
-    prs: Vec<PrState>,
+    prs: Vec<Option<PrState>>,
 ) -> Result<()> {
     let remote = repo.default_remote()?;
-
-    let commits = link_stack(base_branch, commits, |commit| commit.gherrit_id.clone());
-
-    enum PrResolution {
-        Existing(PrState),
-        ToCreate(BatchCreate),
-    }
-
-    // 1. Identify existing PRs or queue for creation
-    let resolutions: Vec<_> = commits
-        .iter()
-        .map(|entry| {
-            let c = &entry.item;
-
-            if let Some(pr) = prs.iter().find(|pr| pr.head_branch == c.gherrit_id) {
-                log::debug!("Found existing PR #{} for {}", pr.number.green().bold(), c.gherrit_id);
-                PrResolution::Existing(pr.clone())
-            } else {
-                log::debug!("No GitHub PR exists for {}; queuing creation...", c.gherrit_id);
-                PrResolution::ToCreate(BatchCreate {
-                    title: c.message_title.clone(),
-                    body: c.message_body.clone(),
-                    base_branch: entry.base_branch.clone(),
-                    head_branch: c.gherrit_id.clone(),
-                })
-            }
-        })
-        .collect();
-
-    // 2. Batch create missing PRs
-    let creations = resolutions
-        .iter()
-        .filter_map(|resolution| match resolution {
-            PrResolution::ToCreate(create) => Some(create),
-            PrResolution::Existing(_) => None,
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let num_creations = creations.len();
-    let new_prs = if !creations.is_empty() {
-        log::info!("Creating {num_creations} PRs...");
-        let repo_id = fetch_repo_id(octocrab, &remote).await?;
-        let created = batch_create_prs(octocrab, &repo_id, creations).await?;
-        assert_eq!(created.len(), num_creations);
-        log::info!("Created {num_creations} PRs.");
-        created
-    } else {
-        HashMap::new()
-    };
-
-    // 3. Resolve final PR states
-    //
-    // We zip commits with resolutions. Since resolutions were built in order,
-    // they match perfectly.
-    let commit_pr_states = commits
-        .iter()
-        .zip(resolutions)
-        .map(|(entry, resolution)| {
-            let pr_state = match resolution {
-                PrResolution::Existing(state) => state,
-                PrResolution::ToCreate(create) => {
-                    let created = new_prs.get(&create.head_branch).ok_or_else(|| {
-                        eyre::eyre!("Failed to resolve created PR for {}", create.head_branch)
-                    })?;
-                    log::info!(
-                        "Created PR #{}: {}",
-                        created.number.green().bold(),
-                        created.url.blue().underline()
-                    );
-                    PrState {
-                        number: created.number,
-                        node_id: created.node_id.clone(),
-                        title: Some(create.title),
-                        body: Some(create.body),
-                        base_branch: create.base_branch,
-                        head_branch: create.head_branch,
-                        // NOTE: We assume that newly-created PRs are in the
-                        // OPEN state.
-                        state: PullRequestState::Open,
-                    }
-                }
-            };
-            Ok((entry, pr_state))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
     let public_branch = (!is_private_stack(repo, branch_name))
         .then(|| {
             let head_ref = repo.head().ok()?.try_into_referent()?;
@@ -404,61 +317,119 @@ async fn sync_prs(
             (cat == Category::LocalBranch).then(|| short_name.to_string())
         })
         .flatten();
-
     let repo_url = remote.repo_url_relative();
-    let stack_pr_numbers =
-        commit_pr_states.iter().map(|(_, state)| state.number).collect::<Vec<_>>();
-    let updates: Vec<PrUpdate> = commit_pr_states
-        .iter()
-        .filter_map(|(entry, pr_state)| {
-            let c = &entry.item;
-            let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
 
-            let body = PrBody {
-                commit_body: &c.message_body,
-                repo_url: &repo_url,
-                public_branch: public_branch.as_deref(),
-                stack_pr_numbers: &stack_pr_numbers,
-                current_pr_number: pr_state.number,
-                latest_version,
-                base_branch: &entry.base_branch,
-                gherrit_id: &c.gherrit_id,
-                parent_id: entry.parent_id.as_deref(),
-                child_id: entry.child_id.as_deref(),
-            }
-            .render();
-
-            let pr_num = pr_state.number.green().bold().to_string();
-            let pr_url = remote.pr_url(pr_state.number).blue().underline().to_string();
-
-            let update = plan_update(
-                CurrentPr {
-                    node_id: &pr_state.node_id,
-                    title: pr_state.title.as_deref(),
-                    body: pr_state.body.as_deref(),
-                    base_branch: &pr_state.base_branch,
-                },
-                DesiredPr { title: &c.message_title, body: &body, base_branch: &entry.base_branch },
-            );
-
-            if update.is_some() {
-                log::debug!("Queuing update for PR #{}", pr_num);
-                log::info!("Queued update for PR #{}: {}", pr_num, pr_url);
-            } else {
-                log::info!("PR #{} is up to date: {}", pr_num, pr_url);
-            }
-
-            update
-        })
-        .collect();
-
-    if !updates.is_empty() {
-        log::info!("Updating batch of {} PRs...", updates.len());
-        batch_update_prs(octocrab, updates).await?;
-        log::info!("Batch update complete.");
+    if commits.len() != prs.len() {
+        bail!("GitHub returned {} PR observations for {} stack commits", prs.len(), commits.len());
     }
+    let mut entries = commits
+        .into_iter()
+        .zip(prs)
+        .map(|(commit, pull_request)| ProjectionEntry {
+            pull_request: pull_request
+                .map(|pr| KnownPr::new(pr.number, pr.node_id, pr.title, pr.body, pr.base_branch)),
+            commit: ProjectionCommit {
+                latest_version: latest_versions.get(&commit.gherrit_id).copied().unwrap_or(1),
+                gherrit_id: commit.gherrit_id,
+                title: commit.message_title,
+                commit_body: commit.message_body,
+            },
+        })
+        .collect::<Vec<_>>();
+    entries.iter().for_each(|entry| match &entry.pull_request {
+        Some(pr) => {
+            log::debug!(
+                "Found existing PR #{} for {}",
+                pr.identity.number().green().bold(),
+                entry.commit.gherrit_id
+            );
+        }
+        None => {
+            log::debug!("No GitHub PR exists for {}; queuing creation...", entry.commit.gherrit_id);
+        }
+    });
 
-    Ok(())
+    let context = ProjectionContext {
+        base_branch,
+        repo_url: &repo_url,
+        public_branch: public_branch.as_deref(),
+    };
+    loop {
+        match plan_projection(context, &entries) {
+            ProjectionStep::Create(creations) => {
+                let num_creations = creations.len();
+                log::info!("Creating {num_creations} PRs...");
+                let repo_id = fetch_repo_id(octocrab, &remote).await?;
+                let created =
+                    batch_create_prs(octocrab, &repo_id, creations.iter().cloned()).await?;
+                if created.len() != num_creations {
+                    bail!(
+                        "GitHub returned {} PRs for {num_creations} creation actions",
+                        created.len()
+                    );
+                }
+                ensure_pull_requests_open(
+                    created.iter().map(|pull_request| (pull_request.number, pull_request.state)),
+                )?;
+                log::info!("Created {num_creations} PRs.");
+
+                entries
+                    .iter_mut()
+                    .filter(|entry| entry.pull_request.is_none())
+                    .zip(creations)
+                    .zip(created)
+                    .for_each(|((entry, create), created)| {
+                        debug_assert_eq!(entry.commit.gherrit_id, create.head_branch);
+                        log::info!(
+                            "Created PR #{}: {}",
+                            created.number.green().bold(),
+                            remote.pr_url(created.number).blue().underline()
+                        );
+                        entry.pull_request = Some(KnownPr::new(
+                            created.number,
+                            created.node_id,
+                            created.title,
+                            created.body,
+                            created.base_branch,
+                        ));
+                    });
+            }
+            ProjectionStep::Update(updates) => {
+                log_projection_updates(&remote, &entries, &updates);
+                log::info!("Updating batch of {} PRs...", updates.len());
+                batch_update_prs(octocrab, updates).await?;
+                log::info!("Batch update complete.");
+                return Ok(());
+            }
+            ProjectionStep::Done => {
+                log_projection_updates(&remote, &entries, &[]);
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn log_projection_updates(
+    remote: &util::Remote,
+    entries: &[ProjectionEntry],
+    updates: &[UpdatePr],
+) {
+    entries.iter().for_each(|entry| {
+        let pull_request = entry
+            .pull_request
+            .as_ref()
+            .expect("projection cannot update before every commit has a pull request");
+        let number = pull_request.identity.number();
+        let pr_num = number.green().bold().to_string();
+        let pr_url = remote.pr_url(number).blue().underline().to_string();
+
+        if updates.iter().any(|update| update.number() == number) {
+            log::debug!("Queuing update for PR #{}", pr_num);
+            log::info!("Queued update for PR #{}: {}", pr_num, pr_url);
+        } else {
+            log::info!("PR #{} is up to date: {}", pr_num, pr_url);
+        }
+    });
 }
 
 fn is_private_stack(repo: &util::Repo, branch: &str) -> bool {
@@ -499,15 +470,6 @@ impl TryFrom<gix::Commit<'_>> for Commit {
     }
 }
 
-/// A request to create a new PR in a batch.
-#[derive(Clone)]
-struct BatchCreate {
-    title: String,
-    body: String,
-    base_branch: String,
-    head_branch: String,
-}
-
 /// Fetches the global Repository Node ID for the given owner and repo.
 ///
 /// This ID (e.g., "R_kgDOL...") is required for creating PRs via the GraphQL
@@ -525,9 +487,13 @@ async fn fetch_repo_id(octocrab: &Octocrab, remote: &util::Remote) -> Result<Str
 ///
 /// This avoids rate limits and network latency by grouping updates into
 /// adaptive batches and sending each batch as one GraphQL operation.
-async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<PrUpdate>) -> Result<()> {
+async fn batch_update_prs(
+    octocrab: &Octocrab,
+    updates: impl IntoIterator<Item = UpdatePr>,
+) -> Result<()> {
     let updates = updates.into_iter().map(|update| {
-        UpdatePullRequest::new(update.node_id, update.title, update.body, update.base_branch)
+        let (node_id, title, body, base_branch) = update.into_parts();
+        UpdatePullRequest::new(node_id, title, body, base_branch)
     });
     run_batched_graphql(octocrab, updates).await?;
     Ok(())
@@ -538,12 +504,12 @@ async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<PrUpdate>) -> Result
 /// This avoids rate limits and network latency by grouping creations into
 /// adaptive batches and sending each batch as one GraphQL operation.
 ///
-/// Returns the newly-created PRs keyed by their head branches.
+/// Returns the newly-created PRs in creation-action order.
 async fn batch_create_prs(
     octocrab: &Octocrab,
     repo_id: &str,
-    creations: impl IntoIterator<Item = BatchCreate>,
-) -> Result<HashMap<String, CreatedPullRequest>> {
+    creations: impl IntoIterator<Item = CreatePr>,
+) -> Result<Vec<PrState>> {
     let creations = creations.into_iter().map(|create| {
         CreatePullRequest::new(
             repo_id.to_string(),
@@ -553,18 +519,14 @@ async fn batch_create_prs(
             create.body,
         )
     });
-    Ok(run_batched_graphql(octocrab, creations)
-        .await?
-        .into_iter()
-        .map(|created| (created.head_branch.clone(), created))
-        .collect())
+    run_batched_graphql(octocrab, creations).await
 }
 
 async fn batch_fetch_prs(
     repo: &util::Repo,
     octocrab: &Octocrab,
     head_refs: &[String],
-) -> Result<Vec<PrState>> {
+) -> Result<Vec<Option<PrState>>> {
     let remote = repo.default_remote()?;
     let owner = remote.owner;
     let repo_name = remote.repo_name;
@@ -573,7 +535,7 @@ async fn batch_fetch_prs(
         .cloned()
         .map(|head_ref| FindPullRequest::new(owner.clone(), repo_name.clone(), head_ref));
 
-    Ok(run_batched_graphql(octocrab, queries).await?.into_iter().flatten().collect())
+    run_batched_graphql(octocrab, queries).await
 }
 
 /// Executes batched GraphQL operations (queries or mutations).
