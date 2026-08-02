@@ -10,7 +10,7 @@ use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::{FailureKind, TestEnvironment};
+use crate::{FailureKind, GraphQlOperation, TestEnvironment};
 
 static GITHUB_SCHEMA: LazyLock<Valid<apollo_compiler::Schema>> = LazyLock::new(|| {
     apollo_compiler::Schema::parse_and_validate(
@@ -30,13 +30,6 @@ pub struct MockState {
     pub repo_name: String,
     pub fail_next_request: Option<FailureKind>,
     pub merge_queue: HashSet<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GraphQlOperation {
-    Query,
-    CreatePr,
-    UpdatePr,
 }
 
 impl MockState {
@@ -185,14 +178,7 @@ pub struct GitCompletion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitPush {
     pub args: Vec<String>,
-    pub refspecs: Vec<String>,
     pub exit_code: i32,
-}
-
-impl GitPush {
-    pub fn succeeded(&self) -> bool {
-        self.exit_code == 0
-    }
 }
 
 #[derive(Clone)]
@@ -711,23 +697,10 @@ async fn complete_git(
 }
 
 fn record_push(app_state: &AppState, args: Vec<String>, exit_code: i32) {
-    let command = parse_git_command(&args)
+    parse_git_command(&args)
         .filter(|command| command.name == "push")
         .expect("record_push requires a parsed Git push");
-    let refspecs = command
-        .args
-        .iter()
-        .filter(|arg| !arg.starts_with('-'))
-        .filter(|arg| {
-            let refspec = arg.trim_start_matches('+');
-            refspec.starts_with("refs/")
-                || refspec
-                    .split_once(':')
-                    .is_some_and(|(_, destination)| destination.starts_with("refs/"))
-        })
-        .cloned()
-        .collect();
-    app_state.state.write().unwrap().pushes.push(GitPush { args, refspecs, exit_code });
+    app_state.state.write().unwrap().pushes.push(GitPush { args, exit_code });
 }
 
 #[cfg(test)]
@@ -815,14 +788,7 @@ mod git_tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
 
         let state = app_state.state.read().unwrap();
-        assert_eq!(
-            state.pushes,
-            [GitPush {
-                args: invocation,
-                refspecs: vec!["+HEAD:refs/heads/main".to_string()],
-                exit_code: 0,
-            }]
-        );
+        assert_eq!(state.pushes, [GitPush { args: invocation, exit_code: 0 }]);
     }
 
     #[tokio::test]
@@ -841,8 +807,36 @@ mod git_tests {
         assert_eq!(response.exit_code, 1);
         assert_eq!(
             app_state.state.read().unwrap().pushes,
-            [GitPush { args: invocation, refspecs: Vec::new(), exit_code: 1 }]
+            [GitPush {
+                args: invocation,
+                refspecs: vec!["main".to_string()],
+                delete: false,
+                exit_code: 1,
+            }]
         );
+    }
+
+    #[test]
+    fn records_pushes_without_interpreting_git_syntax() {
+        for tail in [
+            &["origin", ":"][..],
+            &["origin", "tag", "v1"][..],
+            &["-o", "refs/heads/not-a-refspec", "origin", "HEAD:refs/heads/main"][..],
+        ] {
+            let app_state = app_state();
+            let invocation = std::iter::once("git")
+                .chain(std::iter::once("push"))
+                .chain(tail.iter().copied())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+
+            record_push(&app_state, invocation.clone(), 0);
+
+            assert_eq!(
+                app_state.state.read().unwrap().pushes,
+                [GitPush { args: invocation, exit_code: 0 }]
+            );
+        }
     }
 }
 

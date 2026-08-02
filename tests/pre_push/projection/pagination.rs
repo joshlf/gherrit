@@ -17,24 +17,19 @@ fn test_pagination_bug() {
     ctx.commit(&msg);
 
     // 3. Generate 110 PRs in the mock server state
-    ctx.mutate_mock_state(|state| {
-        for i in 1..=110 {
-            let is_target = i == 105;
-            let head_ref =
-                if is_target { change_id.to_string() } else { format!("other-change-{}", i) };
+    let github = ctx.github();
+    for i in 1..=110 {
+        let is_target = i == 105;
+        let head = if is_target { change_id.to_string() } else { format!("other-change-{i}") };
 
-            let pr = testutil::mock_server::PrEntry::mock(testutil::mock_server::MockPrArgs {
-                id: i as u64,
-                title: format!("PR {i}"),
-                body: "body".to_string(),
-                head: head_ref,
-                base: "main".to_string(),
-                repo_owner: "owner",
-                repo_name: "repo",
-            });
-            state.add_pr(pr);
-        }
-    });
+        github.seed_pull_request(testutil::PullRequestSeed {
+            number: i,
+            title: format!("PR {i}"),
+            body: "body".to_string(),
+            head,
+            base: "main".to_string(),
+        });
+    }
 
     // 4. Run gherrit hook pre-push
     let assert =
