@@ -199,7 +199,7 @@ fn check_and_apply_graphql_failure(
     let matches = match fail_action {
         GraphQl => true,
         CreatePr => operations.contains(&GraphQlOperation::CreatePr),
-        UpdatePr | UpdatePrNull => operations.contains(&GraphQlOperation::UpdatePr),
+        UpdatePr => operations.contains(&GraphQlOperation::UpdatePr),
         Git(_) => false,
     };
 
@@ -563,9 +563,7 @@ async fn graphql(
             })),
         );
     }
-    let failure = check_and_apply_graphql_failure(&mut mock_state, &operations);
-    if let Some(failure) = failure.as_ref().filter(|failure| **failure != FailureKind::UpdatePrNull)
-    {
+    if let Some(failure) = check_and_apply_graphql_failure(&mut mock_state, &operations) {
         return (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -586,16 +584,9 @@ async fn graphql(
                 let alias = response_key(field);
 
                 let result = match field.name.as_str() {
-                    "updatePullRequest" => {
-                        let result = handle_update_pr(&mut mock_state, field, &|branch| {
-                            remote_branch_exists(&app_state, branch)
-                        });
-                        if failure == Some(FailureKind::UpdatePrNull) && result.is_ok() {
-                            Ok(serde_json::Value::Null)
-                        } else {
-                            result
-                        }
-                    }
+                    "updatePullRequest" => handle_update_pr(&mut mock_state, field, &|branch| {
+                        remote_branch_exists(&app_state, branch)
+                    }),
                     "createPullRequest" => handle_create_pr(&mut mock_state, field, &|branch| {
                         remote_branch_exists(&app_state, branch)
                     }),
