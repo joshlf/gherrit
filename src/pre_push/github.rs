@@ -2,15 +2,9 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-const MAX_PULL_REQUEST_CANDIDATES: usize = 100;
+use super::reconcile::PullRequestState;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(super) enum PullRequestState {
-    Open,
-    Closed,
-    Merged,
-}
+const MAX_PULL_REQUEST_CANDIDATES: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PullRequest {
@@ -520,6 +514,34 @@ mod tests {
             query.decode(lookup_response(empty_connection(), empty_connection())).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn pull_request_lifecycle_decoding_is_exhaustive_and_fail_closed() {
+        let query =
+            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
+        let response = |state| {
+            let node = pull_request_node(42, state, false);
+            match state {
+                "OPEN" => lookup_response(connection(vec![node], false), empty_connection()),
+                _ => lookup_response(empty_connection(), connection(vec![node], false)),
+            }
+        };
+
+        [
+            ("OPEN", PullRequestState::Open),
+            ("CLOSED", PullRequestState::Closed),
+            ("MERGED", PullRequestState::Merged),
+        ]
+        .into_iter()
+        .for_each(|(wire_state, expected)| {
+            let pull_request = query.decode(response(wire_state)).unwrap().unwrap();
+            assert_eq!(pull_request.state, expected, "wire_state={wire_state}");
+        });
+
+        let error = query.decode(response("UNKNOWN")).unwrap_err();
+        assert_eq!(error.to_string(), "Failed to decode pull request query response");
+        assert!(format!("{error:?}").contains("unknown variant `UNKNOWN`"));
     }
 
     #[test]
