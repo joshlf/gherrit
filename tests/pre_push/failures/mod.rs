@@ -4,7 +4,11 @@ use predicates::prelude::*;
 
 #[test]
 fn test_pre_push_failure() {
-    let ctx = testutil::test_context!().with_installed_hooks().with_mock_github().build();
+    let ctx = testutil::test_context!()
+        .repository("missing", "repo")
+        .with_installed_hooks()
+        .with_mock_github()
+        .build();
     ctx.commit("Init");
 
     ctx.checkout_new("feature-fail");
