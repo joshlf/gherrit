@@ -133,3 +133,28 @@ pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_runtime_uses_only_the_production_endpoint() {
+        assert!(matches!(
+            Runtime::production().github_endpoint,
+            pre_push::GithubEndpoint::Production
+        ));
+    }
+
+    #[cfg(feature = "test-driver")]
+    #[test]
+    fn test_runtime_uses_only_an_explicit_endpoint() {
+        assert!(matches!(Runtime::test(None).github_endpoint, pre_push::GithubEndpoint::Disabled));
+
+        let runtime = Runtime::test(Some("http://127.0.0.1:1234".to_string()));
+        let pre_push::GithubEndpoint::Custom(endpoint) = runtime.github_endpoint else {
+            panic!("an explicit test endpoint must select the custom adapter");
+        };
+        assert_eq!(endpoint, "http://127.0.0.1:1234");
+    }
+}
