@@ -474,9 +474,9 @@ fn validate_pull_requests_field(field: &executable::Field) -> Result<(), String>
             ast::Value::Int(value) => Some(value.as_str()),
             _ => None,
         })
-        .ok_or_else(|| format!("The mock GitHub API requires `{PATH}(first: 1)`"))?;
-    if first != "1" {
-        return Err(format!("The mock GitHub API only supports `{PATH}(first: 1)`"));
+        .ok_or_else(|| format!("The mock GitHub API requires `{PATH}(first: 2)`"))?;
+    if first != "2" {
+        return Err(format!("The mock GitHub API only supports `{PATH}(first: 2)`"));
     }
 
     let states = argument(field, "states")
@@ -1141,7 +1141,7 @@ fn handle_repository_query(
                     variables,
                 )?;
                 let matching_prs: Vec<_> =
-                    mock_state.prs.iter().filter(|pr| pr.head.ref_field == head).take(1).collect();
+                    mock_state.prs.iter().filter(|pr| pr.head.ref_field == head).take(2).collect();
 
                 let mut connection = serde_json::Map::new();
                 for field in selected_fields(&field.selection_set, "repository.pullRequests")? {
@@ -1257,7 +1257,7 @@ mod tests {
 
         let lookup = parse_document(
             "query { op0: repository(owner: \"owner\", name: \"repo\") { \
-             pullRequests(headRefName: \"Ghead\", first: 1, \
+             pullRequests(headRefName: \"Ghead\", first: 2, \
              states: [OPEN, CLOSED, MERGED]) { nodes { number, id, title, body, \
              baseRefName, state } } } }",
         );
@@ -1317,7 +1317,7 @@ mod tests {
 
         let duplicate_states = parse_document(
             "query { repository(owner: \"owner\", name: \"repo\") { \
-             pullRequests(headRefName: \"Ghead\", first: 1, \
+             pullRequests(headRefName: \"Ghead\", first: 2, \
              states: [OPEN, CLOSED, MERGED, OPEN]) { nodes { number } } } }",
         );
         assert!(validate_supported_document(&duplicate_states, &None)
@@ -1346,7 +1346,7 @@ mod tests {
     fn repository_response_contains_only_selected_fields() {
         let document = parse_document(
             "query { repository(owner: \"owner\", name: \"repo\") { \
-             pullRequests(headRefName: \"Ghead\", first: 1, \
+             pullRequests(headRefName: \"Ghead\", first: 2, \
              states: [OPEN, CLOSED, MERGED]) { nodes { number } } } }",
         );
         validate_supported_document(&document, &None).unwrap();
