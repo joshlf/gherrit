@@ -17,6 +17,16 @@ fn test_commit_msg_hook() {
     // Verify trailer was added
     let content = std::fs::read_to_string(msg_file).unwrap();
     assert!(content.contains("\ngherrit-pr-id: G"));
+    let id = content
+        .lines()
+        .find_map(|line| line.strip_prefix("gherrit-pr-id: "))
+        .expect("hook must add a GHerrit ID");
+    assert_eq!(id.len(), 33, "ID must contain `G` and 32 base32 digits");
+    assert!(
+        id.starts_with('G')
+            && id[1..].bytes().all(|byte| matches!(byte, b'a'..=b'z' | b'2'..=b'7')),
+        "ID must use the lowercase base32 alphabet"
+    );
 }
 
 #[test]

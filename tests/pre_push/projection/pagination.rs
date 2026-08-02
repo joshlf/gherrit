@@ -1,20 +1,14 @@
 #[test]
 fn test_pagination_bug() {
-    let ctx = testutil::test_context!()
-        .with_remote()
-        .with_installed_hooks()
-        .with_initial_commit()
-        .with_mock_github()
-        .build();
+    let ctx =
+        testutil::test_context!().with_remote().with_initial_commit().with_mock_github().build();
 
-    // 1. Checkout feature branch and manage it
-    ctx.checkout_new("feature");
-    ctx.gherrit_cmd().args(["manage", "--force"]).assert().success();
+    // 1. Checkout a managed feature branch.
+    ctx.checkout_managed_private("feature");
 
     // 2. Create a commit with a known Change-Id
     let change_id = "I0000000000000000000000000000000000000105";
-    let msg = format!("Commit 105\n\ngherrit-pr-id: {}", change_id);
-    ctx.commit(&msg);
+    ctx.commit_with_explicit_gherrit_id("Commit 105", change_id);
 
     // 3. Generate 110 PRs in the mock server state
     let github = ctx.github();
