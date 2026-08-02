@@ -74,9 +74,5 @@ name = "pre_push"
 path = "tests/pre_push/main.rs"
 required-features = ["test-driver"]
 
-[[test]]
-name = "production"
-path = "tests/production.rs"
-
 [workspace]
 members = ["testutil"]
