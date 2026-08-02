@@ -439,12 +439,20 @@ impl Drop for MockServerInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitOperation {
+    Var,
+    InterpretTrailers,
+    LsRemote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     GraphQl,
     CreatePr,
     UpdatePr,
     UpdatePrNull,
+    Git(GitOperation),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -798,10 +806,22 @@ impl TestContext {
     }
 
     pub fn inject_failure(&self, kind: FailureKind) {
-        assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
-        let mut state = self.mock_state().write().unwrap();
+        match kind {
+            FailureKind::Git(_) => assert!(
+                self.has_git_interceptor,
+                "missing test capability: .with_git_interceptor()"
+            ),
+            _ => assert!(self.has_mock_github, "missing test capability: .with_mock_github()"),
+        }
+        self.enqueue_failure(kind);
+    }
 
-        state.faults.push_back(kind);
+    pub fn expect_git_failure(&self, operation: GitOperation) {
+        self.inject_failure(FailureKind::Git(operation));
+    }
+
+    fn enqueue_failure(&self, kind: FailureKind) {
+        self.mock_state().write().unwrap().faults.push_back(kind);
     }
 
     pub fn limit_graphql_operations_per_request(&self, limit: usize) {
@@ -1291,6 +1311,25 @@ mod tests {
         ctx.run_git(&["checkout", "main"]);
         ctx.checkout_managed_public("public-stack");
         assert_state("public-stack", MANAGED_PUBLIC, "origin");
+    }
+
+    #[test]
+    fn interceptor_only_context_rejects_unconsumed_git_faults() {
+        let driver_dir = TempDir::new().unwrap();
+        let driver = driver_dir.path().join("gherrit-test-driver");
+        fs::write(&driver, "test driver placeholder").unwrap();
+
+        let panic = panic::catch_unwind(|| {
+            let ctx = TestContextBuilder::new(&driver).with_git_interceptor().build();
+            ctx.expect_git_failure(GitOperation::Var);
+        })
+        .expect_err("dropping the fixture must reject an unconsumed Git fault");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("fixture panic must have a string message");
+        assert!(message.contains("Git(Var)"), "unexpected teardown panic: {message}");
     }
 
     #[test]

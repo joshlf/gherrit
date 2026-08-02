@@ -6,7 +6,6 @@
 //! `git.exe` and recognized by its executable name.
 
 use std::{
-    collections::HashMap,
     env,
     ffi::OsStr,
     io::{self, Read as _, Write as _},
@@ -24,8 +23,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Serialize)]
 struct GitRequest {
     args: Vec<String>,
-    cwd: String,
-    env: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -54,11 +51,7 @@ pub fn run() -> ExitCode {
         .chain(env::args().skip(argument_offset))
         .collect::<Vec<_>>();
     let server_url = env::var("GHERRIT_MOCK_SERVER_URL").expect("missing mock server URL");
-    let request = GitRequest {
-        args: args.clone(),
-        cwd: env::current_dir().unwrap().to_string_lossy().into_owned(),
-        env: env::vars().filter(|(name, _)| name == "MOCK_BIN_FAIL_CMD").collect(),
-    };
+    let request = GitRequest { args: args.clone() };
 
     let response = post_json(&server_url, "/_internal/git", &request);
     let response: GitResponse =
