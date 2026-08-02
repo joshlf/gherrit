@@ -10,7 +10,7 @@ use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::{FailureKind, TestEnvironment};
+use crate::{FailureKind, GraphQlOperation, TestEnvironment};
 
 static GITHUB_SCHEMA: LazyLock<Valid<apollo_compiler::Schema>> = LazyLock::new(|| {
     apollo_compiler::Schema::parse_and_validate(
@@ -30,13 +30,6 @@ pub struct MockState {
     pub repo_name: String,
     pub fail_next_request: Option<FailureKind>,
     pub merge_queue: HashSet<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GraphQlOperation {
-    Query,
-    CreatePr,
-    UpdatePr,
 }
 
 impl MockState {
@@ -186,13 +179,8 @@ pub struct GitCompletion {
 pub struct GitPush {
     pub args: Vec<String>,
     pub refspecs: Vec<String>,
+    pub delete: bool,
     pub exit_code: i32,
-}
-
-impl GitPush {
-    pub fn succeeded(&self) -> bool {
-        self.exit_code == 0
-    }
 }
 
 #[derive(Clone)]
@@ -714,20 +702,151 @@ fn record_push(app_state: &AppState, args: Vec<String>, exit_code: i32) {
     let command = parse_git_command(&args)
         .filter(|command| command.name == "push")
         .expect("record_push requires a parsed Git push");
-    let refspecs = command
-        .args
-        .iter()
-        .filter(|arg| !arg.starts_with('-'))
-        .filter(|arg| {
-            let refspec = arg.trim_start_matches('+');
-            refspec.starts_with("refs/")
-                || refspec
-                    .split_once(':')
-                    .is_some_and(|(_, destination)| destination.starts_with("refs/"))
-        })
-        .cloned()
-        .collect();
-    app_state.state.write().unwrap().pushes.push(GitPush { args, refspecs, exit_code });
+    let parsed = parse_push_arguments(command.args)
+        .unwrap_or_else(|error| panic!("failed to record Git push: {error}"));
+    let refspecs = parsed.refspecs.into_iter().map(ToString::to_string).collect();
+    let delete = parsed.delete;
+    app_state.state.write().unwrap().pushes.push(GitPush { args, refspecs, delete, exit_code });
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedPush<'a> {
+    delete: bool,
+    refspecs: Vec<&'a str>,
+}
+
+/// Classifies every `git push` argument exactly once.
+///
+/// This intentionally recognizes the documented `git push` option grammar
+/// rather than scanning arbitrary tokens for flag or ref-like text. Unknown
+/// options fail closed so a future value-taking option cannot silently turn
+/// its value into a recorded refspec.
+fn parse_push_arguments(arguments: &[String]) -> Result<ParsedPush<'_>, String> {
+    let mut delete = false;
+    let mut options = true;
+    let mut repository_from_option = false;
+    let mut positionals = Vec::new();
+    let mut remaining = arguments;
+
+    while let Some((argument, rest)) = remaining.split_first() {
+        remaining = rest;
+
+        if options && argument == "--" {
+            options = false;
+            continue;
+        }
+        if !options || !argument.starts_with('-') || argument == "-" {
+            positionals.push(argument.as_str());
+            continue;
+        }
+
+        match argument.as_str() {
+            "--delete" => delete = true,
+            "--no-delete" => delete = false,
+            "--repo" => {
+                let Some((_, rest)) = remaining.split_first() else {
+                    return Err("`--repo` is missing its value".to_string());
+                };
+                remaining = rest;
+                repository_from_option = true;
+            }
+            "--receive-pack" | "--exec" | "--recurse-submodules" | "--push-option" => {
+                let Some((_, rest)) = remaining.split_first() else {
+                    return Err(format!("`{argument}` is missing its value"));
+                };
+                remaining = rest;
+            }
+            argument if argument.starts_with("--repo=") => repository_from_option = true,
+            argument if long_push_option_is_supported(argument) => {}
+            argument if argument.starts_with("--") => {
+                return Err(format!("unsupported `git push` option `{argument}`"));
+            }
+            argument => {
+                let short_options = argument.trim_start_matches('-');
+                for (index, option) in short_options.char_indices() {
+                    match option {
+                        'd' => delete = true,
+                        'o' => {
+                            if index + option.len_utf8() == short_options.len() {
+                                let Some((_, rest)) = remaining.split_first() else {
+                                    return Err("`-o` is missing its value".to_string());
+                                };
+                                remaining = rest;
+                            }
+                            break;
+                        }
+                        'v' | 'q' | 'n' | 'f' | 'u' | '4' | '6' => {}
+                        _ => {
+                            return Err(format!("unsupported `git push` option `-{option}`"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let refspecs = if repository_from_option {
+        positionals
+    } else {
+        positionals.get(1..).unwrap_or_default().to_vec()
+    };
+    Ok(ParsedPush { delete, refspecs })
+}
+
+fn long_push_option_is_supported(argument: &str) -> bool {
+    matches!(
+        argument,
+        "--verbose"
+            | "--no-verbose"
+            | "--quiet"
+            | "--no-quiet"
+            | "--all"
+            | "--no-all"
+            | "--branches"
+            | "--no-branches"
+            | "--mirror"
+            | "--no-mirror"
+            | "--tags"
+            | "--no-tags"
+            | "--dry-run"
+            | "--no-dry-run"
+            | "--porcelain"
+            | "--no-porcelain"
+            | "--force"
+            | "--no-force"
+            | "--force-with-lease"
+            | "--no-force-with-lease"
+            | "--force-if-includes"
+            | "--no-force-if-includes"
+            | "--thin"
+            | "--no-thin"
+            | "--set-upstream"
+            | "--no-set-upstream"
+            | "--progress"
+            | "--no-progress"
+            | "--prune"
+            | "--no-prune"
+            | "--verify"
+            | "--no-verify"
+            | "--follow-tags"
+            | "--no-follow-tags"
+            | "--signed"
+            | "--no-signed"
+            | "--atomic"
+            | "--no-atomic"
+            | "--ipv4"
+            | "--ipv6"
+    ) || [
+        "--repo=",
+        "--receive-pack=",
+        "--exec=",
+        "--recurse-submodules=",
+        "--push-option=",
+        "--force-with-lease=",
+        "--signed=",
+    ]
+    .iter()
+    .any(|prefix| argument.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -820,6 +939,7 @@ mod git_tests {
             [GitPush {
                 args: invocation,
                 refspecs: vec!["+HEAD:refs/heads/main".to_string()],
+                delete: false,
                 exit_code: 0,
             }]
         );
@@ -841,8 +961,93 @@ mod git_tests {
         assert_eq!(response.exit_code, 1);
         assert_eq!(
             app_state.state.read().unwrap().pushes,
-            [GitPush { args: invocation, refspecs: Vec::new(), exit_code: 1 }]
+            [GitPush {
+                args: invocation,
+                refspecs: vec!["main".to_string()],
+                delete: false,
+                exit_code: 1,
+            }]
         );
+    }
+
+    #[tokio::test]
+    async fn records_long_and_short_delete_options() {
+        for option in ["--delete", "-d"] {
+            let app_state = app_state();
+            let invocation = args(&["git", "push", option, "origin", "refs/heads/old"]);
+
+            record_push(&app_state, invocation.clone(), 0);
+
+            assert_eq!(
+                app_state.state.read().unwrap().pushes,
+                [GitPush {
+                    args: invocation,
+                    refspecs: vec!["refs/heads/old".to_string()],
+                    delete: true,
+                    exit_code: 0,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_each_push_argument_once() {
+        let expected_refspec = "HEAD:refs/heads/main";
+        for arguments in [
+            args(&["-o", "-d", "origin", expected_refspec]),
+            args(&["-qo", "refs/heads/not-a-refspec", "origin", expected_refspec]),
+            args(&["--push-option", "refs/heads/not-a-refspec", "origin", expected_refspec]),
+            args(&["--push-option=refs/heads/not-a-refspec", "origin", expected_refspec]),
+            args(&["--receive-pack", "refs/heads/not-a-refspec", "origin", expected_refspec]),
+            args(&["--exec", "refs/heads/not-a-refspec", "origin", expected_refspec]),
+            args(&["--recurse-submodules", "refs/heads/not-a-refspec", "origin", expected_refspec]),
+            args(&["--repo", "origin", expected_refspec]),
+            args(&["--repo=origin", expected_refspec]),
+        ] {
+            assert_eq!(
+                parse_push_arguments(&arguments).unwrap(),
+                ParsedPush { delete: false, refspecs: vec![expected_refspec] },
+                "arguments: {arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn derives_effective_delete_state() {
+        for (arguments, expected_delete, expected_refspecs) in [
+            (args(&["origin", "refs/heads/old"]), false, vec!["refs/heads/old"]),
+            (args(&["--delete", "origin", "refs/heads/old"]), true, vec!["refs/heads/old"]),
+            (args(&["-qd", "origin", "refs/heads/old"]), true, vec!["refs/heads/old"]),
+            (args(&["-dq", "origin", "refs/heads/old"]), true, vec!["refs/heads/old"]),
+            (args(&["--delete", "--no-delete", "origin"]), false, vec![]),
+            (args(&["--no-delete", "-qd", "origin"]), true, vec![]),
+            (args(&["-qd", "--no-delete", "origin"]), false, vec![]),
+            (args(&["-odelete", "origin", "refs/heads/old"]), false, vec!["refs/heads/old"]),
+            (args(&["-o", "-d", "origin", "refs/heads/old"]), false, vec!["refs/heads/old"]),
+            (args(&["-qo", "-d", "origin", "refs/heads/old"]), false, vec!["refs/heads/old"]),
+            (args(&["-do", "value", "origin", "refs/heads/old"]), true, vec!["refs/heads/old"]),
+            (args(&["--push-option", "--delete", "origin"]), false, vec![]),
+            (args(&["--", "--delete", "refs/heads/old"]), false, vec!["refs/heads/old"]),
+        ] {
+            assert_eq!(
+                parse_push_arguments(&arguments).unwrap(),
+                ParsedPush { delete: expected_delete, refspecs: expected_refspecs },
+                "arguments: {arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_argument_parsing_fails_closed() {
+        for arguments in [
+            args(&["--future-value-option", "refs/heads/not-a-refspec", "origin"]),
+            args(&["-x", "origin"]),
+            args(&["-o"]),
+            args(&["--push-option"]),
+            args(&["--repo"]),
+        ] {
+            assert!(parse_push_arguments(&arguments).is_err(), "arguments: {arguments:?}");
+        }
     }
 }
 
