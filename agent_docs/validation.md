@@ -31,8 +31,10 @@ this setting on sensitive repositories or with real credentials.
 
 ## Testing Strategy
 
-- **Unit Tests:** Place unit tests in a `mod tests` module within the source
-  file they test.
+See [testing.md](./testing.md) for the product-risk model, test layers, snapshot
+policy, and performance goals. Place pure tests next to the source they test
+when that keeps the behavior easy to discover. Use an integration target for
+adapter contracts and complete process-boundary scenarios.
 
 ### Updating Snapshots
 
