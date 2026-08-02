@@ -457,7 +457,8 @@ pub enum GraphQlOperation {
     UpdatePr,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PullRequestState {
     Open,
     Closed,
@@ -492,7 +493,7 @@ pub struct PullRequestSeed {
     pub base: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PullRequestSnapshot {
     pub number: usize,
     pub node_id: String,
@@ -781,6 +782,14 @@ impl TestContext {
         })
     }
 
+    pub fn successful_ref_updates(&self) -> Vec<RefUpdate> {
+        self.recorded_pushes()
+            .into_iter()
+            .filter(PushRecord::succeeded)
+            .flat_map(|push| push.ref_updates)
+            .collect()
+    }
+
     pub fn formatted_github_state(&self) -> String {
         let state = self.github().pull_requests();
         let json = serde_json::to_string_pretty(&state).expect("Failed to serialize PRs");
@@ -930,11 +939,13 @@ fn normalize_windows_stderr(stderr: &str) -> String {
         .expect("Invalid regex")
     });
     static MISSING_TMP_WARNING_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?m)^bash\.exe: warning: could not find /tmp, please create!(?:\r?\n|$)")
-            .expect("Invalid regex")
+        Regex::new(
+            r"(?m)(?P<prefix>^| Stderr: )bash\.exe: warning: could not find /tmp, please create!(?:\r?\n|$)",
+        )
+        .expect("Invalid regex")
     });
 
-    let stderr = MISSING_TMP_WARNING_REGEX.replace_all(stderr, "");
+    let stderr = MISSING_TMP_WARNING_REGEX.replace_all(stderr, "${prefix}");
     let stderr = CLAP_USAGE_REGEX.replace_all(&stderr, "Usage: gherrit${suffix}");
     COMMAND_STATUS_REGEX.replace_all(&stderr, "${prefix}exit status: ").into_owned()
 }
@@ -1108,7 +1119,7 @@ macro_rules! assert_failure_snapshot {
 #[macro_export]
 macro_rules! assert_pr_snapshot {
     ($ctx:expr, $name:expr $(,)?) => {
-        insta::assert_snapshot!($name, $ctx.formatted_mock_pr_state());
+        insta::assert_snapshot!($name, $ctx.formatted_github_state());
     };
 }
 
@@ -1224,6 +1235,8 @@ mod tests {
             "Usage: gherrit.exe manage\r\n",
             "[gherrit] [WARN] Failed: Command \"git\" failed with status: exit code: 128\r\n",
             "bash.exe: warning: could not find /tmp, please create!\r\n",
+            "[gherrit] [WARN] Nested command failed. Stderr: bash.exe: warning: could not find /tmp, please create!\r\n",
+            "fatal: repository missing\r\n",
             "payload: Usage: gherrit.exe manage\r\n",
             "payload: Command failed with status: exit code: 2\r\n",
             "payload: bash.exe: warning: could not find /tmp, please create!\r\n",
@@ -1235,6 +1248,7 @@ mod tests {
             concat!(
                 "Usage: gherrit manage\r\n",
                 "[gherrit] [WARN] Failed: Command \"git\" failed with status: exit status: 128\r\n",
+                "[gherrit] [WARN] Nested command failed. Stderr: fatal: repository missing\r\n",
                 "payload: Usage: gherrit.exe manage\r\n",
                 "payload: Command failed with status: exit code: 2\r\n",
                 "payload: bash.exe: warning: could not find /tmp, please create!\r\n",
