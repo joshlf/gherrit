@@ -7,7 +7,7 @@ use owo_colors::OwoColorize;
 
 use crate::{
     re,
-    util::{self, CommandExt as _, HeadState},
+    util::{self, HeadState},
 };
 
 mod autosquash;
@@ -16,6 +16,7 @@ mod body;
 mod github;
 mod publication;
 mod reconcile;
+mod remote;
 
 use batching::{
     BatchPlan, INITIAL_GRAPHQL_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
@@ -27,11 +28,12 @@ use github::{
     PullRequest as PrState, RepositoryIdQuery, UpdatePullRequest, batch_document,
     decode_batch_response,
 };
-use publication::{PushTarget, plan_push, push_batches, remote_query_batches};
+use publication::{PushTarget, plan_push, push_batches};
 use reconcile::{
     CurrentPr, DesiredPr, PrUpdate, PullRequestState, ensure_pull_requests_open, link_stack,
     plan_update,
 };
+use remote::observe_managed_branches;
 
 pub(crate) enum GithubEndpoint {
     Production,
@@ -153,10 +155,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
 
     // Fetch remote branch states to ensure we don't act on stale information.
-    let remote_branch_states = get_remote_branch_states(repo, &gherrit_ids).unwrap_or_else(|e| {
-        log::warn!("Failed to fetch remote branch states: {}", e);
-        HashMap::new()
-    });
+    let remote_branch_states = observe_managed_branches(repo, &gherrit_ids)?;
 
     let mut next_versions = HashMap::new();
 
@@ -173,10 +172,8 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
             // Lease the branch to ensure it hasn't changed since our fetch.
             // If we know the remote SHA, we expect it. If we don't (None), we
             // expect "" (creation).
-            let expected_sha = remote_branch_states
-                .get(&c.gherrit_id)
-                .map(|s| s.as_deref().unwrap_or(""))
-                .unwrap_or("");
+            let expected_sha =
+                remote_branch_states.get(&c.gherrit_id).map(String::as_str).unwrap_or("");
 
             targets.push(PushTarget {
                 object_id: c.id,
@@ -250,39 +247,6 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
     }
 
     Ok(next_versions)
-}
-
-#[allow(clippy::type_complexity)]
-fn get_remote_branch_states(
-    repo: &util::Repo,
-    gherrit_ids: &[String],
-) -> Result<HashMap<String, Option<String>>> {
-    let mut states: HashMap<String, Option<String>> = HashMap::new();
-    for chunk in remote_query_batches(gherrit_ids) {
-        let mut args = vec!["ls-remote".to_string(), repo.default_remote_name()];
-        args.extend(chunk.iter().map(|id| format!("refs/heads/{id}")));
-
-        let output = util::cmd("git", args).checked_output()?;
-        let output = core::str::from_utf8(&output.stdout)?;
-
-        for line in output.lines() {
-            // Output format: "<SHA>\t<refname>"
-            let Some((sha, ref_name)) = line.split_once('\t') else {
-                continue;
-            };
-
-            // Match heads: refs/heads/<id>
-            let head_re = re!(r"refs/heads/([a-zA-Z0-9]+)$");
-            if let Some(caps) = head_re.captures(ref_name)
-                && let Some(id_match) = caps.get(1)
-            {
-                let id = id_match.as_str().to_string();
-                states.insert(id, Some(sha.to_string()));
-            }
-        }
-    }
-
-    Ok(states)
 }
 
 fn get_local_version(repo: &util::Repo, gherrit_id: &str) -> Result<usize> {
