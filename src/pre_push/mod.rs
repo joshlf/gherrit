@@ -33,7 +33,37 @@ use github::{
 use publication::{PushTarget, plan_push, push_batches, remote_query_batches};
 use reconcile::{CurrentPr, DesiredPr, PrUpdate, link_stack, plan_update};
 
-pub async fn run(repo: &util::Repo, github_api_url: Option<&str>) -> Result<()> {
+#[derive(Eq, PartialEq)]
+pub(crate) enum GithubEndpoint {
+    Production,
+    #[cfg(feature = "test-driver")]
+    Custom(String),
+    #[cfg(feature = "test-driver")]
+    Disabled,
+}
+
+impl GithubEndpoint {
+    fn is_disabled(&self) -> bool {
+        #[cfg(feature = "test-driver")]
+        {
+            *self == Self::Disabled
+        }
+        #[cfg(not(feature = "test-driver"))]
+        {
+            false
+        }
+    }
+
+    fn custom_url(&self) -> Option<&str> {
+        #[cfg(feature = "test-driver")]
+        if let Self::Custom(url) = self {
+            return Some(url);
+        }
+        None
+    }
+}
+
+pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<()> {
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) | HeadState::Pending(bn) => bn,
@@ -57,13 +87,17 @@ pub async fn run(repo: &util::Repo, github_api_url: Option<&str>) -> Result<()> 
         return Ok(());
     }
 
+    if github_endpoint.is_disabled() {
+        bail!("The GHerrit test driver cannot sync PRs without a configured GitHub endpoint");
+    }
+
     let token = util::get_github_token()?;
     let mut builder = Octocrab::builder().personal_token(token);
 
     // A custom endpoint is an explicit dependency supplied by the caller. The
-    // production binary always passes `None`, so an environment variable
-    // cannot redirect a user's token.
-    if let Some(api_url) = github_api_url {
+    // production binary always selects `Production`, so an environment
+    // variable cannot redirect a user's token.
+    if let Some(api_url) = github_endpoint.custom_url() {
         log::warn!("Using custom GitHub API URL: {}", api_url);
         builder = builder.base_uri(api_url)?;
     }
