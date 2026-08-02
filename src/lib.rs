@@ -10,18 +10,23 @@ use manage::State;
 pub(crate) use util::{cmd_macro as cmd, re_macro as re};
 
 pub struct Runtime {
-    github_api_url: Option<String>,
+    github_endpoint: pre_push::GithubEndpoint,
+    id_entropy: fn() -> commit_msg::IdEntropy,
 }
 
 impl Runtime {
     pub fn production() -> Self {
-        Self { github_api_url: None }
+        Self { github_endpoint: pre_push::GithubEndpoint::Production, id_entropy: rand::random }
     }
 
-    #[cfg(gherrit_test)]
+    #[cfg(feature = "test-driver")]
     #[doc(hidden)]
-    pub fn test() -> Self {
-        Self { github_api_url: std::env::var("GHERRIT_GITHUB_API_URL").ok() }
+    pub fn test(github_api_url: Option<String>) -> Self {
+        Self {
+            github_endpoint: github_api_url
+                .map_or(pre_push::GithubEndpoint::Disabled, pre_push::GithubEndpoint::Custom),
+            id_entropy: || [0; commit_msg::ID_ENTROPY_BYTES],
+        }
     }
 }
 
@@ -100,12 +105,12 @@ pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
     match cli.command {
         Commands::Hook(cmd) => match cmd {
             HookCommands::PrePush { .. } => {
-                pre_push::run(&repo, runtime.github_api_url.as_deref()).await?;
+                pre_push::run(&repo, &runtime.github_endpoint).await?;
             }
             HookCommands::PostCheckout { prev, new, flag } => {
                 manage::post_checkout(&repo, &prev, &new, &flag)?
             }
-            HookCommands::CommitMsg { file } => commit_msg::run(&repo, &file)?,
+            HookCommands::CommitMsg { file } => commit_msg::run(&repo, &file, runtime.id_entropy)?,
         },
         Commands::Manage { force, public, private } => {
             let target_state = if public {
