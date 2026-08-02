@@ -18,10 +18,20 @@ use crate::manage::State;
 /// # Example
 ///
 /// ```rust
+/// use gherrit::cmd;
+///
+/// let branch_name = "feature";
+/// let state = true;
 /// // - "git" is the command; "config" is an argument.
 /// // - "branch.{branch_name}.gherritManaged" is a single argument (even if it contains spaces when formatted).
 /// // - `state` is a single argument (even if it contains spaces when formatted).
-/// cmd!("git config", "branch.{branch_name}.gherritManaged", state)
+/// let command = cmd!("git config", "branch.{branch_name}.gherritManaged", state);
+///
+/// assert_eq!(command.get_program(), "git");
+/// assert_eq!(
+///     command.get_args().collect::<Vec<_>>(),
+///     ["config", "branch.feature.gherritManaged", "true"],
+/// );
 /// ```
 #[macro_export]
 macro_rules! cmd {
@@ -37,26 +47,21 @@ macro_rules! cmd {
 
         #[allow(unused_mut)]
         let mut args: Vec<String> = pre_args.iter().map(|s| s.to_string()).collect();
-        cmd!(@inner args $(, $($rest)*)?);
+        $crate::cmd!(@inner args $(, $($rest)*)?);
 
-        log::debug!("exec: {} {}", bin, args.iter().map(|s| if s.contains(" ") {
-            format!("'{}'", s)
-        } else {
-            s.clone()
-        }).collect::<Vec<_>>().join(" "));
-        $crate::util::cmd(bin, &args)
+        $crate::__cmd(bin, &args)
     }};
 
     // String literal (treated as a format string, but not broken apart).
     (@inner $vec:ident, $l:literal $(, $($rest:tt)*)?) => {
         $vec.push(format!($l));
-        cmd!(@inner $vec $(, $($rest)*)?);
+        $crate::cmd!(@inner $vec $(, $($rest)*)?);
     };
 
     // Expression (not broken apart).
     (@inner $vec:ident, $e:expr $(, $($rest:tt)*)?) => {
         $vec.push($e.to_string());
-        cmd!(@inner $vec $(, $($rest)*)?);
+        $crate::cmd!(@inner $vec $(, $($rest)*)?);
     };
 
     (@inner $vec:ident $(,)?) => {};
@@ -81,6 +86,15 @@ macro_rules! re {
 pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Command {
     let mut c = Command::new(name);
     c.args(args);
+    let arguments = c
+        .get_args()
+        .map(|argument| {
+            let argument = argument.to_string_lossy();
+            if argument.contains(' ') { format!("'{argument}'") } else { argument.into_owned() }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    log::debug!("exec: {name} {arguments}");
     c
 }
 

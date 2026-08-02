@@ -7,6 +7,8 @@ mod util;
 use clap::{Parser, Subcommand};
 use eyre::{Result, WrapErr};
 use manage::State;
+#[doc(hidden)]
+pub use util::cmd as __cmd;
 
 pub struct Runtime {
     github_endpoint: pre_push::GithubEndpoint,
