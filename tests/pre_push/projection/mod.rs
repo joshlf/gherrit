@@ -5,25 +5,24 @@ fn assert_valid_gherrit_metadata(ctx: &testutil::TestContext) {
     const PREFIX: &str = "<!-- gherrit-meta: ";
     const SUFFIX: &str = " -->";
 
-    ctx.inspect_mock_state(|state| {
-        state.prs.iter().enumerate().for_each(|(index, pr)| {
-            let body = pr.body.as_deref().expect("PR body");
-            let (_, metadata) = body.rsplit_once(PREFIX).expect("GHerrit metadata marker");
-            let metadata = metadata.strip_suffix(SUFFIX).expect("metadata must end the PR body");
-            let metadata: serde_json::Value =
-                serde_json::from_str(metadata).expect("GHerrit metadata must be valid JSON");
-            let parent = index.checked_sub(1).map(|index| &state.prs[index].head.ref_field);
-            let child = state.prs.get(index + 1).map(|pr| &pr.head.ref_field);
+    let prs = ctx.github().pull_requests();
+    prs.iter().enumerate().for_each(|(index, pr)| {
+        let body = pr.body.as_deref().expect("PR body");
+        let (_, metadata) = body.rsplit_once(PREFIX).expect("GHerrit metadata marker");
+        let metadata = metadata.strip_suffix(SUFFIX).expect("metadata must end the PR body");
+        let metadata: serde_json::Value =
+            serde_json::from_str(metadata).expect("GHerrit metadata must be valid JSON");
+        let parent = index.checked_sub(1).map(|index| &prs[index].head);
+        let child = prs.get(index + 1).map(|pr| &pr.head);
 
-            assert_eq!(
-                metadata,
-                serde_json::json!({
-                    "id": &pr.head.ref_field,
-                    "parent": parent,
-                    "child": child,
-                })
-            );
-        });
+        assert_eq!(
+            metadata,
+            serde_json::json!({
+                "id": &pr.head,
+                "parent": parent,
+                "child": child,
+            })
+        );
     });
 }
 
