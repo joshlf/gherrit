@@ -27,7 +27,7 @@ use batching::{
 use publication::{PushTarget, plan_push, push_batches, remote_query_batches};
 use reconcile::{CurrentPr, DesiredPr, PrUpdate, link_stack, plan_update};
 
-pub async fn run(repo: &util::Repo) -> Result<()> {
+pub async fn run(repo: &util::Repo, github_api_url: Option<&str>) -> Result<()> {
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) | HeadState::Pending(bn) => bn,
@@ -54,12 +54,10 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     let token = util::get_github_token()?;
     let mut builder = Octocrab::builder().personal_token(token);
 
-    // NOTE: It would be very dangerous to support this in production, as an
-    // attacker could use it to steal a user's GitHub API token. Thus, we only
-    // support it in testing.
-    if util::__TESTING
-        && let Ok(api_url) = std::env::var("GHERRIT_GITHUB_API_URL")
-    {
+    // A custom endpoint is an explicit dependency supplied by the caller. The
+    // production binary always passes `None`, so an environment variable
+    // cannot redirect a user's token.
+    if let Some(api_url) = github_api_url {
         log::warn!("Using custom GitHub API URL: {}", api_url);
         builder = builder.base_uri(api_url)?;
     }
