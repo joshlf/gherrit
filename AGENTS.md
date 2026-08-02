@@ -35,7 +35,9 @@ It achieves this by:
 
 - `src/`: Core CLI source code.
     - `main.rs`: Production executable composition root.
-    - `process.rs`: Standalone process setup and CLI lifecycle.
+    - `test_driver_main.rs`: Feature-gated system-test composition root.
+    - `process.rs`: Process setup shared by the two executable targets.
+    - `test_git.rs`: Git interceptor compiled only into the test driver.
     - `lib.rs`: Fallible asynchronous command dispatch and runtime inputs.
     - `pre_push/mod.rs`: **CORE LOGIC**. Handles commit analysis, ref creation,
       pushing, and PR syncing.
