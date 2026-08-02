@@ -4,15 +4,11 @@ use predicates::prelude::*;
 
 #[test]
 fn test_pre_push_failure() {
-    let ctx = testutil::test_context!()
-        .repository("missing", "repo")
-        .with_installed_hooks()
-        .with_mock_github()
-        .build();
+    let ctx = testutil::test_context!().repository("missing", "repo").with_mock_github().build();
     ctx.commit("Init");
 
-    ctx.checkout_new("feature-fail");
-    ctx.commit("Work to push");
+    ctx.checkout_managed_private("feature-fail");
+    ctx.commit_with_gherrit_id("Work to push");
 
     // Configure an invalid remote to trigger `git push` failure
     ctx.run_git(&["remote", "add", "broken-remote", "missing/repo.git"]);
@@ -27,16 +23,12 @@ fn test_pre_push_failure() {
 
 #[test]
 fn test_pre_push_edit_failure() {
-    let ctx = testutil::test_context!()
-        .with_remote()
-        .with_installed_hooks()
-        .with_initial_commit()
-        .with_mock_github()
-        .build();
+    let ctx =
+        testutil::test_context!().with_remote().with_initial_commit().with_mock_github().build();
 
     // Setup: Create PR first
-    ctx.checkout_new("feature-edit-fail");
-    ctx.commit("Initial Work");
+    ctx.checkout_managed_private("feature-edit-fail");
+    ctx.commit_with_gherrit_id("Initial Work");
     // Initial push creates PR
     ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
 
@@ -67,14 +59,13 @@ fn test_pre_push_edit_failure() {
 fn test_pre_push_ls_remote_failure() {
     let ctx = testutil::test_context!()
         .with_remote()
-        .with_installed_hooks()
         .with_initial_commit()
         .with_mock_github()
         .with_git_interceptor()
         .build();
     // Manage branch
-    ctx.checkout_new("feature-ls-remote-fail");
-    ctx.commit("Work");
+    ctx.checkout_managed_private("feature-ls-remote-fail");
+    ctx.commit_with_gherrit_id("Work");
 
     // Hook should succeed but warn about ls-remote failure
     ctx.gherrit_cmd()
@@ -89,13 +80,12 @@ fn test_pre_push_ls_remote_failure() {
 fn test_pre_push_pr_list_failure() {
     let ctx = testutil::test_context!()
         .with_remote()
-        .with_installed_hooks()
         .with_initial_commit()
         .with_mock_github()
         .with_git_interceptor()
         .build();
-    ctx.checkout_new("feature-pr-list-fail");
-    ctx.commit("Work");
+    ctx.checkout_managed_private("feature-pr-list-fail");
+    ctx.commit_with_gherrit_id("Work");
 
     // Trigger hook
     ctx.inject_failure(testutil::FailureKind::GraphQl);
@@ -115,13 +105,12 @@ fn test_pre_push_pr_list_failure() {
 fn test_pre_push_pr_create_failure() {
     let ctx = testutil::test_context!()
         .with_remote()
-        .with_installed_hooks()
         .with_initial_commit()
         .with_mock_github()
         .with_git_interceptor()
         .build();
-    ctx.checkout_new("feature-pr-create-fail");
-    ctx.commit("Work");
+    ctx.checkout_managed_private("feature-pr-create-fail");
+    ctx.commit_with_gherrit_id("Work");
 
     // Trigger hook
     ctx.inject_failure(testutil::FailureKind::CreatePr);
