@@ -68,7 +68,7 @@ fn test_stack_id_comes_only_from_the_trailer_block() {
     assert_eq!(ctx.remote_ref_oid("refs/heads/Greal").as_deref(), Some(ctx.head_oid().as_str()));
     let pull_requests = ctx.github().pull_requests();
     assert_eq!(pull_requests.len(), 1);
-    let body = pull_requests[0].body.as_deref().expect("created PR body");
+    let body = &pull_requests[0].body;
     assert!(body.contains("gherrit-pr-id: Gexample"));
     assert!(!body.contains("\ngherrit-pr-id: Greal\n"));
 }

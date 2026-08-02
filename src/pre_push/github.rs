@@ -10,19 +10,10 @@ const MAX_PULL_REQUEST_CANDIDATES: usize = 100;
 pub(super) struct PullRequest {
     pub(super) number: u64,
     pub(super) node_id: String,
-    pub(super) title: Option<String>,
-    pub(super) body: Option<String>,
+    pub(super) title: String,
+    pub(super) body: String,
     pub(super) base_branch: String,
-    pub(super) head_branch: String,
     pub(super) state: PullRequestState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct CreatedPullRequest {
-    pub(super) head_branch: String,
-    pub(super) number: u64,
-    pub(super) url: String,
-    pub(super) node_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,8 +187,8 @@ impl BatchedOperation for FindPullRequest {
         struct Node {
             number: u64,
             id: String,
-            title: Option<String>,
-            body: Option<String>,
+            title: String,
+            body: String,
             base_ref_name: String,
             state: PullRequestState,
             is_cross_repository: bool,
@@ -244,7 +235,6 @@ impl BatchedOperation for FindPullRequest {
             title: node.title,
             body: node.body,
             base_branch: node.base_ref_name,
-            head_branch: self.head_branch.clone(),
             state: node.state,
         }))
     }
@@ -273,7 +263,7 @@ impl CreatePullRequest {
 }
 
 impl BatchedOperation for CreatePullRequest {
-    type Output = CreatedPullRequest;
+    type Output = PullRequest;
 
     const TYPE: OperationType = OperationType::Mutation;
 
@@ -287,7 +277,9 @@ impl BatchedOperation for CreatePullRequest {
         ]
         .map(|(name, value)| format!("{name}: {}", json!(value)))
         .join(", ");
-        format!("createPullRequest(input: {{ {fields} }}) {{ pullRequest {{ number, url, id }} }}")
+        format!(
+            "createPullRequest(input: {{ {fields} }}) {{ pullRequest {{ number, id, title, body, baseRefName, state }} }}"
+        )
     }
 
     fn decode(&self, response: Value) -> Result<Self::Output> {
@@ -298,10 +290,14 @@ impl BatchedOperation for CreatePullRequest {
         }
 
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct CreatedPullRequestResponse {
             number: u64,
-            url: String,
             id: String,
+            title: String,
+            body: String,
+            base_ref_name: String,
+            state: PullRequestState,
         }
 
         let response: Response = serde_json::from_value(response)
@@ -313,11 +309,13 @@ impl BatchedOperation for CreatePullRequest {
             )
         })?;
 
-        Ok(CreatedPullRequest {
-            head_branch: self.head_branch.clone(),
+        Ok(PullRequest {
             number: created.number,
-            url: created.url,
             node_id: created.id,
+            title: created.title,
+            body: created.body,
+            base_branch: created.base_ref_name,
+            state: created.state,
         })
     }
 }
@@ -378,7 +376,7 @@ mod tests {
             "number": number,
             "id": format!("PR_{number}"),
             "title": "Title",
-            "body": null,
+            "body": "Body",
             "baseRefName": "main",
             "state": state,
             "isCrossRepository": is_cross_repository,
@@ -442,7 +440,7 @@ mod tests {
 
         assert_eq!(
             create.document(),
-            r#"createPullRequest(input: { repositoryId: "repo\"id", baseRefName: "base\nbranch", headRefName: "head\\branch", title: "A \"title\"", body: "line one\nline two" }) { pullRequest { number, url, id } }"#
+            r#"createPullRequest(input: { repositoryId: "repo\"id", baseRefName: "base\nbranch", headRefName: "head\\branch", title: "A \"title\"", body: "line one\nline two" }) { pullRequest { number, id, title, body, baseRefName, state } }"#
         );
     }
 
@@ -503,10 +501,9 @@ mod tests {
             Some(PullRequest {
                 number: 42,
                 node_id: "PR_42".to_string(),
-                title: Some("Title".to_string()),
-                body: None,
+                title: "Title".to_string(),
+                body: "Body".to_string(),
                 base_branch: "main".to_string(),
-                head_branch: "G123".to_string(),
                 state: PullRequestState::Open,
             })
         );
@@ -691,6 +688,8 @@ mod tests {
                     vec![json!({
                         "number": 42,
                         "id": "PR_42",
+                        "title": "Title",
+                        "body": "Body",
                         "state": "OPEN",
                         "isCrossRepository": false,
                     })],
@@ -746,16 +745,21 @@ mod tests {
                 .decode(json!({
                     "pullRequest": {
                         "number": 42,
-                        "url": "https://github.test/pull/42",
-                        "id": "PR_42"
+                        "id": "PR_42",
+                        "title": "Title",
+                        "body": "Body",
+                        "baseRefName": "main",
+                        "state": "OPEN"
                     }
                 }))
                 .unwrap(),
-            CreatedPullRequest {
-                head_branch: "G123".to_string(),
+            PullRequest {
                 number: 42,
-                url: "https://github.test/pull/42".to_string(),
                 node_id: "PR_42".to_string(),
+                title: "Title".to_string(),
+                body: "Body".to_string(),
+                base_branch: "main".to_string(),
+                state: PullRequestState::Open,
             }
         );
     }

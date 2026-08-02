@@ -503,8 +503,8 @@ pub struct PullRequestSnapshot {
     pub number: usize,
     pub node_id: String,
     pub state: PullRequestState,
-    pub title: Option<String>,
-    pub body: Option<String>,
+    pub title: String,
+    pub body: String,
     pub head: String,
     pub base: String,
 }
