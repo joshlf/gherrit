@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+use super::body::PrBody;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(super) enum PullRequestState {
@@ -100,24 +102,74 @@ pub(super) fn link_stack<T>(
     .collect()
 }
 
-/// Metadata currently stored on a PR.
-pub(super) struct CurrentPr<'a> {
-    pub(super) node_id: &'a str,
-    pub(super) title: Option<&'a str>,
-    pub(super) body: Option<&'a str>,
+/// Local commit state needed to project one pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProjectionCommit {
+    pub(super) gherrit_id: String,
+    pub(super) title: String,
+    pub(super) commit_body: String,
+    pub(super) latest_version: usize,
+}
+
+/// GitHub state observed for one pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ObservedPr {
+    pub(super) number: u64,
+    pub(super) node_id: String,
+    pub(super) title: Option<String>,
+    pub(super) body: Option<String>,
+    pub(super) base_branch: String,
+    pub(super) head_branch: String,
+}
+
+/// Transport-independent request to create one pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CreatePr {
+    pub(super) title: String,
+    pub(super) body: String,
+    pub(super) base_branch: String,
+    pub(super) head_branch: String,
+}
+
+/// Context shared by every pull request in a projected stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProjectionContext<'a> {
     pub(super) base_branch: &'a str,
+    pub(super) repo_url: &'a str,
+    pub(super) public_branch: Option<&'a str>,
+}
+
+/// The next semantic stage required to project a stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ProjectionPlan {
+    /// Missing pull requests must be created before their assigned numbers can
+    /// be included in the final stack bodies.
+    Create(Vec<CreatePr>),
+    /// Existing pull requests need these minimal metadata patches.
+    Update(Vec<UpdatePr>),
+    /// Every pull request already matches the desired projection.
+    Done,
+}
+
+/// Metadata currently stored on a PR.
+struct CurrentPr<'a> {
+    node_id: &'a str,
+    title: Option<&'a str>,
+    body: Option<&'a str>,
+    base_branch: &'a str,
 }
 
 /// Metadata derived from a local commit and its stack position.
-pub(super) struct DesiredPr<'a> {
-    pub(super) title: &'a str,
-    pub(super) body: &'a str,
-    pub(super) base_branch: &'a str,
+struct DesiredPr<'a> {
+    title: &'a str,
+    body: &'a str,
+    base_branch: &'a str,
 }
 
-/// The fields that must be changed to reconcile a PR.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct PrUpdate {
+/// Transport-independent minimal patch for one pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct UpdatePr {
+    pub(super) number: u64,
     /// The global node ID of the PR to update.
     pub(super) node_id: String,
     pub(super) title: Option<String>,
@@ -128,7 +180,7 @@ pub(super) struct PrUpdate {
 }
 
 /// Returns the minimal update needed to make `current` match `desired`.
-pub(super) fn plan_update(current: CurrentPr<'_>, desired: DesiredPr<'_>) -> Option<PrUpdate> {
+fn plan_update(number: u64, current: CurrentPr<'_>, desired: DesiredPr<'_>) -> Option<UpdatePr> {
     let title = (current.title != Some(desired.title)).then(|| desired.title.to_string());
     let body = current
         .body
@@ -137,12 +189,90 @@ pub(super) fn plan_update(current: CurrentPr<'_>, desired: DesiredPr<'_>) -> Opt
     let base_branch =
         (current.base_branch != desired.base_branch).then(|| desired.base_branch.to_string());
 
-    (title.is_some() || body.is_some() || base_branch.is_some()).then(|| PrUpdate {
+    (title.is_some() || body.is_some() || base_branch.is_some()).then(|| UpdatePr {
+        number,
         node_id: current.node_id.to_string(),
         title,
         body,
         base_branch,
     })
+}
+
+/// Derives the next projection stage from local intent and observed PR state.
+///
+/// The returned vectors are ordered independent actions, not transport
+/// batches. The caller may commit any prefix, but must reobserve and plan again
+/// after interruption. Assigned numbers from `Create` must be observed before
+/// updates can be derived.
+pub(super) fn plan_projection(
+    context: ProjectionContext<'_>,
+    commits: &[ProjectionCommit],
+    pull_requests: &[ObservedPr],
+) -> ProjectionPlan {
+    let entries = link_stack(context.base_branch, commits, |commit| commit.gherrit_id.clone());
+    let matched = entries
+        .iter()
+        .map(|entry| {
+            let pull_request =
+                pull_requests.iter().find(|pr| pr.head_branch == entry.item.gherrit_id);
+            (entry, pull_request)
+        })
+        .collect::<Vec<_>>();
+
+    let creations = matched
+        .iter()
+        .filter(|(_, pull_request)| pull_request.is_none())
+        .map(|(entry, _)| CreatePr {
+            title: entry.item.title.clone(),
+            body: entry.item.commit_body.clone(),
+            base_branch: entry.base_branch.clone(),
+            head_branch: entry.item.gherrit_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    if !creations.is_empty() {
+        return ProjectionPlan::Create(creations);
+    }
+
+    let stack_pr_numbers = matched
+        .iter()
+        .map(|(_, pull_request)| {
+            pull_request.expect("missing pull request would have required creation").number
+        })
+        .collect::<Vec<_>>();
+    let updates = matched
+        .into_iter()
+        .filter_map(|(entry, pull_request)| {
+            let pull_request =
+                pull_request.expect("missing pull request would have required creation");
+            let commit = entry.item;
+            let body = PrBody {
+                commit_body: &commit.commit_body,
+                repo_url: context.repo_url,
+                public_branch: context.public_branch,
+                stack_pr_numbers: &stack_pr_numbers,
+                current_pr_number: pull_request.number,
+                latest_version: commit.latest_version,
+                base_branch: &entry.base_branch,
+                gherrit_id: &commit.gherrit_id,
+                parent_id: entry.parent_id.as_deref(),
+                child_id: entry.child_id.as_deref(),
+            }
+            .render();
+
+            plan_update(
+                pull_request.number,
+                CurrentPr {
+                    node_id: &pull_request.node_id,
+                    title: pull_request.title.as_deref(),
+                    body: pull_request.body.as_deref(),
+                    base_branch: &pull_request.base_branch,
+                },
+                DesiredPr { title: &commit.title, body: &body, base_branch: &entry.base_branch },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if updates.is_empty() { ProjectionPlan::Done } else { ProjectionPlan::Update(updates) }
 }
 
 fn normalize_body(body: &str) -> String {
@@ -319,6 +449,318 @@ mod tests {
         assert_eq!(calls, 3);
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ProjectionCase {
+        Absent,
+        Converged,
+        Drifted,
+    }
+
+    const PROJECTION_CASES: [ProjectionCase; 3] =
+        [ProjectionCase::Absent, ProjectionCase::Converged, ProjectionCase::Drifted];
+
+    fn projection_context() -> ProjectionContext<'static> {
+        ProjectionContext { base_branch: "main", repo_url: "/owner/repo", public_branch: None }
+    }
+
+    fn projection_commits() -> Vec<ProjectionCommit> {
+        ["A", "B"]
+            .into_iter()
+            .map(|id| ProjectionCommit {
+                gherrit_id: id.to_string(),
+                title: format!("Title {id}"),
+                commit_body: format!("Body {id}\n\ngherrit-pr-id: {id}"),
+                latest_version: 1,
+            })
+            .collect()
+    }
+
+    fn assigned_number(commits: &[ProjectionCommit], head_branch: &str) -> u64 {
+        let index = commits
+            .iter()
+            .position(|commit| commit.gherrit_id == head_branch)
+            .expect("created PR must identify a projected commit");
+        u64::try_from(index + 1).unwrap() * 11
+    }
+
+    fn desired_pr(commits: &[ProjectionCommit], index: usize) -> ObservedPr {
+        let commit = &commits[index];
+        let parent_id = (index == 1).then_some("A");
+        let child_id = (index == 0).then_some("B");
+        let base_branch = parent_id.unwrap_or("main");
+        let number = assigned_number(commits, &commit.gherrit_id);
+        let stack_pr_numbers = commits
+            .iter()
+            .map(|commit| assigned_number(commits, &commit.gherrit_id))
+            .collect::<Vec<_>>();
+        let body = PrBody {
+            commit_body: &commit.commit_body,
+            repo_url: projection_context().repo_url,
+            public_branch: None,
+            stack_pr_numbers: &stack_pr_numbers,
+            current_pr_number: number,
+            latest_version: commit.latest_version,
+            base_branch,
+            gherrit_id: &commit.gherrit_id,
+            parent_id,
+            child_id,
+        }
+        .render();
+
+        ObservedPr {
+            number,
+            node_id: format!("PR_{number}"),
+            title: Some(commit.title.clone()),
+            body: Some(body),
+            base_branch: base_branch.to_string(),
+            head_branch: commit.gherrit_id.clone(),
+        }
+    }
+
+    fn observed_world(commits: &[ProjectionCommit], cases: [ProjectionCase; 2]) -> Vec<ObservedPr> {
+        cases
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, case)| match case {
+                ProjectionCase::Absent => None,
+                ProjectionCase::Converged => Some(desired_pr(commits, index)),
+                ProjectionCase::Drifted => {
+                    let mut pull_request = desired_pr(commits, index);
+                    pull_request.title = Some(format!("Stale {index}"));
+                    Some(pull_request)
+                }
+            })
+            .collect()
+    }
+
+    fn apply_creations(
+        commits: &[ProjectionCommit],
+        pull_requests: &mut Vec<ObservedPr>,
+        creations: &[CreatePr],
+    ) {
+        creations.iter().for_each(|create| {
+            assert!(
+                pull_requests.iter().all(|pr| pr.head_branch != create.head_branch),
+                "planner emitted a duplicate creation for {}",
+                create.head_branch
+            );
+            let number = assigned_number(commits, &create.head_branch);
+            pull_requests.push(ObservedPr {
+                number,
+                node_id: format!("PR_{number}"),
+                title: Some(create.title.clone()),
+                body: Some(create.body.clone()),
+                base_branch: create.base_branch.clone(),
+                head_branch: create.head_branch.clone(),
+            });
+        });
+    }
+
+    fn apply_updates(pull_requests: &mut [ObservedPr], updates: &[UpdatePr]) {
+        updates.iter().for_each(|update| {
+            let pull_request = pull_requests
+                .iter_mut()
+                .find(|pull_request| pull_request.node_id == update.node_id)
+                .expect("update must identify an observed pull request");
+            if let Some(title) = &update.title {
+                pull_request.title = Some(title.clone());
+            }
+            if let Some(body) = &update.body {
+                pull_request.body = Some(body.clone());
+            }
+            if let Some(base_branch) = &update.base_branch {
+                pull_request.base_branch.clone_from(base_branch);
+            }
+        });
+    }
+
+    fn apply_projection_plan(
+        commits: &[ProjectionCommit],
+        pull_requests: &mut Vec<ObservedPr>,
+        plan: &ProjectionPlan,
+    ) {
+        match plan {
+            ProjectionPlan::Create(creations) => {
+                apply_creations(commits, pull_requests, creations);
+            }
+            ProjectionPlan::Update(updates) => apply_updates(pull_requests, updates),
+            ProjectionPlan::Done => {}
+        }
+    }
+
+    #[test]
+    fn an_empty_projection_is_already_done() {
+        assert_eq!(plan_projection(projection_context(), &[], &[]), ProjectionPlan::Done);
+    }
+
+    #[test]
+    fn projection_planning_exhausts_two_commit_worlds_in_stack_order() {
+        let commits = projection_commits();
+        let mut cases = 0;
+
+        PROJECTION_CASES.into_iter().for_each(|first| {
+            PROJECTION_CASES.into_iter().for_each(|second| {
+                cases += 1;
+                let states = [first, second];
+                let pull_requests = observed_world(&commits, states);
+                let plan = plan_projection(projection_context(), &commits, &pull_requests);
+
+                let expected_creations = states
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, state)| *state == ProjectionCase::Absent)
+                    .map(|(index, _)| CreatePr {
+                        title: commits[index].title.clone(),
+                        body: commits[index].commit_body.clone(),
+                        base_branch: if index == 0 { "main" } else { "A" }.to_string(),
+                        head_branch: commits[index].gherrit_id.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let expected_updates = states
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, state)| *state == ProjectionCase::Drifted)
+                    .map(|(index, _)| UpdatePr {
+                        number: assigned_number(&commits, &commits[index].gherrit_id),
+                        node_id: format!(
+                            "PR_{}",
+                            assigned_number(&commits, &commits[index].gherrit_id)
+                        ),
+                        title: Some(commits[index].title.clone()),
+                        body: None,
+                        base_branch: None,
+                    })
+                    .collect::<Vec<_>>();
+                let expected = if !expected_creations.is_empty() {
+                    ProjectionPlan::Create(expected_creations)
+                } else if !expected_updates.is_empty() {
+                    ProjectionPlan::Update(expected_updates)
+                } else {
+                    ProjectionPlan::Done
+                };
+
+                assert_eq!(plan, expected, "states={states:?}");
+            });
+        });
+
+        assert_eq!(cases, 9);
+    }
+
+    #[test]
+    fn applying_projection_stages_converges_idempotently() {
+        let commits = projection_commits();
+
+        PROJECTION_CASES.into_iter().for_each(|first| {
+            PROJECTION_CASES.into_iter().for_each(|second| {
+                let states = [first, second];
+                let mut pull_requests = observed_world(&commits, states);
+                let first_plan = plan_projection(projection_context(), &commits, &pull_requests);
+                apply_projection_plan(&commits, &mut pull_requests, &first_plan);
+                let second_plan = plan_projection(projection_context(), &commits, &pull_requests);
+                apply_projection_plan(&commits, &mut pull_requests, &second_plan);
+                let final_plan = plan_projection(projection_context(), &commits, &pull_requests);
+
+                assert_eq!(final_plan, ProjectionPlan::Done, "states={states:?}");
+                [first_plan, second_plan]
+                    .iter()
+                    .find(|plan| matches!(plan, ProjectionPlan::Update(_)))
+                    .into_iter()
+                    .for_each(|plan| apply_projection_plan(&commits, &mut pull_requests, plan));
+                assert_eq!(
+                    plan_projection(projection_context(), &commits, &pull_requests),
+                    ProjectionPlan::Done,
+                    "reapplying a successful stage changed convergence for states={states:?}"
+                );
+            });
+        });
+    }
+
+    fn converge(commits: &[ProjectionCommit], pull_requests: &mut Vec<ObservedPr>) {
+        for _ in 0..3 {
+            let plan = plan_projection(projection_context(), commits, pull_requests);
+            if plan == ProjectionPlan::Done {
+                return;
+            }
+            apply_projection_plan(commits, pull_requests, &plan);
+        }
+        panic!("projection did not converge: {pull_requests:?}");
+    }
+
+    #[test]
+    fn recovers_after_every_committed_creation_prefix() {
+        let commits = projection_commits();
+        let ProjectionPlan::Create(creations) =
+            plan_projection(projection_context(), &commits, &[])
+        else {
+            panic!("an absent stack must begin with creation");
+        };
+
+        (0..=creations.len()).for_each(|committed| {
+            let mut pull_requests = Vec::new();
+            apply_creations(&commits, &mut pull_requests, &creations[..committed]);
+
+            let replanned = plan_projection(projection_context(), &commits, &pull_requests);
+            if committed < creations.len() {
+                assert_eq!(
+                    replanned,
+                    ProjectionPlan::Create(creations[committed..].to_vec()),
+                    "committed creation prefix={committed}"
+                );
+            } else {
+                assert!(
+                    matches!(replanned, ProjectionPlan::Update(_)),
+                    "a fully-created stack must advance to updates after a lost acknowledgement"
+                );
+            }
+
+            converge(&commits, &mut pull_requests);
+            assert_eq!(pull_requests.len(), commits.len());
+            assert_eq!(
+                plan_projection(projection_context(), &commits, &pull_requests),
+                ProjectionPlan::Done
+            );
+        });
+    }
+
+    #[test]
+    fn recovers_idempotently_after_every_committed_update_prefix() {
+        let commits = projection_commits();
+        let initial = observed_world(&commits, [ProjectionCase::Drifted; 2]);
+        let ProjectionPlan::Update(updates) =
+            plan_projection(projection_context(), &commits, &initial)
+        else {
+            panic!("a drifted stack must require updates");
+        };
+
+        (0..=updates.len()).for_each(|committed| {
+            let mut pull_requests = initial.clone();
+            apply_updates(&mut pull_requests, &updates[..committed]);
+            let after_commit = pull_requests.clone();
+            apply_updates(&mut pull_requests, &updates[..committed]);
+            assert_eq!(
+                pull_requests, after_commit,
+                "replaying a lost-ack update prefix must be idempotent"
+            );
+
+            let expected = if committed == updates.len() {
+                ProjectionPlan::Done
+            } else {
+                ProjectionPlan::Update(updates[committed..].to_vec())
+            };
+            assert_eq!(
+                plan_projection(projection_context(), &commits, &pull_requests),
+                expected,
+                "committed update prefix={committed}"
+            );
+
+            converge(&commits, &mut pull_requests);
+            assert_eq!(
+                plan_projection(projection_context(), &commits, &pull_requests),
+                ProjectionPlan::Done
+            );
+        });
+    }
+
     fn current<'a>(
         title: Option<&'a str>,
         body: Option<&'a str>,
@@ -335,8 +777,9 @@ mod tests {
         title: Option<&str>,
         body: Option<&str>,
         base_branch: Option<&str>,
-    ) -> Option<PrUpdate> {
-        Some(PrUpdate {
+    ) -> Option<UpdatePr> {
+        Some(UpdatePr {
+            number: 42,
             node_id: "PR_node".to_string(),
             title: title.map(ToString::to_string),
             body: body.map(ToString::to_string),
@@ -348,6 +791,7 @@ mod tests {
     fn omits_an_update_when_metadata_matches() {
         assert_eq!(
             plan_update(
+                42,
                 current(Some("Title"), Some("Body"), "main"),
                 desired("Title", "Body", "main"),
             ),
@@ -359,6 +803,7 @@ mod tests {
     fn treats_line_endings_and_outer_whitespace_as_equivalent() {
         assert_eq!(
             plan_update(
+                42,
                 current(Some("Title"), Some(" \r\nBody\r\n "), "main"),
                 desired("Title", "Body\n", "main"),
             ),
@@ -370,6 +815,7 @@ mod tests {
     fn preserves_meaningful_body_whitespace() {
         assert_eq!(
             plan_update(
+                42,
                 current(Some("Title"), Some("Line one\n\nLine two"), "main"),
                 desired("Title", "Line one\nLine two", "main"),
             ),
@@ -378,39 +824,46 @@ mod tests {
     }
 
     #[test]
-    fn plans_each_metadata_delta_independently() {
-        let cases = [
-            (
-                current(Some("Old"), Some("Body"), "main"),
-                desired("Title", "Body", "main"),
-                update(Some("Title"), None, None),
-            ),
-            (
-                current(Some("Title"), Some("Old"), "main"),
-                desired("Title", "Body", "main"),
-                update(None, Some("Body"), None),
-            ),
-            (
-                current(Some("Title"), Some("Body"), "old-base"),
-                desired("Title", "Body", "main"),
-                update(None, None, Some("main")),
-            ),
-            (
-                current(Some("Old"), Some("Old"), "old-base"),
-                desired("Title", "Body", "main"),
-                update(Some("Title"), Some("Body"), Some("main")),
-            ),
-        ];
+    fn plans_every_metadata_delta_combination_minimally() {
+        let mut cases = 0;
 
-        for (current, desired, expected) in cases {
-            assert_eq!(plan_update(current, desired), expected);
-        }
+        [false, true].into_iter().for_each(|title_drift| {
+            [false, true].into_iter().for_each(|body_drift| {
+                [false, true].into_iter().for_each(|base_drift| {
+                    cases += 1;
+                    let expected = (title_drift || body_drift || base_drift).then(|| {
+                        update(
+                            title_drift.then_some("Title"),
+                            body_drift.then_some("Body"),
+                            base_drift.then_some("main"),
+                        )
+                        .unwrap()
+                    });
+
+                    assert_eq!(
+                        plan_update(
+                            42,
+                            current(
+                                Some(if title_drift { "Old" } else { "Title" }),
+                                Some(if body_drift { "Old" } else { "Body" }),
+                                if base_drift { "old-base" } else { "main" },
+                            ),
+                            desired("Title", "Body", "main"),
+                        ),
+                        expected,
+                        "drift=({title_drift}, {body_drift}, {base_drift})"
+                    );
+                });
+            });
+        });
+
+        assert_eq!(cases, 8);
     }
 
     #[test]
     fn fills_in_missing_title_and_body() {
         assert_eq!(
-            plan_update(current(None, None, "main"), desired("Title", "Body", "main"),),
+            plan_update(42, current(None, None, "main"), desired("Title", "Body", "main"),),
             update(Some("Title"), Some("Body"), None)
         );
     }
@@ -418,6 +871,7 @@ mod tests {
     #[test]
     fn omits_an_unchanged_base_from_other_updates() {
         let update = plan_update(
+            42,
             current(Some("Old"), Some("Body"), "main"),
             desired("Title", "Body", "main"),
         )
