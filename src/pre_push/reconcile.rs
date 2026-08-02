@@ -1,3 +1,72 @@
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(super) enum PullRequestState {
+    Open,
+    Closed,
+    Merged,
+}
+
+/// A PR lifecycle observation that forbids mutation.
+///
+/// `Open` is unrepresentable, so consumers do not rely on a field invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonOpenPullRequest {
+    Closed { number: u64 },
+    Merged { number: u64 },
+}
+
+impl NonOpenPullRequest {
+    /// Converts a lifecycle observation into rejection evidence.
+    ///
+    /// Returns `None` exactly when the pull request is open.
+    fn from_state(number: u64, state: PullRequestState) -> Option<Self> {
+        match state {
+            PullRequestState::Open => None,
+            PullRequestState::Closed => Some(Self::Closed { number }),
+            PullRequestState::Merged => Some(Self::Merged { number }),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct NonOpenPullRequests {
+    pull_requests: Vec<NonOpenPullRequest>,
+}
+
+impl std::fmt::Display for NonOpenPullRequests {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.pull_requests.iter().try_for_each(|pull_request| {
+            // Rejection evidence contains only non-open states, so this match
+            // consumes the complete state space without a fallback case.
+            let (state, number) = match *pull_request {
+                NonOpenPullRequest::Closed { number } => ("closed", number),
+                NonOpenPullRequest::Merged { number } => ("merged", number),
+            };
+            writeln!(
+                formatter,
+                "Cannot push to {state} PR #{number}. Please open a new PR or reopen the existing one."
+            )
+        })?;
+        write!(formatter, "You may want to rebase on the latest changes before pushing.")
+    }
+}
+
+impl std::error::Error for NonOpenPullRequests {}
+
+/// Rejects a stack containing any closed or merged pull request.
+pub(super) fn ensure_pull_requests_open(
+    pull_requests: impl IntoIterator<Item = (u64, PullRequestState)>,
+) -> Result<(), NonOpenPullRequests> {
+    let pull_requests = pull_requests
+        .into_iter()
+        .filter_map(|(number, state)| NonOpenPullRequest::from_state(number, state))
+        .collect::<Vec<_>>();
+
+    if pull_requests.is_empty() { Ok(()) } else { Err(NonOpenPullRequests { pull_requests }) }
+}
+
 /// A stack item annotated with the relationships needed to project it as a PR.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct StackEntry<T> {
@@ -85,6 +154,72 @@ fn normalize_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PR_STATES: [PullRequestState; 3] =
+        [PullRequestState::Open, PullRequestState::Closed, PullRequestState::Merged];
+
+    #[test]
+    fn pull_request_lifecycle_policy_covers_every_state() {
+        let cases = [
+            (PullRequestState::Open, None),
+            (
+                PullRequestState::Closed,
+                Some(
+                    "Cannot push to closed PR #42. Please open a new PR or reopen the existing one.\n\
+                     You may want to rebase on the latest changes before pushing.",
+                ),
+            ),
+            (
+                PullRequestState::Merged,
+                Some(
+                    "Cannot push to merged PR #42. Please open a new PR or reopen the existing one.\n\
+                     You may want to rebase on the latest changes before pushing.",
+                ),
+            ),
+        ];
+
+        cases.into_iter().for_each(|(state, expected_error)| {
+            let error =
+                ensure_pull_requests_open([(42, state)]).err().map(|error| error.to_string());
+            assert_eq!(error.as_deref(), expected_error, "state={state:?}");
+        });
+    }
+
+    #[test]
+    fn pull_request_lifecycle_policy_is_exhaustive_for_two_pr_stacks() {
+        PR_STATES.into_iter().for_each(|first_state| {
+            PR_STATES.into_iter().for_each(|second_state| {
+                let observed = [(11, first_state), (22, second_state)];
+                let expected = observed
+                    .into_iter()
+                    .filter_map(|(number, state)| NonOpenPullRequest::from_state(number, state))
+                    .collect::<Vec<_>>();
+                let actual = ensure_pull_requests_open(observed)
+                    .err()
+                    .map(|error| error.pull_requests)
+                    .unwrap_or_default();
+
+                assert_eq!(actual, expected, "states=({first_state:?}, {second_state:?})");
+            });
+        });
+    }
+
+    #[test]
+    fn pull_request_lifecycle_diagnostic_reports_every_violation_in_order() {
+        let error = ensure_pull_requests_open([
+            (11, PullRequestState::Merged),
+            (22, PullRequestState::Open),
+            (33, PullRequestState::Closed),
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Cannot push to merged PR #11. Please open a new PR or reopen the existing one.\n\
+             Cannot push to closed PR #33. Please open a new PR or reopen the existing one.\n\
+             You may want to rebase on the latest changes before pushing."
+        );
+    }
 
     fn link_ids(base_branch: &str, ids: &[&str]) -> Vec<StackEntry<String>> {
         link_stack(base_branch, ids.iter().copied().map(str::to_owned), Clone::clone)

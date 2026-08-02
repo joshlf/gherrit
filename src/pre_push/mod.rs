@@ -24,11 +24,14 @@ use batching::{
 use body::{PrBody, gherrit_pr_id_re};
 use github::{
     BatchedOperation, CreatePullRequest, CreatedPullRequest, FindPullRequest,
-    PullRequest as PrState, PullRequestState, RepositoryIdQuery, UpdatePullRequest, batch_document,
+    PullRequest as PrState, RepositoryIdQuery, UpdatePullRequest, batch_document,
     decode_batch_response,
 };
 use publication::{PushTarget, plan_push, push_batches, remote_query_batches};
-use reconcile::{CurrentPr, DesiredPr, PrUpdate, link_stack, plan_update};
+use reconcile::{
+    CurrentPr, DesiredPr, PrUpdate, PullRequestState, ensure_pull_requests_open, link_stack,
+    plan_update,
+};
 
 #[derive(Eq, PartialEq)]
 pub(crate) enum GithubEndpoint {
@@ -103,23 +106,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
 
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
     let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
-
-    let errors: Vec<String> = prs.iter().filter_map(|pr| match pr.state {
-        PullRequestState::Open => None,
-        PullRequestState::Closed => Some((pr.number, "closed")),
-        PullRequestState::Merged => Some((pr.number, "merged")),
-    }).map(|(number, state)| {
-        format!(
-            "Cannot push to {state} PR #{number}. Please open a new PR or reopen the existing one."
-        )
-    }).collect();
-
-    if !errors.is_empty() {
-        bail!(
-            "{}\nYou may want to rebase on the latest changes before pushing.",
-            errors.join("\n")
-        );
-    }
+    ensure_pull_requests_open(prs.iter().map(|pr| (pr.number, pr.state)))?;
 
     let latest_versions = push_to_origin(repo, &commits)?;
     let default_branch = repo.find_default_branch_on_default_remote();
