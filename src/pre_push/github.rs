@@ -2,7 +2,7 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::reconcile::PullRequestState;
+use super::{batching::ReplaySafety, reconcile::PullRequestState};
 
 const MAX_PULL_REQUEST_CANDIDATES: usize = 100;
 
@@ -46,6 +46,7 @@ pub(super) trait BatchedOperation {
     type Output;
 
     const TYPE: OperationType;
+    const REPLAY_SAFETY: ReplaySafety;
 
     fn document(&self) -> String;
     fn decode(&self, response: Value) -> Result<Self::Output>;
@@ -153,6 +154,7 @@ impl BatchedOperation for FindPullRequest {
     type Output = Option<PullRequest>;
 
     const TYPE: OperationType = OperationType::Query;
+    const REPLAY_SAFETY: ReplaySafety = ReplaySafety::BlindRetrySafe;
 
     fn document(&self) -> String {
         let connection = |alias: &str, states: &str| {
@@ -276,6 +278,7 @@ impl BatchedOperation for CreatePullRequest {
     type Output = CreatedPullRequest;
 
     const TYPE: OperationType = OperationType::Mutation;
+    const REPLAY_SAFETY: ReplaySafety = ReplaySafety::RequiresReobservation;
 
     fn document(&self) -> String {
         let fields = [
@@ -346,6 +349,7 @@ impl BatchedOperation for UpdatePullRequest {
     type Output = ();
 
     const TYPE: OperationType = OperationType::Mutation;
+    const REPLAY_SAFETY: ReplaySafety = ReplaySafety::RequiresReobservation;
 
     fn document(&self) -> String {
         let fields = std::iter::once(("pullRequestId", &self.node_id))
@@ -398,6 +402,13 @@ mod tests {
 
     fn empty_connection() -> Value {
         connection(Vec::new(), false)
+    }
+
+    #[test]
+    fn only_observations_are_blind_retry_safe() {
+        assert_eq!(FindPullRequest::REPLAY_SAFETY, ReplaySafety::BlindRetrySafe);
+        assert_eq!(UpdatePullRequest::REPLAY_SAFETY, ReplaySafety::RequiresReobservation);
+        assert_eq!(CreatePullRequest::REPLAY_SAFETY, ReplaySafety::RequiresReobservation);
     }
 
     #[test]

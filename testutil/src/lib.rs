@@ -450,6 +450,7 @@ pub enum GitOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     GraphQl,
+    GraphQlResourceLimit { operation: GraphQlOperation, applied: usize },
     CreatePr,
     UpdatePr,
     Git(GitOperation),
