@@ -32,7 +32,6 @@ pub struct MockState {
     pub repo_owner: String,
     pub repo_name: String,
     pub faults: VecDeque<FailureKind>,
-    pub merge_queue: HashSet<u64>,
 }
 
 impl MockState {
@@ -748,10 +747,6 @@ fn handle_update_pr(
     if base.as_deref() == Some(pr.head.ref_field.as_str()) {
         return Err("Pull request head and base branches must differ".to_string());
     }
-    if mock_state.merge_queue.contains(&pr.id) && base.is_some() {
-        return Err("Pull request is in a merge queue and cannot be updated".to_string());
-    }
-
     if let Some(title) = title {
         pr.title = Some(title);
     }
