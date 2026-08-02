@@ -48,14 +48,11 @@ fn test_pre_push_edit_failure() {
         .failure()
         .stderr(predicates::str::contains("Injected UpdatePr failure"));
     ctx.assert_failure_consumed();
-    ctx.inspect_mock_state(|state| {
-        assert_eq!(
-            state.graphql_requests.last(),
-            Some(&vec![testutil::mock_server::GraphQlOperation::UpdatePr])
-        );
-        assert_eq!(state.prs.len(), 1);
-        assert_eq!(state.prs[0].title.as_deref(), Some("Initial Work"));
-    });
+    let requests = ctx.github().requests();
+    assert_eq!(requests.last(), Some(&vec![testutil::GraphQlOperation::UpdatePr]));
+    let prs = ctx.github().pull_requests();
+    assert_eq!(prs.len(), 1);
+    assert_eq!(prs[0].title.as_deref(), Some("Initial Work"));
 
     let gherrit_id = ctx.gherrit_id("HEAD").unwrap();
     let remote_ref = format!("refs/heads/{gherrit_id}");
@@ -105,14 +102,9 @@ fn test_pre_push_pr_list_failure() {
         .failure()
         .stderr(predicate::str::contains("Injected GraphQl failure"));
     ctx.assert_failure_consumed();
-    ctx.inspect_mock_state(|state| {
-        assert_eq!(
-            state.graphql_requests,
-            vec![vec![testutil::mock_server::GraphQlOperation::Query]]
-        );
-        assert!(state.prs.is_empty());
-        assert!(state.pushes.is_empty());
-    });
+    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]]);
+    assert!(ctx.github().pull_requests().is_empty());
+    assert!(ctx.recorded_pushes().is_empty());
 }
 
 #[test]
@@ -136,12 +128,8 @@ fn test_pre_push_pr_create_failure() {
         .failure()
         .stderr(predicate::str::contains("Injected CreatePr failure"));
     ctx.assert_failure_consumed();
-    ctx.inspect_mock_state(|state| {
-        assert_eq!(
-            state.graphql_requests.last(),
-            Some(&vec![testutil::mock_server::GraphQlOperation::CreatePr])
-        );
-        assert!(state.prs.is_empty());
-        assert_eq!(state.pushes.iter().filter(|push| push.succeeded()).count(), 1);
-    });
+    let requests = ctx.github().requests();
+    assert_eq!(requests.last(), Some(&vec![testutil::GraphQlOperation::CreatePr]));
+    assert!(ctx.github().pull_requests().is_empty());
+    assert_eq!(ctx.recorded_pushes().iter().filter(|push| push.succeeded()).count(), 1);
 }
