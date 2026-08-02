@@ -12,8 +12,12 @@ fn test_full_stack_lifecycle_mocked() {
     ctx.checkout_new("feature-stack");
 
     ctx.commit("Commit A");
+    let commit_a_id = ctx.gherrit_id("HEAD").unwrap();
+    let commit_a_oid = ctx.head_oid();
 
     ctx.commit("Commit B");
+    let commit_b_id = ctx.gherrit_id("HEAD").unwrap();
+    let commit_b_oid = ctx.head_oid();
 
     // Trigger Pre-Push Hook (Simulate 'git push'). We call the hook directly
     // because simulating a real 'git push' that calls the hook recursively is
@@ -27,10 +31,18 @@ fn test_full_stack_lifecycle_mocked() {
     // Verify Side Effects (Mock Only)
     testutil::assert_pr_snapshot!(ctx, "full_stack_lifecycle_state");
 
-    ctx.inspect_mock_state(|state| {
-        assert!(state.pushes.iter().any(|push| push.succeeded()), "Expected a successful push");
-    });
-    assert!(!ctx.remote_refs("refs/heads").is_empty(), "Expected remote branches to be updated");
+    assert!(
+        ctx.recorded_pushes().iter().any(|push| push.succeeded()),
+        "Expected a successful push"
+    );
+    assert_eq!(
+        ctx.remote_ref_oid(&format!("refs/heads/{commit_a_id}")).as_deref(),
+        Some(commit_a_oid.as_str())
+    );
+    assert_eq!(
+        ctx.remote_ref_oid(&format!("refs/heads/{commit_b_id}")).as_deref(),
+        Some(commit_b_oid.as_str())
+    );
 }
 
 #[test]
@@ -46,32 +58,29 @@ fn test_version_increment() {
     // Create feature branch
     ctx.checkout_new("feat-versioning");
     ctx.commit("Feature Commit");
+    let gherrit_id = ctx.gherrit_id("HEAD").unwrap();
+    let v1_oid = ctx.head_oid();
+    let managed_ref = format!("refs/heads/{gherrit_id}");
+    let v1_ref = format!("refs/tags/gherrit/{gherrit_id}/v1");
+    let v2_ref = format!("refs/tags/gherrit/{gherrit_id}/v2");
 
     // Push 1 (v1)
     testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "version_increment_v1");
 
-    // Verify v1 pushed
-    let v1_count = ctx.count_successfully_pushed_containing("/v1");
-    assert!(v1_count > 0, "Expected v1 tag to be pushed");
+    assert_eq!(ctx.remote_ref_oid(&managed_ref).as_deref(), Some(v1_oid.as_str()));
+    assert_eq!(ctx.remote_ref_oid(&v1_ref).as_deref(), Some(v1_oid.as_str()));
 
     // Amend commit (modifies SHA, keeps Change-ID)
     ctx.amend();
+    let v2_oid = ctx.head_oid();
+    assert_ne!(v2_oid, v1_oid);
 
     // Push 2 (v2)
     testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "version_increment_v2");
 
-    // Verify v2 pushed
-    let v2_count = ctx.count_successfully_pushed_containing("/v2");
-    assert!(v2_count > 0, "Expected v2 tag to be pushed");
-
-    // Verify v1 NOT pushed AGAIN.
-    let v1_count_final = ctx.count_successfully_pushed_containing("/v1");
-    assert_eq!(v1_count_final, v1_count, "v1 tag should NOT be pushed again in the second push.");
-
-    // Verify that tags actually exist on the remote.
-    let tags = ctx.remote_refs("refs/tags/gherrit");
-    assert!(tags.iter().any(|tag| tag.ends_with("/v1")), "Remote should contain v1 tag");
-    assert!(tags.iter().any(|tag| tag.ends_with("/v2")), "Remote should contain v2 tag");
+    assert_eq!(ctx.remote_ref_oid(&managed_ref).as_deref(), Some(v2_oid.as_str()));
+    assert_eq!(ctx.remote_ref_oid(&v1_ref).as_deref(), Some(v1_oid.as_str()));
+    assert_eq!(ctx.remote_ref_oid(&v2_ref).as_deref(), Some(v2_oid.as_str()));
 }
 
 #[test]
@@ -116,11 +125,10 @@ fn test_optimistic_locking_conflict() {
     // Attempt push - should fail due to atomic lock
     testutil::assert_failure_snapshot!(ctx, ctx.hook_cmd("pre-push"), "optimistic_locking_v2_fail");
 
-    ctx.inspect_mock_state(|state| {
-        assert_eq!(state.pushes.len(), 2, "Expected one successful and one failed push");
-        assert!(state.pushes[0].succeeded(), "Initial push should succeed");
-        assert!(!state.pushes[1].succeeded(), "Conflicting push should fail");
-    });
+    let pushes = ctx.recorded_pushes();
+    assert_eq!(pushes.len(), 2, "Expected one successful and one failed push");
+    assert!(pushes[0].succeeded(), "Initial push should succeed");
+    assert!(!pushes[1].succeeded(), "Conflicting push should fail");
     assert_eq!(
         ctx.remote_ref_oid(&managed_ref).as_deref(),
         Some(pushed_oid.as_str()),
@@ -151,15 +159,13 @@ fn test_graphql_batch_backoff() {
         "graphql_batch_backoff"
     );
 
-    ctx.inspect_mock_state(|state| {
-        assert_eq!(
-            state.pushes.iter().filter(|push| push.succeeded()).count(),
-            2,
-            "Expected two pushes at the test batch size"
-        );
-        assert_eq!(state.prs.len(), 4, "Expected every commit to have a PR");
-        insta::assert_debug_snapshot!("graphql_batch_backoff_trace", state.graphql_requests);
-    });
+    assert_eq!(
+        ctx.recorded_pushes().iter().filter(|push| push.succeeded()).count(),
+        2,
+        "Expected two pushes at the test batch size"
+    );
+    assert_eq!(ctx.github().pull_requests().len(), 4, "Expected every commit to have a PR");
+    insta::assert_debug_snapshot!("graphql_batch_backoff_trace", ctx.github().requests());
 
     let v1_refs = ctx
         .remote_refs("refs/tags/gherrit")
