@@ -8,6 +8,10 @@ Use the commands in [validation.md](./validation.md) before submitting a
 change. They match the checks run in CI, including the required test-build
 configuration.
 
+Use [testing.md](./testing.md) when choosing a test layer or extending the test
+infrastructure. It defines the product-risk model and the target architecture
+for the ongoing migration away from broad system fixtures.
+
 - `cargo build`: Builds the project.
 
 ### Test Dependencies
