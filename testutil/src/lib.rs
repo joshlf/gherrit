@@ -448,6 +448,7 @@ pub enum FailureKind {
     GraphQl,
     CreatePr,
     UpdatePr,
+    UpdatePrNull,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -590,6 +591,20 @@ impl Drop for TestContext {
     fn drop(&mut self) {
         // Stop the server before fixture directories and state are released.
         drop(self.mock_server.take());
+
+        let pending_faults = self
+            .mock_server_state
+            .as_ref()
+            .and_then(|state| state.read().ok())
+            .map(|state| state.faults.clone())
+            .unwrap_or_default();
+        if !pending_faults.is_empty() {
+            if thread::panicking() {
+                eprintln!("Test fixture also has unconsumed faults: {pending_faults:?}");
+            } else {
+                panic!("Test fixture has unconsumed faults: {pending_faults:?}");
+            }
+        }
     }
 }
 
@@ -737,7 +752,7 @@ impl TestContext {
         assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
         let mut state = self.mock_state().write().unwrap();
 
-        state.fail_next_request = Some(kind);
+        state.faults.push_back(kind);
     }
 
     pub fn limit_graphql_operations_per_request(&self, limit: usize) {
@@ -749,9 +764,9 @@ impl TestContext {
     pub fn assert_failure_consumed(&self) {
         self.inspect_mock_state(|state| {
             assert!(
-                state.fail_next_request.is_none(),
-                "Expected injected failure to be consumed, but {:?} remains",
-                state.fail_next_request
+                state.faults.is_empty(),
+                "Expected injected failures to be consumed, but {:?} remain",
+                state.faults
             );
         });
     }
