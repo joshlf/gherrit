@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Get Rust Version
         id: rust-version
@@ -53,6 +55,19 @@ jobs:
 
       - name: Test stack metadata parser
         run: bash ci/test_extract_stack_child.sh
+
+      - name: Build bootstrap binary and archive checkout
+        run: |
+          cargo build --release --locked
+          mkdir -p bootstrap
+          cp target/release/gherrit bootstrap/gherrit
+          tar --exclude='./target' --exclude='./bootstrap' -czf bootstrap/workspace.tar.gz .
+
+      - name: Upload bootstrap workspace
+        uses: actions/upload-artifact@v4
+        with:
+          name: gherrit-bootstrap
+          path: bootstrap/
 
   windows-tests:
     name: Windows Tests
