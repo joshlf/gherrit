@@ -10,7 +10,7 @@ jobs:
   validate:
     name: Validate and Test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -65,11 +65,32 @@ jobs:
           tar --exclude='./target' -czf /tmp/gherrit-bootstrap/workspace.tar.gz .
           cp /tmp/gherrit-bootstrap/* bootstrap/
 
+      - name: Archive Rust toolchain and dependency cache
+        run: |
+          toolchain=$(rustup which --toolchain "${{ steps.rust-version.outputs.version }}" rustc)
+          toolchain=$(dirname "$(dirname "$toolchain")")
+          rm -rf /tmp/rust-bootstrap bootstrap-rust
+          mkdir -p /tmp/rust-bootstrap/toolchain /tmp/rust-bootstrap/cargo-home bootstrap-rust
+          cp -a "$toolchain"/. /tmp/rust-bootstrap/toolchain/
+          if [ -d "$HOME/.cargo/registry" ]; then
+            cp -a "$HOME/.cargo/registry" /tmp/rust-bootstrap/cargo-home/
+          fi
+          if [ -d "$HOME/.cargo/git" ]; then
+            cp -a "$HOME/.cargo/git" /tmp/rust-bootstrap/cargo-home/
+          fi
+          tar -czf bootstrap-rust/rust-bootstrap.tar.gz -C /tmp/rust-bootstrap .
+
       - name: Upload bootstrap workspace
         uses: actions/upload-artifact@v4
         with:
           name: gherrit-bootstrap
           path: bootstrap/
+
+      - name: Upload Rust bootstrap
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-bootstrap
+          path: bootstrap-rust/
 
   windows-tests:
     name: Windows Tests
