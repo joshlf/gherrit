@@ -56,12 +56,13 @@ jobs:
       - name: Test stack metadata parser
         run: bash ci/test_extract_stack_child.sh
 
-      - name: Build bootstrap binary and archive checkout
+      - name: Archive bootstrap workspace
         run: |
-          cargo build --release --locked
-          mkdir -p bootstrap
-          cp target/release/gherrit bootstrap/gherrit
-          tar --exclude='./target' --exclude='./bootstrap' -czf bootstrap/workspace.tar.gz .
+          rm -rf /tmp/gherrit-bootstrap
+          mkdir -p /tmp/gherrit-bootstrap bootstrap
+          cp target/debug/gherrit /tmp/gherrit-bootstrap/gherrit
+          tar --exclude='./target' -czf /tmp/gherrit-bootstrap/workspace.tar.gz .
+          cp /tmp/gherrit-bootstrap/* bootstrap/
 
       - name: Upload bootstrap workspace
         uses: actions/upload-artifact@v4
