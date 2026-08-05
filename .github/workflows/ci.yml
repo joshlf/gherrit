@@ -58,6 +58,7 @@ jobs:
 
       - name: Archive bootstrap workspace
         run: |
+          cargo build --locked
           rm -rf /tmp/gherrit-bootstrap
           mkdir -p /tmp/gherrit-bootstrap bootstrap
           cp target/debug/gherrit /tmp/gherrit-bootstrap/gherrit
