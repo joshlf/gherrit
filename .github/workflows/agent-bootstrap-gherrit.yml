@@ -1,4 +1,4 @@
-name: Agent bootstrap GHerrit
+name: Agent publish GHerrit stack
 
 on:
   push:
@@ -6,23 +6,42 @@ on:
       - agent/bootstrap-gherrit-build
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
 
 jobs:
-  package:
+  publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install nightly rustfmt
-        run: rustup toolchain install nightly --profile minimal --component rustfmt
-
-      - name: Package nightly toolchain
-        run: tar -C "$HOME/.rustup/toolchains" -czf nightly-rustfmt.tar.gz nightly-x86_64-unknown-linux-gnu
-
-      - uses: actions/upload-artifact@v4
+      - name: Checkout implementation source branch
+        uses: actions/checkout@v4
         with:
-          name: nightly-rustfmt
-          path: nightly-rustfmt.tar.gz
-          if-no-files-found: error
-          retention-days: 1
+          ref: agent/safe-pr-reorder-source
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and install modified GHerrit
+        run: cargo install --path . --locked
+
+      - name: Configure repository and install GHerrit hooks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          gherrit install
+          gherrit manage --private
+
+      - name: Publish with GHerrit
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: git push
+
+      - name: Clean temporary source and bootstrap branches
+        if: success()
+        run: |
+          git push origin --delete agent/safe-pr-reorder-source || true
+          git push origin --delete agent/bootstrap-gherrit-build || true
