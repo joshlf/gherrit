@@ -78,6 +78,7 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
 
     let remote_default = observe_remote_default(repo)?;
     let staging_bases = plan_pr_staging(repo, &commits, &prs, &publication, &remote_default)?;
+    validate_topology_transition_state(&prs, &staging_bases)?;
     for staging in &staging_bases {
         log::debug!(
             "PR #{} ({}) stages {} -> {} before final base {} ({:?}, node {})",
@@ -91,12 +92,40 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
         );
     }
 
+    apply_staging_bases(&octocrab, &remote_default.name, &staging_bases).await?;
+    let prepared_candidates = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
+    let prepared_prs = select_canonical_prs(repo, &gherrit_ids, prepared_candidates)?;
+    validate_prs_for_publication(&prepared_prs, &publication)?;
+    verify_staging_bases(
+        repo,
+        &commits,
+        &prepared_prs,
+        &publication,
+        &remote_default,
+        &staging_bases,
+    )?;
+    verify_publication_inputs(repo, &publication, &remote_default)?;
+
     execute_publication(repo, &publication)?;
-    let latest_versions = publication.latest_versions;
+    let latest_versions = publication.latest_versions.clone();
     let default_branch = remote_default.name;
 
+    let projected_candidates = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
+    let projected_prs = select_canonical_prs(repo, &gherrit_ids, projected_candidates)?;
+    validate_prs_after_publication(&projected_prs, &publication)?;
+
     let num_commits = commits.len();
-    sync_prs(repo, &octocrab, branch_name, &default_branch, commits, latest_versions, prs).await?;
+    sync_prs(
+        repo,
+        &octocrab,
+        branch_name,
+        &default_branch,
+        commits,
+        latest_versions,
+        projected_prs,
+    )
+    .await?;
+    verify_final_projection(repo, &octocrab, &gherrit_ids, &default_branch, &publication).await?;
 
     log::info!("Successfully synced {num_commits} commits.");
     Ok(())
@@ -458,6 +487,198 @@ fn git_is_ancestor(repo: &util::Repo, ancestor: &str, descendant: &str) -> Resul
     }
 }
 
+fn validate_topology_transition_state(
+    prs: &[PrState],
+    staging_bases: &[StagingBase],
+) -> Result<()> {
+    let topology_changes =
+        staging_bases.iter().any(|staging| staging.current_base != staging.desired_base);
+    if !topology_changes {
+        return Ok(());
+    }
+
+    let mut errors = Vec::new();
+    for pr in prs {
+        if pr.is_in_merge_queue {
+            errors.push(format!(
+                "PR #{} is in the merge queue; remove it before reordering this stack",
+                pr.number
+            ));
+        }
+        if pr.auto_merge_enabled {
+            errors.push(format!(
+                "PR #{} has auto-merge enabled; disable it before reordering this stack",
+                pr.number
+            ));
+        }
+        if pr.native_stack {
+            errors.push(format!(
+                "PR #{} belongs to a native GitHub stack; unstack it before GHerrit rewrites bases",
+                pr.number
+            ));
+        }
+    }
+    if !errors.is_empty() {
+        bail!("{}", errors.join("\n"));
+    }
+    Ok(())
+}
+
+async fn apply_staging_bases(
+    octocrab: &Octocrab,
+    default_branch: &str,
+    staging_bases: &[StagingBase],
+) -> Result<()> {
+    let mut updates = staging_bases
+        .iter()
+        .filter(|staging| staging.current_base != staging.staging_base)
+        .map(|staging| PrUpdate {
+            node_id: staging.node_id.clone(),
+            title: None,
+            body: None,
+            base_branch: Some(staging.staging_base.clone()),
+        })
+        .collect::<Vec<_>>();
+
+    // Move PRs to non-default staging bases first and expose temporary roots
+    // only for the shortest possible portion of the preparation phase.
+    updates.sort_by_key(|update| update.base_branch.as_deref() == Some(default_branch));
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    log::info!("Preparing {} PR bases for a safe ref publication...", updates.len());
+    batch_update_prs(octocrab, updates).await?;
+    log::info!("Prepared PR bases for ref publication.");
+    Ok(())
+}
+
+fn verify_staging_bases(
+    repo: &util::Repo,
+    commits: &[Commit],
+    prs: &[PrState],
+    publication: &PublicationPlan,
+    remote_default: &RemoteDefault,
+    expected: &[StagingBase],
+) -> Result<()> {
+    let actual = plan_pr_staging(repo, commits, prs, publication, remote_default)?;
+    for expected in expected {
+        let actual = actual
+            .iter()
+            .find(|actual| actual.head_branch == expected.head_branch)
+            .ok_or_else(|| eyre!("Prepared PR #{} disappeared", expected.number))?;
+        if actual.current_base != expected.staging_base
+            || actual.staging_base != expected.staging_base
+        {
+            bail!(
+                "PR #{} was expected on safe staging base `{}`, but GitHub reports `{}`",
+                expected.number,
+                expected.staging_base,
+                actual.current_base
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_publication_inputs(
+    repo: &util::Repo,
+    publication: &PublicationPlan,
+    remote_default: &RemoteDefault,
+) -> Result<()> {
+    let mut branches = publication.expected_heads.keys().cloned().collect::<Vec<_>>();
+    branches.push(remote_default.name.clone());
+    let observed = get_remote_branch_states(repo, &branches)
+        .wrap_err("Failed to verify remote refs after preparing PR bases")?;
+
+    for (branch, expected) in &publication.expected_heads {
+        if observed.get(branch) != Some(expected) {
+            bail!("Remote branch `{branch}` changed after PR base preparation");
+        }
+    }
+    if observed.get(&remote_default.name).and_then(Option::as_deref)
+        != Some(remote_default.oid.as_str())
+    {
+        bail!("The remote default branch changed after PR base preparation");
+    }
+    Ok(())
+}
+
+fn validate_prs_after_publication(prs: &[PrState], publication: &PublicationPlan) -> Result<()> {
+    let expected_heads = publication
+        .desired_heads
+        .iter()
+        .map(|(branch, oid)| (branch.clone(), oid.to_string()))
+        .collect::<HashMap<_, _>>();
+    validate_prs_against_heads(prs, &expected_heads, "after Git publication")
+}
+
+fn validate_prs_against_heads(
+    prs: &[PrState],
+    expected_heads: &HashMap<String, String>,
+    phase: &str,
+) -> Result<()> {
+    let mut errors = Vec::new();
+    for pr in prs {
+        if pr.state != PullRequestState::Open {
+            errors.push(format!("PR #{} became {:?} {phase}", pr.number, pr.state));
+        }
+        let expected = expected_heads.get(&pr.head_branch).map(String::as_str);
+        if expected != Some(pr.head_oid.as_str()) {
+            errors.push(format!(
+                "PR #{} reports head {}, expected {} {phase}",
+                pr.number,
+                pr.head_oid,
+                expected.unwrap_or("<missing>")
+            ));
+        }
+    }
+    if !errors.is_empty() {
+        bail!("{}", errors.join("\n"));
+    }
+    Ok(())
+}
+
+async fn verify_final_projection(
+    repo: &util::Repo,
+    octocrab: &Octocrab,
+    gherrit_ids: &[String],
+    default_branch: &str,
+    publication: &PublicationPlan,
+) -> Result<()> {
+    let candidates = batch_fetch_prs(repo, octocrab, gherrit_ids).await?;
+    let prs = select_canonical_prs(repo, gherrit_ids, candidates)?;
+    validate_prs_after_publication(&prs, publication)?;
+    if prs.len() != gherrit_ids.len() {
+        bail!(
+            "Expected {} canonical PRs after reconciliation, found {}",
+            gherrit_ids.len(),
+            prs.len()
+        );
+    }
+
+    let desired = link_stack(default_branch, gherrit_ids.iter().cloned(), Clone::clone)
+        .into_iter()
+        .map(|entry| (entry.item, entry.base_branch))
+        .collect::<HashMap<_, _>>();
+    let mut errors = Vec::new();
+    for pr in prs {
+        let expected = desired.get(&pr.head_branch).map(String::as_str);
+        if expected != Some(pr.base_branch.as_str()) {
+            errors.push(format!(
+                "PR #{} targets `{}`, expected `{}`",
+                pr.number,
+                pr.base_branch,
+                expected.unwrap_or("<missing>")
+            ));
+        }
+    }
+    if !errors.is_empty() {
+        bail!("Final PR projection is incomplete:\n{}", errors.join("\n"));
+    }
+    Ok(())
+}
+
 fn get_local_version(repo: &util::Repo, gherrit_id: &str) -> Result<usize> {
     let prefix = format!("refs/tags/gherrit/{}/v", gherrit_id);
     let mut max_ver = 0;
@@ -803,7 +1024,7 @@ async fn sync_prs(
         .flatten();
 
     let repo_url = remote.repo_url_relative();
-    let updates: Vec<PrUpdate> = commit_pr_states
+    let mut updates: Vec<PrUpdate> = commit_pr_states
         .iter()
         .filter_map(|(entry, pr_state)| {
             let c = &entry.item;
@@ -855,6 +1076,11 @@ async fn sync_prs(
             update
         })
         .collect();
+
+    // A stale root is the most dangerous final intermediate state: it is
+    // temporarily landing-eligible. Move non-root PRs to their final bases
+    // before assigning the final default-branch root.
+    updates.sort_by_key(|update| update.base_branch.as_deref() == Some(base_branch));
 
     if !updates.is_empty() {
         log::info!("Updating batch of {} PRs...", updates.len());
@@ -1212,24 +1438,6 @@ fn validate_prs_for_publication(prs: &[PrState], publication: &PublicationPlan) 
                 pr.head_oid,
                 pr.head_branch,
                 expected_head.unwrap_or("<missing>")
-            ));
-        }
-        if pr.is_in_merge_queue {
-            errors.push(format!(
-                "PR #{} is in the merge queue; remove it before changing this stack",
-                pr.number
-            ));
-        }
-        if pr.auto_merge_enabled {
-            errors.push(format!(
-                "PR #{} has auto-merge enabled; disable it before changing this stack",
-                pr.number
-            ));
-        }
-        if pr.native_stack {
-            errors.push(format!(
-                "PR #{} belongs to a native GitHub stack; unstack it before GHerrit rewrites bases",
-                pr.number
             ));
         }
 
