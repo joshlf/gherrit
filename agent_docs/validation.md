@@ -24,6 +24,7 @@ GHERRIT_TEST_BUILD=1 cargo test --workspace --all-targets --locked
 ci/check_todo.sh
 bash ci/test_extract_stack_child.sh
 bash ci/test_select_cascade_child.sh
+bash ci/test_cascade_action.sh
 ```
 
 `GHERRIT_TEST_BUILD=1` is **required** for Clippy and tests so the binary under

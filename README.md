@@ -251,11 +251,17 @@ To solve this, GHerrit implements a **Cascading Merge** system:
     parent and child PRs.
 2.  **Automated Rebase**: A GitHub Action (`gherrit-rebase-stack.yml`) triggers
     only when a root PR targeting the repository's default branch is merged. It:
-    *   Reads the metadata to find the *child* PR's ID.
-    *   Requires exactly one open PR for that synthesized branch name.
-    *   Verifies that the child still targets the merged parent's branch and
-        that its head commit carries the expected GHerrit ID.
-    *   Retargets the child PR to the repository's default branch.
+    *   Authenticates the merged root and child using immutable repository
+        identities and matching two-sided GHerrit metadata.
+    *   Ignores same-named fork PRs and requires exactly one same-repository
+        open PR for the synthesized child branch.
+    *   Accepts either the original parent base or GitHub's legitimate
+        automatic retarget to the default branch after the parent ref is
+        deleted, while rejecting every other topology.
+    *   Verifies that the checked-out child OID and commit trailer match the
+        GraphQL-observed PR before changing or pushing it.
+    *   Retargets the child PR to the repository's default branch when GitHub
+        has not already done so.
     *   Rebases the child PR onto the updated default branch.
     *   Force-pushes the updated child PR.
 

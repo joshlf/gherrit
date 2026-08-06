@@ -57,6 +57,9 @@ jobs:
       - name: Test cascade child selection
         run: bash ci/test_select_cascade_child.sh
 
+      - name: Test cascade action
+        run: bash ci/test_cascade_action.sh
+
   windows-tests:
     name: Windows Tests
     runs-on: windows-latest

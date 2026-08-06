@@ -4,37 +4,58 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-parser=ci/extract_stack_child.sh
+child_parser=ci/extract_stack_child.sh
+metadata_parser=ci/extract_stack_metadata.sh
+id=Gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+child=Gbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 assert_child() {
   local expected=$1
   local body=$2
   local actual
-  actual=$(printf '%s\n' "$body" | bash "$parser")
+  actual=$(printf '%s' "$body" | bash "$child_parser")
   if [[ $actual != "$expected" ]]; then
     echo "expected child '$expected', got '$actual'" >&2
     exit 1
   fi
 }
 
+assert_metadata() {
+  local expected=$1
+  local body=$2
+  local actual
+  actual=$(printf '%s' "$body" | bash "$metadata_parser")
+  if [[ $actual != "$expected" ]]; then
+    echo "expected metadata '$expected', got '$actual'" >&2
+    exit 1
+  fi
+}
+
 assert_rejected() {
   local body=$1
-  if printf '%s\n' "$body" | bash "$parser" >/dev/null 2>&1; then
+  if printf '%s' "$body" | bash "$metadata_parser" >/dev/null 2>&1; then
     echo "expected malformed metadata to be rejected" >&2
     exit 1
   fi
 }
 
-assert_child Gchild '<!-- gherrit-meta: {"id":"Gid","parent":null,"child":"Gchild"} -->'
-assert_child Gchild '<!-- gherrit-meta: {"id": "Gid", "parent": null, "child": "Gchild"}" -->'
-assert_child '' '<!-- gherrit-meta: {"id":"Gid","parent":null,"child":null} -->'
+canonical="<!-- gherrit-meta: {\"id\":\"$id\",\"parent\":null,\"child\":\"$child\"} -->"
+assert_child "$child" "$canonical"
+assert_metadata "{\"child\":\"$child\",\"id\":\"$id\",\"parent\":null}" "$canonical"
+assert_child "$child" "<!-- gherrit-meta: {\"id\": \"$id\", \"parent\": null, \"child\": \"$child\"}\" -->"
+assert_child '' "<!-- gherrit-meta: {\"id\":\"$id\",\"parent\":null,\"child\":null} -->"
 
-assert_child Gactual 'A commit-body example:
-<!-- gherrit-meta: {"id":"Gfake","parent":null,"child":"Gwrong"} -->
+assert_child "$child" "A commit-body example:
+<!-- gherrit-meta: {\"id\":\"$child\",\"parent\":null,\"child\":null} -->
 
-<!-- gherrit-meta: {"id":"Gid","parent":null,"child":"Gactual"} -->'
+$canonical"
 
 assert_rejected 'No metadata here.'
-assert_rejected '<!-- gherrit-meta: {"id":"Gid","parent":null} -->'
+assert_rejected "<!-- gherrit-meta: {\"id\":\"$id\",\"parent\":null,\"child\":null} -->
+text"
+assert_rejected "<!-- gherrit-meta: {\"id\":\"$id\",\"parent\":null} -->"
 assert_rejected '<!-- gherrit-meta: not-json -->'
-assert_rejected '<!-- gherrit-meta: {"child":"Gone"} {"child":"Gtwo"} -->'
+assert_rejected "<!-- gherrit-meta: {\"id\":\"$id\",\"parent\":null,\"child\":null,\"extra\":true} -->"
+assert_rejected '<!-- gherrit-meta: {"id":"main","parent":null,"child":null} -->'
+assert_rejected "<!-- gherrit-meta: {\"id\":\"$id\",\"parent\":\"$id\",\"child\":null} -->"
+assert_rejected "<!-- gherrit-meta: {\"id\":\"$id\",\"parent\":null,\"child\":\"$id\"} -->"
