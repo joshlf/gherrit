@@ -21,12 +21,12 @@ jobs:
           components: rustfmt, clippy
 
       - name: Build GHerrit
-        run: cargo build --release --locked
+        run: cargo build --locked
 
       - name: Package checkout
         run: |
           git archive --format=tar.gz --output=gherrit-source.tar.gz HEAD
-          cp target/release/gherrit gherrit-linux-amd64
+          cp target/debug/gherrit gherrit-linux-amd64
 
       - uses: actions/upload-artifact@v4
         with:
