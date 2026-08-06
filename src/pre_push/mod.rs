@@ -189,7 +189,7 @@ fn validate_repository_dag_authority(repo: &util::Repo) -> Result<()> {
         );
     }
 
-    let grafts = repo.path().join("info/grafts");
+    let grafts = repo.common_dir().join("info/grafts");
     if std::fs::read(&grafts)
         .is_ok_and(|contents| contents.iter().any(|byte| !byte.is_ascii_whitespace()))
     {

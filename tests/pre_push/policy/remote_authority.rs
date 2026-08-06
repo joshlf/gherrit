@@ -103,3 +103,29 @@ fn rejects_shallow_replace_and_graft_dags_before_mutation() {
         assert!(ctx.remote_refs("refs/heads/G").is_empty());
     }
 }
+
+#[test]
+fn rejects_common_grafts_from_a_linked_worktree_before_mutation() {
+    let ctx = context();
+    let worktree = ctx.dir.path().join("linked-worktree");
+    let worktree_arg = worktree.to_str().unwrap();
+    ctx.git_cmd()
+        .args(["worktree", "add", "-b", "linked-graft", worktree_arg, "main"])
+        .assert()
+        .success();
+
+    ctx.manage_cmd().current_dir(&worktree).assert().success();
+    ctx.git_cmd()
+        .current_dir(&worktree)
+        .args(["commit", "--allow-empty", "-m", "Feature from linked worktree"])
+        .assert()
+        .success();
+    std::fs::write(ctx.repo_path.join(".git/info/grafts"), "deadbeef\n").unwrap();
+
+    ctx.hook_cmd("pre-push")
+        .current_dir(&worktree)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(".git/info/grafts"));
+    assert!(ctx.remote_refs("refs/heads/G").is_empty());
+}
