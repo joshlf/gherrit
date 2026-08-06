@@ -204,3 +204,98 @@ fn test_graphql_batch_backoff() {
         .count();
     assert_eq!(v1_refs, 4, "Expected every v1 tag on the remote");
 }
+
+#[test]
+fn projection_only_requires_latest_remote_tag_to_match_the_branch_head() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+
+    ctx.checkout_new("version-coherence");
+    ctx.commit("Version coherence");
+    ctx.hook_cmd("pre-push").assert().success();
+    let id = ctx.gherrit_id("HEAD").unwrap();
+    let remote_refs = ctx.remote_refs("refs");
+
+    ctx.remote_git_cmd()
+        .args(["tag", &format!("gherrit/{id}/v2"), "refs/heads/main"])
+        .assert()
+        .success();
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("inconsistent remote state"));
+    let expected =
+        remote_refs.into_iter().chain([format!("refs/tags/gherrit/{id}/v2")]).collect::<Vec<_>>();
+    assert_eq!(ctx.remote_refs("refs"), expected);
+}
+
+#[test]
+fn missing_remote_version_tag_is_repaired_without_advancing_the_branch() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+
+    ctx.checkout_new("missing-version-repair");
+    ctx.commit("Missing version repair");
+    ctx.hook_cmd("pre-push").assert().success();
+    let id = ctx.gherrit_id("HEAD").unwrap();
+    let branch = format!("refs/heads/{id}");
+    let oid = ctx.remote_ref_oid(&branch).unwrap();
+    ctx.remote_git_cmd()
+        .args(["update-ref", "-d", &format!("refs/tags/gherrit/{id}/v1")])
+        .assert()
+        .success();
+
+    ctx.hook_cmd("pre-push").assert().success();
+    assert_eq!(ctx.remote_ref_oid(&branch).as_deref(), Some(oid.as_str()));
+    assert_eq!(
+        ctx.remote_ref_oid(&format!("refs/tags/gherrit/{id}/v1")).as_deref(),
+        Some(oid.as_str())
+    );
+}
+
+#[test]
+fn annotated_remote_version_uses_its_peeled_commit_target() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+
+    ctx.checkout_new("annotated-version");
+    ctx.commit("Annotated version");
+    ctx.hook_cmd("pre-push").assert().success();
+    let id = ctx.gherrit_id("HEAD").unwrap();
+    ctx.remote_git_cmd()
+        .args([
+            "-c",
+            "user.name=GHerrit Test",
+            "-c",
+            "user.email=gherrit@example.com",
+            "tag",
+            "-a",
+            "-m",
+            "annotated",
+            &format!("gherrit/{id}/v2"),
+            &format!("refs/heads/{id}"),
+        ])
+        .assert()
+        .success();
+    let mut pushes = 0;
+    ctx.inspect_mock_state(|state| pushes = state.pushes.len());
+
+    ctx.hook_cmd("pre-push").assert().success();
+    ctx.inspect_mock_state(|state| assert_eq!(state.pushes.len(), pushes));
+}

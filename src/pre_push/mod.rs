@@ -420,6 +420,12 @@ struct PublicationPlan {
     desired_heads: HashMap<String, ObjectId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteVersion {
+    version: usize,
+    target_oid: String,
+}
+
 fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<PublicationPlan> {
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
     let expected_heads = get_remote_branch_states(repo, &gherrit_ids)
@@ -438,21 +444,37 @@ fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<Publication
             let desired_oid = commit.id.to_string();
             let expected_remote_sha =
                 expected_heads.get(&commit.gherrit_id).and_then(|sha| sha.as_deref()).unwrap_or("");
-            let remote_version = remote_versions.get(&commit.gherrit_id).copied().unwrap_or(0);
+            let remote_version = remote_versions.get(&commit.gherrit_id);
             desired_heads.insert(commit.gherrit_id.clone(), commit.id);
 
             // If remote Git already contains this exact head and a coherent
             // patch version, this invocation is projection-only. This is what
             // makes a retry after a successful push but failed GitHub update
             // repair the PRs without manufacturing another version.
-            if expected_remote_sha == desired_oid && remote_version > 0 {
-                latest_versions.insert(commit.gherrit_id.clone(), remote_version);
-                continue;
+            if expected_remote_sha == desired_oid {
+                if let Some(remote_version) = remote_version {
+                    if remote_version.target_oid != desired_oid {
+                        bail!(
+                            "Remote patch tag gherrit/{}/v{} points to {}, but managed branch {} points to {}. Refusing to treat this inconsistent remote state as a projection-only retry.",
+                            commit.gherrit_id,
+                            remote_version.version,
+                            remote_version.target_oid,
+                            commit.gherrit_id,
+                            desired_oid
+                        );
+                    }
+                    latest_versions.insert(commit.gherrit_id.clone(), remote_version.version);
+                    continue;
+                }
             }
 
-            let next_version = remote_version.checked_add(1).ok_or_else(|| {
-                eyre!("Patch version overflow for GHerrit ID `{}`", commit.gherrit_id)
-            })?;
+            let next_version = remote_version
+                .map(|version| version.version)
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    eyre!("Patch version overflow for GHerrit ID `{}`", commit.gherrit_id)
+                })?;
             latest_versions.insert(commit.gherrit_id.clone(), next_version);
             targets.push(PushTarget {
                 object_id: commit.id,
@@ -588,36 +610,102 @@ struct RemoteDefault {
 fn get_remote_versions(
     repo: &util::Repo,
     gherrit_ids: &[String],
-) -> Result<HashMap<String, usize>> {
-    let mut versions = gherrit_ids.iter().cloned().map(|id| (id, 0)).collect::<HashMap<_, _>>();
+) -> Result<HashMap<String, RemoteVersion>> {
+    let mut observations: HashMap<(String, usize), TagObservation> = HashMap::new();
     for chunk in remote_query_batches(gherrit_ids) {
         let mut args =
             vec!["ls-remote".to_string(), "--tags".to_string(), repo.default_remote_name()];
         args.extend(chunk.iter().map(|id| format!("refs/tags/gherrit/{id}/v*")));
         let output = util::cmd("git", args).checked_output()?;
-        let output = core::str::from_utf8(&output.stdout)?;
+        parse_remote_version_lines(
+            core::str::from_utf8(&output.stdout)?,
+            gherrit_ids,
+            &mut observations,
+        )?;
+    }
 
-        for line in output.lines() {
-            let Some((_, ref_name)) = line.split_once('\t') else {
-                continue;
-            };
-            let ref_name = ref_name.strip_suffix("^{}").unwrap_or(ref_name);
-            let Some(rest) = ref_name.strip_prefix("refs/tags/gherrit/") else {
-                continue;
-            };
-            let Some((id, version)) = rest.rsplit_once("/v") else {
-                continue;
-            };
-            let Some(current) = versions.get_mut(id) else {
-                continue;
-            };
-            let version = version.parse::<usize>().map_err(|_| {
-                eyre!("Remote patch tag `{ref_name}` has an invalid version number")
-            })?;
-            *current = (*current).max(version);
+    let requested = gherrit_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut versions: HashMap<String, RemoteVersion> = HashMap::new();
+    for ((id, version), observation) in observations {
+        if !requested.contains(id.as_str()) {
+            continue;
+        }
+        let target_oid = observation.peeled_oid.unwrap_or(observation.direct_oid);
+        match versions.get(&id) {
+            Some(existing) if existing.version >= version => {}
+            _ => {
+                versions.insert(id, RemoteVersion { version, target_oid });
+            }
         }
     }
     Ok(versions)
+}
+
+#[derive(Debug, Default)]
+struct TagObservation {
+    direct_oid: String,
+    peeled_oid: Option<String>,
+}
+
+fn parse_remote_version_lines(
+    output: &str,
+    gherrit_ids: &[String],
+    observations: &mut HashMap<(String, usize), TagObservation>,
+) -> Result<()> {
+    let requested = gherrit_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    for line in output.lines() {
+        let Some((oid, ref_name)) = line.split_once('\t') else {
+            continue;
+        };
+        let (ref_name, peeled) = match ref_name.strip_suffix("^{}") {
+            Some(ref_name) => (ref_name, true),
+            None => (ref_name, false),
+        };
+        let Some(rest) = ref_name.strip_prefix("refs/tags/gherrit/") else {
+            continue;
+        };
+        let Some((id, version)) = rest.rsplit_once("/v") else {
+            continue;
+        };
+        if !requested.contains(id) {
+            continue;
+        }
+        let version = version
+            .parse::<usize>()
+            .map_err(|_| eyre!("Remote patch tag `{ref_name}` has an invalid version number"))?;
+        let observation = observations.entry((id.to_string(), version)).or_default();
+        let slot = if peeled {
+            &mut observation.peeled_oid
+        } else {
+            if observation.direct_oid.is_empty() {
+                observation.direct_oid = oid.to_string();
+                continue;
+            }
+            if observation.direct_oid != oid {
+                bail!(
+                    "Remote patch tag `{ref_name}` was reported with conflicting object IDs {} and {oid}",
+                    observation.direct_oid
+                );
+            }
+            continue;
+        };
+        match slot {
+            Some(existing) if existing != oid => bail!(
+                "Remote patch tag `{ref_name}` was reported with conflicting peeled object IDs {existing} and {oid}"
+            ),
+            Some(_) => {}
+            None => *slot = Some(oid.to_string()),
+        }
+    }
+
+    for ((id, version), observation) in observations.iter() {
+        if observation.direct_oid.is_empty() {
+            bail!(
+                "Remote patch tag `gherrit/{id}/v{version}` has a peeled target but no tag ref object"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn observe_remote_default(repo: &util::Repo) -> Result<RemoteDefault> {
@@ -2043,6 +2131,41 @@ fn graphql_operation<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ids() -> Vec<String> {
+        vec!["Gabcdefghijklmnopqrstuvwxyz234567".to_string()]
+    }
+
+    #[test]
+    fn remote_version_parser_prefers_peeled_targets_and_rejects_conflicts() {
+        let mut observations = HashMap::new();
+        parse_remote_version_lines(
+            concat!(
+                "1111111111111111111111111111111111111111\trefs/tags/gherrit/Gabcdefghijklmnopqrstuvwxyz234567/v1\n",
+                "2222222222222222222222222222222222222222\trefs/tags/gherrit/Gabcdefghijklmnopqrstuvwxyz234567/v2\n",
+                "3333333333333333333333333333333333333333\trefs/tags/gherrit/Gabcdefghijklmnopqrstuvwxyz234567/v2^{}\n",
+            ),
+            &ids(),
+            &mut observations,
+        )
+        .unwrap();
+        assert_eq!(
+            observations
+                .get(&("Gabcdefghijklmnopqrstuvwxyz234567".to_string(), 2))
+                .unwrap()
+                .peeled_oid
+                .as_deref(),
+            Some("3333333333333333333333333333333333333333")
+        );
+
+        let error = parse_remote_version_lines(
+            "4444444444444444444444444444444444444444\trefs/tags/gherrit/Gabcdefghijklmnopqrstuvwxyz234567/v2^{}\n",
+            &ids(),
+            &mut observations,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("conflicting peeled object IDs"));
+    }
 
     #[test]
     fn missing_graphql_operation_is_an_error() {
