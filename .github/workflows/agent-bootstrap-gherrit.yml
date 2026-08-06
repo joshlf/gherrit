@@ -56,7 +56,7 @@ jobs:
           PY
 
           target=$(git rev-list --reverse origin/main..HEAD | sed -n '6p')
-          test "$(git show --no-patch --format=%s "$target")" = "[tests] Align fixtures with remote authority"
+          test "$(git show --no-patch --format=%s "$target")" = "Align fixtures with remote authority"
           git add src/main.rs \
             tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap \
             tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap
@@ -85,6 +85,9 @@ jobs:
 
       - name: Verify reconstructed tree
         run: test "${{ steps.reconstruct.outputs.actual_tree }}" = 1fb8bb9bacb3177d6a42286ca1bb49dcd8b42cc1
+
+      - name: Publish feature branch
+        run: git push --force-with-lease origin HEAD:refs/heads/agent/safe-pr-reorder
 
       - name: Install Rust 1.89
         uses: dtolnay/rust-toolchain@master
