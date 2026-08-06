@@ -44,9 +44,23 @@ fi
 
 candidate=${candidates[0]}
 number=$(jq -er '.number | numbers' <<<"$candidate")
+node_id=$(jq -er '.id | strings | select(length > 0)' <<<"$candidate")
 base=$(jq -er '.baseRefName | strings' <<<"$candidate")
 head_oid=$(jq -er '.headRefOid | strings | select(length > 0)' <<<"$candidate")
 body=$(jq -er '.body | strings' <<<"$candidate")
+
+if jq -e '.isInMergeQueue == true' >/dev/null <<<"$candidate"; then
+  echo "Child PR #$number is in the merge queue; refusing to mutate it." >&2
+  exit 1
+fi
+if jq -e '.autoMergeRequest != null' >/dev/null <<<"$candidate"; then
+  echo "Child PR #$number has auto-merge enabled; refusing to mutate it." >&2
+  exit 1
+fi
+if jq -e '.stackEntry != null' >/dev/null <<<"$candidate"; then
+  echo "Child PR #$number belongs to a native GitHub stack; refusing to mutate it." >&2
+  exit 1
+fi
 
 if ! metadata=$(printf '%s' "$body" | bash "$script_dir/extract_stack_metadata.sh"); then
   echo "Child PR #$number has invalid terminal GHerrit metadata." >&2
@@ -56,23 +70,31 @@ if [[ $(jq -er '.id' <<<"$metadata") != "$child_id" ]]; then
   echo "Child PR #$number metadata ID does not match '$child_id'." >&2
   exit 1
 fi
-if [[ $(jq -er '.parent // ""' <<<"$metadata") != "$merged_head" ]]; then
-  echo "Child PR #$number metadata does not point back to '$merged_head'." >&2
+metadata_parent=$(jq -r '.parent // ""' <<<"$metadata")
+if [[ $metadata_parent != "$merged_head" && -n $metadata_parent ]]; then
+  echo "Child PR #$number metadata does not point back to '$merged_head' or describe an already-promoted child." >&2
   exit 1
 fi
 
 if [[ $base == "$merged_head" ]]; then
   mode=parent
-elif [[ $base == "$default_branch" && $parent_ref_exists == false ]]; then
-  mode=automatically-retargeted
+elif [[ $base == "$default_branch" ]]; then
+  if [[ $parent_ref_exists == false ]]; then
+    mode=automatically-retargeted
+  else
+    mode=default-based-recovery
+  fi
 else
-  echo "Child PR #$number targets '$base', which is not a legitimate pre-cascade base." >&2
+  echo "Child PR #$number targets '$base', which is not a legitimate cascade or recovery base." >&2
   exit 1
 fi
 
 jq -cn \
   --argjson number "$number" \
+  --arg nodeId "$node_id" \
   --arg baseRefName "$base" \
   --arg headRefOid "$head_oid" \
   --arg mode "$mode" \
-  '{number: $number, baseRefName: $baseRefName, headRefOid: $headRefOid, mode: $mode}'
+  --arg body "$body" \
+  --arg metadataParent "$metadata_parent" \
+  '{number: $number, nodeId: $nodeId, baseRefName: $baseRefName, headRefOid: $headRefOid, mode: $mode, body: $body, metadataParent: $metadataParent}'

@@ -258,12 +258,19 @@ To solve this, GHerrit implements a **Cascading Merge** system:
     *   Accepts either the original parent base or GitHub's legitimate
         automatic retarget to the default branch after the parent ref is
         deleted, while rejecting every other topology.
-    *   Verifies that the checked-out child OID and commit trailer match the
-        GraphQL-observed PR before changing or pushing it.
-    *   Retargets the child PR to the repository's default branch when GitHub
-        has not already done so.
-    *   Rebases the child PR onto the updated default branch.
-    *   Force-pushes the updated child PR.
+    *   Rejects children in the merge queue, with auto-merge enabled, or owned
+        by GitHub's native stacked-PR feature before performing any mutation.
+    *   Verifies that the checked-out child OID, commit trailer, and current
+        patch-version tag match the GraphQL-observed PR before changing it.
+    *   Rebases exactly the child commit onto the updated default branch while
+        preserving an authenticated empty commit if the patch is already
+        upstream, then revalidates the resulting one-commit topology.
+    *   Atomically publishes the rebased child branch and its next
+        `refs/tags/gherrit/<id>/v<version>` tag using explicit leases.
+    *   Retargets the PR only after Git publication is confirmed and rewrites
+        its terminal metadata so the promoted child becomes the next root.
+    *   Re-observes lost or failed push and API acknowledgements so retries can
+        safely resume from every durable intermediate state.
 
 This ensures that as soon as you merge the bottom of the stack, the next PR
 automatically updates and becomes ready for review/merge, keeping the entire
