@@ -32,6 +32,7 @@ pub struct MockState {
     pub merge_queue: HashSet<u64>,
     pub auto_merge: HashSet<u64>,
     pub native_stacks: HashSet<u64>,
+    pub base_updates: Vec<BaseUpdate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +196,13 @@ impl GitPush {
     pub fn succeeded(&self) -> bool {
         self.exit_code == 0
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseUpdate {
+    pub pr_id: u64,
+    pub old_base: String,
+    pub new_base: String,
 }
 
 #[derive(Clone)]
@@ -741,7 +749,14 @@ async fn complete_git(
         return StatusCode::BAD_REQUEST;
     }
 
-    record_push(&app_state, completion.args, completion.exit_code);
+    let exit_code = completion.exit_code;
+    record_push(&app_state, completion.args, exit_code);
+    if exit_code == 0 {
+        if let Err(message) = apply_indirect_merges(&app_state) {
+            eprintln!("mock GitHub indirect-merge evaluation failed: {message}");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -763,6 +778,59 @@ fn record_push(app_state: &AppState, args: Vec<String>, exit_code: i32) {
         .cloned()
         .collect();
     app_state.state.write().unwrap().pushes.push(GitPush { args, refspecs, exit_code });
+}
+
+fn apply_indirect_merges(app_state: &AppState) -> Result<(), String> {
+    let candidates = {
+        let state = app_state.state.read().unwrap();
+        state
+            .prs
+            .iter()
+            .filter(|pr| pr.state == "OPEN")
+            .map(|pr| (pr.id, pr.head.ref_field.clone(), pr.base.ref_field.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    let mut merged = HashSet::new();
+    for (id, head, base) in candidates {
+        let Some(head_oid) = remote_branch_oid(app_state, &head)? else {
+            continue;
+        };
+        let Some(base_oid) = remote_branch_oid(app_state, &base)? else {
+            continue;
+        };
+        let output = app_state
+            .test_environment
+            .command(&app_state.system_git)
+            .arg("--git-dir")
+            .arg(&app_state.remote_path)
+            .args(["merge-base", "--is-ancestor", &head_oid, &base_oid])
+            .output()
+            .map_err(|error| {
+                format!(
+                    "Failed to evaluate whether PR head {head}@{head_oid} is reachable from {base}@{base_oid}: {error}"
+                )
+            })?;
+        match output.status.code() {
+            Some(0) => {
+                merged.insert(id);
+            }
+            Some(1) => {}
+            code => {
+                return Err(format!("Reachability check for PR {id} exited with {code:?}"));
+            }
+        }
+    }
+
+    if !merged.is_empty() {
+        let mut state = app_state.state.write().unwrap();
+        for pr in &mut state.prs {
+            if pr.state == "OPEN" && merged.contains(&pr.id) {
+                pr.state = "MERGED".to_string();
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -975,6 +1043,19 @@ async fn graphql(
         response_json.insert("errors".to_string(), serde_json::Value::Array(errors));
     }
 
+    let mutates_prs = operations.iter().any(|operation| {
+        matches!(operation, GraphQlOperation::CreatePr | GraphQlOperation::UpdatePr)
+    });
+    drop(mock_state);
+    if mutates_prs {
+        if let Err(message) = apply_indirect_merges(&app_state) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "errors": [{ "message": message }] })),
+            );
+        }
+    }
+
     (StatusCode::OK, Json(serde_json::Value::Object(response_json)))
 }
 
@@ -1087,12 +1168,23 @@ fn handle_update_pr(
     if let Some(body) = &body {
         pr.body = Some(body.clone());
     }
-    if let Some(base) = base {
-        pr.base.ref_field = base;
-    }
+    let base_update = base.and_then(|base| {
+        (pr.base.ref_field != base).then(|| BaseUpdate {
+            pr_id: pr.id,
+            old_base: std::mem::replace(&mut pr.base.ref_field, base.clone()),
+            new_base: base,
+        })
+    });
 
     if body.as_deref().is_some_and(|body| body.contains("TRIGGER_GRAPHQL_NULL")) {
+        if let Some(update) = base_update {
+            mock_state.base_updates.push(update);
+        }
         return Ok(serde_json::Value::Null);
+    }
+
+    if let Some(update) = base_update {
+        mock_state.base_updates.push(update);
     }
 
     let mut response = serde_json::Map::new();
@@ -1390,7 +1482,7 @@ mod tests {
 
         let lookup = parse_document(
             "query { op0: repository(owner: \"owner\", name: \"repo\") { \
-             pullRequests(headRefName: \"Ghead\", first: 1, \
+             pullRequests(headRefName: \"Ghead\", first: 100, \
              states: [OPEN, CLOSED, MERGED]) { nodes { number, id, title, body, \
              baseRefName, state } } } }",
         );
@@ -1450,7 +1542,7 @@ mod tests {
 
         let duplicate_states = parse_document(
             "query { repository(owner: \"owner\", name: \"repo\") { \
-             pullRequests(headRefName: \"Ghead\", first: 1, \
+             pullRequests(headRefName: \"Ghead\", first: 100, \
              states: [OPEN, CLOSED, MERGED, OPEN]) { nodes { number } } } }",
         );
         assert!(validate_supported_document(&duplicate_states, &None)
@@ -1479,7 +1571,7 @@ mod tests {
     fn repository_response_contains_only_selected_fields() {
         let document = parse_document(
             "query { repository(owner: \"owner\", name: \"repo\") { \
-             pullRequests(headRefName: \"Ghead\", first: 1, \
+             pullRequests(headRefName: \"Ghead\", first: 100, \
              states: [OPEN, CLOSED, MERGED]) { nodes { number } } } }",
         );
         validate_supported_document(&document, &None).unwrap();
@@ -1494,7 +1586,10 @@ mod tests {
             repo_owner: "owner",
             repo_name: "repo",
         }));
-        let response = handle_repository_query(&state, root_field(&document), &None).unwrap();
+        let response = handle_repository_query(&state, root_field(&document), &None, &|branch| {
+            Ok(Some(format!("{branch}-oid")))
+        })
+        .unwrap();
         assert_eq!(
             response,
             serde_json::json!({
