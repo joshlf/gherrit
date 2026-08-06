@@ -1,81 +1,14 @@
 name: Agent publish safe-pr-reorder review fixes
 
 on:
-  push:
-    branches:
-      - agent/bootstrap-gherrit-build
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  publish:
+  disabled:
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout publisher payload
-        uses: actions/checkout@v4
-        with:
-          ref: agent/bootstrap-gherrit-build
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Reconstruct and publish review-fix transport
-        run: |
-          set -euxo pipefail
-
-          cat \
-            agent_payloads/safe-pr-reorder-review-fixes.patch.gz.b64.00 \
-            agent_payloads/safe-pr-reorder-review-fixes.patch.gz.b64.01 \
-            agent_payloads/safe-pr-reorder-review-fixes.patch.gz.b64.02 \
-            agent_payloads/safe-pr-reorder-review-fixes.patch.gz.b64.03 \
-            agent_payloads/safe-pr-reorder-review-fixes.patch.gz.b64.04 \
-            agent_payloads/safe-pr-reorder-review-fixes.patch.gz.b64.05 \
-            agent_payloads/safe-pr-reorder-review-fixes.patch.gz.b64.06 \
-            agent_payloads/safe-pr-reorder-review-fixes.patch.gz.b64.07 \
-            | base64 --decode \
-            | gzip --decompress \
-            > /tmp/review-fixes.patch
-
-          test "$(sha256sum /tmp/review-fixes.patch | cut -d' ' -f1)" = \
-            30456950f4c1388c3fcd664eddc2668b24994f616bb7f42d40da7449abcd312b
-
-          expected=f1c7e77f908e0d82b8d17bded3c1b5b0f4ef0e58
-          git fetch origin \
-            +refs/heads/agent/safe-pr-reorder:refs/remotes/origin/agent/safe-pr-reorder
-          test "$(git rev-parse refs/remotes/origin/agent/safe-pr-reorder)" = "$expected"
-
-          git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout --force -B agent/safe-pr-reorder \
-            refs/remotes/origin/agent/safe-pr-reorder
-          git am /tmp/review-fixes.patch
-
-          test "$(git rev-list --count "$expected"..HEAD)" = 8
-          test "$(git rev-parse HEAD^{tree})" = \
-            f7e96bca2f50d40d67de7d7138cb25bdd0fa0ad6
-
-          # GitHub Actions' token cannot change workflow files. Preserve the
-          # desired file locally, then remove that single change from commit 7
-          # for transport. The GitHub connector will restore the exact blob by
-          # replacing commits 7 and 8 after this push succeeds.
-          cp .github/workflows/ci.yml /tmp/desired-ci.yml
-          workflow_commit=$(git rev-list --reverse "$expected"..HEAD | sed -n '7p')
-          test "$(git show --no-patch --format=%s "$workflow_commit")" = \
-            "Authenticate cascade topology before rebasing"
-          git checkout "$workflow_commit^" -- .github/workflows/ci.yml
-          git add .github/workflows/ci.yml
-          git commit --fixup="$workflow_commit" --no-verify
-          GIT_SEQUENCE_EDITOR=true \
-            git rebase --interactive --autosquash "$expected"
-
-          test "$(git rev-list --count "$expected"..HEAD)" = 8
-          test "$(git show --no-patch --format=%s HEAD)" = \
-            "Align validation fixtures with remote authority"
-          git diff --exit-code "$expected" -- .github/workflows/ci.yml
-          git diff --check "$expected"...HEAD
-          git log --reverse --format='%H %T %P %s' "$expected"..HEAD
-
-          git push origin \
-            HEAD:refs/heads/agent/safe-pr-reorder \
-            --force-with-lease=refs/heads/agent/safe-pr-reorder:$expected
+      - run: echo disabled
