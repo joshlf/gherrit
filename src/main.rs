@@ -1,4 +1,5 @@
 mod commit_msg;
+mod gherrit_id;
 mod install;
 mod manage;
 mod pre_push;

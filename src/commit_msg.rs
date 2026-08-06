@@ -24,7 +24,7 @@ use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
 
 use crate::{
-    cmd,
+    cmd, gherrit_id,
     util::{self, CommandExt as _},
 };
 
@@ -99,8 +99,11 @@ pub fn run(repo: &util::Repo, msg_file: &str) -> Result<()> {
     let output = cmd!("git interpret-trailers --parse", msg_file).checked_output()?;
     let trailers = String::from_utf8_lossy(&output.stdout);
 
-    let re = crate::re!(r"^gherrit-pr-id: .*");
-    if trailers.lines().any(|line| re.is_match(line)) {
+    let parsed = trailers.lines().filter_map(|line| {
+        let (token, value) = line.split_once(": ")?;
+        Some((token.as_bytes(), value.as_bytes()))
+    });
+    if gherrit_id::from_trailers(parsed)?.is_some() {
         return Ok(());
     }
 

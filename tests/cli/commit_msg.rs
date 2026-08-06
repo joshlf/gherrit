@@ -123,3 +123,31 @@ fn test_commit_msg_trailers_failure() {
             .stderr(predicate::str::contains("Simulated failure for git interpret-trailers"));
     }
 }
+
+#[test]
+fn commit_msg_ignores_matching_prose_but_rejects_an_invalid_real_trailer() {
+    let ctx = testutil::test_context!().with_initial_commit().build();
+    ctx.manage_cmd().assert().success();
+
+    let prose_file = ctx.repo_path.join("PROSE_MSG");
+    std::fs::write(
+        &prose_file,
+        "feat: prose\n\nA sentence containing gherrit-pr-id: main.\n\nNot-A-Trailer paragraph.",
+    )
+    .unwrap();
+    ctx.gherrit_cmd()
+        .args(["hook", "commit-msg", prose_file.to_str().unwrap()])
+        .assert()
+        .success();
+    let prose = std::fs::read_to_string(&prose_file).unwrap();
+    assert!(prose.contains("gherrit-pr-id: G"));
+    assert!(!prose.ends_with("gherrit-pr-id: main\n"));
+
+    let invalid_file = ctx.repo_path.join("INVALID_MSG");
+    std::fs::write(&invalid_file, "feat: invalid\n\ngherrit-pr-id: main\n").unwrap();
+    ctx.gherrit_cmd()
+        .args(["hook", "commit-msg", invalid_file.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Invalid gherrit-pr-id `main`"));
+}
