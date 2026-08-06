@@ -151,9 +151,10 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
         }
         util::CommitsBetweenError::Eyre(e) => e,
     })?;
+    validate_linear_history(default_ref.detach(), &commits)?;
 
     let remote = repo.default_remote_name();
-    commits
+    let commits = commits
         .into_iter()
         .map(|c| -> Result<Commit> {
             let msg = c.message()?;
@@ -171,7 +172,41 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
 
             c.try_into()
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut seen = HashSet::new();
+    for commit in &commits {
+        if !seen.insert(commit.gherrit_id.as_str()) {
+            bail!(
+                "Stack contains duplicate gherrit-pr-id `{}`; every managed commit must have a unique ID",
+                commit.gherrit_id
+            );
+        }
+    }
+    Ok(commits)
+}
+
+fn validate_linear_history(base: ObjectId, commits: &[gix::Commit<'_>]) -> Result<()> {
+    let mut expected_parent = base;
+    for commit in commits {
+        let parents = commit.parent_ids().map(gix::Id::detach).collect::<Vec<_>>();
+        if parents.len() != 1 {
+            bail!(
+                "Commit {} has {} parents; GHerrit only supports a linear first-parent stack",
+                commit.id,
+                parents.len()
+            );
+        }
+        if parents[0] != expected_parent {
+            bail!(
+                "Commit {} does not directly follow {}; GHerrit only supports a linear first-parent stack",
+                commit.id,
+                expected_parent
+            );
+        }
+        expected_parent = commit.id;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -1162,18 +1197,21 @@ impl TryFrom<gix::Commit<'_>> for Commit {
         let message_body =
             message.body.map(|body| core::str::from_utf8(body).unwrap()).unwrap_or("").to_string();
         let gherrit_id = {
-            let re = gherrit_pr_id_re();
-            let captures = re
-                .captures(&message_body)
-                .ok_or_else(|| eyre!("Commit {} missing gherrit-pr-id trailer", c.id))?;
-            captures.get(1).unwrap().as_str().to_string()
+            let mut captures = gherrit_pr_id_re().captures_iter(&message_body);
+            let first = captures.next().ok_or_else(|| {
+                eyre!("Commit {} missing a non-empty gherrit-pr-id trailer", c.id)
+            })?;
+            if captures.next().is_some() {
+                bail!("Commit {} contains multiple gherrit-pr-id trailers", c.id);
+            }
+            first.get(1).unwrap().as_str().to_string()
         };
 
         Ok(Commit { id: c.id, gherrit_id, message_title, message_body })
     }
 }
 
-re!(gherrit_pr_id_re, r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$");
+re!(gherrit_pr_id_re, r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]+)$");
 
 /// A request to create a new PR in a batch.
 #[derive(Clone)]

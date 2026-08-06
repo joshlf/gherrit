@@ -1,5 +1,6 @@
 mod autosquash;
 mod pr_state;
+mod topology;
 mod unmanaged;
 
 #[test]
