@@ -264,7 +264,13 @@ To solve this, GHerrit implements a **Cascading Merge** system:
         patch-version tag match the GraphQL-observed PR before changing it.
     *   Rebases exactly the child commit onto the updated default branch while
         preserving an authenticated empty commit if the patch is already
-        upstream, then revalidates the resulting one-commit topology.
+        upstream, then revalidates the resulting one-commit topology. A retry
+        can advance an authenticated child from an older default-branch tip.
+    *   Authenticates every open PR using the rewritten child branch as its
+        base and refuses unrelated, operationally blocked, or
+        reachability-unsafe consumers.
+    *   Precomputes the promoted PR body before durable Git publication,
+        including recovery from GHerrit's provisional creation body.
     *   Atomically publishes the rebased child branch and its next
         `refs/tags/gherrit/<id>/v<version>` tag using explicit leases.
     *   Retargets the PR only after Git publication is confirmed and rewrites

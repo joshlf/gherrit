@@ -95,3 +95,50 @@ if printf '%s\trefs/tags/gherrit/%s/v01\n' "$oid1" "$id" |
   echo "expected noncanonical cascade version tag to be rejected" >&2
   exit 1
 fi
+
+repository=R_repo
+consumer_body="<!-- gherrit-meta: {\"id\":\"$child\",\"parent\":\"$id\",\"child\":null} -->"
+consumer_json=$(
+  jq -cn \
+    --arg repository "$repository" \
+    --arg parent "$id" \
+    --arg child "$child" \
+    --arg body "$consumer_body" '
+      {data:{repository:{id:$repository,pullRequests:{totalCount:1,nodes:[{
+        id:"PR_child",number:2,body:$body,
+        headRefName:$child,headRefOid:"0123456789abcdef",
+        baseRefName:$parent,isCrossRepository:false,isInMergeQueue:false,
+        autoMergeRequest:null,stackEntry:null,
+        headRepository:{id:$repository},baseRepository:{id:$repository}
+      }]}}}}
+    '
+)
+selected=$(
+  printf '%s' "$consumer_json" |
+    python3 ci/gherrit_protocol.py base-consumer \
+      --child "$id" --grandchild "$child" --repository "$repository"
+)
+[[ $(jq -er '.headRefName' <<<"$selected") == "$child" ]]
+
+assert_consumer_rejected() {
+  local payload=$1
+  shift
+  if printf '%s' "$payload" |
+    python3 ci/gherrit_protocol.py base-consumer \
+      --child "$id" "$@" --repository "$repository" >/dev/null 2>&1; then
+    echo "expected unsafe base consumer to be rejected" >&2
+    exit 1
+  fi
+}
+assert_consumer_rejected \
+  "$(jq '.data.repository.pullRequests.nodes[0].isCrossRepository = true' <<<"$consumer_json")" \
+  --grandchild "$child"
+assert_consumer_rejected \
+  "$(jq '.data.repository.pullRequests.nodes[0].headRepository = null' <<<"$consumer_json")" \
+  --grandchild "$child"
+assert_consumer_rejected \
+  "$(jq '.data.repository.pullRequests.totalCount = 2 | .data.repository.pullRequests.nodes += [.data.repository.pullRequests.nodes[0]]' <<<"$consumer_json")" \
+  --grandchild "$child"
+assert_consumer_rejected "$consumer_json"
+
+echo "stack metadata and cascade protocol parser tests passed"

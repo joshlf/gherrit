@@ -178,6 +178,11 @@ CHILD_BASE=$(jq -er '.baseRefName' <<<"$CHILD_SELECTION")
 CHILD_HEAD_OID=$(jq -er '.headRefOid' <<<"$CHILD_SELECTION")
 CHILD_MODE=$(jq -er '.mode' <<<"$CHILD_SELECTION")
 CHILD_BODY=$(jq -er '.body' <<<"$CHILD_SELECTION")
+CHILD_METADATA=$(
+  printf '%s' "$CHILD_BODY" |
+    bash "$action_path/ci/extract_stack_metadata.sh"
+)
+GRANDCHILD_ID=$(jq -er '.child // ""' <<<"$CHILD_METADATA")
 echo "Identified current child PR: #$CHILD_PR ($CHILD_MODE)"
 
 git config user.name "github-actions[bot]"
@@ -214,12 +219,38 @@ head_is_canonical_child() {
   [[ $(git log -1 --format=%B | bash "$action_path/ci/extract_gherrit_id.sh") == "$CHILD_ID" ]]
 }
 
-if ! head_is_canonical_child; then
-  if [[ $(git rev-list --parents -n 1 HEAD | wc -w) -ne 2 ]]; then
-    echo "::error::Child PR head is not a linear single-parent commit."
+if [[ $(git rev-list --parents -n 1 HEAD | wc -w) -ne 2 ]]; then
+  echo "::error::Child PR head is not a linear single-parent commit."
+  exit 1
+fi
+OLD_PARENT=$(git rev-parse HEAD^)
+
+if git --no-replace-objects merge-base --is-ancestor HEAD "$DEFAULT_OID"; then
+  echo "::error::Authenticated child head is already reachable from '$DEFAULT_BRANCH'; refusing to cascade an already-landed PR."
+  exit 1
+else
+  status=$?
+  if (( status != 1 )); then
+    echo "::error::Could not determine whether the child head is already reachable from '$DEFAULT_BRANCH'."
     exit 1
   fi
-  OLD_PARENT=$(git rev-parse HEAD^)
+fi
+
+if [[ "$OLD_PARENT" == "$DEFAULT_OID" ]]; then
+  : # The child is already canonical on the current default tip.
+elif git --no-replace-objects merge-base --is-ancestor "$OLD_PARENT" "$DEFAULT_OID"; then
+  echo "Authenticated child is based on an older default-branch commit; rebasing it onto the current '$DEFAULT_BRANCH'."
+  if ! git rebase --reapply-cherry-picks --keep-empty --empty=keep \
+    --onto "origin/$DEFAULT_BRANCH" "$OLD_PARENT"; then
+    echo "::error::Rebase conflict for PR #$CHILD_PR. The PR base was not changed; manual intervention is required."
+    exit 1
+  fi
+else
+  status=$?
+  if (( status != 1 )); then
+    echo "::error::Could not determine whether the child parent belongs to '$DEFAULT_BRANCH'."
+    exit 1
+  fi
   OLD_PARENT_ID=$(git log -1 --format=%B "$OLD_PARENT" | bash "$action_path/ci/extract_gherrit_id.sh")
   if [[ "$OLD_PARENT_ID" != "$MERGED_PR_HEAD" ]]; then
     echo "::error::Child PR head is not directly based on an authenticated commit for merged parent '$MERGED_PR_HEAD'."
@@ -250,7 +281,104 @@ if [[ "$POST_REBASE_ID" != "$CHILD_ID" ]]; then
   exit 1
 fi
 
+PROSPECTIVE_VERSION=$LATEST_VERSION
 if [[ "$NEW_HEAD_OID" != "$CHILD_HEAD_OID" ]]; then
+  PROSPECTIVE_VERSION=$NEXT_VERSION
+fi
+
+# Body promotion is fallible, so compute and validate it before publishing the
+# durable branch-and-version transaction. The exact result is reused for the
+# later projection mutation.
+DESIRED_BODY=$(
+  printf '%s' "$CHILD_BODY" |
+    python3 "$action_path/ci/gherrit_protocol.py" promote-body \
+      --id "$CHILD_ID" \
+      --parent "$MERGED_PR_HEAD" \
+      --latest "$PROSPECTIVE_VERSION" \
+      --repo-url "https://github.com/$TARGET_REPOSITORY" \
+      --base "$DEFAULT_BRANCH"
+)
+
+query_base_consumers() {
+  gh api graphql \
+    -f owner="$OWNER" \
+    -f name="$REPOSITORY_NAME" \
+    -f base="$CHILD_ID" \
+    -f query='query($owner: String!, $name: String!, $base: String!) {
+      repository(owner: $owner, name: $name) {
+        id
+        pullRequests(baseRefName: $base, first: 100, states: [OPEN]) {
+          totalCount
+          nodes {
+            id
+            number
+            body
+            headRefName
+            headRefOid
+            baseRefName
+            isCrossRepository
+            isInMergeQueue
+            autoMergeRequest { enabledAt }
+            stackEntry { id }
+            headRepository { id }
+            baseRepository { id }
+          }
+        }
+      }
+    }'
+}
+
+validate_base_consumers() {
+  local lookup selection grandchild_head remote_head version_lines base_oid status
+  lookup=$(query_base_consumers)
+  selection=$(
+    printf '%s' "$lookup" |
+      python3 "$action_path/ci/gherrit_protocol.py" base-consumer \
+        --child "$CHILD_ID" \
+        --grandchild "$GRANDCHILD_ID" \
+        --repository "$TARGET_REPOSITORY_ID"
+  )
+  if [[ "$selection" == null ]]; then
+    return 0
+  fi
+
+  grandchild_head=$(jq -er '.headRefOid' <<<"$selection")
+  remote_head=$(git ls-remote origin "refs/heads/$GRANDCHILD_ID" |
+    awk -v ref="refs/heads/$GRANDCHILD_ID" '$2 == ref { print $1 }')
+  if [[ -z "$remote_head" || "$remote_head" != "$grandchild_head" ]]; then
+    echo "::error::Authenticated grandchild PR head does not match remote branch '$GRANDCHILD_ID'."
+    exit 1
+  fi
+  git fetch --no-tags origin "refs/heads/$GRANDCHILD_ID" >/dev/null
+  if [[ $(git rev-parse FETCH_HEAD) != "$grandchild_head" ]]; then
+    echo "::error::Fetched grandchild branch does not match its GraphQL-observed head."
+    exit 1
+  fi
+  if [[ $(git log -1 --format=%B FETCH_HEAD | bash "$action_path/ci/extract_gherrit_id.sh") != "$GRANDCHILD_ID" ]]; then
+    echo "::error::Authenticated grandchild branch does not carry its expected GHerrit ID."
+    exit 1
+  fi
+  version_lines=$(git ls-remote --tags origin "refs/tags/gherrit/$GRANDCHILD_ID/v*")
+  printf '%s\n' "$version_lines" |
+    python3 "$action_path/ci/gherrit_protocol.py" version-state \
+      --id "$GRANDCHILD_ID" --expected-head "$grandchild_head" >/dev/null
+
+  for base_oid in "$CHILD_HEAD_OID" "$NEW_HEAD_OID"; do
+    if git --no-replace-objects merge-base --is-ancestor "$grandchild_head" "$base_oid"; then
+      echo "::error::Grandchild PR head would be reachable from rewritten base branch '$CHILD_ID'; refusing an indirect merge."
+      exit 1
+    else
+      status=$?
+      if (( status != 1 )); then
+        echo "::error::Could not prove grandchild reachability safety for rewritten branch '$CHILD_ID'."
+        exit 1
+      fi
+    fi
+  done
+}
+
+if [[ "$NEW_HEAD_OID" != "$CHILD_HEAD_OID" ]]; then
+  validate_base_consumers
   VERSION_REF="refs/tags/gherrit/$CHILD_ID/v$NEXT_VERSION"
   if ! git push --atomic --no-verify \
     --force-with-lease="refs/heads/$CHILD_ID:$CHILD_HEAD_OID" \
@@ -271,20 +399,10 @@ if [[ "$NEW_HEAD_OID" != "$CHILD_HEAD_OID" ]]; then
       exit 1
     fi
   fi
-  LATEST_VERSION=$NEXT_VERSION
+  LATEST_VERSION=$PROSPECTIVE_VERSION
 else
   echo "Child head is already the canonical commit above the updated default branch; no new patch version is required."
 fi
-
-DESIRED_BODY=$(
-  printf '%s' "$CHILD_BODY" |
-    python3 "$action_path/ci/gherrit_protocol.py" promote-body \
-      --id "$CHILD_ID" \
-      --parent "$MERGED_PR_HEAD" \
-      --latest "$LATEST_VERSION" \
-      --repo-url "https://github.com/$TARGET_REPOSITORY" \
-      --base "$DEFAULT_BRANCH"
-)
 
 needs_projection_update=true
 if [[ "$CHILD_BASE" == "$DEFAULT_BRANCH" && "$CHILD_BODY" == "$DESIRED_BODY" ]]; then
