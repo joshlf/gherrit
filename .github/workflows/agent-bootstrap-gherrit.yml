@@ -36,33 +36,23 @@ jobs:
 
           # Fold the final logger cleanup into the existing fixture commit,
           # preserving the planned eleven-commit review stack.
-          cat > /tmp/logger-cleanup.patch <<'PATCH'
-          diff --git a/src/main.rs b/src/main.rs
-          --- a/src/main.rs
-          +++ b/src/main.rs
-          @@ -103,7 +103,12 @@ fn main() -> ExitCode {
-                               log::Level::Trace => &level_style_trace,
-                           };
-           
-          -                writeln!(buf, "{prefix}{level_style} {}", record.args())
-          +                let message = record.args().to_string();
-          +                if message.is_empty() {
-          +                    writeln!(buf, "{prefix}{level_style}")
-          +                } else {
-          +                    writeln!(buf, "{prefix}{level_style} {message}")
-          +                }
-                       }
-                   })
-                   .init();
-          PATCH
-          git apply --check /tmp/logger-cleanup.patch
-          git apply /tmp/logger-cleanup.patch
-          sed -i 's/\[gherrit\] \[ERROR\] $/[gherrit] [ERROR]/' \
-            tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap \
-            tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap
-          ! grep -nE '\[gherrit\] \[ERROR\] $' \
-            tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap \
-            tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap
+          python3 - <<'PY'
+          from pathlib import Path
+          main = Path("src/main.rs")
+          text = main.read_text()
+          old = '                writeln!(buf, "{prefix}{level_style} {}", record.args())\n'
+          new = '                let message = record.args().to_string();\n                if message.is_empty() {\n                    writeln!(buf, "{prefix}{level_style}")\n                } else {\n                    writeln!(buf, "{prefix}{level_style} {message}")\n                }\n'
+          assert old in text
+          main.write_text(text.replace(old, new))
+          first = Path("tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap")
+          text = first.read_text()
+          assert "[gherrit] [ERROR] \n" in text
+          first.write_text(text.replace("[gherrit] [ERROR] \n", "[gherrit] [ERROR]\n"))
+          second = Path("tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap")
+          text = second.read_text()
+          assert "[gherrit] [ERROR] \n" in text
+          second.write_text(text.replace("[gherrit] [ERROR] \n", "[gherrit] [ERROR]\n"))
+          PY
 
           target=$(git rev-list --reverse origin/main..HEAD | sed -n '6p')
           test "$(git show --no-patch --format=%s "$target")" = "[tests] Align fixtures with remote authority"
