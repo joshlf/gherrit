@@ -1,0 +1,38 @@
+name: Agent bootstrap GHerrit
+
+on:
+  push:
+    branches:
+      - agent/bootstrap-gherrit-build
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Build GHerrit
+        run: cargo build --release --locked
+
+      - name: Package checkout
+        run: |
+          git archive --format=tar.gz --output=gherrit-source.tar.gz HEAD
+          cp target/release/gherrit gherrit-linux-amd64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gherrit-bootstrap
+          path: |
+            gherrit-source.tar.gz
+            gherrit-linux-amd64
+          if-no-files-found: error
+          retention-days: 1
