@@ -1,4 +1,4 @@
-name: Agent export safe-pr-reorder head
+name: Agent publish safe-pr-reorder third-review fixes
 
 on:
   push:
@@ -6,35 +6,51 @@ on:
       - agent/bootstrap-gherrit-build
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  export:
+  publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout exact feature head
+      - name: Checkout publisher payload
         uses: actions/checkout@v4
         with:
-          ref: 42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6
+          ref: agent/bootstrap-gherrit-build
           fetch-depth: 0
           fetch-tags: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Export exact source and history
+      - name: Verify, apply, and publish
         run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = 42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6
-          git bundle create /tmp/gherrit-safe-pr-reorder-current.bundle HEAD main
-          git archive --format=tar.gz --output=/tmp/gherrit-safe-pr-reorder-current.tar.gz HEAD
-          sha256sum /tmp/gherrit-safe-pr-reorder-current.bundle /tmp/gherrit-safe-pr-reorder-current.tar.gz \
-            > /tmp/SHA256SUMS
+          set -euxo pipefail
 
-      - name: Upload export
-        uses: actions/upload-artifact@v4
-        with:
-          name: safe-pr-reorder-current-head
-          path: |
-            /tmp/gherrit-safe-pr-reorder-current.bundle
-            /tmp/gherrit-safe-pr-reorder-current.tar.gz
-            /tmp/SHA256SUMS
-          if-no-files-found: error
-          retention-days: 1
+          payload=agent_payloads/review3/safe-pr-reorder-review3.patch.gz.b64
+          test "$(sha256sum "$payload" | awk '{print $1}')" = \
+            07d686abc57d42c162ed3c6229d1f3625b4d26fc7c0707bb6299ef992a640e47
+          base64 --decode "$payload" | gzip --decompress > /tmp/review3.patch
+          test "$(sha256sum /tmp/review3.patch | awk '{print $1}')" = \
+            fd6d8bd9e3a8ba71dd0ad48a1b6f91c5638062f0c66a88c2be634ea572aeebd2
+
+          git fetch --force origin \
+            refs/heads/agent/safe-pr-reorder:refs/remotes/origin/agent/safe-pr-reorder
+          test "$(git rev-parse refs/remotes/origin/agent/safe-pr-reorder)" = \
+            42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --detach 42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6
+          git am /tmp/review3.patch
+
+          test "$(git rev-list --count 42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6..HEAD)" = 3
+          test "$(git rev-parse HEAD^{tree})" = bb295f9c9d286149fa7b43033ab73732e3fc0836
+          test "$(git show --no-patch --format=%s HEAD~2)" = \
+            "Check grafts in the common Git directory"
+          test "$(git show --no-patch --format=%s HEAD~1)" = \
+            "Authenticate PR body promotion envelopes"
+          test "$(git show --no-patch --format=%s HEAD)" = \
+            "Protect cascade branch rewrites and retries"
+          git diff --check 42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6...HEAD
+
+          git push \
+            --force-with-lease=refs/heads/agent/safe-pr-reorder:42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6 \
+            origin HEAD:refs/heads/agent/safe-pr-reorder
