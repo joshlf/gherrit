@@ -229,14 +229,14 @@ fn projection_only_requires_latest_remote_tag_to_match_the_branch_head() {
     ctx.hook_cmd("pre-push")
         .assert()
         .failure()
-        .stderr(predicates::str::contains("inconsistent remote state"));
+        .stderr(predicates::str::contains("Refusing to extend this inconsistent remote history"));
     let expected =
         remote_refs.into_iter().chain([format!("refs/tags/gherrit/{id}/v2")]).collect::<Vec<_>>();
     assert_eq!(ctx.remote_refs("refs"), expected);
 }
 
 #[test]
-fn missing_remote_version_tag_is_repaired_without_advancing_the_branch() {
+fn existing_branch_without_an_authoritative_version_tag_is_rejected() {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_installed_hooks()
@@ -256,12 +256,94 @@ fn missing_remote_version_tag_is_repaired_without_advancing_the_branch() {
         .assert()
         .success();
 
-    ctx.hook_cmd("pre-push").assert().success();
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no authoritative GHerrit patch-version tag"));
     assert_eq!(ctx.remote_ref_oid(&branch).as_deref(), Some(oid.as_str()));
+    assert!(ctx.remote_ref_oid(&format!("refs/tags/gherrit/{id}/v1")).is_none());
+}
+
+#[test]
+fn update_requires_latest_remote_tag_to_match_the_observed_branch_head() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+
+    ctx.checkout_new("version-update-coherence");
+    ctx.commit("Version update coherence");
+    ctx.hook_cmd("pre-push").assert().success();
+    let id = ctx.gherrit_id("HEAD").unwrap();
+    let original_head = ctx.remote_ref_oid(&format!("refs/heads/{id}")).unwrap();
+    ctx.remote_git_cmd()
+        .args(["tag", &format!("gherrit/{id}/v2"), "refs/heads/main"])
+        .assert()
+        .success();
+    ctx.amend();
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Refusing to extend this inconsistent remote history"));
     assert_eq!(
-        ctx.remote_ref_oid(&format!("refs/tags/gherrit/{id}/v1")).as_deref(),
-        Some(oid.as_str())
+        ctx.remote_ref_oid(&format!("refs/heads/{id}")).as_deref(),
+        Some(original_head.as_str())
     );
+}
+
+#[test]
+fn rejects_noncanonical_remote_version_names() {
+    for suffix in ["0", "01", "+1", "-1"] {
+        let ctx = testutil::test_context!()
+            .with_remote()
+            .with_installed_hooks()
+            .with_initial_commit()
+            .with_mock_github()
+            .with_git_interceptor()
+            .build();
+
+        ctx.checkout_new(&format!("bad-version-{suffix}"));
+        ctx.commit("Bad remote version spelling");
+        let id = ctx.gherrit_id("HEAD").unwrap();
+        ctx.remote_git_cmd()
+            .args(["tag", &format!("gherrit/{id}/v{suffix}"), "refs/heads/main"])
+            .assert()
+            .success();
+
+        ctx.hook_cmd("pre-push")
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("noncanonical version number"));
+    }
+}
+
+#[test]
+fn rejects_gaps_in_authoritative_remote_version_history() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+
+    ctx.checkout_new("missing-version-gap");
+    ctx.commit("Missing version gap");
+    ctx.hook_cmd("pre-push").assert().success();
+    let id = ctx.gherrit_id("HEAD").unwrap();
+    ctx.remote_git_cmd()
+        .args(["tag", &format!("gherrit/{id}/v3"), &format!("refs/heads/{id}")])
+        .assert()
+        .success();
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("missing authoritative version v2 before v3"));
 }
 
 #[test]
@@ -298,4 +380,67 @@ fn annotated_remote_version_uses_its_peeled_commit_target() {
 
     ctx.hook_cmd("pre-push").assert().success();
     ctx.inspect_mock_state(|state| assert_eq!(state.pushes.len(), pushes));
+}
+
+#[test]
+fn exact_local_sync_after_a_versioned_cascade_is_projection_only() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+
+    ctx.checkout_new("cascade-sync");
+    ctx.commit("Root");
+    let root_oid = ctx.head_oid();
+    ctx.commit("Child");
+    let child_id = ctx.gherrit_id("HEAD").unwrap();
+    ctx.hook_cmd("pre-push").assert().success();
+
+    ctx.run_git(&["checkout", "main"]);
+    ctx.git_cmd()
+        .args(["commit", "--allow-empty", "--no-verify", "-m", "Land root as squash"])
+        .assert()
+        .success();
+    ctx.git_cmd().args(["push", "--quiet", "--no-verify", "origin", "main"]).assert().success();
+    ctx.run_git(&["checkout", "cascade-sync"]);
+    ctx.run_git(&["rebase", "--onto", "main", &root_oid]);
+    let cascaded_oid = ctx.head_oid();
+    ctx.git_cmd()
+        .args([
+            "push",
+            "--quiet",
+            "--no-verify",
+            "--atomic",
+            "--force",
+            "origin",
+            &format!("HEAD:refs/heads/{child_id}"),
+            &format!("HEAD:refs/tags/gherrit/{child_id}/v2"),
+        ])
+        .assert()
+        .success();
+    ctx.mutate_mock_state(|state| {
+        let child = state.prs.iter_mut().find(|pr| pr.head.ref_field == child_id).unwrap();
+        child.base.ref_field = "main".to_string();
+    });
+    let mut pushes_before = 0;
+    ctx.inspect_mock_state(|state| pushes_before = state.pushes.len());
+
+    ctx.hook_cmd("pre-push").assert().success();
+    assert_eq!(
+        ctx.remote_ref_oid(&format!("refs/heads/{child_id}")).as_deref(),
+        Some(cascaded_oid.as_str())
+    );
+    assert_eq!(
+        ctx.remote_ref_oid(&format!("refs/tags/gherrit/{child_id}/v2")).as_deref(),
+        Some(cascaded_oid.as_str())
+    );
+    ctx.inspect_mock_state(|state| {
+        assert_eq!(state.pushes.len(), pushes_before, "exact cascade sync must not publish v3");
+        let child = state.prs.iter().find(|pr| pr.head.ref_field == child_id).unwrap();
+        assert_eq!(child.base.ref_field, "main");
+        assert!(child.body.as_deref().unwrap().contains("\"parent\":null"));
+    });
 }

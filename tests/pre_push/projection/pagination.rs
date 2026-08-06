@@ -20,7 +20,14 @@ fn test_pagination_bug() {
     // branch directly so this test isolates candidate lookup rather than
     // malformed PR/Git coherence.
     ctx.git_cmd()
-        .args(["push", "--quiet", "--no-verify", "origin", &format!("HEAD:refs/heads/{change_id}")])
+        .args([
+            "push",
+            "--quiet",
+            "--no-verify",
+            "origin",
+            &format!("HEAD:refs/heads/{change_id}"),
+            &format!("HEAD:refs/tags/gherrit/{change_id}/v1"),
+        ])
         .assert()
         .success();
 

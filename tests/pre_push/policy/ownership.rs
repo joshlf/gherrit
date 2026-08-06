@@ -37,6 +37,7 @@ fn refuses_to_overwrite_an_unowned_id_shaped_branch() {
         .arg("push")
         .args(["--quiet", "--no-verify", "origin"])
         .arg(format!("HEAD:refs/heads/{id}"))
+        .arg(format!("HEAD:refs/tags/gherrit/{id}/v1"))
         .assert()
         .success();
     let unowned_oid = ctx.remote_ref_oid(&format!("refs/heads/{id}")).unwrap();
@@ -142,4 +143,52 @@ fn repository_lookup_and_canonical_selection_ignore_url_casing() {
     ctx.hook_cmd("pre-push").assert().success();
     ctx.amend();
     ctx.hook_cmd("pre-push").assert().success();
+}
+
+#[test]
+fn updates_an_owned_branch_after_the_remote_default_advances() {
+    let ctx = context();
+    let id = create_change(&ctx);
+
+    ctx.run_git(&["checkout", "main"]);
+    ctx.git_cmd()
+        .args(["commit", "--allow-empty", "--no-verify", "-m", "Advance main"])
+        .assert()
+        .success();
+    ctx.git_cmd().args(["push", "--quiet", "--no-verify", "origin", "main"]).assert().success();
+    ctx.run_git(&["checkout", "ownership-feature"]);
+    ctx.run_git(&["rebase", "main"]);
+
+    ctx.hook_cmd("pre-push").assert().success();
+    assert_eq!(
+        ctx.remote_ref_oid(&format!("refs/heads/{id}")).as_deref(),
+        Some(ctx.head_oid().as_str())
+    );
+    assert!(ctx.remote_ref_oid(&format!("refs/tags/gherrit/{id}/v2")).is_some());
+}
+
+#[test]
+fn updates_the_unmerged_suffix_after_the_root_lands_on_an_advanced_default() {
+    let ctx = context();
+    ctx.checkout_new("ownership-stack");
+    ctx.commit("Root change");
+    let root = ctx.head_oid();
+    ctx.commit("Middle change");
+    let middle_id = ctx.gherrit_id("HEAD").unwrap();
+    ctx.commit("Top change");
+    let top_id = ctx.gherrit_id("HEAD").unwrap();
+    ctx.hook_cmd("pre-push").assert().success();
+
+    ctx.run_git(&["checkout", "main"]);
+    ctx.git_cmd()
+        .args(["commit", "--allow-empty", "--no-verify", "-m", "Land root as a squash"])
+        .assert()
+        .success();
+    ctx.git_cmd().args(["push", "--quiet", "--no-verify", "origin", "main"]).assert().success();
+    ctx.run_git(&["checkout", "ownership-stack"]);
+    ctx.run_git(&["rebase", "--onto", "main", &root]);
+
+    ctx.hook_cmd("pre-push").assert().success();
+    assert!(ctx.remote_ref_oid(&format!("refs/tags/gherrit/{middle_id}/v2")).is_some());
+    assert!(ctx.remote_ref_oid(&format!("refs/tags/gherrit/{top_id}/v2")).is_some());
 }

@@ -319,18 +319,30 @@ fn validate_existing_branch_ownership(
         let tip = repo.rev_parse_single(oid.as_str()).wrap_err_with(|| {
             format!("Existing branch `{branch}` points to unavailable object {oid}")
         })?;
-        let commits = repo.commits_between(default_oid, tip).map_err(|error| match error {
-            util::CommitsBetweenError::NotAncestor => eyre!(
-                "Existing branch `{branch}` at {oid} is not descended from the observed remote default {} at {}; GHerrit ownership cannot be proven",
+        let merge_base = repo.merge_base(default_oid, tip).map_err(|error| {
+            eyre!(
+                "Existing branch `{branch}` at {oid} has no provable common ancestor with the observed remote default {} at {}: {error}",
                 remote_default.name,
                 remote_default.oid
+            )
+        })?;
+        if merge_base.detach() == tip.detach() {
+            bail!(
+                "Existing branch `{branch}` at {oid} is already reachable from the observed remote default {} at {}; it cannot represent an active GHerrit change",
+                remote_default.name,
+                remote_default.oid
+            );
+        }
+        let commits = repo.commits_between(merge_base, tip).map_err(|error| match error {
+            util::CommitsBetweenError::NotAncestor => eyre!(
+                "Existing branch `{branch}` at {oid} is not descended from its merge base with the observed remote default; GHerrit ownership cannot be proven"
             ),
             util::CommitsBetweenError::Eyre(error) => error,
         })?;
         if commits.is_empty() {
-            bail!("Existing branch `{branch}` points directly at the remote default branch");
+            bail!("Existing branch `{branch}` has no managed suffix beyond its merge base");
         }
-        validate_linear_history(default_oid.detach(), &commits)?;
+        validate_linear_history(merge_base.detach(), &commits)?;
 
         let mut seen = HashSet::new();
         for (index, commit) in commits.iter().enumerate() {
@@ -457,23 +469,40 @@ fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<Publication
             let remote_version = remote_versions.get(&commit.gherrit_id);
             desired_heads.insert(commit.gherrit_id.clone(), commit.id);
 
-            // If remote Git already contains this exact head and a coherent
-            // patch version, this invocation is projection-only. This is what
-            // makes a retry after a successful push but failed GitHub update
-            // repair the PRs without manufacturing another version.
-            if expected_remote_sha == desired_oid
-                && let Some(remote_version) = remote_version
-            {
-                if remote_version.target_oid != desired_oid {
+            match (expected_remote_sha.is_empty(), remote_version) {
+                (true, Some(remote_version)) => bail!(
+                    "Remote patch tag gherrit/{}/v{} exists, but managed branch {} does not. Refusing to publish into an inconsistent remote history.",
+                    commit.gherrit_id,
+                    remote_version.version,
+                    commit.gherrit_id
+                ),
+                (false, None) => bail!(
+                    "Managed branch {} points to {}, but it has no authoritative GHerrit patch-version tag. Refusing to overwrite an unauthenticated remote history.",
+                    commit.gherrit_id,
+                    expected_remote_sha
+                ),
+                (false, Some(remote_version))
+                    if remote_version.target_oid != expected_remote_sha =>
+                {
                     bail!(
-                        "Remote patch tag gherrit/{}/v{} points to {}, but managed branch {} points to {}. Refusing to treat this inconsistent remote state as a projection-only retry.",
+                        "Remote patch tag gherrit/{}/v{} points to {}, but managed branch {} points to {}. Refusing to extend this inconsistent remote history.",
                         commit.gherrit_id,
                         remote_version.version,
                         remote_version.target_oid,
                         commit.gherrit_id,
-                        desired_oid
+                        expected_remote_sha
                     );
                 }
+                _ => {}
+            }
+
+            // If remote Git already contains this exact head and its latest
+            // authoritative version tag targets that head, this invocation is
+            // projection-only. This lets a retry repair GitHub projection
+            // without manufacturing another patch version.
+            if expected_remote_sha == desired_oid
+                && let Some(remote_version) = remote_version
+            {
                 latest_versions.insert(commit.gherrit_id.clone(), remote_version.version);
                 continue;
             }
@@ -716,6 +745,21 @@ fn get_remote_versions(
     }
 
     let requested = gherrit_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut observed_versions: HashMap<&str, BTreeSet<usize>> = HashMap::new();
+    for (id, version) in observations.keys() {
+        if requested.contains(id.as_str()) {
+            observed_versions.entry(id.as_str()).or_default().insert(*version);
+        }
+    }
+    for (id, observed) in observed_versions {
+        let latest = *observed.last().expect("observed version set is nonempty");
+        if let Some(missing) = (1..=latest).find(|version| !observed.contains(version)) {
+            bail!(
+                "Remote patch history for GHerrit ID `{id}` is missing authoritative version v{missing} before v{latest}"
+            );
+        }
+    }
+
     let mut versions: HashMap<String, RemoteVersion> = HashMap::new();
     for ((id, version), observation) in observations {
         if !requested.contains(id.as_str()) {
@@ -761,9 +805,16 @@ fn parse_remote_version_lines(
         if !requested.contains(id) {
             continue;
         }
-        let version = version
+        if version.is_empty() || !version.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("Remote patch tag `{ref_name}` has a noncanonical version number");
+        }
+        let parsed_version = version
             .parse::<usize>()
             .map_err(|_| eyre!("Remote patch tag `{ref_name}` has an invalid version number"))?;
+        if parsed_version == 0 || version != parsed_version.to_string() {
+            bail!("Remote patch tag `{ref_name}` has a noncanonical version number");
+        }
+        let version = parsed_version;
         let observation = observations.entry((id.to_string(), version)).or_default();
         let slot = if peeled {
             &mut observation.peeled_oid
