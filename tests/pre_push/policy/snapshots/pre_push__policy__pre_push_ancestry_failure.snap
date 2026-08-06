@@ -9,6 +9,6 @@ STDOUT:
 
 STDERR:
 [gherrit] Branch lonely-branch is MANAGED. Syncing stack...
-[gherrit] [ERROR] Failed to collect commits: The branch 'lonely-branch' is not based on 'main'.
-[gherrit] [ERROR] GHerrit only supports stacked branches that share history with the default branch.
-[gherrit] [ERROR] Maybe you want to 'git rebase' on 'main' before pushing?
+[gherrit] [ERROR] Failed to collect commits: The publication remote's default branch `main` at [SHA_1] is not an ancestor of `lonely-branch`.
+[gherrit] [ERROR] GHerrit refuses to substitute a local or stale default-branch ref.
+[gherrit] [ERROR] Fetch and rebase the stack onto `origin/main` before pushing.

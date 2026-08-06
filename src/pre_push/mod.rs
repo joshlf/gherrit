@@ -48,7 +48,10 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
         true => log::info!("Branch {} is MANAGED. Syncing stack...", branch_name.yellow()),
     }
 
-    let commits = collect_commits(repo).wrap_err("Failed to collect commits")?;
+    validate_repository_dag_authority(repo)?;
+    let remote_default = observe_remote_default(repo)?;
+    fetch_remote_default(repo, &remote_default)?;
+    let commits = collect_commits(repo, &remote_default).wrap_err("Failed to collect commits")?;
 
     if commits.is_empty() {
         log::info!("No commits to sync.");
@@ -80,7 +83,6 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     let base_consumers = batch_fetch_base_consumers(repo, &octocrab, &rewritten_branches).await?;
     validate_base_consumers(&prs, &rewritten_branches, &base_consumers)?;
 
-    let remote_default = observe_remote_default(repo)?;
     let staging_bases = plan_pr_staging(repo, &commits, &prs, &publication, &remote_default)?;
     validate_topology_transition_state(&prs, &staging_bases)?;
     for staging in &staging_bases {
@@ -135,18 +137,80 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     Ok(())
 }
 
-fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
+fn validate_repository_dag_authority(repo: &util::Repo) -> Result<()> {
+    let mut shallow = util::cmd("git", ["rev-parse", "--is-shallow-repository"]);
+    shallow.current_dir(repo.workdir().unwrap_or(repo.path()));
+    let output = shallow.checked_output()?;
+    if core::str::from_utf8(&output.stdout)?.trim() == "true" {
+        bail!(
+            "GHerrit cannot prove PR reachability from a shallow repository. Fetch complete history (for example, `git fetch --unshallow`) before pushing."
+        );
+    }
+
+    if std::env::var_os("GIT_REPLACE_REF_BASE").is_some() {
+        bail!(
+            "GHerrit cannot prove remote reachability while GIT_REPLACE_REF_BASE is set; unset it before pushing"
+        );
+    }
+
+    let mut replacements = util::cmd(
+        "git",
+        ["for-each-ref", "--format=%(refname)", "refs/replace"],
+    );
+    replacements.current_dir(repo.workdir().unwrap_or(repo.path()));
+    let output = replacements.checked_output()?;
+    if !output.stdout.is_empty() {
+        bail!(
+            "GHerrit cannot prove remote reachability while local replace refs exist; delete refs/replace/* before pushing"
+        );
+    }
+
+    let grafts = repo.path().join("info/grafts");
+    if std::fs::read(&grafts).is_ok_and(|contents| {
+        contents.iter().any(|byte| !byte.is_ascii_whitespace())
+    }) {
+        bail!(
+            "GHerrit cannot prove remote reachability while .git/info/grafts is nonempty; remove the graft configuration before pushing"
+        );
+    }
+
+    Ok(())
+}
+
+fn fetch_remote_default(repo: &util::Repo, remote_default: &RemoteDefault) -> Result<()> {
+    fetch_remote_branch_objects(repo, std::slice::from_ref(&remote_default.name))
+        .wrap_err("Failed to fetch the publication remote's default branch")?;
+    repo.rev_parse_single(remote_default.oid.as_str()).wrap_err_with(|| {
+        format!(
+            "Fetched remote default branch `{}`, but object {} is unavailable",
+            remote_default.name, remote_default.oid
+        )
+    })?;
+
+    let observed = get_remote_branch_states(repo, std::slice::from_ref(&remote_default.name))?;
+    if observed.get(&remote_default.name).and_then(Option::as_deref)
+        != Some(remote_default.oid.as_str())
+    {
+        bail!("The remote default branch changed while its history was being fetched");
+    }
+    Ok(())
+}
+
+fn collect_commits(repo: &util::Repo, remote_default: &RemoteDefault) -> Result<Vec<Commit>> {
     let head = repo.rev_parse_single("HEAD")?;
-    let default_branch = repo.find_default_branch_on_default_remote();
-    let default_ref = repo.rev_parse_single(format!("refs/heads/{}", default_branch).as_str())?;
+    let default_ref = repo.rev_parse_single(remote_default.oid.as_str())?;
 
     let commits = repo.commits_between(default_ref, head).map_err(|err| match err {
         util::CommitsBetweenError::NotAncestor => {
             let branch_name = repo.current_branch().name().unwrap_or("current branch");
             eyre!(
-                "The branch '{branch_name}' is not based on '{default_branch}'.\n\
-                 GHerrit only supports stacked branches that share history with the default branch.\n\
-                 Maybe you want to 'git rebase' on '{default_branch}' before pushing?"
+                "The publication remote's default branch `{}` at {} is not an ancestor of `{branch_name}`.\n\
+                 GHerrit refuses to substitute a local or stale default-branch ref.\n\
+                 Fetch and rebase the stack onto `{}/{}` before pushing.",
+                remote_default.name,
+                remote_default.oid,
+                repo.default_remote_name(),
+                remote_default.name,
             )
         }
         util::CommitsBetweenError::Eyre(e) => e,
@@ -161,12 +225,11 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
             let title = core::str::from_utf8(msg.title)?;
 
             if ["fixup!", "squash!", "amend!"].iter().any(|p| title.starts_with(p)) {
-                // FIXME: Currently, the indent before `git rebase` is not
-                // preserved.
                 bail!(
                     "Stack contains pending fixup/squash/amend commits.\n\
                     Please squash your history before syncing:\n\
-                        git rebase -i --autosquash {remote}/{default_branch}",
+                        git rebase -i --autosquash {remote}/{}",
+                    remote_default.name,
                 );
             }
 
@@ -580,7 +643,7 @@ fn fetch_remote_branch_objects(repo: &util::Repo, branches: &[String]) -> Result
 }
 
 fn git_is_ancestor(repo: &util::Repo, ancestor: &str, descendant: &str) -> Result<bool> {
-    let mut command = util::cmd("git", ["merge-base", "--is-ancestor", ancestor, descendant]);
+    let mut command = util::cmd("git", ["--no-replace-objects", "merge-base", "--is-ancestor", ancestor, descendant]);
     command.current_dir(repo.workdir().unwrap_or(repo.path()));
     let status = command
         .status()
