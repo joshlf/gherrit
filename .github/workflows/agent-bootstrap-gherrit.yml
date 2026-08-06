@@ -34,36 +34,35 @@ jobs:
           git checkout --force -B agent/safe-pr-reorder main
           git am /tmp/safe-pr-reorder.patch
 
-          # Fold the final logging/snapshot cleanup into the existing fixture
-          # commit, preserving the planned eleven-commit review stack.
-          python3 - <<'PY'
-          from pathlib import Path
-
-          main = Path("src/main.rs")
-          text = main.read_text()
-          old = '                writeln!(buf, "{prefix}{level_style} {}", record.args())\n'
-          new = '''                let message = record.args().to_string();
-                          if message.is_empty() {
-                              writeln!(buf, "{prefix}{level_style}")
-                          } else {
-                              writeln!(buf, "{prefix}{level_style} {message}")
-                          }
-          '''
-          if old not in text:
-              raise SystemExit("expected logger formatter was not found")
-          main.write_text(text.replace(old, new))
-
-          for name in [
-              "tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap",
-              "tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap",
-          ]:
-              path = Path(name)
-              text = path.read_text()
-              old = "[gherrit] [ERROR] \n"
-              if old not in text:
-                  raise SystemExit(f"expected trailing-space snapshot line missing from {name}")
-              path.write_text(text.replace(old, "[gherrit] [ERROR]\n"))
-          PY
+          # Fold the final logger cleanup into the existing fixture commit,
+          # preserving the planned eleven-commit review stack.
+          cat > /tmp/logger-cleanup.patch <<'PATCH'
+          diff --git a/src/main.rs b/src/main.rs
+          --- a/src/main.rs
+          +++ b/src/main.rs
+          @@ -103,7 +103,12 @@ fn main() -> ExitCode {
+                               log::Level::Trace => &level_style_trace,
+                           };
+           
+          -                writeln!(buf, "{prefix}{level_style} {}", record.args())
+          +                let message = record.args().to_string();
+          +                if message.is_empty() {
+          +                    writeln!(buf, "{prefix}{level_style}")
+          +                } else {
+          +                    writeln!(buf, "{prefix}{level_style} {message}")
+          +                }
+                       }
+                   })
+                   .init();
+          PATCH
+          git apply --check /tmp/logger-cleanup.patch
+          git apply /tmp/logger-cleanup.patch
+          sed -i 's/\[gherrit\] \[ERROR\] $/[gherrit] [ERROR]/' \
+            tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap \
+            tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap
+          ! grep -nE '\[gherrit\] \[ERROR\] $' \
+            tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap \
+            tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap
 
           target=$(git rev-list --reverse origin/main..HEAD | sed -n '6p')
           test "$(git show --no-patch --format=%s "$target")" = "[tests] Align fixtures with remote authority"
