@@ -1,4 +1,5 @@
 mod autosquash;
+mod operational_state;
 mod ownership;
 mod pr_state;
 mod remote_authority;

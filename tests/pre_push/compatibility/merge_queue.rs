@@ -31,6 +31,11 @@ fn test_reproduce_merge_queue_failure() {
     // 3. Amend the commit (update title/body) but NOT the base
     ctx.commit("Initial Feature Work (Amended)");
 
-    // 4. Push again
-    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
+    // 4. Even though no base update is needed, changing the queued PR head is
+    // operationally unsafe and must be rejected before Git publication.
+    ctx.gherrit_cmd()
+        .args(["hook", "pre-push"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("is in the merge queue"));
 }

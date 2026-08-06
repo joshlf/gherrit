@@ -33,6 +33,7 @@ pub struct MockState {
     pub auto_merge: HashSet<u64>,
     pub native_stacks: HashSet<u64>,
     pub base_updates: Vec<BaseUpdate>,
+    pub merge_queue_after_base_update: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1252,6 +1253,9 @@ fn handle_update_pr(
 
     if let Some(update) = base_update {
         mock_state.base_updates.push(update);
+        if let Some(pr_id) = mock_state.merge_queue_after_base_update.take() {
+            mock_state.merge_queue.insert(pr_id);
+        }
     }
 
     let mut response = serde_json::Map::new();

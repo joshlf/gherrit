@@ -89,7 +89,7 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     validate_base_consumers(&repository, &prs, &rewritten_branches, &base_consumers)?;
 
     let staging_bases = plan_pr_staging(repo, &commits, &prs, &publication, &remote_default)?;
-    validate_topology_transition_state(&prs, &staging_bases)?;
+    validate_operational_state(&prs)?;
     for staging in &staging_bases {
         log::debug!(
             "PR #{} ({}) stages {} -> {} before final base {} ({:?}, node {})",
@@ -107,6 +107,7 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     let prepared_candidates = batch_fetch_prs(&remote, &octocrab, &gherrit_ids).await?;
     let prepared_prs = select_canonical_prs(&repository, &gherrit_ids, prepared_candidates)?;
     validate_prs_for_publication(&prepared_prs, &publication)?;
+    validate_operational_state(&prepared_prs)?;
     verify_staging_bases(
         repo,
         &commits,
@@ -766,33 +767,24 @@ fn git_is_ancestor(repo: &util::Repo, ancestor: &str, descendant: &str) -> Resul
     }
 }
 
-fn validate_topology_transition_state(
-    prs: &[PrState],
-    staging_bases: &[StagingBase],
-) -> Result<()> {
-    let topology_changes =
-        staging_bases.iter().any(|staging| staging.current_base != staging.desired_base);
-    if !topology_changes {
-        return Ok(());
-    }
-
+fn validate_operational_state(prs: &[PrState]) -> Result<()> {
     let mut errors = Vec::new();
     for pr in prs {
         if pr.is_in_merge_queue {
             errors.push(format!(
-                "PR #{} is in the merge queue; remove it before reordering this stack",
+                "PR #{} is in the merge queue; remove it before GHerrit publishes this stack",
                 pr.number
             ));
         }
         if pr.auto_merge_enabled {
             errors.push(format!(
-                "PR #{} has auto-merge enabled; disable it before reordering this stack",
+                "PR #{} has auto-merge enabled; disable it before GHerrit publishes this stack",
                 pr.number
             ));
         }
         if pr.native_stack {
             errors.push(format!(
-                "PR #{} belongs to a native GitHub stack; unstack it before GHerrit rewrites bases",
+                "PR #{} belongs to a native GitHub stack; unstack it before GHerrit publishes this stack",
                 pr.number
             ));
         }
