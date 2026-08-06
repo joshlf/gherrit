@@ -31,10 +31,17 @@ fn test_pagination_bug() {
             let head_ref =
                 if is_target { change_id.to_string() } else { format!("other-change-{}", i) };
 
+            let body = if is_target {
+                format!(
+                    "<!-- gherrit-meta: {{\"id\":\"{change_id}\",\"parent\":null,\"child\":null}} -->"
+                )
+            } else {
+                "body".to_string()
+            };
             let pr = testutil::mock_server::PrEntry::mock(testutil::mock_server::MockPrArgs {
                 id: i as u64,
                 title: format!("PR {i}"),
-                body: "body".to_string(),
+                body,
                 head: head_ref,
                 base: "main".to_string(),
                 repo_owner: "owner",

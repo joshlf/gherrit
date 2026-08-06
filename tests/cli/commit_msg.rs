@@ -135,10 +135,7 @@ fn commit_msg_ignores_matching_prose_but_rejects_an_invalid_real_trailer() {
         "feat: prose\n\nA sentence containing gherrit-pr-id: main.\n\nNot-A-Trailer paragraph.",
     )
     .unwrap();
-    ctx.gherrit_cmd()
-        .args(["hook", "commit-msg", prose_file.to_str().unwrap()])
-        .assert()
-        .success();
+    ctx.gherrit_cmd().args(["hook", "commit-msg", prose_file.to_str().unwrap()]).assert().success();
     let prose = std::fs::read_to_string(&prose_file).unwrap();
     assert!(prose.contains("gherrit-pr-id: G"));
     assert!(!prose.ends_with("gherrit-pr-id: main\n"));

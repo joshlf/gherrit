@@ -24,18 +24,14 @@ pub fn validate(id: &str) -> Result<Format> {
 
     if bytes.len() == 33
         && bytes[0] == b'G'
-        && bytes[1..]
-            .iter()
-            .all(|byte| matches!(byte, b'a'..=b'z' | b'2'..=b'7'))
+        && bytes[1..].iter().all(|byte| matches!(byte, b'a'..=b'z' | b'2'..=b'7'))
     {
         return Ok(Format::CurrentBase32);
     }
 
     if bytes.len() == 41
         && matches!(bytes[0], b'G' | b'I')
-        && bytes[1..]
-            .iter()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && bytes[1..].iter().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
         return Ok(if bytes[0] == b'G' { Format::LegacyGHex } else { Format::LegacyChangeId });
     }
@@ -93,10 +89,7 @@ pub fn from_message(message: &[u8]) -> Result<Option<String>> {
     let output = child.wait_with_output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "`git interpret-trailers --parse` failed with status {}: {stderr}",
-            output.status
-        );
+        bail!("`git interpret-trailers --parse` failed with status {}: {stderr}", output.status);
     }
 
     from_trailers(output.stdout.split(|byte| *byte == b'\n').filter_map(|line| {
@@ -113,10 +106,7 @@ mod tests {
 
     #[test]
     fn accepts_current_and_explicit_legacy_formats() {
-        assert_eq!(
-            validate("Gabcdefghijklmnopqrstuvwxyz234567").unwrap(),
-            Format::CurrentBase32
-        );
+        assert_eq!(validate("Gabcdefghijklmnopqrstuvwxyz234567").unwrap(), Format::CurrentBase32);
         assert_eq!(
             validate("G0000000000000000000000000000000000000001").unwrap(),
             Format::LegacyGHex
@@ -147,10 +137,7 @@ mod tests {
 
     #[test]
     fn requires_exactly_one_valid_parsed_trailer() {
-        assert_eq!(
-            from_trailers([(b"Other".as_slice(), b"value".as_slice())]).unwrap(),
-            None
-        );
+        assert_eq!(from_trailers([(b"Other".as_slice(), b"value".as_slice())]).unwrap(), None);
         assert_eq!(
             from_trailers([(
                 b"GHERRIT-PR-ID".as_slice(),

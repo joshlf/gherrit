@@ -99,7 +99,7 @@ fn test_precedence_over_trailer_check() {
     // Create a fixup commit that ALSO has a valid trailer. Normally, a trailer
     // makes a commit valid for Gherrit. But 'fixup!' should still block it
     // because it's considered "work in progress/to be squashed".
-    let msg = "fixup! Some feature\n\ngherrit-pr-id: G12345";
+    let msg = "fixup! Some feature\n\ngherrit-pr-id: Gabcdefghijklmnopqrstuvwxyz234567";
     ctx.commit(msg);
 
     let output = ctx.gherrit_cmd().args(["hook", "pre-push"]).assert();
@@ -146,8 +146,20 @@ fn test_dynamic_remote_and_branch_suggestion() {
     // Configure gherrit to use upstream
     ctx.run_git(&["config", "gherrit.remote", "upstream"]);
 
-    // Install hooks manually since we didn't use init_and_install_hooks
+    // Install hooks manually since we didn't use init_and_install_hooks.
+    // The publication remote must have an authoritative symbolic default and
+    // exact boundary commit before GHerrit can inspect the stack.
     ctx.commit("Initial commit");
+    ctx.git_cmd()
+        .args(["push", "--no-verify", "upstream", "master:refs/heads/master"])
+        .assert()
+        .success();
+    ctx.git_cmd()
+        .arg("--git-dir")
+        .arg(&upstream_path)
+        .args(["symbolic-ref", "HEAD", "refs/heads/master"])
+        .assert()
+        .success();
     ctx.checkout_new("feature-dynamic");
 
     // Create fixup

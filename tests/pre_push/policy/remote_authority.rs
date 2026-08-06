@@ -51,14 +51,8 @@ fn rejects_when_remote_default_is_not_an_ancestor() {
 fn follows_remote_head_across_rename_and_stale_local_origin_head() {
     let ctx = context();
     let main_oid = ctx.remote_ref_oid("refs/heads/main").unwrap();
-    ctx.remote_git_cmd()
-        .args(["update-ref", "refs/heads/trunk", &main_oid])
-        .assert()
-        .success();
-    ctx.remote_git_cmd()
-        .args(["symbolic-ref", "HEAD", "refs/heads/trunk"])
-        .assert()
-        .success();
+    ctx.remote_git_cmd().args(["update-ref", "refs/heads/trunk", &main_oid]).assert().success();
+    ctx.remote_git_cmd().args(["symbolic-ref", "HEAD", "refs/heads/trunk"]).assert().success();
     ctx.remote_git_cmd().args(["update-ref", "-d", "refs/heads/main"]).assert().success();
 
     // Deliberately make the local remote-HEAD hint stale and delete the local
@@ -105,10 +99,7 @@ fn rejects_shallow_replace_and_graft_dags_before_mutation() {
             "graft" => ".git/info/grafts",
             _ => unreachable!(),
         };
-        ctx.hook_cmd("pre-push")
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains(expected));
+        ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(expected));
         assert!(ctx.remote_refs("refs/heads/G").is_empty());
     }
 }

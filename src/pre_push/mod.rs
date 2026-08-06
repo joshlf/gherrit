@@ -136,12 +136,14 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
 
     let num_commits = commits.len();
     sync_prs(
-        repo,
-        &octocrab,
-        &remote,
-        &repository,
-        branch_name,
-        &default_branch,
+        SyncPrContext {
+            repo,
+            octocrab: &octocrab,
+            remote: &remote,
+            repository: &repository,
+            branch_name,
+            base_branch: &default_branch,
+        },
         commits,
         latest_versions,
         projected_prs,
@@ -459,21 +461,21 @@ fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<Publication
             // patch version, this invocation is projection-only. This is what
             // makes a retry after a successful push but failed GitHub update
             // repair the PRs without manufacturing another version.
-            if expected_remote_sha == desired_oid {
-                if let Some(remote_version) = remote_version {
-                    if remote_version.target_oid != desired_oid {
-                        bail!(
-                            "Remote patch tag gherrit/{}/v{} points to {}, but managed branch {} points to {}. Refusing to treat this inconsistent remote state as a projection-only retry.",
-                            commit.gherrit_id,
-                            remote_version.version,
-                            remote_version.target_oid,
-                            commit.gherrit_id,
-                            desired_oid
-                        );
-                    }
-                    latest_versions.insert(commit.gherrit_id.clone(), remote_version.version);
-                    continue;
+            if expected_remote_sha == desired_oid
+                && let Some(remote_version) = remote_version
+            {
+                if remote_version.target_oid != desired_oid {
+                    bail!(
+                        "Remote patch tag gherrit/{}/v{} points to {}, but managed branch {} points to {}. Refusing to treat this inconsistent remote state as a projection-only retry.",
+                        commit.gherrit_id,
+                        remote_version.version,
+                        remote_version.target_oid,
+                        commit.gherrit_id,
+                        desired_oid
+                    );
                 }
+                latest_versions.insert(commit.gherrit_id.clone(), remote_version.version);
+                continue;
             }
 
             let next_version = remote_version
@@ -1405,17 +1407,22 @@ impl PrBodyBuilder<'_> {
 /// 1. Finds existing PRs or creates new ones for new commits.
 /// 2. Updates PR metadata (title, body, base branch) to match the local stack.
 /// 3. Updates are queued and executed in batches to optimize performance.
+struct SyncPrContext<'a> {
+    repo: &'a util::Repo,
+    octocrab: &'a Octocrab,
+    remote: &'a Remote,
+    repository: &'a RepositoryIdentity,
+    branch_name: &'a str,
+    base_branch: &'a str,
+}
+
 async fn sync_prs(
-    repo: &util::Repo,
-    octocrab: &Octocrab,
-    remote: &Remote,
-    repository: &RepositoryIdentity,
-    branch_name: &str,
-    base_branch: &str,
+    context: SyncPrContext<'_>,
     commits: Vec<Commit>,
     latest_versions: HashMap<String, usize>,
     prs: Vec<PrState>,
 ) -> Result<()> {
+    let SyncPrContext { repo, octocrab, remote, repository, branch_name, base_branch } = context;
     let commits = link_stack(base_branch, commits, |commit| commit.gherrit_id.clone());
 
     enum PrResolution {

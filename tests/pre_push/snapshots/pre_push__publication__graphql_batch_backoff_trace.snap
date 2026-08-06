@@ -5,17 +5,6 @@ expression: state.graphql_requests
 [
     [
         Query,
-        Query,
-        Query,
-        Query,
-    ],
-    [
-        Query,
-        Query,
-    ],
-    [
-        Query,
-        Query,
     ],
     [
         Query,
@@ -46,6 +35,17 @@ expression: state.graphql_requests
         Query,
     ],
     [
+        Query,
+        Query,
+        Query,
+        Query,
+    ],
+    [
+        Query,
+        Query,
+    ],
+    [
+        Query,
         Query,
     ],
     [

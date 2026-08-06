@@ -59,16 +59,10 @@ fn rejects_non_linear_history() {
 
 #[test]
 fn rejects_invalid_or_reserved_id_spellings_before_remote_io() {
-    for (index, id) in [
-        "main",
-        "master",
-        "HEAD",
-        "feature",
-        "G12345",
-        "Gabcdefghijklmnopqrstuvwxyz234567extra",
-    ]
-    .into_iter()
-    .enumerate()
+    for (index, id) in
+        ["main", "master", "HEAD", "feature", "G12345", "Gabcdefghijklmnopqrstuvwxyz234567extra"]
+            .into_iter()
+            .enumerate()
     {
         let ctx = context();
         ctx.checkout_new(&format!("invalid-id-{index}"));

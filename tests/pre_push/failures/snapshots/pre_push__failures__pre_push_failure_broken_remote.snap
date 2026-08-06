@@ -9,8 +9,7 @@ STDOUT:
 
 STDERR:
 [gherrit] Branch feature-fail is MANAGED. Syncing stack...
-[gherrit] [WARN] Using custom GitHub API URL: [MOCK_SERVER_URL]
-[gherrit] [ERROR] Failed to observe remote GHerrit branches: Command "git" "ls-remote" "broken-remote" "refs/heads/[GHERRIT_ID_1]" failed with status: exit status: 128. Stderr: fatal: 'missing/repo.git' does not appear to be a git repository
+[gherrit] [ERROR] Failed to observe the publication remote's default branch: Command "git" "ls-remote" "--symref" "broken-remote" "HEAD" failed with status: exit status: 128. Stderr: fatal: 'missing/repo.git' does not appear to be a git repository
 [gherrit] [ERROR] fatal: Could not read from remote repository.
 [gherrit] [ERROR]
 [gherrit] [ERROR] Please make sure you have the correct access rights

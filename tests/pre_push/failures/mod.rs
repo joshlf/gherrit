@@ -84,7 +84,9 @@ fn test_pre_push_ls_remote_failure() {
         .env("MOCK_BIN_FAIL_CMD", "git:ls-remote")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Failed to observe remote GHerrit branches"));
+        .stderr(predicate::str::contains(
+            "Failed to observe the publication remote's default branch",
+        ));
     assert_eq!(ctx.remote_refs("refs"), remote_refs);
     ctx.inspect_mock_state(|state| {
         assert!(state.pushes.is_empty());
