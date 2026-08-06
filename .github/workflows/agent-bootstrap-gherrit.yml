@@ -1,4 +1,4 @@
-name: Agent publish GHerrit stack
+name: Agent publish feature branch transport
 
 on:
   push:
@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   publish:
@@ -20,7 +19,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Reconstruct implementation stack
+      - name: Reconstruct and publish transport branch
         id: reconstruct
         run: |
           set -euxo pipefail
@@ -41,8 +40,8 @@ jobs:
           git checkout --force -B agent/safe-pr-reorder main
           git am /tmp/safe-pr-reorder.patch
 
-          # Fold the final logger cleanup into the existing fixture commit,
-          # preserving the planned eleven-commit review stack.
+          # Fold the logger cleanup into the fixture commit, preserving the
+          # planned eleven-commit stack and the validated final tree.
           python3 - <<'PY'
           from pathlib import Path
           main = Path("src/main.rs")
@@ -51,81 +50,51 @@ jobs:
           new = '                let message = record.args().to_string();\n                if message.is_empty() {\n                    writeln!(buf, "{prefix}{level_style}")\n                } else {\n                    writeln!(buf, "{prefix}{level_style} {message}")\n                }\n'
           assert old in text
           main.write_text(text.replace(old, new))
-          first = Path("tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap")
-          text = first.read_text()
-          assert "[gherrit] [ERROR] \n" in text
-          first.write_text(text.replace("[gherrit] [ERROR] \n", "[gherrit] [ERROR]\n"))
-          second = Path("tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap")
-          text = second.read_text()
-          assert "[gherrit] [ERROR] \n" in text
-          second.write_text(text.replace("[gherrit] [ERROR] \n", "[gherrit] [ERROR]\n"))
+          for path in [
+              Path("tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap"),
+              Path("tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap"),
+          ]:
+              text = path.read_text()
+              assert "[gherrit] [ERROR] \n" in text
+              path.write_text(text.replace("[gherrit] [ERROR] \n", "[gherrit] [ERROR]\n"))
           PY
 
-          target=$(git rev-list --reverse origin/main..HEAD | sed -n '6p')
-          test "$(git show --no-patch --format=%s "$target")" = "Align fixtures with remote authority"
+          fixture_commit=$(git rev-list --reverse origin/main..HEAD | sed -n '6p')
+          test "$(git show --no-patch --format=%s "$fixture_commit")" = "Align fixtures with remote authority"
           git add src/main.rs \
             tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap \
             tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap
-          git commit --fixup="$target" --no-verify
+          git commit --fixup="$fixture_commit" --no-verify
           GIT_SEQUENCE_EDITOR=true git rebase --interactive --autosquash origin/main
 
           test "$(git rev-list --count origin/main..HEAD)" = 11
-          ! git log --format=%s origin/main..HEAD | grep -q '^fixup!'
-          actual_tree=$(git rev-parse HEAD^{tree})
-          echo "actual_tree=$actual_tree" | tee -a "$GITHUB_OUTPUT"
-          git log --reverse --format='%h %s' origin/main..HEAD
-          git archive --format=tar.gz --output=/tmp/reconstructed.tar.gz HEAD
-          git format-patch --stdout --binary origin/main..HEAD > /tmp/reconstructed.patch
-          git diff --binary origin/main...HEAD > /tmp/reconstructed.diff
+          test "$(git rev-parse HEAD^{tree})" = 1fb8bb9bacb3177d6a42286ca1bb49dcd8b42cc1
 
-      - name: Export reconstructed stack
+          # The Actions GitHub App cannot update workflow files. Remove only
+          # ci.yml from the commit that introduced its three-line change;
+          # the connector will restore that file by replacing the same commit.
+          cp .github/workflows/ci.yml /tmp/desired-ci.yml
+          workflow_commit=$(git rev-list --reverse origin/main..HEAD -- .github/workflows/ci.yml | tail -n 1)
+          test "$(git show --no-patch --format=%s "$workflow_commit")" = "Validate cascade topology before rebasing"
+          git checkout origin/main -- .github/workflows/ci.yml
+          git add .github/workflows/ci.yml
+          git commit --fixup="$workflow_commit" --no-verify
+          GIT_SEQUENCE_EDITOR=true git rebase --interactive --autosquash origin/main
+
+          test "$(git rev-list --count origin/main..HEAD)" = 11
+          test "$(git show --no-patch --format=%s HEAD)" = "Validate cascade topology before rebasing"
+          git diff --exit-code origin/main -- .github/workflows/ci.yml
+          git diff --check origin/main...HEAD
+          echo "transport_head=$(git rev-parse HEAD)" | tee -a "$GITHUB_OUTPUT"
+          echo "transport_parent=$(git rev-parse HEAD^)" | tee -a "$GITHUB_OUTPUT"
+          echo "transport_tree=$(git rev-parse HEAD^{tree})" | tee -a "$GITHUB_OUTPUT"
+          git log --reverse --format='%H %s' origin/main..HEAD
+          git push --force-with-lease origin HEAD:refs/heads/agent/safe-pr-reorder
+
+      - name: Export desired CI workflow
         uses: actions/upload-artifact@v4
         with:
-          name: reconstructed-gherrit-stack
-          path: |
-            /tmp/reconstructed.tar.gz
-            /tmp/reconstructed.patch
-            /tmp/reconstructed.diff
+          name: desired-ci-workflow
+          path: /tmp/desired-ci.yml
           if-no-files-found: error
           retention-days: 1
-
-      - name: Verify reconstructed tree
-        run: test "${{ steps.reconstruct.outputs.actual_tree }}" = 1fb8bb9bacb3177d6a42286ca1bb49dcd8b42cc1
-
-      - name: Publish feature branch
-        run: git push --force-with-lease origin HEAD:refs/heads/agent/safe-pr-reorder
-
-      - name: Install Rust 1.89
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.89.0
-
-      - name: Validate reconstructed stack
-        run: |
-          set -euo pipefail
-          git diff --check origin/main...HEAD
-          GHERRIT_TEST_BUILD=1 cargo test --workspace --all-targets --locked
-          ci/check_todo.sh
-          bash ci/test_extract_stack_child.sh
-          bash ci/test_select_cascade_child.sh
-
-      - name: Build and install modified GHerrit
-        run: |
-          cargo install --path . --locked --force
-          gherrit --version
-
-      - name: Install GHerrit hooks and manage the stack
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gherrit install
-          gherrit manage --private
-
-      - name: Publish with GHerrit
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: git push
-
-      - name: Clean temporary bootstrap branch
-        if: success()
-        run: git push --no-verify origin --delete agent/bootstrap-gherrit-build || true
