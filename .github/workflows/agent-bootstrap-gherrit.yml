@@ -1,111 +1,14 @@
 name: Agent publish feature branch transport
 
 on:
-  push:
-    branches:
-      - agent/bootstrap-gherrit-build
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  publish:
+  disabled:
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout publisher payload
-        uses: actions/checkout@v4
-        with:
-          ref: agent/bootstrap-gherrit-build
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Reconstruct and publish transport branch
-        id: reconstruct
-        run: |
-          set -euxo pipefail
-          {
-            git show 9fb8644c06323ebc57205bd7b72176d8253933b1:.github/agent/safe-pr-reorder.patch.gz.b64.00
-            cat .github/agent/safe-pr-reorder.patch.gz.b64.01 \
-              .github/agent/safe-pr-reorder.patch.gz.b64.02 \
-              .github/agent/safe-pr-reorder.patch.gz.b64.03 \
-              .github/agent/safe-pr-reorder.patch.gz.b64.04 \
-              .github/agent/safe-pr-reorder.patch.gz.b64.05
-          } | base64 --decode \
-            | gzip --decompress \
-            > /tmp/safe-pr-reorder.patch
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git branch --force main origin/main
-          git checkout --force -B agent/safe-pr-reorder main
-          git am /tmp/safe-pr-reorder.patch
-
-          # Fold the logger cleanup into the fixture commit, preserving the
-          # planned eleven-commit stack and the validated final tree.
-          python3 - <<'PY'
-          from pathlib import Path
-          main = Path("src/main.rs")
-          text = main.read_text()
-          old = '                writeln!(buf, "{prefix}{level_style} {}", record.args())\n'
-          new = '                let message = record.args().to_string();\n                if message.is_empty() {\n                    writeln!(buf, "{prefix}{level_style}")\n                } else {\n                    writeln!(buf, "{prefix}{level_style} {message}")\n                }\n'
-          assert old in text
-          main.write_text(text.replace(old, new))
-          for path in [
-              Path("tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap"),
-              Path("tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap"),
-          ]:
-              text = path.read_text()
-              assert "[gherrit] [ERROR] \n" in text
-              path.write_text(text.replace("[gherrit] [ERROR] \n", "[gherrit] [ERROR]\n"))
-          PY
-
-          fixture_commit=$(git rev-list --reverse origin/main..HEAD | sed -n '6p')
-          test "$(git show --no-patch --format=%s "$fixture_commit")" = "Align fixtures with remote authority"
-          git add src/main.rs \
-            tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap \
-            tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap
-          git commit --fixup="$fixture_commit" --no-verify
-          GIT_SEQUENCE_EDITOR=true git rebase --interactive --autosquash origin/main
-
-          test "$(git rev-list --count origin/main..HEAD)" = 11
-          test "$(git rev-parse HEAD^{tree})" = 1fb8bb9bacb3177d6a42286ca1bb49dcd8b42cc1
-
-          # The Actions GitHub App cannot update workflow files. Remove both
-          # workflow-file changes from commit 11 for transport; the connector
-          # will restore them by replacing that same commit.
-          mkdir -p /tmp/desired-workflows
-          cp .github/workflows/ci.yml /tmp/desired-workflows/ci.yml
-          cp .github/workflows/gherrit-rebase-stack.yml \
-            /tmp/desired-workflows/gherrit-rebase-stack.yml
-          workflow_commit=$(git rev-list --reverse origin/main..HEAD -- \
-            .github/workflows/ci.yml \
-            .github/workflows/gherrit-rebase-stack.yml | tail -n 1)
-          test "$(git show --no-patch --format=%s "$workflow_commit")" = "Validate cascade topology before rebasing"
-          git checkout origin/main -- \
-            .github/workflows/ci.yml \
-            .github/workflows/gherrit-rebase-stack.yml
-          git add \
-            .github/workflows/ci.yml \
-            .github/workflows/gherrit-rebase-stack.yml
-          git commit --fixup="$workflow_commit" --no-verify
-          GIT_SEQUENCE_EDITOR=true git rebase --interactive --autosquash origin/main
-
-          test "$(git rev-list --count origin/main..HEAD)" = 11
-          test "$(git show --no-patch --format=%s HEAD)" = "Validate cascade topology before rebasing"
-          git diff --exit-code origin/main -- \
-            .github/workflows/ci.yml \
-            .github/workflows/gherrit-rebase-stack.yml
-          git diff --check origin/main...HEAD
-          echo "transport_head=$(git rev-parse HEAD)" | tee -a "$GITHUB_OUTPUT"
-          echo "transport_parent=$(git rev-parse HEAD^)" | tee -a "$GITHUB_OUTPUT"
-          echo "transport_tree=$(git rev-parse HEAD^{tree})" | tee -a "$GITHUB_OUTPUT"
-          git log --reverse --format='%H %s' origin/main..HEAD
-          git push --force-with-lease origin HEAD:refs/heads/agent/safe-pr-reorder
-
-      - name: Export desired workflows
-        uses: actions/upload-artifact@v4
-        with:
-          name: desired-workflows
-          path: /tmp/desired-workflows
-          if-no-files-found: error
-          retention-days: 1
+      - run: echo disabled
