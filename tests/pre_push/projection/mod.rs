@@ -1,5 +1,6 @@
 mod base;
 mod pagination;
+mod reorder;
 
 fn assert_valid_gherrit_metadata(ctx: &testutil::TestContext) {
     const PREFIX: &str = "<!-- gherrit-meta: ";

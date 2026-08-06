@@ -200,7 +200,9 @@ mod tests {
         }
     }
 
-    fn ancestry(edges: &[(&str, &str)]) -> impl FnMut(&str, &str) -> Result<bool> + '_ {
+    fn ancestry<'a>(
+        edges: &'a [(&'a str, &'a str)],
+    ) -> impl FnMut(&str, &str) -> Result<bool> + 'a {
         move |ancestor, descendant| {
             Ok(edges.iter().any(|(a, d)| *a == ancestor && *d == descendant))
         }
