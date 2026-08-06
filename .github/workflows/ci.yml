@@ -54,6 +54,9 @@ jobs:
       - name: Test stack metadata parser
         run: bash ci/test_extract_stack_child.sh
 
+      - name: Test cascade child selection
+        run: bash ci/test_select_cascade_child.sh
+
   windows-tests:
     name: Windows Tests
     runs-on: windows-latest

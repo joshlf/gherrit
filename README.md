@@ -52,7 +52,9 @@ synchronizes them to GitHub as a chain of dependent Pull Requests.
 
     jobs:
       rebase-stack:
-        if: github.event.pull_request.merged == true
+        if: >-
+          github.event.pull_request.merged == true &&
+          github.event.pull_request.base.ref == github.event.repository.default_branch
         runs-on: ubuntu-latest
         steps:
           - uses: actions/checkout@v4
@@ -248,11 +250,13 @@ To solve this, GHerrit implements a **Cascading Merge** system:
     the PR description (inside an HTML comment) containing the IDs of the
     parent and child PRs.
 2.  **Automated Rebase**: A GitHub Action (`gherrit-rebase-stack.yml`) triggers
-    whenever a PR is merged. It:
+    only when a root PR targeting the repository's default branch is merged. It:
     *   Reads the metadata to find the *child* PR's ID.
-    *   Finds the child PR by its synthesized branch name (e.g., `G...`)
-    *   Retargets the child PR to base off `main`.
-    *   Rebases the child PR onto the new `main`.
+    *   Requires exactly one open PR for that synthesized branch name.
+    *   Verifies that the child still targets the merged parent's branch and
+        that its head commit carries the expected GHerrit ID.
+    *   Retargets the child PR to the repository's default branch.
+    *   Rebases the child PR onto the updated default branch.
     *   Force-pushes the updated child PR.
 
 This ensures that as soon as you merge the bottom of the stack, the next PR
