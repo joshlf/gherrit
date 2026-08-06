@@ -28,6 +28,7 @@ jobs:
           git bundle create gherrit.bundle --all
           cp target/debug/gherrit gherrit-linux-amd64
           cp "$(command -v gh)" gh-linux-amd64
+          tar -C "$HOME" -czf rust-dev-env.tar.gz .rustup .cargo
 
       - uses: actions/upload-artifact@v4
         with:
@@ -36,5 +37,6 @@ jobs:
             gherrit.bundle
             gherrit-linux-amd64
             gh-linux-amd64
+            rust-dev-env.tar.gz
           if-no-files-found: error
           retention-days: 1
