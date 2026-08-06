@@ -103,7 +103,15 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
         );
     }
 
-    apply_staging_bases(&octocrab, &remote_default.name, &staging_bases).await?;
+    apply_staging_bases(
+        &remote,
+        &repository,
+        &octocrab,
+        &gherrit_ids,
+        &remote_default.name,
+        &staging_bases,
+    )
+    .await?;
     let prepared_candidates = batch_fetch_prs(&remote, &octocrab, &gherrit_ids).await?;
     let prepared_prs = select_canonical_prs(&repository, &gherrit_ids, prepared_candidates)?;
     validate_prs_for_publication(&prepared_prs, &publication)?;
@@ -547,16 +555,97 @@ fn execute_publication(repo: &util::Repo, publication: &PublicationPlan) -> Resu
 
         let status = child.wait().unwrap();
         if !status.success() {
-            let remote = repo.default_remote_name();
-            bail!(
-                "`git push` failed. The remote might be ahead or changed. Run `git fetch {remote}` to sync."
-            );
+            match classify_push_outcome(repo, plan).wrap_err(
+                "`git push` failed and GHerrit could not determine the resulting remote state",
+            )? {
+                PushOutcome::Applied => {
+                    log::warn!(
+                        "`git push` reported failure, but every branch and version tag in the atomic transaction is present at the planned object IDs; continuing with PR reconciliation"
+                    );
+                }
+                PushOutcome::NotApplied => {
+                    let remote = repo.default_remote_name();
+                    bail!(
+                        "`git push` failed and the planned remote refs were not applied. Run `git fetch {remote}` to inspect the remote before retrying."
+                    );
+                }
+                PushOutcome::Inconsistent(details) => bail!(
+                    "`git push` failed and left a ref state that is neither the complete planned atomic transaction nor the complete pre-push state:\n{}",
+                    details.join("\n")
+                ),
+            }
         }
 
         persist_local_tags(repo, &plan.persisted_tags);
     }
 
     Ok(())
+}
+
+enum PushOutcome {
+    Applied,
+    NotApplied,
+    Inconsistent(Vec<String>),
+}
+
+fn classify_push_outcome(repo: &util::Repo, plan: &PushPlan) -> Result<PushOutcome> {
+    let refs = plan.ref_updates.iter().map(|update| update.ref_name.clone()).collect::<Vec<_>>();
+    let observed = get_remote_ref_states(repo, &refs)?;
+    let all_after = plan.ref_updates.iter().all(|update| {
+        observed.get(&update.ref_name).and_then(Option::as_deref)
+            == Some(update.desired_after.as_str())
+    });
+    if all_after {
+        return Ok(PushOutcome::Applied);
+    }
+    let all_before = plan
+        .ref_updates
+        .iter()
+        .all(|update| observed.get(&update.ref_name).cloned().flatten() == update.expected_before);
+    if all_before {
+        return Ok(PushOutcome::NotApplied);
+    }
+
+    let details = plan
+        .ref_updates
+        .iter()
+        .map(|update| {
+            let observed =
+                observed.get(&update.ref_name).and_then(Option::as_deref).unwrap_or("<missing>");
+            format!(
+                "{}: observed {observed}, expected before {}, desired after {}",
+                update.ref_name,
+                update.expected_before.as_deref().unwrap_or("<missing>"),
+                update.desired_after
+            )
+        })
+        .collect();
+    Ok(PushOutcome::Inconsistent(details))
+}
+
+fn get_remote_ref_states(
+    repo: &util::Repo,
+    refs: &[String],
+) -> Result<HashMap<String, Option<String>>> {
+    let mut states =
+        refs.iter().cloned().map(|reference| (reference, None)).collect::<HashMap<_, _>>();
+    for chunk in remote_query_batches(refs) {
+        let mut args = vec!["ls-remote".to_string(), repo.default_remote_name()];
+        args.extend(chunk.iter().cloned());
+        let output = util::cmd("git", args).checked_output()?;
+        for line in core::str::from_utf8(&output.stdout)?.lines() {
+            let Some((oid, reference)) = line.split_once('\t') else {
+                continue;
+            };
+            if let Some(state) = states.get_mut(reference) {
+                if state.as_deref().is_some_and(|existing| existing != oid) {
+                    bail!("Remote ref `{reference}` was reported with conflicting object IDs");
+                }
+                *state = Some(oid.to_string());
+            }
+        }
+    }
+    Ok(states)
 }
 
 fn persist_local_tags(repo: &util::Repo, tags: &[PersistedTag]) {
@@ -884,7 +973,10 @@ fn validate_operational_state(prs: &[PrState]) -> Result<()> {
 }
 
 async fn apply_staging_bases(
+    remote: &Remote,
+    repository: &RepositoryIdentity,
     octocrab: &Octocrab,
+    gherrit_ids: &[String],
     default_branch: &str,
     staging_bases: &[StagingBase],
 ) -> Result<()> {
@@ -907,9 +999,84 @@ async fn apply_staging_bases(
     }
 
     log::info!("Preparing {} PR bases for a safe ref publication...", updates.len());
-    batch_update_prs(octocrab, updates).await?;
+    if let Err(mutation_error) = batch_update_prs(octocrab, updates).await {
+        let candidates = batch_fetch_prs(remote, octocrab, gherrit_ids)
+            .await
+            .wrap_err("Failed to re-observe PRs after a staging mutation error")?;
+        let prs = select_canonical_prs(repository, gherrit_ids, candidates)?;
+        match classify_staging_mutation_outcome(&prs, staging_bases)? {
+            StagingMutationOutcome::Applied => log::warn!(
+                "The staging GraphQL mutation reported failure, but every affected PR is on its planned safety base; continuing after re-observation"
+            ),
+            StagingMutationOutcome::NotApplied => {
+                return Err(mutation_error).wrap_err(
+                    "The staging GraphQL mutation failed and re-observation confirmed that none of its base changes were applied",
+                );
+            }
+            StagingMutationOutcome::Inconsistent(details) => bail!(
+                "The staging GraphQL mutation failed and re-observation found a partial or unexpected result:\n{}\nOriginal mutation error: {mutation_error:#}",
+                details.join("\n")
+            ),
+        }
+    }
     log::info!("Prepared PR bases for ref publication.");
     Ok(())
+}
+
+enum StagingMutationOutcome {
+    Applied,
+    NotApplied,
+    Inconsistent(Vec<String>),
+}
+
+fn classify_staging_mutation_outcome(
+    prs: &[PrState],
+    staging_bases: &[StagingBase],
+) -> Result<StagingMutationOutcome> {
+    let affected = staging_bases
+        .iter()
+        .filter(|staging| staging.current_base != staging.staging_base)
+        .collect::<Vec<_>>();
+    let mut applied = 0;
+    let mut not_applied = 0;
+    let mut details = Vec::new();
+
+    for staging in affected {
+        let Some(pr) = prs.iter().find(|pr| pr.node_id == staging.node_id) else {
+            details.push(format!(
+                "PR node {} ({}) was not found after staging",
+                staging.node_id, staging.head_branch
+            ));
+            continue;
+        };
+        if pr.base_branch == staging.staging_base {
+            applied += 1;
+        } else if pr.base_branch == staging.current_base {
+            not_applied += 1;
+        } else {
+            details.push(format!(
+                "PR #{} ({}) targets `{}`, expected pre-mutation `{}` or staged `{}`",
+                pr.number,
+                pr.head_branch,
+                pr.base_branch,
+                staging.current_base,
+                staging.staging_base
+            ));
+        }
+    }
+
+    if details.is_empty() && not_applied == 0 {
+        Ok(StagingMutationOutcome::Applied)
+    } else if details.is_empty() && applied == 0 {
+        Ok(StagingMutationOutcome::NotApplied)
+    } else {
+        if details.is_empty() {
+            details.push(format!(
+                "{applied} staging base changes were applied and {not_applied} were not applied"
+            ));
+        }
+        Ok(StagingMutationOutcome::Inconsistent(details))
+    }
 }
 
 fn verify_staging_bases(

@@ -1,3 +1,4 @@
+mod ambiguous;
 mod batch_update;
 
 use predicates::prelude::*;

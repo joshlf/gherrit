@@ -35,6 +35,7 @@ struct GitResponse {
     exit_code: i32,
     passthrough: bool,
     report_exit_status: bool,
+    override_exit_code: Option<i32>,
 }
 
 #[derive(Serialize)]
@@ -57,7 +58,11 @@ pub fn run() -> ExitCode {
     let request = GitRequest {
         args: args.clone(),
         cwd: env::current_dir().unwrap().to_string_lossy().into_owned(),
-        env: env::vars().filter(|(name, _)| name == "MOCK_BIN_FAIL_CMD").collect(),
+        env: env::vars()
+            .filter(|(name, _)| {
+                matches!(name.as_str(), "MOCK_BIN_FAIL_CMD" | "MOCK_BIN_FAIL_AFTER_CMD")
+            })
+            .collect(),
     };
 
     let response = post_json(&server_url, "/_internal/git", &request);
@@ -84,7 +89,7 @@ pub fn run() -> ExitCode {
         post_json(&server_url, "/_internal/git/complete", &completion);
     }
 
-    exit_code(code)
+    exit_code(response.override_exit_code.unwrap_or(code))
 }
 
 fn invocation_argument_offset() -> Option<usize> {

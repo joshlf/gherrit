@@ -199,6 +199,7 @@ pub struct GitResponse {
     pub exit_code: i32,
     pub passthrough: bool,
     pub report_exit_status: bool,
+    pub override_exit_code: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -275,6 +276,7 @@ fn check_and_apply_graphql_failure(
     let fail_action = mock_state.fail_next_request.as_ref()?;
     let matches = match fail_action {
         GraphQl => true,
+        GraphQlAfterApply | UpdatePrAfterApply => false,
         CreatePr => operations.contains(&GraphQlOperation::CreatePr),
         UpdatePr => operations.contains(&GraphQlOperation::UpdatePr),
     };
@@ -284,6 +286,21 @@ fn check_and_apply_graphql_failure(
     }
 
     mock_state.fail_next_request.take()
+}
+
+fn check_and_apply_graphql_after_failure(
+    mock_state: &mut MockState,
+    operations: &[GraphQlOperation],
+) -> Option<FailureKind> {
+    use FailureKind::*;
+
+    let fail_action = mock_state.fail_next_request.as_ref()?;
+    let matches = match fail_action {
+        GraphQlAfterApply => true,
+        UpdatePrAfterApply => operations.contains(&GraphQlOperation::UpdatePr),
+        GraphQl | CreatePr | UpdatePr => false,
+    };
+    matches.then(|| mock_state.fail_next_request.take().unwrap())
 }
 
 fn graphql_operations(document: &ExecutableDocument) -> Vec<GraphQlOperation> {
@@ -773,6 +790,7 @@ async fn handle_git(
                 exit_code: 1,
                 passthrough: false,
                 report_exit_status: false,
+                override_exit_code: None,
             });
         }
     }
@@ -790,12 +808,18 @@ async fn handle_git(
         );
 
         // For now, we still want to passthrough to real git to actually move refs in the local repo
+        let override_exit_code = req
+            .env
+            .get("MOCK_BIN_FAIL_AFTER_CMD")
+            .is_some_and(|fail_cmd| fail_cmd == "git:push")
+            .then_some(1);
         return Json(GitResponse {
             stdout: "".to_string(),
             stderr,
             exit_code: 0,
             passthrough: true,
             report_exit_status: true,
+            override_exit_code,
         });
     }
 
@@ -806,6 +830,7 @@ async fn handle_git(
         exit_code: 0,
         passthrough: true,
         report_exit_status: false,
+        override_exit_code: None,
     })
 }
 
@@ -1111,6 +1136,7 @@ async fn graphql(
         response_json.insert("errors".to_string(), serde_json::Value::Array(errors));
     }
 
+    let after_failure = check_and_apply_graphql_after_failure(&mut mock_state, &operations);
     let mutates_prs = operations.iter().any(|operation| {
         matches!(operation, GraphQlOperation::CreatePr | GraphQlOperation::UpdatePr)
     });
@@ -1122,6 +1148,17 @@ async fn graphql(
                 Json(serde_json::json!({ "errors": [{ "message": message }] })),
             );
         }
+    }
+
+    if let Some(failure) = after_failure {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "errors": [
+                    { "message": format!("Injected {failure:?} failure after application") }
+                ]
+            })),
+        );
     }
 
     (StatusCode::OK, Json(serde_json::Value::Object(response_json)))

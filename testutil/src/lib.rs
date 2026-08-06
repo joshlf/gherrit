@@ -446,8 +446,10 @@ impl Drop for MockServerInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FailureKind {
     GraphQl,
+    GraphQlAfterApply,
     CreatePr,
     UpdatePr,
+    UpdatePrAfterApply,
 }
 
 impl Drop for TestContext {

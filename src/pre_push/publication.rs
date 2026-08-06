@@ -28,6 +28,14 @@ pub(super) struct PersistedTag {
 pub(super) struct PushPlan {
     pub arguments: Vec<String>,
     pub persisted_tags: Vec<PersistedTag>,
+    pub ref_updates: Vec<PlannedRefUpdate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PlannedRefUpdate {
+    pub ref_name: String,
+    pub expected_before: Option<String>,
+    pub desired_after: String,
 }
 
 pub(super) fn push_batches<T>(items: &[T]) -> slice::Chunks<'_, T> {
@@ -78,8 +86,30 @@ pub(super) fn plan_push(remote: &str, targets: &[PushTarget<'_>]) -> PushPlan {
             version: target.version,
         })
         .collect();
+    let ref_updates = targets
+        .iter()
+        .flat_map(|target| {
+            let desired_after = target.object_id.to_string();
+            [
+                PlannedRefUpdate {
+                    ref_name: format!("refs/heads/{}", target.gherrit_id),
+                    expected_before: (!target.expected_remote_sha.is_empty())
+                        .then(|| target.expected_remote_sha.to_string()),
+                    desired_after: desired_after.clone(),
+                },
+                PlannedRefUpdate {
+                    ref_name: format!(
+                        "refs/tags/gherrit/{}/v{}",
+                        target.gherrit_id, target.version
+                    ),
+                    expected_before: None,
+                    desired_after,
+                },
+            ]
+        })
+        .collect();
 
-    PushPlan { arguments, persisted_tags }
+    PushPlan { arguments, persisted_tags, ref_updates }
 }
 
 #[cfg(test)]
@@ -164,5 +194,30 @@ mod tests {
         assert_eq!(plan.persisted_tags[1].object_id, object_id(0x22));
         assert_eq!(plan.persisted_tags[1].gherrit_id, "Gtwo");
         assert_eq!(plan.persisted_tags[1].version, 1);
+        assert_eq!(
+            plan.ref_updates,
+            [
+                PlannedRefUpdate {
+                    ref_name: "refs/heads/Gone".to_string(),
+                    expected_before: Some("abc123".to_string()),
+                    desired_after: object_id(0x11).to_string(),
+                },
+                PlannedRefUpdate {
+                    ref_name: "refs/tags/gherrit/Gone/v2".to_string(),
+                    expected_before: None,
+                    desired_after: object_id(0x11).to_string(),
+                },
+                PlannedRefUpdate {
+                    ref_name: "refs/heads/Gtwo".to_string(),
+                    expected_before: None,
+                    desired_after: object_id(0x22).to_string(),
+                },
+                PlannedRefUpdate {
+                    ref_name: "refs/tags/gherrit/Gtwo/v1".to_string(),
+                    expected_before: None,
+                    desired_after: object_id(0x22).to_string(),
+                },
+            ]
+        );
     }
 }
