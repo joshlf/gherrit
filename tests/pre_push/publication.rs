@@ -75,7 +75,7 @@ fn test_version_increment() {
 }
 
 #[test]
-fn test_optimistic_locking_conflict() {
+fn test_remote_version_allocation_skips_occupied_versions() {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_installed_hooks()
@@ -113,19 +113,55 @@ fn test_optimistic_locking_conflict() {
     let new_msg = format!("Commit V1 (Amended)\n\ngherrit-pr-id: {}", gherrit_id);
     ctx.amend_with_message(&new_msg);
 
-    // Attempt push - should fail due to atomic lock
-    testutil::assert_failure_snapshot!(ctx, ctx.hook_cmd("pre-push"), "optimistic_locking_v2_fail");
+    // Remote version allocation observes the occupied v2 and publishes v3.
+    testutil::assert_success_snapshot!(
+        ctx,
+        ctx.hook_cmd("pre-push"),
+        "remote_version_allocation_v3"
+    );
 
     ctx.inspect_mock_state(|state| {
-        assert_eq!(state.pushes.len(), 2, "Expected one successful and one failed push");
-        assert!(state.pushes[0].succeeded(), "Initial push should succeed");
-        assert!(!state.pushes[1].succeeded(), "Conflicting push should fail");
+        assert_eq!(state.pushes.len(), 2, "Expected two successful publications");
+        assert!(state.pushes.iter().all(testutil::mock_server::GitPush::succeeded));
     });
-    assert_eq!(
-        ctx.remote_ref_oid(&managed_ref).as_deref(),
-        Some(pushed_oid.as_str()),
-        "Failed atomic push must not update the managed ref"
-    );
+    assert_ne!(ctx.head_oid(), pushed_oid);
+    assert_eq!(ctx.remote_ref_oid(&managed_ref).as_deref(), Some(ctx.head_oid().as_str()));
+    assert!(ctx.count_successfully_pushed_containing("/v3") > 0);
+    let tags = ctx.remote_refs(&format!("refs/tags/gherrit/{gherrit_id}"));
+    assert!(tags.iter().any(|tag| tag.ends_with("/v1")));
+    assert!(tags.iter().any(|tag| tag.ends_with("/v2")));
+    assert!(tags.iter().any(|tag| tag.ends_with("/v3")));
+}
+
+#[test]
+fn test_exact_noop_retry_is_projection_only() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+
+    ctx.checkout_new("projection-only");
+    ctx.commit("Projection-only retry");
+    ctx.hook_cmd("pre-push").assert().success();
+
+    let pushes_after_first = {
+        let mut count = 0;
+        ctx.inspect_mock_state(|state| count = state.pushes.len());
+        count
+    };
+    let tags_after_first = ctx.remote_refs("refs/tags/gherrit");
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    ctx.inspect_mock_state(|state| {
+        assert_eq!(state.pushes.len(), pushes_after_first, "No-op retry must not push Git refs");
+        assert_eq!(state.prs.len(), 1);
+        assert_eq!(state.prs[0].state, "OPEN");
+    });
+    assert_eq!(ctx.remote_refs("refs/tags/gherrit"), tags_after_first);
 }
 
 #[test]

@@ -206,6 +206,8 @@ fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<Publication
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
     let expected_heads = get_remote_branch_states(repo, &gherrit_ids)
         .wrap_err("Failed to observe remote GHerrit branches")?;
+    let remote_versions = get_remote_versions(repo, &gherrit_ids)
+        .wrap_err("Failed to observe remote GHerrit patch versions")?;
 
     let mut latest_versions = HashMap::new();
     let mut desired_heads = HashMap::new();
@@ -215,17 +217,25 @@ fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<Publication
         let mut targets = Vec::with_capacity(chunk.len());
 
         for commit in chunk {
-            // Version allocation remains local for now. Keeping it in the pure
-            // planning phase ensures retries execute the exact same ref tuple
-            // rather than recomputing after a partial or ambiguous result.
-            let local_max = get_local_version(repo, &commit.gherrit_id).unwrap_or(0);
-            let next_version = local_max + 1;
-            latest_versions.insert(commit.gherrit_id.clone(), next_version);
-            desired_heads.insert(commit.gherrit_id.clone(), commit.id);
-
+            let desired_oid = commit.id.to_string();
             let expected_remote_sha =
                 expected_heads.get(&commit.gherrit_id).and_then(|sha| sha.as_deref()).unwrap_or("");
+            let remote_version = remote_versions.get(&commit.gherrit_id).copied().unwrap_or(0);
+            desired_heads.insert(commit.gherrit_id.clone(), commit.id);
 
+            // If remote Git already contains this exact head and a coherent
+            // patch version, this invocation is projection-only. This is what
+            // makes a retry after a successful push but failed GitHub update
+            // repair the PRs without manufacturing another version.
+            if expected_remote_sha == desired_oid && remote_version > 0 {
+                latest_versions.insert(commit.gherrit_id.clone(), remote_version);
+                continue;
+            }
+
+            let next_version = remote_version.checked_add(1).ok_or_else(|| {
+                eyre!("Patch version overflow for GHerrit ID `{}`", commit.gherrit_id)
+            })?;
+            latest_versions.insert(commit.gherrit_id.clone(), next_version);
             targets.push(PushTarget {
                 object_id: commit.id,
                 gherrit_id: &commit.gherrit_id,
@@ -234,7 +244,9 @@ fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<Publication
             });
         }
 
-        batches.push(plan_push(&repo.default_remote_name(), &targets));
+        if !targets.is_empty() {
+            batches.push(plan_push(&repo.default_remote_name(), &targets));
+        }
     }
 
     Ok(PublicationPlan { batches, latest_versions, expected_heads, desired_heads })
@@ -341,6 +353,41 @@ fn get_remote_branch_states(
 struct RemoteDefault {
     name: String,
     oid: String,
+}
+
+fn get_remote_versions(
+    repo: &util::Repo,
+    gherrit_ids: &[String],
+) -> Result<HashMap<String, usize>> {
+    let mut versions = gherrit_ids.iter().cloned().map(|id| (id, 0)).collect::<HashMap<_, _>>();
+    for chunk in remote_query_batches(gherrit_ids) {
+        let mut args =
+            vec!["ls-remote".to_string(), "--tags".to_string(), repo.default_remote_name()];
+        args.extend(chunk.iter().map(|id| format!("refs/tags/gherrit/{id}/v*")));
+        let output = util::cmd("git", args).checked_output()?;
+        let output = core::str::from_utf8(&output.stdout)?;
+
+        for line in output.lines() {
+            let Some((_, ref_name)) = line.split_once('\t') else {
+                continue;
+            };
+            let ref_name = ref_name.strip_suffix("^{}").unwrap_or(ref_name);
+            let Some(rest) = ref_name.strip_prefix("refs/tags/gherrit/") else {
+                continue;
+            };
+            let Some((id, version)) = rest.rsplit_once("/v") else {
+                continue;
+            };
+            let Some(current) = versions.get_mut(id) else {
+                continue;
+            };
+            let version = version.parse::<usize>().map_err(|_| {
+                eyre!("Remote patch tag `{ref_name}` has an invalid version number")
+            })?;
+            *current = (*current).max(version);
+        }
+    }
+    Ok(versions)
 }
 
 fn observe_remote_default(repo: &util::Repo) -> Result<RemoteDefault> {
@@ -677,31 +724,6 @@ async fn verify_final_projection(
         bail!("Final PR projection is incomplete:\n{}", errors.join("\n"));
     }
     Ok(())
-}
-
-fn get_local_version(repo: &util::Repo, gherrit_id: &str) -> Result<usize> {
-    let prefix = format!("refs/tags/gherrit/{}/v", gherrit_id);
-    let mut max_ver = 0;
-
-    // Use .all() and manual filtering to avoid `prefixed` API type issues.
-    let references = repo.references().map_err(|e| eyre!(e))?;
-
-    for reference in references.all().map_err(|e| eyre!(e))? {
-        let reference = reference.map_err(|e| eyre!(e))?;
-        let name = reference.name().as_bstr().to_string();
-
-        if name.starts_with(&prefix) {
-            // Parse "refs/tags/gherrit/<id>/v<ver>"
-            if let Some(ver_str) = name.rsplit('v').next()
-                && let Ok(ver) = ver_str.parse::<usize>()
-                && ver > max_ver
-            {
-                max_ver = ver;
-            }
-        }
-    }
-
-    Ok(max_ver)
 }
 
 struct PrBodyBuilder<'a> {
