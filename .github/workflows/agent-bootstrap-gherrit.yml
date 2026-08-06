@@ -1,14 +1,40 @@
-name: Agent publish safe-pr-reorder second-review fixes
+name: Agent export safe-pr-reorder head
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - agent/bootstrap-gherrit-build
 
 permissions:
   contents: read
 
 jobs:
-  disabled:
-    if: ${{ false }}
+  export:
     runs-on: ubuntu-latest
     steps:
-      - run: echo disabled
+      - name: Checkout exact feature head
+        uses: actions/checkout@v4
+        with:
+          ref: 42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Export exact source and history
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6
+          git bundle create /tmp/gherrit-safe-pr-reorder-current.bundle HEAD main
+          git archive --format=tar.gz --output=/tmp/gherrit-safe-pr-reorder-current.tar.gz HEAD
+          sha256sum /tmp/gherrit-safe-pr-reorder-current.bundle /tmp/gherrit-safe-pr-reorder-current.tar.gz \
+            > /tmp/SHA256SUMS
+
+      - name: Upload export
+        uses: actions/upload-artifact@v4
+        with:
+          name: safe-pr-reorder-current-head
+          path: |
+            /tmp/gherrit-safe-pr-reorder-current.bundle
+            /tmp/gherrit-safe-pr-reorder-current.tar.gz
+            /tmp/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
