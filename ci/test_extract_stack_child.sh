@@ -59,3 +59,39 @@ assert_rejected "<!-- gherrit-meta: {\"id\":\"$id\",\"parent\":null,\"child\":nu
 assert_rejected '<!-- gherrit-meta: {"id":"main","parent":null,"child":null} -->'
 assert_rejected "<!-- gherrit-meta: {\"id\":\"$id\",\"parent\":\"$id\",\"child\":null} -->"
 assert_rejected "<!-- gherrit-meta: {\"id\":\"$id\",\"parent\":null,\"child\":\"$id\"} -->"
+
+
+legacy_g=G0123456789abcdef0123456789abcdef01234567
+legacy_i=I0123456789abcdef0123456789abcdef01234567
+assert_metadata "{\"child\":null,\"id\":\"$legacy_g\",\"parent\":null}" \
+  "<!-- gherrit-meta: {\"id\":\"$legacy_g\",\"parent\":null,\"child\":null} -->"
+assert_metadata "{\"child\":null,\"id\":\"$legacy_i\",\"parent\":null}" \
+  "<!-- gherrit-meta: {\"id\":\"$legacy_i\",\"parent\":null,\"child\":null} -->"
+
+assert_trailer() {
+  local expected=$1 message=$2 actual
+  actual=$(printf '%s' "$message" | bash ci/extract_gherrit_id.sh)
+  if [[ $actual != "$expected" ]]; then
+    echo "expected trailer ID '$expected', got '$actual'" >&2
+    exit 1
+  fi
+}
+assert_trailer "$id" "Subject"$'\n\n'"GhErRiT-Pr-Id: $id"
+assert_trailer "$legacy_g" "Subject"$'\n\n'"GHERRIT-PR-ID: $legacy_g"
+assert_trailer "$legacy_i" "Subject"$'\n\n'"gherrit-pr-id: $legacy_i"
+
+oid1=1111111111111111111111111111111111111111
+oid2=2222222222222222222222222222222222222222
+version_lines=$(printf '%s\trefs/tags/gherrit/%s/v1\n%s\trefs/tags/gherrit/%s/v2\n' \
+  "$oid1" "$id" "$oid2" "$id")
+version_state=$(printf '%s' "$version_lines" | python3 ci/gherrit_protocol.py \
+  version-state --id "$id" --expected-head "$oid2")
+[[ $(jq -er '.latest' <<<"$version_state") == 2 ]]
+[[ $(printf '%s' "$version_lines" | python3 ci/gherrit_protocol.py \
+  authenticate-version --id "$id" --expected-target "$oid1") == 1 ]]
+if printf '%s\trefs/tags/gherrit/%s/v01\n' "$oid1" "$id" |
+  python3 ci/gherrit_protocol.py version-state --id "$id" --expected-head "$oid1" \
+    >/dev/null 2>&1; then
+  echo "expected noncanonical cascade version tag to be rejected" >&2
+  exit 1
+fi
