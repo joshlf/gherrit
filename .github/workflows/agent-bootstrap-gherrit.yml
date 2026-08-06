@@ -1,55 +1,14 @@
 name: Agent publish safe-pr-reorder second-review fixes
 
 on:
-  push:
-    branches:
-      - agent/bootstrap-gherrit-build
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  publish:
+  disabled:
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout transport payload
-        uses: actions/checkout@v4
-        with:
-          ref: agent/bootstrap-gherrit-build
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Verify and publish review fixes
-        run: |
-          set -euxo pipefail
-
-          cat \
-            agent_payloads/review2/safe-pr-reorder-review2.patch.gz.b64.00 \
-            agent_payloads/review2/safe-pr-reorder-review2.patch.gz.b64.01 \
-            agent_payloads/review2/safe-pr-reorder-review2.patch.gz.b64.02 \
-            agent_payloads/review2/safe-pr-reorder-review2.patch.gz.b64.03 \
-            agent_payloads/review2/safe-pr-reorder-review2.patch.gz.b64.04 \
-            agent_payloads/review2/safe-pr-reorder-review2.patch.gz.b64.05 \
-            | base64 --decode \
-            | gzip --decompress \
-            > /tmp/safe-pr-reorder-review2.patch
-
-          echo "b9e5b61c44ab6578a13628461492cf10fc3826055379021e8680ec250d795ec3  /tmp/safe-pr-reorder-review2.patch" \
-            | sha256sum --check --strict
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git fetch --no-tags origin refs/heads/agent/safe-pr-reorder
-          test "$(git rev-parse FETCH_HEAD)" = "6405b50621194500890d305545134c33ac66aa93"
-          git checkout --force -B agent/safe-pr-reorder FETCH_HEAD
-          git am /tmp/safe-pr-reorder-review2.patch
-
-          test "$(git rev-list --count 6405b50621194500890d305545134c33ac66aa93..HEAD)" = "4"
-          test "$(git rev-parse HEAD^{tree})" = "ab5866e56aa431eebb010dcbf0a25ed097d33d32"
-          git diff --check 6405b50621194500890d305545134c33ac66aa93...HEAD
-          git log --reverse --format='%H %s' 6405b50621194500890d305545134c33ac66aa93..HEAD
-
-          git push \
-            --force-with-lease=refs/heads/agent/safe-pr-reorder:6405b50621194500890d305545134c33ac66aa93 \
-            origin HEAD:refs/heads/agent/safe-pr-reorder
+      - run: echo disabled
