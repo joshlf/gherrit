@@ -75,13 +75,20 @@ fn test_pre_push_ls_remote_failure() {
     ctx.checkout_new("feature-ls-remote-fail");
     ctx.commit("Work");
 
-    // Hook should succeed but warn about ls-remote failure
+    // Remote observation is a safety prerequisite. A failed ls-remote must
+    // abort before GHerrit mutates either Git or GitHub.
+    let remote_refs = ctx.remote_refs("refs");
     ctx.gherrit_cmd()
         .args(["hook", "pre-push"])
         .env("MOCK_BIN_FAIL_CMD", "git:ls-remote")
         .assert()
-        .success()
-        .stderr(predicate::str::contains("Failed to fetch remote branch states"));
+        .failure()
+        .stderr(predicate::str::contains("Failed to observe remote GHerrit branches"));
+    assert_eq!(ctx.remote_refs("refs"), remote_refs);
+    ctx.inspect_mock_state(|state| {
+        assert!(state.pushes.is_empty());
+        assert!(state.prs.is_empty());
+    });
 }
 
 #[test]

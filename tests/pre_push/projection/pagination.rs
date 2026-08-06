@@ -16,6 +16,14 @@ fn test_pagination_bug() {
     let msg = format!("Commit 105\n\ngherrit-pr-id: {}", change_id);
     ctx.commit(&msg);
 
+    // Existing PRs necessarily have an existing remote head branch. Seed the
+    // branch directly so this test isolates candidate lookup rather than
+    // malformed PR/Git coherence.
+    ctx.git_cmd()
+        .args(["push", "--quiet", "--no-verify", "origin", &format!("HEAD:refs/heads/{change_id}")])
+        .assert()
+        .success();
+
     // 3. Generate 110 PRs in the mock server state
     ctx.mutate_mock_state(|state| {
         for i in 1..=110 {

@@ -12,8 +12,12 @@ STDERR:
 [gherrit] [WARN] Using custom GitHub API URL: [MOCK_SERVER_URL]
 [gherrit] [WARN] Hit GitHub resource limit with GraphQL batch of size 4
 [gherrit] [WARN] Backing off GraphQL batch size from 4 to 2.
+[gherrit] [WARN] Hit GitHub resource limit with GraphQL batch of size 4
+[gherrit] [WARN] Backing off GraphQL batch size from 4 to 2.
 [gherrit] Pushing chunk to remote...
 [gherrit] Pushing chunk to remote...
+[gherrit] [WARN] Hit GitHub resource limit with GraphQL batch of size 4
+[gherrit] [WARN] Backing off GraphQL batch size from 4 to 2.
 [gherrit] Creating 4 PRs...
 [gherrit] [WARN] Hit GitHub resource limit with GraphQL batch of size 4
 [gherrit] [WARN] Backing off GraphQL batch size from 4 to 2.
@@ -30,4 +34,6 @@ STDERR:
 [gherrit] [WARN] Hit GitHub resource limit with GraphQL batch of size 4
 [gherrit] [WARN] Backing off GraphQL batch size from 4 to 2.
 [gherrit] Batch update complete.
+[gherrit] [WARN] Hit GitHub resource limit with GraphQL batch of size 4
+[gherrit] [WARN] Backing off GraphQL batch size from 4 to 2.
 [gherrit] Successfully synced 4 commits.
