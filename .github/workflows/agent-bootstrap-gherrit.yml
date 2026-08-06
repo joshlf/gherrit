@@ -20,8 +20,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Build GHerrit
-        run: cargo build --locked
+      - name: Build all test targets
+        run: cargo test --workspace --all-targets --locked --no-run
 
       - name: Package checkout and tools
         run: |
