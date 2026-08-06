@@ -23,16 +23,18 @@ jobs:
       - name: Build GHerrit
         run: cargo build --locked
 
-      - name: Package checkout
+      - name: Package checkout and tools
         run: |
-          git archive --format=tar.gz --output=gherrit-source.tar.gz HEAD
+          git bundle create gherrit.bundle --all
           cp target/debug/gherrit gherrit-linux-amd64
+          cp "$(command -v gh)" gh-linux-amd64
 
       - uses: actions/upload-artifact@v4
         with:
           name: gherrit-bootstrap
           path: |
-            gherrit-source.tar.gz
+            gherrit.bundle
             gherrit-linux-amd64
+            gh-linux-amd64
           if-no-files-found: error
           retention-days: 1
