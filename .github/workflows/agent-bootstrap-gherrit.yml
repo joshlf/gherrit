@@ -13,25 +13,94 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout implementation source branch
+      - name: Checkout publisher payload
         uses: actions/checkout@v4
         with:
-          ref: agent/safe-pr-reorder-source
+          ref: agent/bootstrap-gherrit-build
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Reconstruct implementation stack
+        run: |
+          set -euo pipefail
+          cat .github/agent/safe-pr-reorder.patch.gz.b64.* \
+            | base64 --decode \
+            | gzip --decompress \
+            > /tmp/safe-pr-reorder.patch
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git branch --force main origin/main
+          git checkout --force -B agent/safe-pr-reorder main
+          git am /tmp/safe-pr-reorder.patch
+
+          # Fold the final logging/snapshot cleanup into the existing fixture
+          # commit, preserving the planned eleven-commit review stack.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          main = Path("src/main.rs")
+          text = main.read_text()
+          old = '                writeln!(buf, "{prefix}{level_style} {}", record.args())\n'
+          new = '''                let message = record.args().to_string();
+                          if message.is_empty() {
+                              writeln!(buf, "{prefix}{level_style}")
+                          } else {
+                              writeln!(buf, "{prefix}{level_style} {message}")
+                          }
+          '''
+          if old not in text:
+              raise SystemExit("expected logger formatter was not found")
+          main.write_text(text.replace(old, new))
+
+          for name in [
+              "tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap",
+              "tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap",
+          ]:
+              path = Path(name)
+              text = path.read_text()
+              old = "[gherrit] [ERROR] \n"
+              if old not in text:
+                  raise SystemExit(f"expected trailing-space snapshot line missing from {name}")
+              path.write_text(text.replace(old, "[gherrit] [ERROR]\n"))
+          PY
+
+          target=$(git rev-list --reverse origin/main..HEAD | sed -n '6p')
+          test "$(git show --no-patch --format=%s "$target")" = "[tests] Align fixtures with remote authority"
+          git add src/main.rs \
+            tests/cli/snapshots/cli__install__install_edge_cases_conflict.snap \
+            tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap
+          git commit --fixup="$target" --no-verify
+          GIT_SEQUENCE_EDITOR=true git rebase --interactive --autosquash origin/main
+
+          test "$(git rev-list --count origin/main..HEAD)" = 11
+          test "$(git rev-parse HEAD^{tree})" = 1fb8bb9bacb3177d6a42286ca1bb49dcd8b42cc1
+          ! git log --format=%s origin/main..HEAD | grep -q '^fixup!'
+          git log --reverse --format='%h %s' origin/main..HEAD
+
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+
+      - name: Validate reconstructed stack
+        run: |
+          set -euo pipefail
+          git diff --check origin/main...HEAD
+          GHERRIT_TEST_BUILD=1 cargo test --workspace --all-targets --locked
+          ci/check_todo.sh
+          bash ci/test_extract_stack_child.sh
+          bash ci/test_select_cascade_child.sh
 
       - name: Build and install modified GHerrit
-        run: cargo install --path . --locked
+        run: |
+          cargo install --path . --locked --force
+          gherrit --version
 
-      - name: Configure repository and install GHerrit hooks
+      - name: Install GHerrit hooks and manage the stack
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           gherrit install
           gherrit manage --private
 
@@ -40,8 +109,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git push
 
-      - name: Clean temporary source and bootstrap branches
+      - name: Clean temporary bootstrap branch
         if: success()
-        run: |
-          git push origin --delete agent/safe-pr-reorder-source || true
-          git push origin --delete agent/bootstrap-gherrit-build || true
+        run: git push --no-verify origin --delete agent/bootstrap-gherrit-build || true
