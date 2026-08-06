@@ -17,12 +17,14 @@ pub(super) struct PushTarget<'a> {
     pub expected_remote_sha: &'a str,
 }
 
+#[derive(Debug, Clone)]
 pub(super) struct PersistedTag {
     pub object_id: ObjectId,
     pub gherrit_id: String,
     pub version: usize,
 }
 
+#[derive(Debug, Clone)]
 pub(super) struct PushPlan {
     pub arguments: Vec<String>,
     pub persisted_tags: Vec<PersistedTag>,

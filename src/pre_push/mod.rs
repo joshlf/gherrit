@@ -24,7 +24,9 @@ use batching::{
     BatchPlan, INITIAL_GRAPHQL_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
     classify_response, query_exceeds_limit,
 };
-use publication::{PushTarget, plan_push, push_batches, remote_query_batches};
+use publication::{
+    PersistedTag, PushPlan, PushTarget, plan_push, push_batches, remote_query_batches,
+};
 use reconcile::{CurrentPr, DesiredPr, PrUpdate, link_stack, plan_update};
 
 pub async fn run(repo: &util::Repo) -> Result<()> {
@@ -86,7 +88,9 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
         );
     }
 
-    let latest_versions = push_to_origin(repo, &commits)?;
+    let publication = plan_publication(repo, &commits)?;
+    execute_publication(repo, &publication)?;
+    let latest_versions = publication.latest_versions;
     let default_branch = repo.find_default_branch_on_default_remote();
 
     let num_commits = commits.len();
@@ -154,54 +158,59 @@ struct PrState {
     state: PullRequestState,
 }
 
-#[allow(clippy::too_many_lines)]
-fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<String, usize>> {
+struct PublicationPlan {
+    batches: Vec<PushPlan>,
+    latest_versions: HashMap<String, usize>,
+}
+
+fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<PublicationPlan> {
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
+    let expected_heads = get_remote_branch_states(repo, &gherrit_ids)
+        .wrap_err("Failed to observe remote GHerrit branches")?;
 
-    // Fetch remote branch states to ensure we don't act on stale information.
-    let remote_branch_states = get_remote_branch_states(repo, &gherrit_ids).unwrap_or_else(|e| {
-        log::warn!("Failed to fetch remote branch states: {}", e);
-        HashMap::new()
-    });
-
-    let mut next_versions = HashMap::new();
+    let mut latest_versions = HashMap::new();
+    let mut batches = Vec::new();
 
     for chunk in push_batches(commits) {
         let mut targets = Vec::with_capacity(chunk.len());
 
-        for c in chunk {
-            // Determine the next version based on local tags (Optimistic
-            // Locking).
-            let local_max = get_local_version(repo, &c.gherrit_id).unwrap_or(0);
-            let next_ver = local_max + 1;
-            next_versions.insert(c.gherrit_id.clone(), next_ver);
+        for commit in chunk {
+            // Version allocation remains local for now. Keeping it in the pure
+            // planning phase ensures retries execute the exact same ref tuple
+            // rather than recomputing after a partial or ambiguous result.
+            let local_max = get_local_version(repo, &commit.gherrit_id).unwrap_or(0);
+            let next_version = local_max + 1;
+            latest_versions.insert(commit.gherrit_id.clone(), next_version);
 
-            // Lease the branch to ensure it hasn't changed since our fetch.
-            // If we know the remote SHA, we expect it. If we don't (None), we
-            // expect "" (creation).
-            let expected_sha = remote_branch_states
-                .get(&c.gherrit_id)
-                .map(|s| s.as_deref().unwrap_or(""))
+            let expected_remote_sha = expected_heads
+                .get(&commit.gherrit_id)
+                .and_then(|sha| sha.as_deref())
                 .unwrap_or("");
 
             targets.push(PushTarget {
-                object_id: c.id,
-                gherrit_id: &c.gherrit_id,
-                version: next_ver,
-                expected_remote_sha: expected_sha,
+                object_id: commit.id,
+                gherrit_id: &commit.gherrit_id,
+                version: next_version,
+                expected_remote_sha,
             });
         }
 
-        let plan = plan_push(&repo.default_remote_name(), &targets);
+        batches.push(plan_push(&repo.default_remote_name(), &targets));
+    }
 
+    Ok(PublicationPlan { batches, latest_versions })
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_publication(repo: &util::Repo, publication: &PublicationPlan) -> Result<()> {
+    for plan in &publication.batches {
         log::info!("Pushing chunk to remote...");
-        let mut child = util::cmd("git", plan.arguments)
+        let mut child = util::cmd("git", &plan.arguments)
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
             .spawn()
             .wrap_err("Failed to run `git push`")?;
 
-        // Filter output logic (elided for brevity, same as before)
         {
             use std::io::{BufRead, BufReader};
             let stderr = child.stderr.take().unwrap();
@@ -217,7 +226,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
                 );
                 let cleaned = re.replace(&block, "");
                 if !cleaned.is_empty() {
-                    eprintln!("{}", cleaned);
+                    eprintln!("{cleaned}");
                 }
                 buf.clear();
             };
@@ -227,7 +236,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
                     remote_buffer.push(line);
                 } else {
                     flush_buffer(&mut remote_buffer);
-                    eprintln!("{}", line);
+                    eprintln!("{line}");
                 }
             }
             flush_buffer(&mut remote_buffer);
@@ -235,27 +244,27 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
 
         let status = child.wait().unwrap();
         if !status.success() {
-            // If the push failed, it's likely due to a lease failure
-            // (concurrent modification). If failed, it might be due to the tag
-            // lock or branch lease.
-            let r = repo.default_remote_name();
+            let remote = repo.default_remote_name();
             bail!(
-                "`git push` failed. The remote might be ahead or changed. Run `git fetch {r}` to sync."
+                "`git push` failed. The remote might be ahead or changed. Run `git fetch {remote}` to sync."
             );
         }
 
-        // Persist the local tags now that the push succeeded.
-        for tag in plan.persisted_tags {
-            let _ = repo.reference(
-                format!("refs/tags/gherrit/{}/v{}", tag.gherrit_id, tag.version),
-                tag.object_id,
-                PreviousValue::Any,
-                "gherrit: persist local version state",
-            );
-        }
+        persist_local_tags(repo, &plan.persisted_tags);
     }
 
-    Ok(next_versions)
+    Ok(())
+}
+
+fn persist_local_tags(repo: &util::Repo, tags: &[PersistedTag]) {
+    for tag in tags {
+        let _ = repo.reference(
+            format!("refs/tags/gherrit/{}/v{}", tag.gherrit_id, tag.version),
+            tag.object_id,
+            PreviousValue::Any,
+            "gherrit: persist local version state",
+        );
+    }
 }
 
 #[allow(clippy::type_complexity)]
