@@ -30,6 +30,8 @@ pub struct MockState {
     pub repo_name: String,
     pub fail_next_request: Option<FailureKind>,
     pub merge_queue: HashSet<u64>,
+    pub auto_merge: HashSet<u64>,
+    pub native_stacks: HashSet<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -488,9 +490,9 @@ fn validate_pull_requests_field(field: &executable::Field) -> Result<(), String>
             ast::Value::Int(value) => Some(value.as_str()),
             _ => None,
         })
-        .ok_or_else(|| format!("The mock GitHub API requires `{PATH}(first: 1)`"))?;
-    if first != "1" {
-        return Err(format!("The mock GitHub API only supports `{PATH}(first: 1)`"));
+        .ok_or_else(|| format!("The mock GitHub API requires `{PATH}(first: 100)`"))?;
+    if first != "100" {
+        return Err(format!("The mock GitHub API only supports `{PATH}(first: 100)`"));
     }
 
     let states = argument(field, "states")
@@ -516,17 +518,50 @@ fn validate_pull_requests_field(field: &executable::Field) -> Result<(), String>
     }
 
     for field in selected_fields(&field.selection_set, PATH)? {
-        if field.name != "nodes" {
-            return Err(format!(
-                "The mock GitHub API does not support field `{PATH}.{}`",
-                field.name
-            ));
+        match field.name.as_str() {
+            "totalCount" => {}
+            "nodes" => validate_pr_node_fields(&field.selection_set)?,
+            _ => {
+                return Err(format!(
+                    "The mock GitHub API does not support field `{PATH}.{}`",
+                    field.name
+                ));
+            }
         }
-        validate_scalar_fields(
-            &field.selection_set,
-            "repository.pullRequests.nodes",
-            &["number", "id", "title", "body", "baseRefName", "state"],
-        )?;
+    }
+    Ok(())
+}
+
+fn validate_pr_node_fields(selection_set: &executable::SelectionSet) -> Result<(), String> {
+    const PATH: &str = "repository.pullRequests.nodes";
+    for field in selected_fields(selection_set, PATH)? {
+        match field.name.as_str() {
+            "number" | "id" | "title" | "body" | "baseRefName" | "baseRefOid" | "headRefName"
+            | "headRefOid" | "state" | "isInMergeQueue" => {}
+            "headRepository" => {
+                validate_scalar_fields(
+                    &field.selection_set,
+                    "PullRequest.headRepository",
+                    &["nameWithOwner"],
+                )?;
+            }
+            "autoMergeRequest" => {
+                validate_scalar_fields(
+                    &field.selection_set,
+                    "PullRequest.autoMergeRequest",
+                    &["enabledAt"],
+                )?;
+            }
+            "stackEntry" => {
+                validate_scalar_fields(&field.selection_set, "PullRequest.stackEntry", &["id"])?;
+            }
+            _ => {
+                return Err(format!(
+                    "The mock GitHub API does not support field `{PATH}.{}`",
+                    field.name
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -911,7 +946,11 @@ async fn graphql(
                     "createPullRequest" => handle_create_pr(&mut mock_state, field, &|branch| {
                         remote_branch_exists(&app_state, branch)
                     }),
-                    "repository" => handle_repository_query(&mock_state, field, &variables),
+                    "repository" => {
+                        handle_repository_query(&mock_state, field, &variables, &|branch| {
+                            remote_branch_oid(&app_state, branch)
+                        })
+                    }
                     _ => unreachable!("request was checked by validate_supported_document"),
                 };
                 match result {
@@ -961,6 +1000,23 @@ fn remote_branch_exists(app_state: &AppState, branch: &str) -> Result<bool, Stri
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
+        code => Err(format!("Inspecting remote Git ref `{reference}` exited with {code:?}")),
+    }
+}
+
+fn remote_branch_oid(app_state: &AppState, branch: &str) -> Result<Option<String>, String> {
+    let reference = format!("refs/heads/{branch}");
+    let output = app_state
+        .test_environment
+        .command(&app_state.system_git)
+        .arg("--git-dir")
+        .arg(&app_state.remote_path)
+        .args(["rev-parse", "--verify", "--quiet", &reference])
+        .output()
+        .map_err(|error| format!("Failed to inspect remote Git ref `{reference}`: {error}"))?;
+    match output.status.code() {
+        Some(0) => Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string())),
+        Some(1) => Ok(None),
         code => Err(format!("Inspecting remote Git ref `{reference}` exited with {code:?}")),
     }
 }
@@ -1126,6 +1182,7 @@ fn handle_repository_query(
     mock_state: &MockState,
     field: &executable::Field,
     variables: &GraphQlVariables,
+    branch_oid: &dyn Fn(&str) -> Result<Option<String>, String>,
 ) -> Result<serde_json::Value, String> {
     const PATH: &str = "repository";
     let owner = resolve_string_argument(field, "owner", PATH, variables)?;
@@ -1146,16 +1203,30 @@ fn handle_repository_query(
                     "repository.pullRequests",
                     variables,
                 )?;
-                let matching_prs: Vec<_> =
-                    mock_state.prs.iter().filter(|pr| pr.head.ref_field == head).take(1).collect();
+                let matching_prs = mock_state
+                    .prs
+                    .iter()
+                    .filter(|pr| pr.head.ref_field == head)
+                    .collect::<Vec<_>>();
 
                 let mut connection = serde_json::Map::new();
                 for field in selected_fields(&field.selection_set, "repository.pullRequests")? {
                     match field.name.as_str() {
+                        "totalCount" => {
+                            connection
+                                .insert(response_key(field), serde_json::json!(matching_prs.len()));
+                        }
                         "nodes" => {
                             let nodes = matching_prs
                                 .iter()
-                                .map(|pr| project_pr_node(pr, &field.selection_set))
+                                .map(|pr| {
+                                    project_pr_node(
+                                        mock_state,
+                                        pr,
+                                        &field.selection_set,
+                                        branch_oid,
+                                    )
+                                })
                                 .collect::<Result<Vec<_>, _>>()?;
                             connection.insert(response_key(field), serde_json::json!(nodes));
                         }
@@ -1178,9 +1249,17 @@ fn handle_repository_query(
 }
 
 fn project_pr_node(
+    mock_state: &MockState,
     pr: &PrEntry,
     selection_set: &executable::SelectionSet,
+    branch_oid: &dyn Fn(&str) -> Result<Option<String>, String>,
 ) -> Result<serde_json::Value, String> {
+    let head_oid = branch_oid(&pr.head.ref_field)?
+        .ok_or_else(|| format!("Head branch `{}` does not exist", pr.head.ref_field))?;
+    let base_oid = branch_oid(&pr.base.ref_field)?
+        .ok_or_else(|| format!("Base branch `{}` does not exist", pr.base.ref_field))?;
+    let repository_name = format!("{}/{}", mock_state.repo_owner, mock_state.repo_name);
+
     let mut node = serde_json::Map::new();
     for field in selected_fields(selection_set, "repository.pullRequests.nodes")? {
         let value = match field.name.as_str() {
@@ -1189,12 +1268,62 @@ fn project_pr_node(
             "title" => serde_json::json!(pr.title),
             "body" => serde_json::json!(pr.body),
             "baseRefName" => serde_json::json!(pr.base.ref_field),
+            "baseRefOid" => serde_json::json!(base_oid),
+            "headRefName" => serde_json::json!(pr.head.ref_field),
+            "headRefOid" => serde_json::json!(head_oid),
+            "headRepository" => project_nested_object(
+                field,
+                "PullRequest.headRepository",
+                &[("nameWithOwner", serde_json::json!(repository_name))],
+            )?,
             "state" => serde_json::json!(pr.state),
+            "isInMergeQueue" => serde_json::json!(mock_state.merge_queue.contains(&pr.id)),
+            "autoMergeRequest" => {
+                if mock_state.auto_merge.contains(&pr.id) {
+                    project_nested_object(
+                        field,
+                        "PullRequest.autoMergeRequest",
+                        &[("enabledAt", serde_json::json!("2026-01-01T00:00:00Z"))],
+                    )?
+                } else {
+                    serde_json::Value::Null
+                }
+            }
+            "stackEntry" => {
+                if mock_state.native_stacks.contains(&pr.id) {
+                    project_nested_object(
+                        field,
+                        "PullRequest.stackEntry",
+                        &[("id", serde_json::json!(format!("STACK_ENTRY_{}", pr.id)))],
+                    )?
+                } else {
+                    serde_json::Value::Null
+                }
+            }
             _ => unreachable!("request was checked by validate_pull_requests_field"),
         };
         node.insert(response_key(field), value);
     }
     Ok(serde_json::Value::Object(node))
+}
+
+fn project_nested_object(
+    field: &executable::Field,
+    path: &str,
+    values: &[(&str, serde_json::Value)],
+) -> Result<serde_json::Value, String> {
+    let values = values.iter().cloned().collect::<HashMap<_, _>>();
+    let mut object = serde_json::Map::new();
+    for selected in selected_fields(&field.selection_set, path)? {
+        object.insert(
+            response_key(selected),
+            values
+                .get(selected.name.as_str())
+                .cloned()
+                .ok_or_else(|| format!("No mock value for `{path}.{}`", selected.name))?,
+        );
+    }
+    Ok(serde_json::Value::Object(object))
 }
 
 #[cfg(test)]

@@ -36697,6 +36697,16 @@ type PublishSponsorsTierPayload {
 }
 
 """
+A member of a native GitHub pull request stack.
+"""
+type PullRequestStackEntry implements Node {
+  """
+  The Node ID of the PullRequestStackEntry object.
+  """
+  id: ID!
+}
+
+"""
 A repository pull request.
 """
 type PullRequest implements Assignable & Closable & Comment & Labelable & Lockable & Node & ProjectV2Owner & Reactable & RepositoryNode & Subscribable & UniformResourceLocatable & Updatable & UpdatableComment {
@@ -37482,6 +37492,11 @@ type PullRequest implements Assignable & Closable & Comment & Labelable & Lockab
     """
     states: [PullRequestReviewState!]
   ): PullRequestReviewConnection
+
+  """
+  The native stack entry for this pull request, if any.
+  """
+  stackEntry: PullRequestStackEntry
 
   """
   Identifies the state of the pull request.

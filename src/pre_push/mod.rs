@@ -68,27 +68,12 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
 
     let octocrab = builder.build()?;
 
-    let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
-    let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
-
-    let errors: Vec<String> = prs.iter().filter_map(|pr| match pr.state {
-        PullRequestState::Open => None,
-        PullRequestState::Closed => Some((pr.number, "closed")),
-        PullRequestState::Merged => Some((pr.number, "merged")),
-    }).map(|(number, state)| {
-        format!(
-            "Cannot push to {state} PR #{number}. Please open a new PR or reopen the existing one."
-        )
-    }).collect();
-
-    if !errors.is_empty() {
-        bail!(
-            "{}\nYou may want to rebase on the latest changes before pushing.",
-            errors.join("\n")
-        );
-    }
-
     let publication = plan_publication(repo, &commits)?;
+    let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
+    let candidates = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
+    let prs = select_canonical_prs(repo, &gherrit_ids, candidates)?;
+    validate_prs_for_publication(&prs, &publication)?;
+
     execute_publication(repo, &publication)?;
     let latest_versions = publication.latest_versions;
     let default_branch = repo.find_default_branch_on_default_remote();
@@ -154,13 +139,21 @@ struct PrState {
     title: Option<String>,
     body: Option<String>,
     base_branch: String,
+    base_oid: String,
     head_branch: String,
+    head_oid: String,
+    head_repository: String,
     state: PullRequestState,
+    is_in_merge_queue: bool,
+    auto_merge_enabled: bool,
+    native_stack: bool,
 }
 
 struct PublicationPlan {
     batches: Vec<PushPlan>,
     latest_versions: HashMap<String, usize>,
+    expected_heads: HashMap<String, Option<String>>,
+    desired_heads: HashMap<String, ObjectId>,
 }
 
 fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<PublicationPlan> {
@@ -169,6 +162,7 @@ fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<Publication
         .wrap_err("Failed to observe remote GHerrit branches")?;
 
     let mut latest_versions = HashMap::new();
+    let mut desired_heads = HashMap::new();
     let mut batches = Vec::new();
 
     for chunk in push_batches(commits) {
@@ -181,6 +175,7 @@ fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<Publication
             let local_max = get_local_version(repo, &commit.gherrit_id).unwrap_or(0);
             let next_version = local_max + 1;
             latest_versions.insert(commit.gherrit_id.clone(), next_version);
+            desired_heads.insert(commit.gherrit_id.clone(), commit.id);
 
             let expected_remote_sha = expected_heads
                 .get(&commit.gherrit_id)
@@ -198,7 +193,12 @@ fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<Publication
         batches.push(plan_push(&repo.default_remote_name(), &targets));
     }
 
-    Ok(PublicationPlan { batches, latest_versions })
+    Ok(PublicationPlan {
+        batches,
+        latest_versions,
+        expected_heads,
+        desired_heads,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -272,7 +272,8 @@ fn get_remote_branch_states(
     repo: &util::Repo,
     gherrit_ids: &[String],
 ) -> Result<HashMap<String, Option<String>>> {
-    let mut states: HashMap<String, Option<String>> = HashMap::new();
+    let mut states: HashMap<String, Option<String>> =
+        gherrit_ids.iter().cloned().map(|id| (id, None)).collect();
     for chunk in remote_query_batches(gherrit_ids) {
         let mut args = vec!["ls-remote".to_string(), repo.default_remote_name()];
         args.extend(chunk.iter().map(|id| format!("refs/heads/{id}")));
@@ -618,10 +619,16 @@ async fn sync_prs(
                         title: Some(create.title),
                         body: Some(create.body),
                         base_branch: create.base_branch,
+                        base_oid: String::new(),
                         head_branch: create.head_branch,
-                        // NOTE: We assume that newly-created PRs are in the
-                        // OPEN state.
+                        head_oid: String::new(),
+                        head_repository: format!("{}/{}", remote.owner, remote.repo_name),
+                        // Newly-created PRs are open and cannot already be in a
+                        // queue, auto-merge request, or native stack.
                         state: PullRequestState::Open,
+                        is_in_merge_queue: false,
+                        auto_merge_enabled: false,
+                        native_stack: false,
                     }
                 }
             };
@@ -923,19 +930,23 @@ async fn batch_fetch_prs(
         head_refs,
         |head_ref| {
             safe_json_format!(
-                "repository(owner: {owner}, name: {repo_name}) {{ pullRequests(headRefName: {head_ref}, first: 1, states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, title, body, baseRefName, state }} }} }}",
+                "repository(owner: {owner}, name: {repo_name}) {{ pullRequests(headRefName: {head_ref}, first: 100, states: [OPEN, CLOSED, MERGED]) {{ totalCount, nodes {{ number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, headRepository {{ nameWithOwner }}, state, isInMergeQueue, autoMergeRequest {{ enabledAt }}, stackEntry {{ id }} }} }} }}",
                 owner = owner,
                 repo_name = repo_name,
                 head_ref = head_ref,
             )
         },
         |head_ref, val| {
-            if let Some(nodes) = val
-                .get("pullRequests")
-                .and_then(|pr| pr.get("nodes"))
-                .and_then(|n| n.as_array())
-                && let Some(node) = nodes.first()
-            {
+            let pull_requests = json_get!(val["pullRequests"])?;
+            let total_count = json_get!(pull_requests["totalCount"].as_u64())?;
+            let nodes = json_get!(pull_requests["nodes"].as_array())?;
+            if total_count > nodes.len() as u64 {
+                bail!(
+                    "More than 100 PRs exist for head branch `{head_ref}`; cannot select a canonical PR safely"
+                );
+            }
+
+            for node in nodes {
                 let number = json_get!(node["number"].as_u64())?;
                 let id = json_get!(node["id"].as_str())?;
                 let state: PullRequestState =
@@ -947,24 +958,153 @@ async fn batch_fetch_prs(
                     node_id: id.to_string(),
                     title: node
                         .get("title")
-                        .and_then(|t| t.as_str())
+                        .and_then(|title| title.as_str())
                         .map(ToString::to_string),
                     body: node
                         .get("body")
-                        .and_then(|b| b.as_str())
+                        .and_then(|body| body.as_str())
                         .map(ToString::to_string),
-                    base_branch: json_get!(node["baseRefName"].as_str())
-                        .map(|s| s.to_string())
-                        .with_context(|| format!("PR #{number} is missing a base branch name"))?,
-                    head_branch: head_ref.to_string(),
+                    base_branch: json_get!(node["baseRefName"].as_str())?.to_string(),
+                    base_oid: json_get!(node["baseRefOid"].as_str())?.to_string(),
+                    head_branch: json_get!(node["headRefName"].as_str())?.to_string(),
+                    head_oid: json_get!(node["headRefOid"].as_str())?.to_string(),
+                    head_repository: json_get!(node["headRepository"]["nameWithOwner"].as_str())?
+                        .to_string(),
                     state,
+                    is_in_merge_queue: json_get!(node["isInMergeQueue"].as_bool())?,
+                    auto_merge_enabled: node
+                        .get("autoMergeRequest")
+                        .is_some_and(|request| !request.is_null()),
+                    native_stack: node
+                        .get("stackEntry")
+                        .is_some_and(|entry| !entry.is_null()),
                 });
             }
             Ok(())
         },
-    ).await?;
+    )
+    .await?;
 
     Ok(all_prs)
+}
+
+fn select_canonical_prs(
+    repo: &util::Repo,
+    head_refs: &[String],
+    candidates: Vec<PrState>,
+) -> Result<Vec<PrState>> {
+    let remote = repo.default_remote()?;
+    let repository = format!("{}/{}", remote.owner, remote.repo_name);
+    let mut canonical = Vec::new();
+
+    for head_ref in head_refs {
+        let same_repository = candidates
+            .iter()
+            .filter(|pr| pr.head_branch == *head_ref && pr.head_repository == repository)
+            .collect::<Vec<_>>();
+        let open = same_repository
+            .iter()
+            .copied()
+            .filter(|pr| pr.state == PullRequestState::Open)
+            .collect::<Vec<_>>();
+
+        match open.as_slice() {
+            [] => {
+                if let Some(pr) = same_repository.iter().find(|pr| {
+                    matches!(pr.state, PullRequestState::Merged | PullRequestState::Closed)
+                }) {
+                    canonical.push((*pr).clone());
+                }
+            }
+            [pr] => canonical.push((*pr).clone()),
+            _ => {
+                let numbers = open
+                    .iter()
+                    .map(|pr| format!("#{}", pr.number))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "Multiple open PRs ({numbers}) use GHerrit head branch `{head_ref}` in {repository}"
+                );
+            }
+        }
+    }
+
+    Ok(canonical)
+}
+
+fn validate_prs_for_publication(prs: &[PrState], publication: &PublicationPlan) -> Result<()> {
+    let mut errors = Vec::new();
+
+    for pr in prs {
+        match pr.state {
+            PullRequestState::Closed => errors.push(format!(
+                "Cannot push to closed PR #{}. Please reopen it or use a new GHerrit ID.",
+                pr.number
+            )),
+            PullRequestState::Merged => errors.push(format!(
+                "Cannot push to merged PR #{}. Merged PRs cannot be reopened.",
+                pr.number
+            )),
+            PullRequestState::Open => {}
+        }
+
+        let expected_head = publication
+            .expected_heads
+            .get(&pr.head_branch)
+            .and_then(|head| head.as_deref());
+        if expected_head != Some(pr.head_oid.as_str()) {
+            errors.push(format!(
+                "PR #{} reports head {} at {}, but remote Git was observed at {}",
+                pr.number,
+                pr.head_oid,
+                pr.head_branch,
+                expected_head.unwrap_or("<missing>")
+            ));
+        }
+        if pr.is_in_merge_queue {
+            errors.push(format!(
+                "PR #{} is in the merge queue; remove it before changing this stack",
+                pr.number
+            ));
+        }
+        if pr.auto_merge_enabled {
+            errors.push(format!(
+                "PR #{} has auto-merge enabled; disable it before changing this stack",
+                pr.number
+            ));
+        }
+        if pr.native_stack {
+            errors.push(format!(
+                "PR #{} belongs to a native GitHub stack; unstack it before GHerrit rewrites bases",
+                pr.number
+            ));
+        }
+
+        let desired_head = publication
+            .desired_heads
+            .get(&pr.head_branch)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "<missing>".to_string());
+        log::trace!(
+            "Observed PR #{}: {}@{} (desired {}) -> {}@{}",
+            pr.number,
+            pr.head_branch,
+            pr.head_oid,
+            desired_head,
+            pr.base_branch,
+            pr.base_oid
+        );
+    }
+
+    if !errors.is_empty() {
+        bail!(
+            "{}\nYou may want to fetch and reconcile the remote state before pushing.",
+            errors.join("\n")
+        );
+    }
+
+    Ok(())
 }
 
 enum GraphQlOp {
