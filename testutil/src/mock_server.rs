@@ -72,8 +72,20 @@ pub struct PrEntry {
     pub head: RefInfo,
     #[serde(rename = "base")]
     pub base: RefInfo,
+    #[serde(skip)]
+    pub head_repository: Option<MockRepositoryIdentity>,
+    #[serde(skip)]
+    pub base_repository: Option<MockRepositoryIdentity>,
+    #[serde(skip)]
+    pub is_cross_repository: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockRepositoryIdentity {
+    pub id: String,
+    pub name_with_owner: String,
 }
 
 pub struct MockPrArgs<'a> {
@@ -127,6 +139,15 @@ impl PrEntry {
             body: Some(body),
             head: RefInfo { ref_field: head, sha: "".to_string() },
             base: RefInfo { ref_field: base, sha: "".to_string() },
+            head_repository: Some(MockRepositoryIdentity {
+                id: "REPO_NODE_ID".to_string(),
+                name_with_owner: format!("{repo_owner}/{repo_name}"),
+            }),
+            base_repository: Some(MockRepositoryIdentity {
+                id: "REPO_NODE_ID".to_string(),
+                name_with_owner: format!("{repo_owner}/{repo_name}"),
+            }),
+            is_cross_repository: false,
             created_at: "2023-01-01T00:00:00Z".to_string(),
             updated_at: "2023-01-01T00:00:00Z".to_string(),
         }
@@ -578,12 +599,16 @@ fn validate_pr_node_fields(selection_set: &executable::SelectionSet) -> Result<(
     for field in selected_fields(selection_set, PATH)? {
         match field.name.as_str() {
             "number" | "id" | "title" | "body" | "baseRefName" | "baseRefOid" | "headRefName"
-            | "headRefOid" | "state" | "isInMergeQueue" => {}
-            "headRepository" => {
+            | "headRefOid" | "state" | "isInMergeQueue" | "isCrossRepository" => {}
+            "headRepository" | "baseRepository" => {
                 validate_scalar_fields(
                     &field.selection_set,
-                    "PullRequest.headRepository",
-                    &["nameWithOwner"],
+                    if field.name == "headRepository" {
+                        "PullRequest.headRepository"
+                    } else {
+                        "PullRequest.baseRepository"
+                    },
+                    &["id", "nameWithOwner"],
                 )?;
             }
             "autoMergeRequest" => {
@@ -618,7 +643,7 @@ fn validate_repository_field(
 
     for field in selected_fields(&field.selection_set, PATH)? {
         match field.name.as_str() {
-            "id" => {}
+            "id" | "nameWithOwner" => {}
             "pullRequests" => {
                 validate_pull_requests_field(field)?;
                 if argument(field, "headRefName").is_some() {
@@ -1322,7 +1347,9 @@ fn handle_repository_query(
     let owner = resolve_string_argument(field, "owner", PATH, variables)?;
     let name = resolve_string_argument(field, "name", PATH, variables)?;
 
-    if owner != mock_state.repo_owner || name != mock_state.repo_name {
+    if !owner.eq_ignore_ascii_case(&mock_state.repo_owner)
+        || !name.eq_ignore_ascii_case(&mock_state.repo_name)
+    {
         return Ok(serde_json::Value::Null);
     }
 
@@ -1384,6 +1411,15 @@ fn handle_repository_query(
                     serde_json::Value::String("REPO_NODE_ID".to_string()),
                 );
             }
+            "nameWithOwner" => {
+                repo_data.insert(
+                    response_key(field),
+                    serde_json::Value::String(format!(
+                        "{}/{}",
+                        mock_state.repo_owner, mock_state.repo_name
+                    )),
+                );
+            }
             _ => unreachable!("request was checked by validate_repository_field"),
         }
     }
@@ -1397,8 +1433,6 @@ fn project_pr_node(
     selection_set: &executable::SelectionSet,
     branch_oid: &dyn Fn(&str) -> Result<Option<String>, String>,
 ) -> Result<serde_json::Value, String> {
-    let repository_name = format!("{}/{}", mock_state.repo_owner, mock_state.repo_name);
-
     let mut node = serde_json::Map::new();
     for field in selected_fields(selection_set, "repository.pullRequests.nodes")? {
         let value = match field.name.as_str() {
@@ -1412,11 +1446,29 @@ fn project_pr_node(
             "headRefName" => serde_json::json!(pr.head.ref_field),
             "headRefOid" => serde_json::json!(branch_oid(&pr.head.ref_field)?
                 .ok_or_else(|| format!("Head branch `{}` does not exist", pr.head.ref_field))?),
-            "headRepository" => project_nested_object(
-                field,
-                "PullRequest.headRepository",
-                &[("nameWithOwner", serde_json::json!(repository_name))],
-            )?,
+            "headRepository" => match &pr.head_repository {
+                Some(repository) => project_nested_object(
+                    field,
+                    "PullRequest.headRepository",
+                    &[
+                        ("id", serde_json::json!(repository.id)),
+                        ("nameWithOwner", serde_json::json!(repository.name_with_owner)),
+                    ],
+                )?,
+                None => serde_json::Value::Null,
+            },
+            "baseRepository" => match &pr.base_repository {
+                Some(repository) => project_nested_object(
+                    field,
+                    "PullRequest.baseRepository",
+                    &[
+                        ("id", serde_json::json!(repository.id)),
+                        ("nameWithOwner", serde_json::json!(repository.name_with_owner)),
+                    ],
+                )?,
+                None => serde_json::Value::Null,
+            },
+            "isCrossRepository" => serde_json::json!(pr.is_cross_repository),
             "state" => serde_json::json!(pr.state),
             "isInMergeQueue" => serde_json::json!(mock_state.merge_queue.contains(&pr.id)),
             "autoMergeRequest" => {

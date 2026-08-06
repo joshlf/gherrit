@@ -12,7 +12,7 @@ use owo_colors::OwoColorize;
 use serde_json::json;
 
 use crate::{
-    gherrit_id, re,
+    gherrit_id, gherrit_metadata, re,
     util::{self, CommandExt as _, HeadState, Remote},
 };
 
@@ -72,16 +72,21 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     }
 
     let octocrab = builder.build()?;
+    let remote = repo.default_remote()?;
+    let repository = fetch_repository_identity(&octocrab, &remote).await?;
 
     let publication = plan_publication(repo, &commits)?;
+    validate_ids_against_remote_default(&commits, &remote_default)?;
+    validate_existing_branch_ownership(repo, &publication, &remote_default)?;
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
-    let candidates = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
-    let prs = select_canonical_prs(repo, &gherrit_ids, candidates)?;
+    let candidates = batch_fetch_prs(&remote, &octocrab, &gherrit_ids).await?;
+    let prs = select_canonical_prs(&repository, &gherrit_ids, candidates)?;
     validate_prs_for_publication(&prs, &publication)?;
 
     let rewritten_branches = rewritten_existing_branches(&publication);
-    let base_consumers = batch_fetch_base_consumers(repo, &octocrab, &rewritten_branches).await?;
-    validate_base_consumers(&prs, &rewritten_branches, &base_consumers)?;
+    let base_consumers =
+        batch_fetch_base_consumers(&remote, &octocrab, &rewritten_branches).await?;
+    validate_base_consumers(&repository, &prs, &rewritten_branches, &base_consumers)?;
 
     let staging_bases = plan_pr_staging(repo, &commits, &prs, &publication, &remote_default)?;
     validate_topology_transition_state(&prs, &staging_bases)?;
@@ -99,8 +104,8 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     }
 
     apply_staging_bases(&octocrab, &remote_default.name, &staging_bases).await?;
-    let prepared_candidates = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
-    let prepared_prs = select_canonical_prs(repo, &gherrit_ids, prepared_candidates)?;
+    let prepared_candidates = batch_fetch_prs(&remote, &octocrab, &gherrit_ids).await?;
+    let prepared_prs = select_canonical_prs(&repository, &gherrit_ids, prepared_candidates)?;
     validate_prs_for_publication(&prepared_prs, &publication)?;
     verify_staging_bases(
         repo,
@@ -116,14 +121,16 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     let latest_versions = publication.latest_versions.clone();
     let default_branch = remote_default.name;
 
-    let projected_candidates = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
-    let projected_prs = select_canonical_prs(repo, &gherrit_ids, projected_candidates)?;
+    let projected_candidates = batch_fetch_prs(&remote, &octocrab, &gherrit_ids).await?;
+    let projected_prs = select_canonical_prs(&repository, &gherrit_ids, projected_candidates)?;
     validate_prs_after_publication(&projected_prs, &publication)?;
 
     let num_commits = commits.len();
     sync_prs(
         repo,
         &octocrab,
+        &remote,
+        &repository,
         branch_name,
         &default_branch,
         commits,
@@ -131,7 +138,15 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
         projected_prs,
     )
     .await?;
-    verify_final_projection(repo, &octocrab, &gherrit_ids, &default_branch, &publication).await?;
+    verify_final_projection(
+        &remote,
+        &repository,
+        &octocrab,
+        &gherrit_ids,
+        &default_branch,
+        &publication,
+    )
+    .await?;
 
     log::info!("Successfully synced {num_commits} commits.");
     Ok(())
@@ -153,10 +168,8 @@ fn validate_repository_dag_authority(repo: &util::Repo) -> Result<()> {
         );
     }
 
-    let mut replacements = util::cmd(
-        "git",
-        ["for-each-ref", "--format=%(refname)", "refs/replace"],
-    );
+    let mut replacements =
+        util::cmd("git", ["for-each-ref", "--format=%(refname)", "refs/replace"]);
     replacements.current_dir(repo.workdir().unwrap_or(repo.path()));
     let output = replacements.checked_output()?;
     if !output.stdout.is_empty() {
@@ -166,9 +179,9 @@ fn validate_repository_dag_authority(repo: &util::Repo) -> Result<()> {
     }
 
     let grafts = repo.path().join("info/grafts");
-    if std::fs::read(&grafts).is_ok_and(|contents| {
-        contents.iter().any(|byte| !byte.is_ascii_whitespace())
-    }) {
+    if std::fs::read(&grafts)
+        .is_ok_and(|contents| contents.iter().any(|byte| !byte.is_ascii_whitespace()))
+    {
         bail!(
             "GHerrit cannot prove remote reachability while .git/info/grafts is nonempty; remove the graft configuration before pushing"
         );
@@ -249,6 +262,89 @@ fn collect_commits(repo: &util::Repo, remote_default: &RemoteDefault) -> Result<
     Ok(commits)
 }
 
+fn validate_ids_against_remote_default(
+    commits: &[Commit],
+    remote_default: &RemoteDefault,
+) -> Result<()> {
+    if let Some(commit) = commits.iter().find(|commit| commit.gherrit_id == remote_default.name) {
+        bail!(
+            "Commit {} uses gherrit-pr-id `{}`, which collides with the publication remote's default branch",
+            commit.id,
+            commit.gherrit_id
+        );
+    }
+    Ok(())
+}
+
+/// Proves that every existing branch which GHerrit is about to rewrite is an
+/// already-managed GHerrit branch rather than an unrelated user branch that
+/// happens to have an ID-shaped name.
+fn validate_existing_branch_ownership(
+    repo: &util::Repo,
+    publication: &PublicationPlan,
+    remote_default: &RemoteDefault,
+) -> Result<()> {
+    let existing = publication
+        .expected_heads
+        .iter()
+        .filter_map(|(branch, oid)| oid.as_ref().map(|oid| (branch, oid)))
+        .collect::<Vec<_>>();
+    if existing.is_empty() {
+        return Ok(());
+    }
+
+    let branches = existing.iter().map(|(branch, _)| (*branch).clone()).collect::<Vec<_>>();
+    fetch_remote_branch_objects(repo, &branches)
+        .wrap_err("Failed to fetch existing managed branches for ownership validation")?;
+
+    let default_oid = repo.rev_parse_single(remote_default.oid.as_str())?;
+    for (branch, oid) in existing {
+        if branch == &remote_default.name {
+            bail!(
+                "Refusing to treat the publication remote's default branch `{branch}` as a GHerrit-managed branch"
+            );
+        }
+
+        let tip = repo.rev_parse_single(oid.as_str()).wrap_err_with(|| {
+            format!("Existing branch `{branch}` points to unavailable object {oid}")
+        })?;
+        let commits = repo.commits_between(default_oid, tip).map_err(|error| match error {
+            util::CommitsBetweenError::NotAncestor => eyre!(
+                "Existing branch `{branch}` at {oid} is not descended from the observed remote default {} at {}; GHerrit ownership cannot be proven",
+                remote_default.name,
+                remote_default.oid
+            ),
+            util::CommitsBetweenError::Eyre(error) => error,
+        })?;
+        if commits.is_empty() {
+            bail!("Existing branch `{branch}` points directly at the remote default branch");
+        }
+        validate_linear_history(default_oid.detach(), &commits)?;
+
+        let mut seen = HashSet::new();
+        for (index, commit) in commits.iter().enumerate() {
+            let id = gherrit_id::from_message(commit.message_raw()?.as_ref())?.ok_or_else(|| {
+                eyre!(
+                    "Existing branch `{branch}` is not provably GHerrit-owned: commit {} lacks a canonical gherrit-pr-id trailer",
+                    commit.id
+                )
+            })?;
+            if !seen.insert(id.clone()) {
+                bail!(
+                    "Existing branch `{branch}` contains repeated gherrit-pr-id `{id}` in its managed ancestry"
+                );
+            }
+            if index + 1 == commits.len() && id != *branch {
+                bail!(
+                    "Existing branch `{branch}` is not provably GHerrit-owned: its tip commit {} carries gherrit-pr-id `{id}`",
+                    commit.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_linear_history(base: ObjectId, commits: &[gix::Commit<'_>]) -> Result<()> {
     let mut expected_parent = base;
     for commit in commits {
@@ -290,7 +386,9 @@ struct PrState {
     base_oid: String,
     head_branch: String,
     head_oid: String,
-    head_repository: String,
+    head_repository: Option<RepositoryIdentity>,
+    base_repository: Option<RepositoryIdentity>,
+    is_cross_repository: bool,
     state: PullRequestState,
     is_in_merge_queue: bool,
     auto_merge_enabled: bool,
@@ -302,8 +400,16 @@ struct PrBaseConsumer {
     number: u64,
     node_id: String,
     head_branch: String,
-    head_repository: String,
+    head_repository: Option<RepositoryIdentity>,
+    base_repository: Option<RepositoryIdentity>,
+    is_cross_repository: bool,
     base_branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositoryIdentity {
+    node_id: String,
+    name_with_owner: String,
 }
 
 struct PublicationPlan {
@@ -643,7 +749,10 @@ fn fetch_remote_branch_objects(repo: &util::Repo, branches: &[String]) -> Result
 }
 
 fn git_is_ancestor(repo: &util::Repo, ancestor: &str, descendant: &str) -> Result<bool> {
-    let mut command = util::cmd("git", ["--no-replace-objects", "merge-base", "--is-ancestor", ancestor, descendant]);
+    let mut command = util::cmd(
+        "git",
+        ["--no-replace-objects", "merge-base", "--is-ancestor", ancestor, descendant],
+    );
     command.current_dir(repo.workdir().unwrap_or(repo.path()));
     let status = command
         .status()
@@ -810,14 +919,15 @@ fn validate_prs_against_heads(
 }
 
 async fn verify_final_projection(
-    repo: &util::Repo,
+    remote: &Remote,
+    repository: &RepositoryIdentity,
     octocrab: &Octocrab,
     gherrit_ids: &[String],
     default_branch: &str,
     publication: &PublicationPlan,
 ) -> Result<()> {
-    let candidates = batch_fetch_prs(repo, octocrab, gherrit_ids).await?;
-    let prs = select_canonical_prs(repo, gherrit_ids, candidates)?;
+    let candidates = batch_fetch_prs(remote, octocrab, gherrit_ids).await?;
+    let prs = select_canonical_prs(repository, gherrit_ids, candidates)?;
     validate_prs_after_publication(&prs, publication)?;
     if prs.len() != gherrit_ids.len() {
         bail!(
@@ -861,16 +971,7 @@ struct PrBodyBuilder<'a> {
 }
 
 fn gherrit_metadata_comment(id: &str, parent: Option<&str>, child: Option<&str>) -> String {
-    #[derive(serde::Serialize)]
-    struct GherritMetadata<'a> {
-        id: &'a str,
-        parent: Option<&'a str>,
-        child: Option<&'a str>,
-    }
-
-    let metadata = serde_json::to_string(&GherritMetadata { id, parent, child })
-        .expect("serializing GHerrit metadata cannot fail");
-    format!("<!-- gherrit-meta: {metadata} -->")
+    gherrit_metadata::render(id, parent, child)
 }
 
 impl PrBodyBuilder<'_> {
@@ -1060,14 +1161,14 @@ impl PrBodyBuilder<'_> {
 async fn sync_prs(
     repo: &util::Repo,
     octocrab: &Octocrab,
+    remote: &Remote,
+    repository: &RepositoryIdentity,
     branch_name: &str,
     base_branch: &str,
     commits: Vec<Commit>,
     latest_versions: HashMap<String, usize>,
     prs: Vec<PrState>,
 ) -> Result<()> {
-    let remote = repo.default_remote()?;
-
     let commits = link_stack(base_branch, commits, |commit| commit.gherrit_id.clone());
 
     enum PrResolution {
@@ -1108,8 +1209,7 @@ async fn sync_prs(
     let num_creations = creations.len();
     let new_prs = if !creations.is_empty() {
         log::info!("Creating {num_creations} PRs...");
-        let repo_id = fetch_repo_id(octocrab, &remote).await?;
-        let created = batch_create_prs(octocrab, &repo_id, creations).await?;
+        let created = batch_create_prs(octocrab, &repository.node_id, creations).await?;
         assert_eq!(created.len(), num_creations);
         log::info!("Created {num_creations} PRs.");
         created
@@ -1142,7 +1242,9 @@ async fn sync_prs(
                         base_oid: String::new(),
                         head_branch: create.head_branch,
                         head_oid: String::new(),
-                        head_repository: format!("{}/{}", remote.owner, remote.repo_name),
+                        head_repository: Some(repository.clone()),
+                        base_repository: Some(repository.clone()),
+                        is_cross_repository: false,
                         // Newly-created PRs are open and cannot already be in a
                         // queue, auto-merge request, or native stack.
                         state: PullRequestState::Open,
@@ -1275,10 +1377,11 @@ fn remove_terminal_id_trailer(body: &str, id: &str) -> Result<String> {
             let Some((token, value)) = line.split_once(':') else {
                 return false;
             };
-            token.as_bytes().eq_ignore_ascii_case(gherrit_id::TRAILER_TOKEN)
-                && value.trim() == id
+            token.as_bytes().eq_ignore_ascii_case(gherrit_id::TRAILER_TOKEN) && value.trim() == id
         })
-        .ok_or_else(|| eyre!("Parsed gherrit-pr-id trailer `{id}` was not found in the commit body"))?;
+        .ok_or_else(|| {
+            eyre!("Parsed gherrit-pr-id trailer `{id}` was not found in the commit body")
+        })?;
     lines.remove(index);
     Ok(lines.concat().trim_end().to_string())
 }
@@ -1343,16 +1446,29 @@ macro_rules! json_get {
     };
 }
 
-/// Fetches the global Repository Node ID for the given owner and repo.
+fn parse_repository_identity(value: &serde_json::Value) -> Result<Option<RepositoryIdentity>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(RepositoryIdentity {
+        node_id: json_get!(value["id"].as_str())?.to_string(),
+        name_with_owner: json_get!(value["nameWithOwner"].as_str())?.to_string(),
+    }))
+}
+
+/// Fetches the immutable repository identity for the publication repository.
 ///
-/// This ID (e.g., "R_kgDOL...") is required for creating PRs via the GraphQL
-/// API, as the `createPullRequest` mutation accepts a `repositoryId` argument,
-/// not owner/name.
-async fn fetch_repo_id(octocrab: &Octocrab, remote: &Remote) -> Result<String> {
+/// The node ID, rather than owner/name spelling, is the authority used to
+/// decide whether a PR belongs to this repository. `nameWithOwner` is retained
+/// only for diagnostics and generated links.
+async fn fetch_repository_identity(
+    octocrab: &Octocrab,
+    remote: &Remote,
+) -> Result<RepositoryIdentity> {
     // NOTE: It's important that we pass `remote.*` as GraphQL variables, not
     // using string interpolation, as the variables are escaped. Using string
     // interpolation would risk injection attacks.
-    let query = r#"query RepositoryID($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }"#;
+    let query = r#"query RepositoryIdentity($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id, nameWithOwner } }"#;
     let query_body = json!({
         "query": query,
         "variables": {
@@ -1368,8 +1484,11 @@ async fn fetch_repo_id(octocrab: &Octocrab, remote: &Remote) -> Result<String> {
         bail!("Failed to fetch repository ID: {:?}", errors);
     }
 
-    let id = json_get!(response["data"]["repository"]["id"].as_str())?;
-    Ok(id.to_string())
+    let repository = json_get!(response["data"]["repository"])?;
+    Ok(RepositoryIdentity {
+        node_id: json_get!(repository["id"].as_str())?.to_string(),
+        name_with_owner: json_get!(repository["nameWithOwner"].as_str())?.to_string(),
+    })
 }
 
 /// Performs batched updates of PRs using GitHub's GraphQL API.
@@ -1452,13 +1571,12 @@ async fn batch_create_prs(
 }
 
 async fn batch_fetch_prs(
-    repo: &util::Repo,
+    remote: &Remote,
     octocrab: &Octocrab,
     head_refs: &[String],
 ) -> Result<Vec<PrState>> {
-    let remote = repo.default_remote()?;
-    let owner = remote.owner;
-    let repo_name = remote.repo_name;
+    let owner = &remote.owner;
+    let repo_name = &remote.repo_name;
 
     let mut all_prs = Vec::new();
 
@@ -1468,7 +1586,7 @@ async fn batch_fetch_prs(
         head_refs,
         |head_ref| {
             safe_json_format!(
-                "repository(owner: {owner}, name: {repo_name}) {{ pullRequests(headRefName: {head_ref}, first: 100, states: [OPEN, CLOSED, MERGED]) {{ totalCount, nodes {{ number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, headRepository {{ nameWithOwner }}, state, isInMergeQueue, autoMergeRequest {{ enabledAt }}, stackEntry {{ id }} }} }} }}",
+                "repository(owner: {owner}, name: {repo_name}) {{ pullRequests(headRefName: {head_ref}, first: 100, states: [OPEN, CLOSED, MERGED]) {{ totalCount, nodes {{ number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, headRepository {{ id, nameWithOwner }}, baseRepository {{ id, nameWithOwner }}, isCrossRepository, state, isInMergeQueue, autoMergeRequest {{ enabledAt }}, stackEntry {{ id }} }} }} }}",
                 owner = owner,
                 repo_name = repo_name,
                 head_ref = head_ref,
@@ -1506,8 +1624,13 @@ async fn batch_fetch_prs(
                     base_oid: json_get!(node["baseRefOid"].as_str())?.to_string(),
                     head_branch: json_get!(node["headRefName"].as_str())?.to_string(),
                     head_oid: json_get!(node["headRefOid"].as_str())?.to_string(),
-                    head_repository: json_get!(node["headRepository"]["nameWithOwner"].as_str())?
-                        .to_string(),
+                    head_repository: parse_repository_identity(
+                        node.get("headRepository").unwrap_or(&serde_json::Value::Null),
+                    )?,
+                    base_repository: parse_repository_identity(
+                        node.get("baseRepository").unwrap_or(&serde_json::Value::Null),
+                    )?,
+                    is_cross_repository: json_get!(node["isCrossRepository"].as_bool())?,
                     state,
                     is_in_merge_queue: json_get!(node["isInMergeQueue"].as_bool())?,
                     auto_merge_enabled: node
@@ -1527,13 +1650,12 @@ async fn batch_fetch_prs(
 }
 
 async fn batch_fetch_base_consumers(
-    repo: &util::Repo,
+    remote: &Remote,
     octocrab: &Octocrab,
     base_refs: &[String],
 ) -> Result<Vec<PrBaseConsumer>> {
-    let remote = repo.default_remote()?;
-    let owner = remote.owner;
-    let repo_name = remote.repo_name;
+    let owner = &remote.owner;
+    let repo_name = &remote.repo_name;
     let mut consumers = Vec::new();
 
     run_batched_graphql(
@@ -1542,7 +1664,7 @@ async fn batch_fetch_base_consumers(
         base_refs,
         |base_ref| {
             safe_json_format!(
-                "repository(owner: {owner}, name: {repo_name}) {{ pullRequests(baseRefName: {base_ref}, first: 100, states: [OPEN]) {{ totalCount, nodes {{ number, id, headRefName, headRepository {{ nameWithOwner }}, baseRefName }} }} }}",
+                "repository(owner: {owner}, name: {repo_name}) {{ pullRequests(baseRefName: {base_ref}, first: 100, states: [OPEN]) {{ totalCount, nodes {{ number, id, headRefName, headRepository {{ id, nameWithOwner }}, baseRepository {{ id, nameWithOwner }}, isCrossRepository, baseRefName }} }} }}",
                 owner = owner,
                 repo_name = repo_name,
                 base_ref = base_ref,
@@ -1563,10 +1685,13 @@ async fn batch_fetch_base_consumers(
                     number: json_get!(node["number"].as_u64())?,
                     node_id: json_get!(node["id"].as_str())?.to_string(),
                     head_branch: json_get!(node["headRefName"].as_str())?.to_string(),
-                    head_repository: json_get!(
-                        node["headRepository"]["nameWithOwner"].as_str()
-                    )?
-                    .to_string(),
+                    head_repository: parse_repository_identity(
+                        node.get("headRepository").unwrap_or(&serde_json::Value::Null),
+                    )?,
+                    base_repository: parse_repository_identity(
+                        node.get("baseRepository").unwrap_or(&serde_json::Value::Null),
+                    )?,
+                    is_cross_repository: json_get!(node["isCrossRepository"].as_bool())?,
                     base_branch: json_get!(node["baseRefName"].as_str())?.to_string(),
                 });
             }
@@ -1579,6 +1704,7 @@ async fn batch_fetch_base_consumers(
 }
 
 fn validate_base_consumers(
+    repository: &RepositoryIdentity,
     canonical_prs: &[PrState],
     rewritten_branches: &[String],
     consumers: &[PrBaseConsumer],
@@ -1605,12 +1731,24 @@ fn validate_base_consumers(
     let details = external
         .iter()
         .map(|consumer| {
+            let head_repository = consumer
+                .head_repository
+                .as_ref()
+                .map(|identity| identity.name_with_owner.as_str())
+                .unwrap_or("<deleted or unavailable repository>");
+            let ownership = match (&consumer.head_repository, &consumer.base_repository) {
+                (Some(head), Some(base))
+                    if head.node_id == repository.node_id
+                        && base.node_id == repository.node_id
+                        && !consumer.is_cross_repository =>
+                {
+                    "same-repository"
+                }
+                _ => "external or unknown repository",
+            };
             format!(
-                "PR #{} ({}/{} -> {})",
-                consumer.number,
-                consumer.head_repository,
-                consumer.head_branch,
-                consumer.base_branch
+                "PR #{} ({head_repository}/{} -> {}, {ownership})",
+                consumer.number, consumer.head_branch, consumer.base_branch
             )
         })
         .collect::<Vec<_>>()
@@ -1621,18 +1759,52 @@ fn validate_base_consumers(
 }
 
 fn select_canonical_prs(
-    repo: &util::Repo,
+    repository: &RepositoryIdentity,
     head_refs: &[String],
     candidates: Vec<PrState>,
 ) -> Result<Vec<PrState>> {
-    let remote = repo.default_remote()?;
-    let repository = format!("{}/{}", remote.owner, remote.repo_name);
     let mut canonical = Vec::new();
 
     for head_ref in head_refs {
+        let owned_head = candidates
+            .iter()
+            .filter(|pr| {
+                pr.head_branch == *head_ref
+                    && pr
+                        .head_repository
+                        .as_ref()
+                        .is_some_and(|identity| identity.node_id == repository.node_id)
+            })
+            .collect::<Vec<_>>();
+        if let Some(pr) = owned_head.iter().find(|pr| {
+            pr.state == PullRequestState::Open
+                && (pr.is_cross_repository
+                    || pr
+                        .base_repository
+                        .as_ref()
+                        .is_none_or(|identity| identity.node_id != repository.node_id))
+        }) {
+            bail!(
+                "Open PR #{} uses managed head branch `{head_ref}` but its repository identity is inconsistent with publication repository {}",
+                pr.number,
+                repository.name_with_owner
+            );
+        }
+
         let same_repository = candidates
             .iter()
-            .filter(|pr| pr.head_branch == *head_ref && pr.head_repository == repository)
+            .filter(|pr| {
+                pr.head_branch == *head_ref
+                    && !pr.is_cross_repository
+                    && pr
+                        .head_repository
+                        .as_ref()
+                        .is_some_and(|identity| identity.node_id == repository.node_id)
+                    && pr
+                        .base_repository
+                        .as_ref()
+                        .is_some_and(|identity| identity.node_id == repository.node_id)
+            })
             .collect::<Vec<_>>();
         let open = same_repository
             .iter()
@@ -1653,7 +1825,8 @@ fn select_canonical_prs(
                 let numbers =
                     open.iter().map(|pr| format!("#{}", pr.number)).collect::<Vec<_>>().join(", ");
                 bail!(
-                    "Multiple open PRs ({numbers}) use GHerrit head branch `{head_ref}` in {repository}"
+                    "Multiple open PRs ({numbers}) use GHerrit head branch `{head_ref}` in {}",
+                    repository.name_with_owner
                 );
             }
         }
@@ -1676,6 +1849,28 @@ fn validate_prs_for_publication(prs: &[PrState], publication: &PublicationPlan) 
                 pr.number
             )),
             PullRequestState::Open => {}
+        }
+
+        match pr.body.as_deref() {
+            Some(body) => match gherrit_metadata::parse_terminal(body) {
+                Ok(Some(metadata)) if metadata.id == pr.head_branch => {}
+                Ok(Some(metadata)) => errors.push(format!(
+                    "PR #{} head branch `{}` disagrees with terminal GHerrit metadata ID `{}`",
+                    pr.number, pr.head_branch, metadata.id
+                )),
+                Ok(None) => errors.push(format!(
+                    "PR #{} for managed branch `{}` has no terminal GHerrit metadata",
+                    pr.number, pr.head_branch
+                )),
+                Err(error) => errors.push(format!(
+                    "PR #{} for managed branch `{}` has invalid terminal GHerrit metadata: {error}",
+                    pr.number, pr.head_branch
+                )),
+            },
+            None => errors.push(format!(
+                "PR #{} for managed branch `{}` has no body or terminal GHerrit metadata",
+                pr.number, pr.head_branch
+            )),
         }
 
         let expected_head =
