@@ -489,9 +489,48 @@ fn resolve_string_argument(
     }
 }
 
+fn resolve_optional_string_argument(
+    field: &executable::Field,
+    name: &str,
+    path: &str,
+    variables: &GraphQlVariables,
+) -> Result<Option<String>, String> {
+    argument(field, name).map(|_| resolve_string_argument(field, name, path, variables)).transpose()
+}
+
+fn enum_list_argument(
+    field: &executable::Field,
+    name: &str,
+    path: &str,
+) -> Result<HashSet<String>, String> {
+    let values = argument(field, name)
+        .and_then(|value| match value {
+            ast::Value::List(values) => Some(values),
+            _ => None,
+        })
+        .ok_or_else(|| format!("The mock GitHub API requires `{path}({name}: [...])`"))?;
+    values
+        .iter()
+        .map(|value| match &**value {
+            ast::Value::Enum(value) => Ok(value.to_string()),
+            _ => {
+                Err(format!("The mock GitHub API requires enum values at `{path}({name}: [...])`"))
+            }
+        })
+        .collect()
+}
+
 fn validate_pull_requests_field(field: &executable::Field) -> Result<(), String> {
     const PATH: &str = "repository.pullRequests";
-    validate_argument_names(field, PATH, &["headRefName", "first", "states"])?;
+    validate_argument_names(field, PATH, &["headRefName", "baseRefName", "first", "states"])?;
+
+    let has_head = argument(field, "headRefName").is_some();
+    let has_base = argument(field, "baseRefName").is_some();
+    if has_head == has_base {
+        return Err(format!(
+            "The mock GitHub API requires exactly one of `{PATH}(headRefName:)` or `{PATH}(baseRefName:)`"
+        ));
+    }
 
     let first = argument(field, "first")
         .and_then(|value| match value {
@@ -503,25 +542,19 @@ fn validate_pull_requests_field(field: &executable::Field) -> Result<(), String>
         return Err(format!("The mock GitHub API only supports `{PATH}(first: 100)`"));
     }
 
-    let states = argument(field, "states")
+    let state_count = argument(field, "states")
         .and_then(|value| match value {
-            ast::Value::List(values) => Some(values),
+            ast::Value::List(values) => Some(values.len()),
             _ => None,
         })
-        .ok_or_else(|| {
-            format!("The mock GitHub API requires `{PATH}(states: [OPEN, CLOSED, MERGED])`")
-        })?;
-    let state_count = states.len();
-    let states: HashSet<_> = states
-        .iter()
-        .filter_map(|value| match &**value {
-            ast::Value::Enum(value) => Some(value.as_str()),
-            _ => None,
-        })
-        .collect();
-    if state_count != 3 || states != HashSet::from(["OPEN", "CLOSED", "MERGED"]) {
+        .expect("enum_list_argument already validated the states list");
+    let states = enum_list_argument(field, "states", PATH)?;
+    let all_states =
+        HashSet::from(["OPEN".to_string(), "CLOSED".to_string(), "MERGED".to_string()]);
+    let open_only = HashSet::from(["OPEN".to_string()]);
+    if state_count != states.len() || (states != all_states && states != open_only) {
         return Err(format!(
-            "The mock GitHub API only supports `{PATH}(states: [OPEN, CLOSED, MERGED])`"
+            "The mock GitHub API only supports `{PATH}(states: [OPEN])` or `{PATH}(states: [OPEN, CLOSED, MERGED])`"
         ));
     }
 
@@ -588,12 +621,21 @@ fn validate_repository_field(
             "id" => {}
             "pullRequests" => {
                 validate_pull_requests_field(field)?;
-                resolve_string_argument(
-                    field,
-                    "headRefName",
-                    "repository.pullRequests",
-                    variables,
-                )?;
+                if argument(field, "headRefName").is_some() {
+                    resolve_string_argument(
+                        field,
+                        "headRefName",
+                        "repository.pullRequests",
+                        variables,
+                    )?;
+                } else {
+                    resolve_string_argument(
+                        field,
+                        "baseRefName",
+                        "repository.pullRequests",
+                        variables,
+                    )?;
+                }
             }
             _ => {
                 return Err(format!(
@@ -1289,16 +1331,25 @@ fn handle_repository_query(
     for field in selected_fields(&field.selection_set, PATH)? {
         match field.name.as_str() {
             "pullRequests" => {
-                let head = resolve_string_argument(
+                let head = resolve_optional_string_argument(
                     field,
                     "headRefName",
                     "repository.pullRequests",
                     variables,
                 )?;
+                let base = resolve_optional_string_argument(
+                    field,
+                    "baseRefName",
+                    "repository.pullRequests",
+                    variables,
+                )?;
+                let states = enum_list_argument(field, "states", "repository.pullRequests")?;
                 let matching_prs = mock_state
                     .prs
                     .iter()
-                    .filter(|pr| pr.head.ref_field == head)
+                    .filter(|pr| states.contains(&pr.state))
+                    .filter(|pr| head.as_ref().is_none_or(|head| pr.head.ref_field == *head))
+                    .filter(|pr| base.as_ref().is_none_or(|base| pr.base.ref_field == *base))
                     .collect::<Vec<_>>();
 
                 let mut connection = serde_json::Map::new();
@@ -1346,10 +1397,6 @@ fn project_pr_node(
     selection_set: &executable::SelectionSet,
     branch_oid: &dyn Fn(&str) -> Result<Option<String>, String>,
 ) -> Result<serde_json::Value, String> {
-    let head_oid = branch_oid(&pr.head.ref_field)?
-        .ok_or_else(|| format!("Head branch `{}` does not exist", pr.head.ref_field))?;
-    let base_oid = branch_oid(&pr.base.ref_field)?
-        .ok_or_else(|| format!("Base branch `{}` does not exist", pr.base.ref_field))?;
     let repository_name = format!("{}/{}", mock_state.repo_owner, mock_state.repo_name);
 
     let mut node = serde_json::Map::new();
@@ -1360,9 +1407,11 @@ fn project_pr_node(
             "title" => serde_json::json!(pr.title),
             "body" => serde_json::json!(pr.body),
             "baseRefName" => serde_json::json!(pr.base.ref_field),
-            "baseRefOid" => serde_json::json!(base_oid),
+            "baseRefOid" => serde_json::json!(branch_oid(&pr.base.ref_field)?
+                .ok_or_else(|| format!("Base branch `{}` does not exist", pr.base.ref_field))?),
             "headRefName" => serde_json::json!(pr.head.ref_field),
-            "headRefOid" => serde_json::json!(head_oid),
+            "headRefOid" => serde_json::json!(branch_oid(&pr.head.ref_field)?
+                .ok_or_else(|| format!("Head branch `{}` does not exist", pr.head.ref_field))?),
             "headRepository" => project_nested_object(
                 field,
                 "PullRequest.headRepository",

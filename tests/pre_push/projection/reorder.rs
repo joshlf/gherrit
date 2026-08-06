@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use testutil::mock_server::{BaseUpdate, PrEntry};
+use testutil::mock_server::{BaseUpdate, MockPrArgs, PrEntry};
 
 fn context() -> testutil::TestContext {
     testutil::test_context!()
@@ -194,5 +194,51 @@ fn failed_publication_leaves_prs_on_safe_staging_bases() {
         assert_eq!(pr_by_head(&state.prs, b).base.ref_field, "main");
         assert_eq!(pr_by_head(&state.prs, a).base.ref_field, "main");
         assert_eq!(state.pushes.last().unwrap().exit_code, 1);
+    });
+}
+
+#[test]
+fn unrelated_base_consumer_blocks_the_ref_rewrite() {
+    let ctx = context();
+    let ids = create_stack(&ctx, &["A", "B"]);
+    let (a, b) = (&ids[0], &ids[1]);
+
+    ctx.run_git(&["checkout", "-b", "external", "main"]);
+    ctx.commit("External change");
+    ctx.git_cmd()
+        .args([
+            "push",
+            "--quiet",
+            "--no-verify",
+            "origin",
+            "refs/heads/external:refs/heads/external",
+        ])
+        .assert()
+        .success();
+    ctx.run_git(&["checkout", "feature-reorder"]);
+
+    ctx.mutate_mock_state(|state| {
+        state.add_pr(PrEntry::mock(MockPrArgs {
+            id: 100,
+            title: "External PR".to_string(),
+            body: String::new(),
+            head: "external".to_string(),
+            base: a.clone(),
+            repo_owner: testutil::DEFAULT_OWNER,
+            repo_name: testutil::DEFAULT_REPO,
+        }));
+    });
+
+    rewrite_stack(&ctx, &[("B reordered", b), ("A reordered", a)]);
+    let remote_refs = ctx.remote_refs("refs");
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unrelated open PRs target them: PR #100"));
+
+    assert_eq!(ctx.remote_refs("refs"), remote_refs);
+    ctx.inspect_mock_state(|state| {
+        assert_all_open(state);
+        assert!(state.base_updates.is_empty());
     });
 }

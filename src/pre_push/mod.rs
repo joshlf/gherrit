@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt::{self, Write},
     process::Stdio,
     str,
@@ -75,6 +75,10 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     let candidates = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
     let prs = select_canonical_prs(repo, &gherrit_ids, candidates)?;
     validate_prs_for_publication(&prs, &publication)?;
+
+    let rewritten_branches = rewritten_existing_branches(&publication);
+    let base_consumers = batch_fetch_base_consumers(repo, &octocrab, &rewritten_branches).await?;
+    validate_base_consumers(&prs, &rewritten_branches, &base_consumers)?;
 
     let remote_default = observe_remote_default(repo)?;
     let staging_bases = plan_pr_staging(repo, &commits, &prs, &publication, &remote_default)?;
@@ -195,6 +199,15 @@ struct PrState {
     native_stack: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PrBaseConsumer {
+    number: u64,
+    node_id: String,
+    head_branch: String,
+    head_repository: String,
+    base_branch: String,
+}
+
 struct PublicationPlan {
     batches: Vec<PushPlan>,
     latest_versions: HashMap<String, usize>,
@@ -250,6 +263,18 @@ fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<Publication
     }
 
     Ok(PublicationPlan { batches, latest_versions, expected_heads, desired_heads })
+}
+
+fn rewritten_existing_branches(publication: &PublicationPlan) -> Vec<String> {
+    publication
+        .expected_heads
+        .iter()
+        .filter_map(|(branch, expected)| {
+            let expected = expected.as_deref()?;
+            let desired = publication.desired_heads.get(branch)?.to_string();
+            (expected != desired).then(|| branch.clone())
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1391,6 +1416,100 @@ async fn batch_fetch_prs(
     .await?;
 
     Ok(all_prs)
+}
+
+async fn batch_fetch_base_consumers(
+    repo: &util::Repo,
+    octocrab: &Octocrab,
+    base_refs: &[String],
+) -> Result<Vec<PrBaseConsumer>> {
+    let remote = repo.default_remote()?;
+    let owner = remote.owner;
+    let repo_name = remote.repo_name;
+    let mut consumers = Vec::new();
+
+    run_batched_graphql(
+        octocrab,
+        GraphQlOp::Query,
+        base_refs,
+        |base_ref| {
+            safe_json_format!(
+                "repository(owner: {owner}, name: {repo_name}) {{ pullRequests(baseRefName: {base_ref}, first: 100, states: [OPEN]) {{ totalCount, nodes {{ number, id, headRefName, headRepository {{ nameWithOwner }}, baseRefName }} }} }}",
+                owner = owner,
+                repo_name = repo_name,
+                base_ref = base_ref,
+            )
+        },
+        |base_ref, val| {
+            let pull_requests = json_get!(val["pullRequests"])?;
+            let total_count = json_get!(pull_requests["totalCount"].as_u64())?;
+            let nodes = json_get!(pull_requests["nodes"].as_array())?;
+            if total_count > nodes.len() as u64 {
+                bail!(
+                    "More than 100 open PRs target managed branch `{base_ref}`; cannot prove publication safety"
+                );
+            }
+
+            for node in nodes {
+                consumers.push(PrBaseConsumer {
+                    number: json_get!(node["number"].as_u64())?,
+                    node_id: json_get!(node["id"].as_str())?.to_string(),
+                    head_branch: json_get!(node["headRefName"].as_str())?.to_string(),
+                    head_repository: json_get!(
+                        node["headRepository"]["nameWithOwner"].as_str()
+                    )?
+                    .to_string(),
+                    base_branch: json_get!(node["baseRefName"].as_str())?.to_string(),
+                });
+            }
+            Ok(())
+        },
+    )
+    .await?;
+
+    Ok(consumers)
+}
+
+fn validate_base_consumers(
+    canonical_prs: &[PrState],
+    rewritten_branches: &[String],
+    consumers: &[PrBaseConsumer],
+) -> Result<()> {
+    if rewritten_branches.is_empty() {
+        return Ok(());
+    }
+
+    let canonical_nodes =
+        canonical_prs.iter().map(|pr| pr.node_id.as_str()).collect::<HashSet<_>>();
+    let rewritten = rewritten_branches.iter().map(String::as_str).collect::<HashSet<_>>();
+    let external = consumers
+        .iter()
+        .filter(|consumer| {
+            rewritten.contains(consumer.base_branch.as_str())
+                && !canonical_nodes.contains(consumer.node_id.as_str())
+        })
+        .collect::<Vec<_>>();
+
+    if external.is_empty() {
+        return Ok(());
+    }
+
+    let details = external
+        .iter()
+        .map(|consumer| {
+            format!(
+                "PR #{} ({}/{} -> {})",
+                consumer.number,
+                consumer.head_repository,
+                consumer.head_branch,
+                consumer.base_branch
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "Cannot rewrite managed branches while unrelated open PRs target them: {details}. Retarget or close those PRs first."
+    )
 }
 
 fn select_canonical_prs(
