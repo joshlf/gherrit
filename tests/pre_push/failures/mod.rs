@@ -147,9 +147,15 @@ fn test_pre_push_pr_create_failure() {
         .stderr(predicate::str::contains("Injected CreatePr failure"));
     ctx.assert_failure_consumed();
     ctx.inspect_mock_state(|state| {
+        assert!(
+            state.graphql_requests.iter().flatten().any(|operation| {
+                *operation == testutil::mock_server::GraphQlOperation::CreatePr
+            })
+        );
         assert_eq!(
             state.graphql_requests.last(),
-            Some(&vec![testutil::mock_server::GraphQlOperation::CreatePr])
+            Some(&vec![testutil::mock_server::GraphQlOperation::Query]),
+            "a failed creation must be followed by outcome re-observation"
         );
         assert!(state.prs.is_empty());
         assert_eq!(state.pushes.iter().filter(|push| push.succeeded()).count(), 1);

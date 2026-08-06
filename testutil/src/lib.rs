@@ -448,6 +448,7 @@ pub enum FailureKind {
     GraphQl,
     GraphQlAfterApply,
     CreatePr,
+    CreatePrAfterApply,
     UpdatePr,
     UpdatePrAfterApply,
 }

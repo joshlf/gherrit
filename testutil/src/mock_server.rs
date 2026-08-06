@@ -276,7 +276,7 @@ fn check_and_apply_graphql_failure(
     let fail_action = mock_state.fail_next_request.as_ref()?;
     let matches = match fail_action {
         GraphQl => true,
-        GraphQlAfterApply | UpdatePrAfterApply => false,
+        GraphQlAfterApply | CreatePrAfterApply | UpdatePrAfterApply => false,
         CreatePr => operations.contains(&GraphQlOperation::CreatePr),
         UpdatePr => operations.contains(&GraphQlOperation::UpdatePr),
     };
@@ -297,6 +297,7 @@ fn check_and_apply_graphql_after_failure(
     let fail_action = mock_state.fail_next_request.as_ref()?;
     let matches = match fail_action {
         GraphQlAfterApply => true,
+        CreatePrAfterApply => operations.contains(&GraphQlOperation::CreatePr),
         UpdatePrAfterApply => operations.contains(&GraphQlOperation::UpdatePr),
         GraphQl | CreatePr | UpdatePr => false,
     };
