@@ -21,6 +21,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Reconstruct implementation stack
+        id: reconstruct
         run: |
           set -euo pipefail
           cat .github/agent/safe-pr-reorder.patch.gz.b64.* \
@@ -63,9 +64,25 @@ jobs:
           GIT_SEQUENCE_EDITOR=true git rebase --interactive --autosquash origin/main
 
           test "$(git rev-list --count origin/main..HEAD)" = 11
-          test "$(git rev-parse HEAD^{tree})" = 1fb8bb9bacb3177d6a42286ca1bb49dcd8b42cc1
           ! git log --format=%s origin/main..HEAD | grep -q '^fixup!'
+          actual_tree=$(git rev-parse HEAD^{tree})
+          echo "actual_tree=$actual_tree" | tee -a "$GITHUB_OUTPUT"
           git log --reverse --format='%h %s' origin/main..HEAD
+          git bundle create /tmp/reconstructed.bundle origin/main agent/safe-pr-reorder
+          git format-patch --stdout --binary origin/main..HEAD > /tmp/reconstructed.patch
+
+      - name: Export reconstructed stack
+        uses: actions/upload-artifact@v4
+        with:
+          name: reconstructed-gherrit-stack
+          path: |
+            /tmp/reconstructed.bundle
+            /tmp/reconstructed.patch
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Verify reconstructed tree
+        run: test "${{ steps.reconstruct.outputs.actual_tree }}" = 1fb8bb9bacb3177d6a42286ca1bb49dcd8b42cc1
 
       - name: Install Rust 1.89
         uses: dtolnay/rust-toolchain@master
