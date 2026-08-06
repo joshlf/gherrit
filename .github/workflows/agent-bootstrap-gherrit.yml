@@ -70,20 +70,31 @@ jobs:
           test "$(git rev-list --count origin/main..HEAD)" = 11
           test "$(git rev-parse HEAD^{tree})" = 1fb8bb9bacb3177d6a42286ca1bb49dcd8b42cc1
 
-          # The Actions GitHub App cannot update workflow files. Remove only
-          # ci.yml from the commit that introduced its three-line change;
-          # the connector will restore that file by replacing the same commit.
-          cp .github/workflows/ci.yml /tmp/desired-ci.yml
-          workflow_commit=$(git rev-list --reverse origin/main..HEAD -- .github/workflows/ci.yml | tail -n 1)
+          # The Actions GitHub App cannot update workflow files. Remove both
+          # workflow-file changes from commit 11 for transport; the connector
+          # will restore them by replacing that same commit.
+          mkdir -p /tmp/desired-workflows
+          cp .github/workflows/ci.yml /tmp/desired-workflows/ci.yml
+          cp .github/workflows/gherrit-rebase-stack.yml \
+            /tmp/desired-workflows/gherrit-rebase-stack.yml
+          workflow_commit=$(git rev-list --reverse origin/main..HEAD -- \
+            .github/workflows/ci.yml \
+            .github/workflows/gherrit-rebase-stack.yml | tail -n 1)
           test "$(git show --no-patch --format=%s "$workflow_commit")" = "Validate cascade topology before rebasing"
-          git checkout origin/main -- .github/workflows/ci.yml
-          git add .github/workflows/ci.yml
+          git checkout origin/main -- \
+            .github/workflows/ci.yml \
+            .github/workflows/gherrit-rebase-stack.yml
+          git add \
+            .github/workflows/ci.yml \
+            .github/workflows/gherrit-rebase-stack.yml
           git commit --fixup="$workflow_commit" --no-verify
           GIT_SEQUENCE_EDITOR=true git rebase --interactive --autosquash origin/main
 
           test "$(git rev-list --count origin/main..HEAD)" = 11
           test "$(git show --no-patch --format=%s HEAD)" = "Validate cascade topology before rebasing"
-          git diff --exit-code origin/main -- .github/workflows/ci.yml
+          git diff --exit-code origin/main -- \
+            .github/workflows/ci.yml \
+            .github/workflows/gherrit-rebase-stack.yml
           git diff --check origin/main...HEAD
           echo "transport_head=$(git rev-parse HEAD)" | tee -a "$GITHUB_OUTPUT"
           echo "transport_parent=$(git rev-parse HEAD^)" | tee -a "$GITHUB_OUTPUT"
@@ -91,10 +102,10 @@ jobs:
           git log --reverse --format='%H %s' origin/main..HEAD
           git push --force-with-lease origin HEAD:refs/heads/agent/safe-pr-reorder
 
-      - name: Export desired CI workflow
+      - name: Export desired workflows
         uses: actions/upload-artifact@v4
         with:
-          name: desired-ci-workflow
-          path: /tmp/desired-ci.yml
+          name: desired-workflows
+          path: /tmp/desired-workflows
           if-no-files-found: error
           retention-days: 1
