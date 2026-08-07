@@ -1327,6 +1327,7 @@ async fn verify_final_projection(
 }
 
 const MAX_PR_BODY_BYTES: usize = 60_000;
+const MAX_PR_TITLE_CHARS: usize = 256;
 const FULL_HISTORY_MAX_VERSION: usize = 8;
 const MAX_HISTORY_ROWS: usize = 32;
 
@@ -1871,6 +1872,19 @@ fn preflight_pr_projection(
 
     for (index, entry) in stack.iter().enumerate() {
         let commit = entry.item;
+        let title_chars = commit.message_title.chars().count();
+        if title_chars == 0 {
+            bail!(
+                "Prospective PR title for GHerrit ID `{}` is empty; GitHub requires a nonempty pull-request title",
+                commit.gherrit_id
+            );
+        }
+        if title_chars > MAX_PR_TITLE_CHARS {
+            bail!(
+                "Prospective PR title for GHerrit ID `{}` is {title_chars} characters, exceeding GitHub's {MAX_PR_TITLE_CHARS}-character limit. Shorten the commit subject before publishing.",
+                commit.gherrit_id
+            );
+        }
         let navigation = pr_navigation_markdown(&numbers, index);
         let latest_version = latest_versions.get(&commit.gherrit_id).copied().unwrap_or(1);
         let body = (PrBodyBuilder {

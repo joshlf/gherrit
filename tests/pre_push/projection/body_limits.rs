@@ -89,3 +89,64 @@ fn oversized_final_body_fails_before_remote_or_github_mutation() {
         assert!(state.pushes.is_empty());
     });
 }
+
+#[test]
+fn oversized_initial_title_fails_before_remote_or_github_mutation() {
+    let ctx = context();
+    ctx.checkout_new("oversized-title");
+    ctx.commit(&"x".repeat(257));
+
+    let refs = ctx.remote_refs("refs");
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("257 characters"))
+        .stderr(predicate::str::contains("256-character limit"));
+    assert_eq!(ctx.remote_refs("refs"), refs);
+    ctx.inspect_mock_state(|state| {
+        assert!(state.prs.is_empty());
+        assert!(state.pushes.is_empty());
+    });
+}
+
+#[test]
+fn oversized_updated_title_fails_before_next_version_or_pr_mutation() {
+    let ctx = context();
+    ctx.checkout_new("oversized-updated-title");
+    ctx.commit("Original title");
+    ctx.hook_cmd("pre-push").assert().success();
+
+    let id = ctx.gherrit_id("HEAD").unwrap();
+    let old_head = ctx.remote_ref_oid(&format!("refs/heads/{id}")).unwrap();
+    let old_refs = ctx.remote_refs("refs");
+    ctx.amend_with_message(&"y".repeat(257));
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("257 characters"))
+        .stderr(predicate::str::contains("256-character limit"));
+    assert_eq!(ctx.remote_ref_oid(&format!("refs/heads/{id}")).as_deref(), Some(old_head.as_str()));
+    assert_eq!(ctx.remote_refs("refs"), old_refs);
+    assert!(ctx.remote_ref_oid(&format!("refs/tags/gherrit/{id}/v2")).is_none());
+    ctx.inspect_mock_state(|state| {
+        assert_eq!(state.prs.len(), 1);
+        assert_eq!(state.prs[0].title.as_deref(), Some("Original title"));
+    });
+}
+
+#[test]
+fn exact_github_title_character_limit_accepts_multibyte_characters() {
+    let ctx = context();
+    ctx.checkout_new("exact-title-limit");
+    let title = "é".repeat(256);
+    assert_eq!(title.chars().count(), 256);
+    assert_eq!(title.len(), 512);
+    ctx.commit(&title);
+
+    ctx.hook_cmd("pre-push").assert().success();
+    ctx.inspect_mock_state(|state| {
+        assert_eq!(state.prs.len(), 1);
+        assert_eq!(state.prs[0].title.as_deref(), Some(title.as_str()));
+    });
+}
