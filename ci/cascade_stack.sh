@@ -16,6 +16,38 @@ for name in "${required[@]}"; do
   fi
 done
 
+validate_repository_dag_authority() {
+  local shallow common_dir grafts
+
+  shallow=$(git rev-parse --is-shallow-repository 2>/dev/null) || {
+    echo "::error::Could not determine whether the cascade checkout has complete history."
+    exit 1
+  }
+  if [[ "$shallow" != false ]]; then
+    echo "::error::GHerrit cannot prove cascade reachability from a shallow repository. Check out complete history before running the cascade action."
+    exit 1
+  fi
+
+  if [[ ${GIT_REPLACE_REF_BASE+x} == x ]]; then
+    echo "::error::GHerrit cannot prove cascade reachability while GIT_REPLACE_REF_BASE is set."
+    exit 1
+  fi
+  if [[ -n $(git for-each-ref --format='%(refname)' refs/replace/) ]]; then
+    echo "::error::GHerrit cannot prove cascade reachability while local replace refs exist."
+    exit 1
+  fi
+
+  common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
+    echo "::error::Could not resolve the checkout's common Git directory."
+    exit 1
+  }
+  grafts=$common_dir/info/grafts
+  if [[ -s "$grafts" ]] && grep -q '[^[:space:]]' "$grafts"; then
+    echo "::error::GHerrit cannot prove cascade reachability while the common .git/info/grafts file is nonempty."
+    exit 1
+  fi
+}
+
 if [[ "$MERGED_PR_BASE" != "$DEFAULT_BRANCH" ]]; then
   echo "PR #$MERGED_PR_NUMBER targeted '$MERGED_PR_BASE', not the default branch '$DEFAULT_BRANCH'; refusing to cascade a non-root merge."
   exit 0
@@ -117,6 +149,10 @@ if [[ -z "$CHILD_ID" ]]; then
   echo "Merged PR has no child defined in metadata. Reached top of stack."
   exit 0
 fi
+
+validate_repository_dag_authority
+export GIT_NO_REPLACE_OBJECTS=1
+
 echo "Merged PR indicates next child is ID: $CHILD_ID"
 
 query_child() {
@@ -240,7 +276,7 @@ if [[ "$OLD_PARENT" == "$DEFAULT_OID" ]]; then
   : # The child is already canonical on the current default tip.
 elif git --no-replace-objects merge-base --is-ancestor "$OLD_PARENT" "$DEFAULT_OID"; then
   echo "Authenticated child is based on an older default-branch commit; rebasing it onto the current '$DEFAULT_BRANCH'."
-  if ! git rebase --reapply-cherry-picks --keep-empty --empty=keep \
+  if ! git --no-replace-objects rebase --reapply-cherry-picks --keep-empty --empty=keep \
     --onto "origin/$DEFAULT_BRANCH" "$OLD_PARENT"; then
     echo "::error::Rebase conflict for PR #$CHILD_PR. The PR base was not changed; manual intervention is required."
     exit 1
@@ -259,7 +295,7 @@ else
   printf '%s\n' "$MERGED_VERSION_LINES" |
     python3 "$action_path/ci/gherrit_protocol.py" authenticate-version \
       --id "$MERGED_PR_HEAD" --expected-target "$OLD_PARENT" >/dev/null
-  if ! git rebase --reapply-cherry-picks --keep-empty --empty=keep \
+  if ! git --no-replace-objects rebase --reapply-cherry-picks --keep-empty --empty=keep \
     --onto "origin/$DEFAULT_BRANCH" "$OLD_PARENT"; then
     echo "::error::Rebase conflict for PR #$CHILD_PR. The PR base was not changed; manual intervention is required."
     exit 1
@@ -316,6 +352,7 @@ query_base_consumers() {
             headRefName
             headRefOid
             baseRefName
+            baseRefOid
             isCrossRepository
             isInMergeQueue
             autoMergeRequest { enabledAt }
@@ -328,8 +365,15 @@ query_base_consumers() {
     }'
 }
 
+BASE_CONSUMER_NODE_ID=
+BASE_CONSUMER_HEAD_OID=
+BASE_CONSUMER_BASE_OID=
+
 validate_base_consumers() {
-  local lookup selection grandchild_head remote_head version_lines base_oid status
+  local phase=$1
+  local lookup selection grandchild_node grandchild_head associated_base_oid
+  local remote_head child_version_lines expected_child_head version_lines
+  local grandchild_parent base_oid status
   lookup=$(query_base_consumers)
   selection=$(
     printf '%s' "$lookup" |
@@ -339,10 +383,44 @@ validate_base_consumers() {
         --repository "$TARGET_REPOSITORY_ID"
   )
   if [[ "$selection" == null ]]; then
+    if [[ "$phase" == after && -n "$BASE_CONSUMER_NODE_ID" ]]; then
+      echo "::error::Authenticated grandchild PR disappeared after child-branch publication."
+      exit 1
+    fi
     return 0
   fi
 
+  grandchild_node=$(jq -er '.nodeId' <<<"$selection")
   grandchild_head=$(jq -er '.headRefOid' <<<"$selection")
+  associated_base_oid=$(jq -er '.baseRefOid' <<<"$selection")
+  expected_child_head=$CHILD_HEAD_OID
+  [[ "$phase" == after ]] && expected_child_head=$NEW_HEAD_OID
+  child_version_lines=$(git ls-remote --tags origin "refs/tags/gherrit/$CHILD_ID/v*")
+  printf '%s\n' "$child_version_lines" |
+    python3 "$action_path/ci/gherrit_protocol.py" version-state \
+      --id "$CHILD_ID" --expected-head "$expected_child_head" >/dev/null
+  printf '%s\n' "$child_version_lines" |
+    python3 "$action_path/ci/gherrit_protocol.py" authenticate-version \
+      --id "$CHILD_ID" --expected-target "$associated_base_oid" >/dev/null
+  if [[ "$phase" == after ]]; then
+    if [[ -z "$BASE_CONSUMER_NODE_ID" ||
+          "$grandchild_node" != "$BASE_CONSUMER_NODE_ID" ||
+          "$grandchild_head" != "$BASE_CONSUMER_HEAD_OID" ]]; then
+      echo "::error::Authenticated grandchild PR identity or head changed during child-branch publication."
+      exit 1
+    fi
+    if [[ "$associated_base_oid" != "$BASE_CONSUMER_BASE_OID" &&
+          "$associated_base_oid" != "$CHILD_HEAD_OID" &&
+          "$associated_base_oid" != "$NEW_HEAD_OID" ]]; then
+      echo "::error::Authenticated grandchild PR changed to an unexpected associated base OID during child-branch publication."
+      exit 1
+    fi
+  else
+    BASE_CONSUMER_NODE_ID=$grandchild_node
+    BASE_CONSUMER_HEAD_OID=$grandchild_head
+    BASE_CONSUMER_BASE_OID=$associated_base_oid
+  fi
+
   remote_head=$(git ls-remote origin "refs/heads/$GRANDCHILD_ID" |
     awk -v ref="refs/heads/$GRANDCHILD_ID" '$2 == ref { print $1 }')
   if [[ -z "$remote_head" || "$remote_head" != "$grandchild_head" ]]; then
@@ -358,12 +436,21 @@ validate_base_consumers() {
     echo "::error::Authenticated grandchild branch does not carry its expected GHerrit ID."
     exit 1
   fi
+  if [[ $(git rev-list --parents -n 1 FETCH_HEAD | wc -w) -ne 2 ]]; then
+    echo "::error::Authenticated grandchild head is not exactly one linear commit."
+    exit 1
+  fi
+  grandchild_parent=$(git rev-parse FETCH_HEAD^)
+  printf '%s\n' "$child_version_lines" |
+    python3 "$action_path/ci/gherrit_protocol.py" authenticate-version \
+      --id "$CHILD_ID" --expected-target "$grandchild_parent" >/dev/null
+
   version_lines=$(git ls-remote --tags origin "refs/tags/gherrit/$GRANDCHILD_ID/v*")
   printf '%s\n' "$version_lines" |
     python3 "$action_path/ci/gherrit_protocol.py" version-state \
       --id "$GRANDCHILD_ID" --expected-head "$grandchild_head" >/dev/null
 
-  for base_oid in "$CHILD_HEAD_OID" "$NEW_HEAD_OID"; do
+  for base_oid in "$associated_base_oid" "$CHILD_HEAD_OID" "$NEW_HEAD_OID"; do
     if git --no-replace-objects merge-base --is-ancestor "$grandchild_head" "$base_oid"; then
       echo "::error::Grandchild PR head would be reachable from rewritten base branch '$CHILD_ID'; refusing an indirect merge."
       exit 1
@@ -377,8 +464,9 @@ validate_base_consumers() {
   done
 }
 
+validate_base_consumers before
+
 if [[ "$NEW_HEAD_OID" != "$CHILD_HEAD_OID" ]]; then
-  validate_base_consumers
   VERSION_REF="refs/tags/gherrit/$CHILD_ID/v$NEXT_VERSION"
   if ! git push --atomic --no-verify \
     --force-with-lease="refs/heads/$CHILD_ID:$CHILD_HEAD_OID" \
@@ -404,6 +492,8 @@ else
   echo "Child head is already the canonical commit above the updated default branch; no new patch version is required."
 fi
 
+validate_base_consumers after
+
 needs_projection_update=true
 if [[ "$CHILD_BASE" == "$DEFAULT_BRANCH" && "$CHILD_BODY" == "$DESIRED_BODY" ]]; then
   needs_projection_update=false
@@ -411,15 +501,17 @@ fi
 
 update_failed=false
 if [[ $needs_projection_update == true ]]; then
-  if ! gh api graphql \
-    -f prId="$CHILD_NODE_ID" \
-    -f base="$DEFAULT_BRANCH" \
-    -f body="$DESIRED_BODY" \
-    -f query='mutation($prId: ID!, $base: String!, $body: String!) {
-      updatePullRequest(input: {pullRequestId: $prId, baseRefName: $base, body: $body}) {
-        pullRequest { id number }
-      }
-    }' >/dev/null; then
+  if ! printf '%s' "$DESIRED_BODY" |
+    jq -Rs \
+      --arg prId "$CHILD_NODE_ID" \
+      --arg base "$DEFAULT_BRANCH" \
+      --arg query 'mutation($prId: ID!, $base: String!, $body: String!) {
+        updatePullRequest(input: {pullRequestId: $prId, baseRefName: $base, body: $body}) {
+          pullRequest { id number }
+        }
+      }' \
+      '{query: $query, variables: {prId: $prId, base: $base, body: .}}' |
+    gh api graphql --input - >/dev/null; then
     update_failed=true
   fi
 fi

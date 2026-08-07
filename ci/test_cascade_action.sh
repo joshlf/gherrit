@@ -67,6 +67,13 @@ write_fake_tools() {
 #!/usr/bin/env bash
 set -euo pipefail
 
+for argument in "$@"; do
+  if (( ${#argument} > 10000 )); then
+    echo "unexpected oversized gh argument" >&2
+    exit 1
+  fi
+done
+
 get_arg() {
   local key=$1; shift
   local previous=
@@ -78,7 +85,13 @@ get_arg() {
 }
 
 if [[ ${1:-} == api && ${2:-} == graphql ]]; then
-  joined=$*
+  input_payload=
+  if [[ " $* " == *' --input - '* ]]; then
+    input_payload=$(cat)
+    joined=$(jq -er '.query' <<<"$input_payload")
+  else
+    joined=$*
+  fi
   if [[ $joined == *'mergedPr: pullRequest'* ]]; then
     number=$(get_arg -F "$@" | sed -n 's/^number=//p')
     if [[ -z $number ]]; then number=$(get_arg -f "$@" | sed -n 's/^number=//p'); fi
@@ -117,7 +130,13 @@ if [[ ${1:-} == api && ${2:-} == graphql ]]; then
       if [[ $previous == -f && $value == base=* ]]; then base_arg=${value#base=}; fi
       previous=$value
     done
-    nodes=$(jq -c --arg base "$base_arg" --arg repository "$TARGET_REPOSITORY_ID" '
+    base_refs='{}'
+    while IFS= read -r base_name; do
+      [[ -n $base_name ]] || continue
+      base_oid=$("$REAL_GIT" --git-dir="$TEST_REMOTE" rev-parse "refs/heads/$base_name")
+      base_refs=$(jq -c --arg name "$base_name" --arg oid "$base_oid" '. + {($name): $oid}' <<<"$base_refs")
+    done < <(jq -r --arg base "$base_arg" '.prs[] | select(.base == $base and .merged == false) | .base' "$TEST_STATE" | sort -u)
+    nodes=$(jq -c --arg base "$base_arg" --arg repository "$TARGET_REPOSITORY_ID" --argjson refs "$base_refs" '
       [.prs[] | select(.base == $base and .merged == false) | {
         id: .id,
         number: .number,
@@ -125,6 +144,13 @@ if [[ ${1:-} == api && ${2:-} == graphql ]]; then
         headRefName: .head,
         headRefOid: .head_oid,
         baseRefName: .base,
+        baseRefOid: (
+          if (.base_oid_after? != null) and ($refs[.base] != .base_oid_before) then
+            .base_oid_after
+          else
+            (.base_oid // .base_oid_before // $refs[.base])
+          end
+        ),
         isCrossRepository: (.cross // false),
         isInMergeQueue: .queue,
         autoMergeRequest: (if .auto then {enabledAt: "now"} else null end),
@@ -189,13 +215,19 @@ if [[ ${1:-} == api && ${2:-} == graphql ]]; then
       '
   elif [[ $joined == *'updatePullRequest'* ]]; then
     pr_id= base= body=
-    previous=
-    for value in "$@"; do
-      if [[ $previous == -f && $value == prId=* ]]; then pr_id=${value#prId=}; fi
-      if [[ $previous == -f && $value == base=* ]]; then base=${value#base=}; fi
-      if [[ $previous == -f && $value == body=* ]]; then body=${value#body=}; fi
-      previous=$value
-    done
+    if [[ -n $input_payload ]]; then
+      pr_id=$(jq -er '.variables.prId' <<<"$input_payload")
+      base=$(jq -er '.variables.base' <<<"$input_payload")
+      body=$(jq -er '.variables.body' <<<"$input_payload")
+    else
+      previous=
+      for value in "$@"; do
+        if [[ $previous == -f && $value == prId=* ]]; then pr_id=${value#prId=}; fi
+        if [[ $previous == -f && $value == base=* ]]; then base=${value#base=}; fi
+        if [[ $previous == -f && $value == body=* ]]; then body=${value#body=}; fi
+        previous=$value
+      done
+    fi
     if [[ ${TEST_UPDATE_MODE:-none} == before ]]; then
       echo 'injected update failure before application' >&2
       exit 1
@@ -381,9 +413,19 @@ assert_promoted() {
     exit 1
   fi
   body=$(jq -er --arg id "$id" '.prs[] | select(.head == $id) | .body' "$state")
-  if [[ $(printf '%s' "$body" | bash "$repo_root/ci/extract_stack_metadata.sh" | jq -r '.parent // ""') != "" ]]; then
+  metadata=$(printf '%s' "$body" | bash "$repo_root/ci/extract_stack_metadata.sh")
+  if [[ $(jq -r '.parent // ""' <<<"$metadata") != "" ]]; then
     echo "promoted child '$id' retained parent metadata" >&2
     exit 1
+  fi
+  grep -Fq "[Current](https://github.com/$repository_name/compare/main..$id)" <<<"$body"
+  if grep -Fq -- '- 👉 #1' <<<"$body"; then
+    echo "promoted child '$id' retained stale stack navigation" >&2
+    exit 1
+  fi
+  child=$(jq -r '.child // ""' <<<"$metadata")
+  if [[ -n $child ]]; then
+    grep -Fq "[Next](https://github.com/$repository_name/compare/$id..$child)" <<<"$body"
   fi
 }
 
@@ -764,6 +806,272 @@ if run_group blockers || run_group blocker-queue; then
 fi
 if run_group blockers || run_group blocker-stack; then
   run_blocker_case stack
+fi
+
+# The composite action must reject any checkout whose local DAG can differ from
+# the authoritative remote object graph before it performs API or ref mutation.
+if run_group dag-authority; then
+  for mode in shallow replace-base replace-ref common-graft; do
+    case_dir=$root/dag-authority-$mode
+    remote=$case_dir/remote.git; work=$case_dir/work; state=$case_dir/state.json
+    setup_repository "$case_dir" "$current_a" "$current_b"
+    initialize_state "$work" "$state" "$current_a" "$current_b"
+    merge_equivalent "$work" "$current_a" squash
+    merged_body=$(mark_merged "$state" "$current_a")
+    old_child=$("$real_git" --git-dir="$remote" rev-parse "refs/heads/$current_b")
+    action_work=$work
+    case "$mode" in
+      shallow)
+        action_work=$case_dir/shallow
+        "$real_git" clone --quiet --depth 1 --branch "$current_b" \
+          "file://$remote" "$action_work"
+        [[ $("$real_git" -C "$action_work" rev-parse --is-shallow-repository) == true ]]
+        ;;
+      replace-base)
+        ;;
+      replace-ref)
+        "$real_git" -C "$work" replace HEAD HEAD^
+        ;;
+      common-graft)
+        action_work=$case_dir/linked-worktree
+        "$real_git" -C "$work" worktree add --quiet -b linked-dag-authority \
+          "$action_work" main
+        printf 'deadbeef\n' > "$work/.git/info/grafts"
+        ;;
+    esac
+    TEST_BIN=$case_dir/bin TEST_REMOTE=$remote
+    export TEST_BIN TEST_REMOTE TEST_PUSH_MODE=none TEST_UPDATE_MODE=none
+    write_fake_tools "$TEST_BIN"
+    if [[ $mode == replace-base ]]; then
+      export GIT_REPLACE_REF_BASE=refs/alternate-replacements
+    fi
+    if run_action "$action_work" "$state" "$current_a" 1 "$merged_body" \
+      >/dev/null 2>&1; then
+      echo "$mode DAG-authority case unexpectedly succeeded" >&2
+      exit 1
+    fi
+    unset GIT_REPLACE_REF_BASE || true
+    [[ $("$real_git" --git-dir="$remote" rev-parse "refs/heads/$current_b") == "$old_child" ]]
+    if "$real_git" --git-dir="$remote" show-ref --verify --quiet \
+      "refs/tags/gherrit/$current_b/v2"; then
+      echo "$mode DAG-authority case mutated the remote" >&2
+      exit 1
+    fi
+  done
+fi
+
+# GitHub's PR-associated base OID is part of the safety proof. It must be an
+# authenticated child version before publication, and it is re-observed after
+# publication. An unsafe post-publication change is durable but must fail before
+# PR projection; a retry can finish after the association returns to a safe,
+# authenticated state.
+if run_group base-oid; then
+  for phase in before reachability after; do
+    if [[ ${BASE_OID_PHASE:-all} != all && ${BASE_OID_PHASE:-all} != "$phase" ]]; then
+      continue
+    fi
+    case_dir=$root/base-oid-$phase
+    remote=$case_dir/remote.git; work=$case_dir/work; state=$case_dir/state.json
+    setup_repository "$case_dir" "$current_a" "$current_b" "$current_c"
+    initialize_state "$work" "$state" "$current_a" "$current_b" "$current_c"
+    merge_equivalent "$work" "$current_a" squash
+    merged_body=$(mark_merged "$state" "$current_a")
+    old_child=$("$real_git" --git-dir="$remote" rev-parse "refs/heads/$current_b")
+    unsafe_oid=$("$real_git" --git-dir="$remote" rev-parse refs/heads/main)
+    tmp=$state.tmp
+    if [[ $phase == before ]]; then
+      jq --arg id "$current_c" --arg oid "$unsafe_oid" \
+        '.prs |= map(if .head == $id then .base_oid = $oid else . end)' \
+        "$state" > "$tmp"
+    elif [[ $phase == reachability ]]; then
+      grandchild_head=$("$real_git" --git-dir="$remote" rev-parse "refs/heads/$current_c")
+      "$real_git" --git-dir="$remote" update-ref \
+        "refs/tags/gherrit/$current_b/v1" "$grandchild_head"
+      "$real_git" --git-dir="$remote" update-ref \
+        "refs/tags/gherrit/$current_b/v2" "$old_child"
+      jq --arg id "$current_c" --arg oid "$grandchild_head" \
+        '.prs |= map(if .head == $id then .base_oid = $oid else . end)' \
+        "$state" > "$tmp"
+    else
+      jq --arg id "$current_c" --arg before "$old_child" --arg after "$unsafe_oid" \
+        '.prs |= map(if .head == $id then .base_oid_before = $before | .base_oid_after = $after else . end)' \
+        "$state" > "$tmp"
+    fi
+    mv "$tmp" "$state"
+    TEST_BIN=$case_dir/bin TEST_REMOTE=$remote
+    export TEST_BIN TEST_REMOTE TEST_PUSH_MODE=none TEST_UPDATE_MODE=none
+    write_fake_tools "$TEST_BIN"
+    if run_action "$work" "$state" "$current_a" 1 "$merged_body" \
+      >/dev/null 2>&1; then
+      echo "$phase base-OID case unexpectedly succeeded" >&2
+      exit 1
+    fi
+    if [[ $phase == before || $phase == reachability ]]; then
+      [[ $("$real_git" --git-dir="$remote" rev-parse "refs/heads/$current_b") == "$old_child" ]]
+      forbidden_version=v2
+      [[ $phase == reachability ]] && forbidden_version=v3
+      if "$real_git" --git-dir="$remote" show-ref --verify --quiet \
+        "refs/tags/gherrit/$current_b/$forbidden_version"; then
+        echo "pre-publication base-OID safety failure published $forbidden_version" >&2
+        exit 1
+      fi
+    else
+      new_child=$("$real_git" --git-dir="$remote" rev-parse "refs/heads/$current_b")
+      [[ $new_child != "$old_child" ]]
+      [[ $("$real_git" --git-dir="$remote" rev-parse "refs/tags/gherrit/$current_b/v2") == "$new_child" ]]
+      [[ $(jq -er --arg id "$current_b" '.prs[] | select(.head == $id) | .base' "$state") == "$current_a" ]]
+      tmp=$state.tmp
+      jq --arg id "$current_c" '(.prs[] | select(.head == $id)) |= del(.base_oid, .base_oid_before, .base_oid_after)' \
+        "$state" > "$tmp" && mv "$tmp" "$state"
+      run_action "$work" "$state" "$current_a" 1 "$merged_body"
+      assert_promoted "$remote" "$state" "$current_b" 2
+      if "$real_git" --git-dir="$remote" show-ref --verify --quiet \
+        "refs/tags/gherrit/$current_b/v3"; then
+        echo "base-OID recovery allocated an unnecessary v3" >&2
+        exit 1
+      fi
+    fi
+  done
+fi
+
+replace_grandchild_tip() {
+  local work=$1 remote=$2 state=$3 mode=$4
+  local tip
+  (
+    cd "$work"
+    "$real_git" config user.name test
+    "$real_git" config user.email test@example.com
+    case "$mode" in
+      merge)
+        "$real_git" checkout -B malformed-left "$current_b" >/dev/null
+        echo left > malformed-left.txt
+        "$real_git" add malformed-left.txt
+        "$real_git" commit -m left >/dev/null
+        "$real_git" checkout -B malformed-right "$current_b" >/dev/null
+        echo right > malformed-right.txt
+        "$real_git" add malformed-right.txt
+        "$real_git" commit -m right >/dev/null
+        "$real_git" checkout malformed-left >/dev/null
+        "$real_git" merge --no-ff malformed-right -m 'merge grandchild' \
+          -m "gherrit-pr-id: $current_c" >/dev/null
+        ;;
+      two-commit)
+        "$real_git" checkout -B malformed-grandchild "$current_b" >/dev/null
+        echo first > malformed-first.txt
+        "$real_git" add malformed-first.txt
+        "$real_git" commit -m first >/dev/null
+        echo second > malformed-second.txt
+        "$real_git" add malformed-second.txt
+        "$real_git" commit -m second -m "gherrit-pr-id: $current_c" >/dev/null
+        ;;
+      unrelated-parent)
+        "$real_git" checkout -B malformed-grandchild main >/dev/null
+        echo unrelated > malformed-unrelated.txt
+        "$real_git" add malformed-unrelated.txt
+        "$real_git" commit -m unrelated-parent >/dev/null
+        echo tip > malformed-tip.txt
+        "$real_git" add malformed-tip.txt
+        "$real_git" commit -m tip -m "gherrit-pr-id: $current_c" >/dev/null
+        ;;
+      *) echo "unknown grandchild topology '$mode'" >&2; return 1 ;;
+    esac
+    tip=$("$real_git" rev-parse HEAD)
+    "$real_git" push --quiet --force origin \
+      "HEAD:refs/heads/$current_c"
+    "$real_git" --git-dir="$remote" update-ref \
+      "refs/tags/gherrit/$current_c/v1" "$tip"
+    tmp=$state.tmp
+    jq --arg id "$current_c" --arg oid "$tip" \
+      '.prs |= map(if .head == $id then .head_oid = $oid else . end)' \
+      "$state" > "$tmp" && mv "$tmp" "$state"
+  )
+}
+
+# A canonical grandchild is exactly one commit above a child version authenticated
+# by GHerrit's remote patch history. Merge tips, longer suffixes, and unrelated
+# parents are rejected before the child branch can be rewritten.
+if run_group grandchild-topology; then
+  for mode in merge two-commit unrelated-parent; do
+    if [[ ${GRANDCHILD_TOPOLOGY_MODE:-all} != all && ${GRANDCHILD_TOPOLOGY_MODE:-all} != "$mode" ]]; then
+      continue
+    fi
+    case_dir=$root/grandchild-topology-$mode
+    remote=$case_dir/remote.git; work=$case_dir/work; state=$case_dir/state.json
+    setup_repository "$case_dir" "$current_a" "$current_b" "$current_c"
+    initialize_state "$work" "$state" "$current_a" "$current_b" "$current_c"
+    replace_grandchild_tip "$work" "$remote" "$state" "$mode"
+    merge_equivalent "$work" "$current_a" squash
+    merged_body=$(mark_merged "$state" "$current_a")
+    old_child=$("$real_git" --git-dir="$remote" rev-parse "refs/heads/$current_b")
+    TEST_BIN=$case_dir/bin TEST_REMOTE=$remote
+    export TEST_BIN TEST_REMOTE TEST_PUSH_MODE=none TEST_UPDATE_MODE=none
+    write_fake_tools "$TEST_BIN"
+    if run_action "$work" "$state" "$current_a" 1 "$merged_body" \
+      >/dev/null 2>&1; then
+      echo "$mode grandchild topology unexpectedly succeeded" >&2
+      exit 1
+    fi
+    [[ $("$real_git" --git-dir="$remote" rev-parse "refs/heads/$current_b") == "$old_child" ]]
+    if "$real_git" --git-dir="$remote" show-ref --verify --quiet \
+      "refs/tags/gherrit/$current_b/v2"; then
+      echo "$mode grandchild topology published v2" >&2
+      exit 1
+    fi
+  done
+fi
+
+# Near-limit bodies travel to gh through standard input rather than argv, while
+# bodies whose complete promoted envelope exceeds the conservative cap are
+# rejected before the durable Git transaction.
+if run_group body-limits; then
+  for mode in near-limit oversized; do
+    case_dir=$root/body-limit-$mode
+    remote=$case_dir/remote.git; work=$case_dir/work; state=$case_dir/state.json
+    setup_repository "$case_dir" "$current_a" "$current_b"
+    initialize_state "$work" "$state" "$current_a" "$current_b"
+    count=50000
+    [[ $mode == oversized ]] && count=60001
+    user_body=$(python3 - "$count" <<'PYBODY'
+import sys
+print("x" * int(sys.argv[1]), end="")
+PYBODY
+)
+    if [[ $mode == oversized ]]; then
+      replacement=$(provisional_body_for "$current_b" "$current_a" "" "$user_body")
+    else
+      replacement=$(body_for "$current_b" "$current_a" "")
+      replacement=${replacement/Test PR body./$user_body}
+    fi
+    tmp=$state.tmp
+    jq --arg id "$current_b" --arg body "$replacement" \
+      '.prs |= map(if .head == $id then .body = $body else . end)' \
+      "$state" > "$tmp" && mv "$tmp" "$state"
+    merge_equivalent "$work" "$current_a" squash
+    merged_body=$(mark_merged "$state" "$current_a")
+    old_child=$("$real_git" --git-dir="$remote" rev-parse "refs/heads/$current_b")
+    TEST_BIN=$case_dir/bin TEST_REMOTE=$remote
+    export TEST_BIN TEST_REMOTE TEST_PUSH_MODE=none TEST_UPDATE_MODE=none
+    write_fake_tools "$TEST_BIN"
+    if [[ $mode == near-limit ]]; then
+      run_action "$work" "$state" "$current_a" 1 "$merged_body"
+      assert_promoted "$remote" "$state" "$current_b" 2
+      body=$(jq -er --arg id "$current_b" '.prs[] | select(.head == $id) | .body' "$state")
+      (( $(printf '%s' "$body" | wc -c) > 50000 ))
+      (( $(printf '%s' "$body" | wc -c) < 60000 ))
+    else
+      if run_action "$work" "$state" "$current_a" 1 "$merged_body" \
+        >/dev/null 2>&1; then
+        echo "oversized cascade body unexpectedly succeeded" >&2
+        exit 1
+      fi
+      [[ $("$real_git" --git-dir="$remote" rev-parse "refs/heads/$current_b") == "$old_child" ]]
+      if "$real_git" --git-dir="$remote" show-ref --verify --quiet \
+        "refs/tags/gherrit/$current_b/v2"; then
+        echo "oversized cascade body published v2" >&2
+        exit 1
+      fi
+    fi
+  done
 fi
 
 # If the child patch is already represented upstream, --empty=keep must still

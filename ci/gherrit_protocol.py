@@ -21,6 +21,10 @@ HISTORY_MARKER = "\n\n**Latest Update:**"
 FOOTER = "\n\n*Stacked PRs enabled by [GHerrit](https://github.com/joshlf/gherrit).*"
 METADATA_WARNING = "<!-- WARNING: GHerrit relies on the following metadata to work properly. DO NOT EDIT OR REMOVE. -->"
 PROVISIONAL_STATUS = "\n\n---\n\n*GHerrit is completing the initial projection for this PR.*"
+# GitHub rejects PR bodies above 65,536 characters. A lower UTF-8 byte cap
+# leaves room for API-side representation differences and fails conservatively.
+MAX_PROMOTED_BODY_BYTES = 60_000
+MAX_HISTORY_ROWS = 32
 
 
 def fail(message: str) -> NoReturn:
@@ -123,29 +127,57 @@ def history_section(
         "<details>",
         "<summary><strong>📚 Full Patch History</strong></summary>",
         "",
-        "*Links show the diff between the row version and the column version.*",
-        "",
     ]
-    versions = list(range(latest - 1, 0, -1))
-    lines.append("|Version|" + "".join(f" v{version} |" for version in versions) + "Base|")
-    lines.append("|:---|" + ":---|" * len(versions) + ":---|")
-    prefix = "vs " if latest <= 8 else ""
-    sparse = latest > 8
-    for row in range(latest, 0, -1):
-        cells = [f"|v{row}|"]
-        for column in versions:
-            if column >= row:
-                cells.append("|")
-            elif not sparse or row == latest or row == column + 1:
-                cells.append(
-                    f"[{prefix}v{column}]({repo_url}/compare/gherrit/{gherrit_id}/v{column}..gherrit/{gherrit_id}/v{row})|"
-                )
-            else:
-                cells.append("|")
-        cells.append(
-            f"[{prefix}Base]({repo_url}/compare/{base_branch}..gherrit/{gherrit_id}/v{row})|"
+    if latest <= 8:
+        lines.extend(
+            [
+                "*Links show the diff between the row version and the column version.*",
+                "",
+            ]
         )
-        lines.append("".join(cells))
+        versions = list(range(latest - 1, 0, -1))
+        lines.append(
+            "|Version|" + "".join(f" v{version} |" for version in versions) + "Base|"
+        )
+        lines.append("|:---|" + ":---|" * len(versions) + ":---|")
+        for row in range(latest, 0, -1):
+            cells = [f"|v{row}|"]
+            for column in versions:
+                if column >= row:
+                    cells.append("|")
+                else:
+                    cells.append(
+                        f"[vs v{column}]({repo_url}/compare/gherrit/{gherrit_id}/v{column}..gherrit/{gherrit_id}/v{row})|"
+                    )
+            cells.append(
+                f"[vs Base]({repo_url}/compare/{base_branch}..gherrit/{gherrit_id}/v{row})|"
+            )
+            lines.append("".join(cells))
+    else:
+        oldest = max(1, latest - MAX_HISTORY_ROWS + 1)
+        lines.extend(
+            [
+                "*Each row compares that version with its predecessor and the current base.*",
+                "",
+                "|Version|Previous version|Base|",
+                "|:---|:---|:---|",
+            ]
+        )
+        for version in range(latest, oldest - 1, -1):
+            previous = (
+                f"[v{version - 1}]({repo_url}/compare/gherrit/{gherrit_id}/v{version - 1}..gherrit/{gherrit_id}/v{version})"
+                if version > 1
+                else "—"
+            )
+            base = f"[Base]({repo_url}/compare/{base_branch}..gherrit/{gherrit_id}/v{version})"
+            lines.append(f"|v{version}|{previous}|{base}|")
+        if oldest > 1:
+            lines.extend(
+                [
+                    "",
+                    f"*Showing the latest {MAX_HISTORY_ROWS} of {latest} patch versions; older version tags remain available in Git.*",
+                ]
+            )
     lines.extend(["", "</details>"])
     return "\n".join(lines)
 
@@ -239,6 +271,15 @@ def full_promoted_body(
     return prefix + "\n\n" + METADATA_WARNING + render_metadata(metadata)
 
 
+def emit_promoted_body(body: str) -> None:
+    size = len(body.encode("utf-8"))
+    if size > MAX_PROMOTED_BODY_BYTES:
+        fail(
+            f"Promoted PR body is {size} bytes, exceeding GHerrit's conservative {MAX_PROMOTED_BODY_BYTES}-byte limit. Shorten the user-authored body before cascading."
+        )
+    print(body, end="")
+
+
 def command_promote_body(args: argparse.Namespace) -> None:
     body = sys.stdin.read().rstrip()
     metadata, metadata_start = parse_metadata(body)
@@ -257,7 +298,7 @@ def command_promote_body(args: argparse.Namespace) -> None:
 
     user_body = provisional_user_body(prefix)
     if user_body is not None:
-        print(
+        emit_promoted_body(
             full_promoted_body(
                 user_body=user_body,
                 metadata=metadata,
@@ -265,8 +306,7 @@ def command_promote_body(args: argparse.Namespace) -> None:
                 latest=args.latest,
                 repo_url=repo_url,
                 base_branch=args.base,
-            ),
-            end="",
+            )
         )
         return
 
@@ -280,7 +320,7 @@ def command_promote_body(args: argparse.Namespace) -> None:
     navigation = generated_body.rfind(NAVIGATION_MARKER)
     if navigation < 0:
         fail("Could not find the terminal generated stack-navigation section.")
-    generated_tail = generated_body[navigation:]
+    generated_tail = generated_body[navigation + len(NAVIGATION_MARKER) :]
     if generated_tail.count(DOWNLOAD_MARKER) != 1:
         fail("Generated GHerrit download section is missing or ambiguous.")
     if generated_tail.count(HISTORY_MARKER) > 1:
@@ -291,35 +331,33 @@ def command_promote_body(args: argparse.Namespace) -> None:
     if history >= 0:
         if history > download:
             fail("Existing GHerrit history section is malformed.")
-        generated_tail = (
-            generated_tail[:history].rstrip() + generated_tail[download:]
-        )
-        download = generated_tail.rfind(DOWNLOAD_MARKER)
+    if not generated_tail[download:].endswith("</details>"):
+        fail("Generated GHerrit download section has an unexpected suffix.")
 
-    generated_history = history_section(
+    generated = navigation_section(
+        gherrit_id=args.id,
+        child=metadata["child"],
+        repo_url=repo_url,
+        base_branch=args.base,
+    )
+    generated += history_section(
         gherrit_id=args.id,
         latest=args.latest,
         repo_url=repo_url,
         base_branch=args.base,
     )
-    if generated_history:
-        generated_tail = (
-            generated_tail[:download].rstrip()
-            + generated_history
-            + generated_tail[download:]
-        )
-        download = generated_tail.rfind(DOWNLOAD_MARKER)
-
-    if not generated_tail[download:].endswith("</details>"):
-        fail("Generated GHerrit download section has an unexpected suffix.")
-
-    generated_body = generated_body[:navigation] + generated_tail
-    print(
-        generated_body
-        + terminal_suffix
-        + render_metadata(metadata),
-        end="",
+    generated += "\n" + download_section(
+        gherrit_id=args.id, latest=args.latest, repo_url=repo_url
     )
+
+    promoted = (
+        generated_body[:navigation]
+        + NAVIGATION_MARKER
+        + generated
+        + terminal_suffix
+        + render_metadata(metadata)
+    )
+    emit_promoted_body(promoted)
 
 
 def require_mapping(value: object, context: str) -> dict[str, object]:
@@ -399,14 +437,17 @@ def command_base_consumer(args: argparse.Namespace) -> None:
     number = candidate.get("number")
     node_id = candidate.get("id")
     head_oid = candidate.get("headRefOid")
+    base_oid = candidate.get("baseRefOid")
     if (
         not isinstance(number, int)
         or not isinstance(node_id, str)
         or not node_id
         or not isinstance(head_oid, str)
         or not head_oid
+        or not isinstance(base_oid, str)
+        or not base_oid
     ):
-        fail("Grandchild PR identity or head OID is unavailable.")
+        fail("Grandchild PR identity, head OID, or associated base OID is unavailable.")
     print(
         json.dumps(
             {
@@ -414,6 +455,7 @@ def command_base_consumer(args: argparse.Namespace) -> None:
                 "nodeId": node_id,
                 "headRefName": grandchild,
                 "headRefOid": head_oid,
+                "baseRefOid": base_oid,
             },
             separators=(",", ":"),
         )

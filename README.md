@@ -268,9 +268,17 @@ To solve this, GHerrit implements a **Cascading Merge** system:
         can advance an authenticated child from an older default-branch tip.
     *   Authenticates every open PR using the rewritten child branch as its
         base and refuses unrelated, operationally blocked, or
-        reachability-unsafe consumers.
+        reachability-unsafe consumers. For the canonical grandchild, it also
+        authenticates the PR-associated base OID and the exact one-commit
+        suffix above a versioned child commit, then rechecks the consumer after
+        publication.
+    *   Refuses shallow repositories, replacement refs, and common-directory
+        grafts so every reachability decision uses the complete, unmodified Git
+        DAG. The checkout step must therefore retain `fetch-depth: 0`.
     *   Precomputes the promoted PR body before durable Git publication,
-        including recovery from GHerrit's provisional creation body.
+        including recovery from GHerrit's provisional creation body. Generated
+        history remains bounded for long-lived changes, stale navigation is
+        replaced, and unrepresentable bodies are rejected before Git mutation.
     *   Atomically publishes the rebased child branch and its next
         `refs/tags/gherrit/<id>/v<version>` tag using explicit leases.
     *   Retargets the PR only after Git publication is confirmed and rewrites
