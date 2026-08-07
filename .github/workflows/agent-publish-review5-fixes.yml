@@ -1,0 +1,14 @@
+name: Agent publish safe-pr-reorder fifth-review fixes
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  disabled:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo disabled
