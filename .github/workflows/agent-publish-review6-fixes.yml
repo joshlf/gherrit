@@ -24,13 +24,13 @@ jobs:
           fetch-tags: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Reconstruct exact candidate history
+      - name: Reconstruct exact semantic candidate
         shell: bash
         run: |
           set -euxo pipefail
           base=20a97f10d68cc98793619363a601601ee2e48db2
-          expected_head=249dc06cccdeae88a12961ef6e12c2a717a462ad
-          expected_tree=50eee957d14679825658dbe9b1f9e7427c2f78ab
+          semantic_head=249dc06cccdeae88a12961ef6e12c2a717a462ad
+          semantic_tree=50eee957d14679825658dbe9b1f9e7427c2f78ab
 
           cat agent_payloads/review6/safe-pr-reorder-review6.patch.gz.b64.* \
             > /tmp/review6.patch.gz.b64
@@ -52,9 +52,11 @@ jobs:
           git checkout --detach "$base"
           git am --committer-date-is-author-date /tmp/review6.patch
 
-          test "$(git rev-parse HEAD)" = "$expected_head"
-          test "$(git rev-parse HEAD^{tree})" = "$expected_tree"
+          test "$(git rev-parse HEAD)" = "$semantic_head"
+          test "$(git rev-parse HEAD^{tree})" = "$semantic_tree"
           test "$(git rev-list --count "$base"..HEAD)" = 3
+          test "$(git rev-parse HEAD~2)" = c0b1c75964f4ef1bfd0997df1d2386b915ab31cb
+          test "$(git rev-parse HEAD~1)" = 0f32a6324ef92fcfc16c28fc74453cdf3fec5632
           test "$(git show --no-patch --format=%s HEAD~2)" = \
             "Pin publication to one authenticated remote"
           test "$(git show --no-patch --format=%s HEAD~1)" = \
@@ -82,8 +84,48 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Check formatting
-        run: cargo +nightly fmt --all -- --check
+      - name: Fold exact nightly-rustfmt delta into final commit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          third_committer_date=$(git show -s --format=%cI HEAD)
+          cargo +nightly fmt --all
+
+          cat > /tmp/expected-format-files <<'EOF'
+          src/pre_push/mod.rs
+          src/util.rs
+          tests/pre_push/policy/remote_authority.rs
+          tests/pre_push/projection/body_limits.rs
+          EOF
+          git diff --name-only | LC_ALL=C sort > /tmp/actual-format-files
+          diff -u /tmp/expected-format-files /tmp/actual-format-files
+
+          git diff --binary > /tmp/review6-nightly-rustfmt.patch
+          test "$(sha256sum /tmp/review6-nightly-rustfmt.patch | awk '{print $1}')" = \
+            c1bc7a18c1acfc149c6edeff234a1d1d2ad00cd693759814414c5e9862d227e2
+          git diff --check
+
+          git add \
+            src/pre_push/mod.rs \
+            src/util.rs \
+            tests/pre_push/policy/remote_authority.rs \
+            tests/pre_push/projection/body_limits.rs
+          GIT_COMMITTER_DATE="$third_committer_date" git commit --amend --no-edit
+
+          test "$(git rev-list --count 20a97f10d68cc98793619363a601601ee2e48db2..HEAD)" = 3
+          test "$(git rev-parse HEAD~2)" = c0b1c75964f4ef1bfd0997df1d2386b915ab31cb
+          test "$(git rev-parse HEAD~1)" = 0f32a6324ef92fcfc16c28fc74453cdf3fec5632
+          test "$(git show --no-patch --format=%s HEAD)" = \
+            "Preflight bounded PR projection bodies"
+          test -z "$(git status --porcelain)"
+          cargo +nightly fmt --all -- --check
+          git diff --check 20a97f10d68cc98793619363a601601ee2e48db2...HEAD
+
+          echo "FINAL_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "FINAL_TREE=$(git rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
+          git log --reverse --format='%H %s' \
+            20a97f10d68cc98793619363a601601ee2e48db2..HEAD
+          git show --stat --oneline HEAD
 
       - name: Run Clippy
         env:
@@ -111,15 +153,20 @@ jobs:
           bash -n ci/select_cascade_child.sh
           bash -n ci/test_cascade_action.sh
           python3 -m py_compile ci/gherrit_protocol.py
+          test -z "$(git status --porcelain)"
 
       - name: Publish exact validated history
         shell: bash
         run: |
           set -euxo pipefail
-          test "$(git rev-parse HEAD)" = \
-            249dc06cccdeae88a12961ef6e12c2a717a462ad
-          test "$(git rev-parse HEAD^{tree})" = \
-            50eee957d14679825658dbe9b1f9e7427c2f78ab
+          test -n "$FINAL_HEAD"
+          test -n "$FINAL_TREE"
+          test "$(git rev-parse HEAD)" = "$FINAL_HEAD"
+          test "$(git rev-parse HEAD^{tree})" = "$FINAL_TREE"
+          test "$(git rev-list --count 20a97f10d68cc98793619363a601601ee2e48db2..HEAD)" = 3
           git push --no-verify \
             --force-with-lease=refs/heads/agent/safe-pr-reorder:20a97f10d68cc98793619363a601601ee2e48db2 \
             origin HEAD:refs/heads/agent/safe-pr-reorder
+          observed=$(git ls-remote origin refs/heads/agent/safe-pr-reorder | awk '{print $1}')
+          test "$observed" = "$FINAL_HEAD"
+          printf 'Published %s with tree %s\n' "$FINAL_HEAD" "$FINAL_TREE"
