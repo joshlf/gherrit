@@ -200,6 +200,13 @@ GHerrit synchronizes changes with GitHub in a `pre-push` hook. This allows
 users to use their normal `git push` flow instead of using a bespoke command
 like (hypothetically) `gherrit sync`.
 
+Before observing or updating managed refs, GHerrit resolves the configured
+publication remote to exactly one effective fetch URL and one effective push
+URL. It authenticates both owner/repository paths through GitHub's immutable
+repository node ID and then pins the sole push URL for every Git observation,
+lease, and publication in that operation. Multiple push destinations or a
+fetch/push identity mismatch fail before remote mutation.
+
 ##### "Loopback" Interception Strategy
 
 By default, GHerrit configures managed branches to treat the local repository as
@@ -231,7 +238,11 @@ lists the other commits in that commit's stack:
 &nbsp;
 
 GHerrit emulates this by rewriting each PR's message with links to other PRs in
-the same stack:
+the same stack. Patch history uses a full comparison matrix for early versions
+and a bounded linear summary for long-lived changes. GHerrit constructs and
+size-checks every final PR body and a conservative single-PR GraphQL mutation
+before changing any PR base or remote Git ref, so an unprojectable body cannot
+strand a durable Git publication.
 
 <img width="915" height="317" alt="Screenshot 2025-12-02 at 6 46 15 PM" src="https://github.com/user-attachments/assets/6ee80641-af67-4b37-9f57-797207637bbe" />
 
@@ -251,6 +262,9 @@ To solve this, GHerrit implements a **Cascading Merge** system:
     parent and child PRs.
 2.  **Automated Rebase**: A GitHub Action (`gherrit-rebase-stack.yml`) triggers
     only when a root PR targeting the repository's default branch is merged. It:
+    *   Resolves exactly one effective fetch URL and one effective push URL,
+        authenticates both against the repository's immutable GitHub node ID,
+        and uses the pinned push URL for every subsequent Git read and write.
     *   Authenticates the merged root and child using immutable repository
         identities and matching two-sided GHerrit metadata.
     *   Ignores same-named fork PRs and requires exactly one same-repository
@@ -260,8 +274,10 @@ To solve this, GHerrit implements a **Cascading Merge** system:
         deleted, while rejecting every other topology.
     *   Rejects children in the merge queue, with auto-merge enabled, or owned
         by GitHub's native stacked-PR feature before performing any mutation.
-    *   Verifies that the checked-out child OID, commit trailer, and current
-        patch-version tag match the GraphQL-observed PR before changing it.
+    *   Verifies that the checked-out child OID, commit trailer, current
+        patch-version tag, and PR-associated base OID match the authenticated
+        Git topology before changing it. The child association is rechecked
+        after Git publication and must end at the exact observed default tip.
     *   Rebases exactly the child commit onto the updated default branch while
         preserving an authenticated empty commit if the patch is already
         upstream, then revalidates the resulting one-commit topology. A retry

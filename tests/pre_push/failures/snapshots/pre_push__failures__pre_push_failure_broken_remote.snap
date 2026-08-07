@@ -9,7 +9,7 @@ STDOUT:
 
 STDERR:
 [gherrit] Branch feature-fail is MANAGED. Syncing stack...
-[gherrit] [ERROR] Failed to observe the publication remote's default branch: Command "git" "ls-remote" "--symref" "broken-remote" "HEAD" failed with status: exit status: 128. Stderr: fatal: 'missing/repo.git' does not appear to be a git repository
+[gherrit] [ERROR] Failed to observe the publication remote's default branch: Command cd "." && "git" "ls-remote" "--symref" "missing/repo.git" "HEAD" failed with status: exit status: 128. Stderr: fatal: 'missing/repo.git' does not appear to be a git repository
 [gherrit] [ERROR] fatal: Could not read from remote repository.
 [gherrit] [ERROR]
 [gherrit] [ERROR] Please make sure you have the correct access rights

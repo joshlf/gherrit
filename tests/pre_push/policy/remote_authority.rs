@@ -146,11 +146,7 @@ fn rejects_a_pushurl_that_targets_a_different_repository_before_mutation() {
         .arg("main:refs/heads/main")
         .assert()
         .success();
-    ctx.git_cmd()
-        .args(["remote", "set-url", "--push", "origin"])
-        .arg(&other)
-        .assert()
-        .success();
+    ctx.git_cmd().args(["remote", "set-url", "--push", "origin"]).arg(&other).assert().success();
 
     let original_refs = ctx.remote_refs("refs");
     let other_refs = ctx
@@ -193,11 +189,7 @@ fn rejects_multiple_pushurls_before_mutation() {
     let second = ctx.dir.path().join("second.git");
     ctx.init_bare_repo(&first);
     ctx.init_bare_repo(&second);
-    ctx.git_cmd()
-        .args(["remote", "set-url", "--push", "origin"])
-        .arg(&first)
-        .assert()
-        .success();
+    ctx.git_cmd().args(["remote", "set-url", "--push", "origin"]).arg(&first).assert().success();
     ctx.git_cmd()
         .args(["remote", "set-url", "--add", "--push", "origin"])
         .arg(&second)
@@ -226,14 +218,12 @@ fn accepts_equivalent_file_and_path_urls_for_one_repository() {
         .arg(format!("file://{}", remote.display()))
         .assert()
         .success();
-    ctx.git_cmd()
-        .args(["remote", "set-url", "--push", "origin"])
-        .arg(&remote)
-        .assert()
-        .success();
+    ctx.git_cmd().args(["remote", "set-url", "--push", "origin"]).arg(&remote).assert().success();
 
     ctx.checkout_new("equivalent-remote-urls");
     ctx.commit("Feature change");
+    let id = ctx.gherrit_id("HEAD").unwrap();
+    let head = ctx.head_oid();
     ctx.hook_cmd("pre-push").assert().success();
-    assert_eq!(ctx.remote_refs("refs/heads/G").len(), 1);
+    assert_eq!(ctx.remote_ref_oid(&format!("refs/heads/{id}")).as_deref(), Some(head.as_str()));
 }

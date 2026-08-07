@@ -249,10 +249,7 @@ impl Repo {
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         if urls.is_empty() {
-            bail!(
-                "Remote `{name}` has no effective {} URL",
-                if push { "push" } else { "fetch" }
-            );
+            bail!("Remote `{name}` has no effective {} URL", if push { "push" } else { "fetch" });
         }
         Ok(urls)
     }
@@ -389,9 +386,11 @@ impl RemoteEndpoint {
             Some(PathBuf::from(path))
         } else {
             let candidate = PathBuf::from(url);
-            if candidate.is_absolute() || url.starts_with("./") || url.starts_with("../") {
-                Some(candidate)
-            } else if workdir.join(&candidate).exists() {
+            if candidate.is_absolute()
+                || url.starts_with("./")
+                || url.starts_with("../")
+                || workdir.join(&candidate).exists()
+            {
                 Some(candidate)
             } else {
                 None
@@ -620,19 +619,15 @@ mod tests {
     #[test]
     fn remote_endpoints_pin_one_github_authority() {
         let workdir = std::path::Path::new(".");
-        let https = RemoteEndpoint::parse(
-            "https://github.com/owner/repository.git",
-            workdir,
-        )
-        .unwrap();
-        let ssh = RemoteEndpoint::parse("git@ssh.github.com:owner/repository.git", workdir)
-            .unwrap();
+        let https =
+            RemoteEndpoint::parse("https://github.com/owner/repository.git", workdir).unwrap();
+        let ssh =
+            RemoteEndpoint::parse("git@ssh.github.com:owner/repository.git", workdir).unwrap();
         assert!(https.same_authority(&ssh));
         assert!(https.is_github_com());
         assert!(ssh.is_github_com());
 
-        let other = RemoteEndpoint::parse("git@example.com:owner/repository.git", workdir)
-            .unwrap();
+        let other = RemoteEndpoint::parse("git@example.com:owner/repository.git", workdir).unwrap();
         assert!(!https.same_authority(&other));
         assert!(!other.is_github_com());
     }
@@ -644,11 +639,8 @@ mod tests {
         std::fs::create_dir_all(&repository).unwrap();
         let relative = repository.strip_prefix(root.path()).unwrap().to_string_lossy();
         let path = RemoteEndpoint::parse(&relative, root.path()).unwrap();
-        let file = RemoteEndpoint::parse(
-            &format!("file://{}", repository.display()),
-            root.path(),
-        )
-        .unwrap();
+        let file = RemoteEndpoint::parse(&format!("file://{}", repository.display()), root.path())
+            .unwrap();
         assert!(path.same_authority(&file));
         assert_eq!(path.git_url, file.git_url);
     }

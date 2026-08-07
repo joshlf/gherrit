@@ -73,13 +73,8 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     }
 
     let octocrab = builder.build()?;
-    let repository = fetch_repository_identity(
-        &octocrab,
-        &remote.owner,
-        &remote.repo_name,
-        "fetch URL",
-    )
-    .await?;
+    let repository =
+        fetch_repository_identity(&octocrab, &remote.owner, &remote.repo_name, "fetch URL").await?;
     let push_repository = fetch_repository_identity(
         &octocrab,
         &remote.push_owner,
@@ -105,13 +100,23 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     let candidates = batch_fetch_prs(&remote, &octocrab, &gherrit_ids).await?;
     let prs = select_canonical_prs(&repository, &gherrit_ids, candidates)?;
     validate_prs_for_publication(&prs, &publication)?;
+    preflight_pr_projection(
+        repo,
+        &remote,
+        branch_name,
+        &remote_default.name,
+        &commits,
+        &publication.latest_versions,
+        &prs,
+    )?;
 
     let rewritten_branches = rewritten_existing_branches(&publication);
     let base_consumers =
         batch_fetch_base_consumers(&remote, &octocrab, &rewritten_branches).await?;
     validate_base_consumers(&repository, &prs, &rewritten_branches, &base_consumers)?;
 
-    let staging_bases = plan_pr_staging(repo, &remote, &commits, &prs, &publication, &remote_default)?;
+    let staging_bases =
+        plan_pr_staging(repo, &remote, &commits, &prs, &publication, &remote_default)?;
     validate_operational_state(&prs)?;
     for staging in &staging_bases {
         log::debug!(
@@ -141,6 +146,7 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     validate_operational_state(&prepared_prs)?;
     verify_staging_bases(
         repo,
+        &remote,
         &commits,
         &prepared_prs,
         &publication,
@@ -150,7 +156,6 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     verify_publication_inputs(repo, &remote, &publication, &remote_default)?;
 
     execute_publication(repo, &remote, &publication)?;
-        &remote,
     let latest_versions = publication.latest_versions.clone();
     let default_branch = remote_default.name;
 
@@ -321,6 +326,7 @@ fn validate_ids_against_remote_default(
 /// happens to have an ID-shaped name.
 fn validate_existing_branch_ownership(
     repo: &util::Repo,
+    remote: &Remote,
     publication: &PublicationPlan,
     remote_default: &RemoteDefault,
 ) -> Result<()> {
@@ -330,7 +336,6 @@ fn validate_existing_branch_ownership(
         .filter_map(|(branch, oid)| oid.as_ref().map(|oid| (branch, oid)))
         .collect::<Vec<_>>();
     if existing.is_empty() {
-    remote: &Remote,
         return Ok(());
     }
 
@@ -586,6 +591,7 @@ fn execute_publication(
     for plan in &publication.batches {
         log::info!("Pushing chunk to remote...");
         let mut child = util::cmd("git", &plan.arguments)
+            .current_dir(repo.workdir().unwrap_or(repo.path()))
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
             .spawn()
@@ -595,7 +601,6 @@ fn execute_publication(
             use std::io::{BufRead, BufReader};
             let stderr = child.stderr.take().unwrap();
             let reader = BufReader::new(stderr);
-            .current_dir(repo.workdir().unwrap_or(repo.path()))
             let mut remote_buffer: Vec<String> = Vec::new();
             let flush_buffer = |buf: &mut Vec<String>| {
                 if buf.is_empty() {
@@ -699,6 +704,7 @@ fn classify_push_outcome(
 
 fn get_remote_ref_states(
     repo: &util::Repo,
+    remote: &Remote,
     refs: &[String],
 ) -> Result<HashMap<String, Option<String>>> {
     let mut states =
@@ -710,7 +716,6 @@ fn get_remote_ref_states(
         command.current_dir(repo.workdir().unwrap_or(repo.path()));
         let output = command.checked_output()?;
         for line in core::str::from_utf8(&output.stdout)?.lines() {
-    remote: &Remote,
             let Some((oid, reference)) = line.split_once('\t') else {
                 continue;
             };
@@ -739,6 +744,7 @@ fn persist_local_tags(repo: &util::Repo, tags: &[PersistedTag]) {
 #[allow(clippy::type_complexity)]
 fn get_remote_branch_states(
     repo: &util::Repo,
+    remote: &Remote,
     gherrit_ids: &[String],
 ) -> Result<HashMap<String, Option<String>>> {
     let mut states: HashMap<String, Option<String>> =
@@ -750,7 +756,6 @@ fn get_remote_branch_states(
         let mut command = util::cmd("git", args);
         command.current_dir(repo.workdir().unwrap_or(repo.path()));
         let output = command.checked_output()?;
-    remote: &Remote,
         let output = core::str::from_utf8(&output.stdout)?;
 
         for line in output.lines() {
@@ -778,6 +783,7 @@ struct RemoteDefault {
 
 fn get_remote_versions(
     repo: &util::Repo,
+    remote: &Remote,
     gherrit_ids: &[String],
 ) -> Result<HashMap<String, RemoteVersion>> {
     let mut observations: HashMap<(String, usize), TagObservation> = HashMap::new();
@@ -789,7 +795,6 @@ fn get_remote_versions(
         command.current_dir(repo.workdir().unwrap_or(repo.path()));
         let output = command.checked_output()?;
         parse_remote_version_lines(
-    remote: &Remote,
             core::str::from_utf8(&output.stdout)?,
             gherrit_ids,
             &mut observations,
@@ -930,6 +935,7 @@ fn observe_remote_default(repo: &util::Repo, remote: &Remote) -> Result<RemoteDe
 
 fn plan_pr_staging(
     repo: &util::Repo,
+    remote: &Remote,
     commits: &[Commit],
     prs: &[PrState],
     publication: &PublicationPlan,
@@ -939,7 +945,6 @@ fn plan_pr_staging(
     relevant_branches.extend(
         publication
             .expected_heads
-    remote: &Remote,
             .iter()
             .filter_map(|(branch, oid)| oid.as_ref().map(|_| branch.clone())),
     );
@@ -1194,6 +1199,7 @@ fn classify_staging_mutation_outcome(
 
 fn verify_staging_bases(
     repo: &util::Repo,
+    remote: &Remote,
     commits: &[Commit],
     prs: &[PrState],
     publication: &PublicationPlan,
@@ -1203,7 +1209,6 @@ fn verify_staging_bases(
     let actual = plan_pr_staging(repo, remote, commits, prs, publication, remote_default)?;
     for expected in expected {
         let actual = actual
-    remote: &Remote,
             .iter()
             .find(|actual| actual.head_branch == expected.head_branch)
             .ok_or_else(|| eyre!("Prepared PR #{} disappeared", expected.number))?;
@@ -1223,6 +1228,7 @@ fn verify_staging_bases(
 
 fn verify_publication_inputs(
     repo: &util::Repo,
+    remote: &Remote,
     publication: &PublicationPlan,
     remote_default: &RemoteDefault,
 ) -> Result<()> {
@@ -1232,7 +1238,6 @@ fn verify_publication_inputs(
         .wrap_err("Failed to verify remote refs after preparing PR bases")?;
 
     for (branch, expected) in &publication.expected_heads {
-    remote: &Remote,
         if observed.get(branch) != Some(expected) {
             bail!("Remote branch `{branch}` changed after PR base preparation");
         }
@@ -1321,6 +1326,10 @@ async fn verify_final_projection(
     Ok(())
 }
 
+const MAX_PR_BODY_BYTES: usize = 60_000;
+const FULL_HISTORY_MAX_VERSION: usize = 8;
+const MAX_HISTORY_ROWS: usize = 32;
+
 struct PrBodyBuilder<'a> {
     c: &'a Commit,
     repo_url: &'a str,
@@ -1337,14 +1346,15 @@ fn gherrit_metadata_comment(id: &str, parent: Option<&str>, child: Option<&str>)
 }
 
 impl PrBodyBuilder<'_> {
-    fn build(self) -> String {
+    fn build(self) -> Result<String> {
+        #[derive(Clone, Copy)]
         enum HistoryTableFormat {
             Full,
-            Sparse,
+            Bounded,
         }
 
         fn write_body(
-            slf: &PrBodyBuilder,
+            slf: &PrBodyBuilder<'_>,
             mut w: impl Write,
             format: HistoryTableFormat,
         ) -> fmt::Result {
@@ -1364,99 +1374,111 @@ impl PrBodyBuilder<'_> {
         }
 
         fn write_history_table(
-            slf: &PrBodyBuilder,
+            slf: &PrBodyBuilder<'_>,
             mut w: impl Write,
             format: HistoryTableFormat,
         ) -> fmt::Result {
-            if slf.latest_version > 1 && !slf.repo_url.is_empty() {
-                write!(
-                    w,
-                    "\n\n**Latest Update:** v{} — [Compare vs v{}]({}/compare/gherrit/{}/v{}..gherrit/{}/v{})\n\n",
-                    slf.latest_version,
-                    slf.latest_version - 1,
-                    slf.repo_url,
-                    slf.c.gherrit_id,
-                    slf.latest_version - 1,
-                    slf.c.gherrit_id,
-                    slf.latest_version
-                )?;
+            if slf.latest_version <= 1 || slf.repo_url.is_empty() {
+                return Ok(());
+            }
 
-                w.write_str(
-                    "<details>\n<summary><strong>📚 Full Patch History</strong></summary>\n\n",
-                )?;
-                w.write_str(
-                    "*Links show the diff between the row version and the column version.*\n\n",
-                )?;
+            write!(
+                w,
+                "\n\n**Latest Update:** v{} — [Compare vs v{}]({}/compare/gherrit/{}/v{}..gherrit/{}/v{})\n\n",
+                slf.latest_version,
+                slf.latest_version - 1,
+                slf.repo_url,
+                slf.c.gherrit_id,
+                slf.latest_version - 1,
+                slf.c.gherrit_id,
+                slf.latest_version
+            )?;
+            w.write_str(
+                "<details>\n<summary><strong>📚 Full Patch History</strong></summary>\n\n",
+            )?;
 
-                // Header
-                w.write_str("|Version|")?;
-                for v in (1..slf.latest_version).rev() {
-                    write!(w, " v{} |", v)?;
-                }
-                w.write_str("Base|")?;
+            match format {
+                HistoryTableFormat::Full => {
+                    w.write_str(
+                        "*Links show the diff between the row version and the column version.*\n\n",
+                    )?;
 
-                w.write_str("\n|:---|")?;
-                for _ in 1..slf.latest_version {
-                    w.write_str(":---|")?;
-                }
-                w.write_str(":---|\n")?;
+                    w.write_str("|Version|")?;
+                    for version in (1..slf.latest_version).rev() {
+                        write!(w, " v{version} |")?;
+                    }
+                    w.write_str("Base|")?;
 
-                let prefix = if slf.latest_version <= 8 { "vs " } else { "" };
+                    w.write_str("\n|:---|")?;
+                    for _ in 1..slf.latest_version {
+                        w.write_str(":---|")?;
+                    }
+                    w.write_str(":---|\n")?;
 
-                // Rows
-                for v_row in (1..=slf.latest_version).rev() {
-                    write!(w, "|v{}|", v_row)?;
-
-                    // Previous version columns
-                    for v_col in (1..slf.latest_version).rev() {
-                        if v_col < v_row {
-                            use HistoryTableFormat::*;
-                            // In sparse mode, only show:
-                            // - Diffs between the current version and each previous version
-                            // - Diffs between each version and:
-                            //   - Its previous version
-                            //   - The base branch
-                            let show_link = match format {
-                                Full => true,
-                                Sparse => v_row == slf.latest_version || v_row == v_col + 1,
-                            };
-
-                            if show_link {
+                    for row in (1..=slf.latest_version).rev() {
+                        write!(w, "|v{row}|")?;
+                        for column in (1..slf.latest_version).rev() {
+                            if column < row {
                                 write!(
                                     w,
-                                    "[{}v{}]({}/compare/gherrit/{}/v{}..gherrit/{}/v{})|",
-                                    prefix,
-                                    v_col,
-                                    slf.repo_url,
-                                    slf.c.gherrit_id,
-                                    v_col,
-                                    slf.c.gherrit_id,
-                                    v_row
+                                    "[vs v{column}]({}/compare/gherrit/{}/v{column}..gherrit/{}/v{row})|",
+                                    slf.repo_url, slf.c.gherrit_id, slf.c.gherrit_id
                                 )?;
                             } else {
                                 w.write_str("|")?;
                             }
-                        } else {
-                            w.write_str("|")?;
                         }
+                        writeln!(
+                            w,
+                            "[vs Base]({}/compare/{}..gherrit/{}/v{row})|",
+                            slf.repo_url, slf.base_branch, slf.c.gherrit_id
+                        )?;
                     }
-
-                    // Base column (v0) – compare base_branch..v_row.
-                    write!(
-                        w,
-                        "[{}Base]({}/compare/{}..gherrit/{}/v{})|",
-                        prefix, slf.repo_url, slf.base_branch, slf.c.gherrit_id, v_row
-                    )?;
-
-                    w.write_str("\n")?;
                 }
-                w.write_str("\n</details>")?;
+                HistoryTableFormat::Bounded => {
+                    w.write_str(
+                        "*Each row compares that version with its predecessor and the current base.*\n\n",
+                    )?;
+                    w.write_str("|Version|Previous version|Base|\n")?;
+                    w.write_str("|:---|:---|:---|\n")?;
+
+                    let oldest = slf.latest_version.saturating_sub(MAX_HISTORY_ROWS - 1).max(1);
+                    for version in (oldest..=slf.latest_version).rev() {
+                        write!(w, "|v{version}|")?;
+                        if version > 1 {
+                            write!(
+                                w,
+                                "[v{}]({}/compare/gherrit/{}/v{}..gherrit/{}/v{})|",
+                                version - 1,
+                                slf.repo_url,
+                                slf.c.gherrit_id,
+                                version - 1,
+                                slf.c.gherrit_id,
+                                version
+                            )?;
+                        } else {
+                            w.write_str("—|")?;
+                        }
+                        writeln!(
+                            w,
+                            "[Base]({}/compare/{}..gherrit/{}/v{version})|",
+                            slf.repo_url, slf.base_branch, slf.c.gherrit_id
+                        )?;
+                    }
+                    if oldest > 1 {
+                        write!(
+                            w,
+                            "\n*Showing the latest {MAX_HISTORY_ROWS} of {} patch versions; older version tags remain available in Git.*\n",
+                            slf.latest_version
+                        )?;
+                    }
+                }
             }
 
-            Ok(())
+            w.write_str("\n</details>")
         }
 
-        fn write_download_section(slf: &PrBodyBuilder, mut w: impl Write) -> fmt::Result {
+        fn write_download_section(slf: &PrBodyBuilder<'_>, mut w: impl Write) -> fmt::Result {
             let id = &slf.c.gherrit_id;
 
             w.write_str(
@@ -1479,38 +1501,25 @@ impl PrBodyBuilder<'_> {
                 writeln!(w, "**{title}**\n```bash\n{command}\n```\n")?;
             }
 
-            w.write_str("</details>")?;
-            Ok(())
+            w.write_str("</details>")
         }
 
-        struct ByteCounter(usize);
-        impl Write for ByteCounter {
-            fn write_str(&mut self, s: &str) -> fmt::Result {
-                self.0 += s.len();
-                Ok(())
-            }
-        }
-
-        // Per https://github.com/orgs/community/discussions/27190#discussioncomment-3254953:
-        //
-        //   PR body/Issue comments are still stored in MySQL as a mediumblob
-        //   with a maximum value length of 262,144. This equals a limit of
-        //   65,536 4-byte unicode characters.
-        //
-        // We use half of GitHub's limit to add a safety factor.
-        const MAX_BODY_SIZE_BYTES: usize = 131_072;
-
-        let history_table_format = {
-            use HistoryTableFormat::*;
-
-            let mut full_size = ByteCounter(0);
-            write_body(&self, &mut full_size, Full).unwrap();
-            if full_size.0 > MAX_BODY_SIZE_BYTES { Sparse } else { Full }
+        let format = if self.latest_version <= FULL_HISTORY_MAX_VERSION {
+            HistoryTableFormat::Full
+        } else {
+            HistoryTableFormat::Bounded
         };
-
         let mut body = String::new();
-        write_body(&self, &mut body, history_table_format).unwrap();
-        body
+        write_body(&self, &mut body, format).expect("writing to String cannot fail");
+        if body.len() > MAX_PR_BODY_BYTES {
+            bail!(
+                "Generated PR body for GHerrit ID `{}` is {} UTF-8 bytes, exceeding GHerrit's conservative {}-byte limit. Shorten the commit message or reduce stack metadata before publishing.",
+                self.c.gherrit_id,
+                body.len(),
+                MAX_PR_BODY_BYTES
+            );
+        }
+        Ok(body)
     }
 }
 
@@ -1630,44 +1639,28 @@ async fn sync_prs(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let head_branch_markdown = (!is_private_stack(repo, branch_name))
-        .then(|| {
-            let head_ref = repo.head().ok()?.try_into_referent()?;
-            let (cat, short_name) = head_ref.inner.name.category_and_short_name()?;
-            (cat == Category::LocalBranch)
-                .then(|| format!("This PR is on branch [{short_name}](../tree/{short_name}).\n\n"))
-        })
-        .flatten();
-
+    let head_branch_markdown = head_branch_markdown(repo, branch_name);
     let repo_url = remote.repo_url_relative();
-    let mut updates: Vec<PrUpdate> = commit_pr_states
+    let pr_numbers = commit_pr_states.iter().map(|(_, state)| state.number).collect::<Vec<_>>();
+    let mut updates = commit_pr_states
         .iter()
-        .filter_map(|(entry, pr_state)| {
+        .enumerate()
+        .map(|(index, (entry, pr_state))| -> Result<Option<PrUpdate>> {
             let c = &entry.item;
-            let gh_pr_ids_markdown = commit_pr_states
-                .iter()
-                .rev()
-                .map(|(_, state)| {
-                    let prefix =
-                        if state.number == pr_state.number { "👉" } else { "\u{3000}\u{2009}" };
-                    format!("- {} #{}", prefix, state.number)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
+            let navigation = pr_navigation_markdown(&pr_numbers, index);
             let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
 
             let body = (PrBodyBuilder {
                 c,
                 repo_url: &repo_url,
                 head_branch_markdown: head_branch_markdown.as_deref(),
-                gh_pr_ids_markdown: &gh_pr_ids_markdown,
+                gh_pr_ids_markdown: &navigation,
                 latest_version,
                 base_branch: &entry.base_branch,
                 parent_id: entry.parent_id.as_deref(),
                 child_id: entry.child_id.as_deref(),
             })
-            .build();
+            .build()?;
 
             let pr_num = pr_state.number.green().bold().to_string();
             let pr_url = remote.pr_url(pr_state.number).blue().underline().to_string();
@@ -1689,9 +1682,10 @@ async fn sync_prs(
                 log::info!("PR #{} is up to date: {}", pr_num, pr_url);
             }
 
-            update
+            Ok(update)
         })
-        .collect();
+        .filter_map(Result::transpose)
+        .collect::<Result<Vec<_>>>()?;
 
     // A stale root is the most dangerous final intermediate state: it is
     // temporarily landing-eligible. Move non-root PRs to their final bases
@@ -1705,6 +1699,29 @@ async fn sync_prs(
     }
 
     Ok(())
+}
+
+fn head_branch_markdown(repo: &util::Repo, branch_name: &str) -> Option<String> {
+    if is_private_stack(repo, branch_name) {
+        return None;
+    }
+    let head_ref = repo.head().ok()?.try_into_referent()?;
+    let (category, short_name) = head_ref.inner.name.category_and_short_name()?;
+    (category == Category::LocalBranch)
+        .then(|| format!("This PR is on branch [{short_name}](../tree/{short_name}).\n\n"))
+}
+
+fn pr_navigation_markdown(numbers: &[u64], current_index: usize) -> String {
+    numbers
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(index, number)| {
+            let prefix = if index == current_index { "👉" } else { "\u{3000}\u{2009}" };
+            format!("- {prefix} #{number}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn is_private_stack(repo: &util::Repo, branch: &str) -> bool {
@@ -1817,6 +1834,81 @@ macro_rules! safe_json_format {
     }};
 }
 
+fn update_pull_request_operation(update: &PrUpdate) -> String {
+    safe_json_format!(
+        "updatePullRequest(input: {{ {fields} }}) {{ clientMutationId }}",
+        (fields = {
+            "pullRequestId" : update.node_id,
+            "baseRefName" ? update.base_branch,
+            "title" ? update.title,
+            "body" ? update.body,
+        })
+    )
+}
+
+fn preflight_pr_projection(
+    repo: &util::Repo,
+    remote: &Remote,
+    branch_name: &str,
+    base_branch: &str,
+    commits: &[Commit],
+    latest_versions: &HashMap<String, usize>,
+    prs: &[PrState],
+) -> Result<()> {
+    const MAX_NODE_ID_BYTES: usize = 256;
+
+    let stack = link_stack(base_branch, commits.iter(), |commit| commit.gherrit_id.clone());
+    let existing = prs.iter().map(|pr| (pr.head_branch.as_str(), pr)).collect::<HashMap<_, _>>();
+    // A missing PR's final number is not known until after its head ref exists.
+    // u64::MAX is a conservative upper bound on the decimal width GitHub can
+    // return, so an accepted preflight body cannot grow after PR creation.
+    let numbers = stack
+        .iter()
+        .map(|entry| existing.get(entry.item.gherrit_id.as_str()).map_or(u64::MAX, |pr| pr.number))
+        .collect::<Vec<_>>();
+    let head_branch_markdown = head_branch_markdown(repo, branch_name);
+    let repo_url = remote.repo_url_relative();
+
+    for (index, entry) in stack.iter().enumerate() {
+        let commit = entry.item;
+        let navigation = pr_navigation_markdown(&numbers, index);
+        let latest_version = latest_versions.get(&commit.gherrit_id).copied().unwrap_or(1);
+        let body = (PrBodyBuilder {
+            c: commit,
+            repo_url: &repo_url,
+            head_branch_markdown: head_branch_markdown.as_deref(),
+            gh_pr_ids_markdown: &navigation,
+            latest_version,
+            base_branch: &entry.base_branch,
+            parent_id: entry.parent_id.as_deref(),
+            child_id: entry.child_id.as_deref(),
+        })
+        .build()?;
+
+        let node_id = existing
+            .get(commit.gherrit_id.as_str())
+            .map_or_else(|| "N".repeat(MAX_NODE_ID_BYTES), |pr| pr.node_id.clone());
+        let probe = PrUpdate {
+            node_id,
+            title: Some(commit.message_title.clone()),
+            body: Some(body),
+            base_branch: Some(entry.base_branch.clone()),
+        };
+        let operation = update_pull_request_operation(&probe);
+        let query = format!("mutation {{ op0: {operation} }}");
+        if query_exceeds_limit(&query) {
+            bail!(
+                "The final GraphQL projection for GHerrit ID `{}` would require a {}-byte single-PR mutation, exceeding GHerrit's {}-byte safety limit. Shorten the commit title/body before publishing.",
+                commit.gherrit_id,
+                query.len(),
+                MAX_GRAPHQL_QUERY_BYTES
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Recursively looks up nested values from a JSON object, converting lookup
 /// failures to `Result::Err` values.
 macro_rules! json_get {
@@ -1844,7 +1936,9 @@ fn parse_repository_identity(value: &serde_json::Value) -> Result<Option<Reposit
 /// only for diagnostics and generated links.
 async fn fetch_repository_identity(
     octocrab: &Octocrab,
-    remote: &Remote,
+    owner: &str,
+    repo_name: &str,
+    source: &str,
 ) -> Result<RepositoryIdentity> {
     // NOTE: It's important that we pass `remote.*` as GraphQL variables, not
     // using string interpolation, as the variables are escaped. Using string
@@ -1857,11 +1951,10 @@ async fn fetch_repository_identity(
             "name": repo_name,
         }
     });
-    let response: serde_json::Value =
-        octocrab
-            .graphql(&query_body)
-            .await
-            .wrap_err_with(|| format!("Failed to fetch repository ID for remote {source}"))?;
+    let response: serde_json::Value = octocrab
+        .graphql(&query_body)
+        .await
+        .wrap_err_with(|| format!("Failed to fetch repository ID for remote {source}"))?;
 
     if let Some(errors) = response.get("errors") {
         log::error!("GraphQL errors: {}", errors);
@@ -1884,17 +1977,7 @@ async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<PrUpdate>) -> Result
         octocrab,
         GraphQlOp::Mutation,
         updates,
-        |update| {
-            safe_json_format!(
-                "updatePullRequest(input: {{ {fields} }}) {{ clientMutationId }}",
-                (fields = {
-                    "pullRequestId" : update.node_id,
-                    "baseRefName" ? update.base_branch,
-                    "title" ? update.title,
-                    "body" ? update.body,
-                })
-            )
-        },
+        update_pull_request_operation,
         |update, op_data| {
             if op_data.is_null() {
                 bail!(
@@ -1955,9 +2038,7 @@ async fn batch_create_prs(
 }
 
 async fn create_prs_recoverably(
-    owner: &str,
-    repo_name: &str,
-    source: &str,
+    remote: &Remote,
     repository: &RepositoryIdentity,
     octocrab: &Octocrab,
     creations: Vec<BatchCreate>,

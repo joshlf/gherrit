@@ -8,6 +8,9 @@ expression: state.graphql_requests
     ],
     [
         Query,
+    ],
+    [
+        Query,
         Query,
         Query,
         Query,
