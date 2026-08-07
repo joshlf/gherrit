@@ -1,0 +1,97 @@
+name: Agent export formatted review6 candidate
+
+on:
+  push:
+    branches:
+      - agent/bootstrap-gherrit-build
+    paths:
+      - .github/workflows/agent-export-review6-candidate.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout publisher payload
+        uses: actions/checkout@v4
+        with:
+          ref: agent/bootstrap-gherrit-build
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Reconstruct semantic candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base=20a97f10d68cc98793619363a601601ee2e48db2
+          cat agent_payloads/review6/safe-pr-reorder-review6.patch.gz.b64.* \
+            | base64 --decode \
+            | gzip --decompress \
+            > /tmp/review6.patch
+          test "$(sha256sum /tmp/review6.patch | awk '{print $1}')" = \
+            210bb5da1e28debee2ca7f4354dc71f2ad65a9d4e2e1499088cf6072e9fd021c
+          git checkout --detach "$base"
+          git config user.name "OpenAI Codex"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git am --committer-date-is-author-date /tmp/review6.patch
+          test "$(git rev-parse HEAD)" = 249dc06cccdeae88a12961ef6e12c2a717a462ad
+
+      - name: Install nightly rustfmt
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Apply exact formatting and Clippy repair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo +nightly fmt --all
+          git diff --binary > /tmp/review6-nightly-rustfmt.patch
+          test "$(sha256sum /tmp/review6-nightly-rustfmt.patch | awk '{print $1}')" = \
+            c1bc7a18c1acfc149c6edeff234a1d1d2ad00cd693759814414c5e9862d227e2
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/util.rs")
+          text = path.read_text()
+          old = '''            if candidate.is_absolute() || url.starts_with("./") || url.starts_with("../") {
+                          Some(candidate)
+                      } else if workdir.join(&candidate).exists() {
+                          Some(candidate)
+                      } else {
+                          None
+                      }
+          '''
+          new = '''            if candidate.is_absolute()
+                          || url.starts_with("./")
+                          || url.starts_with("../")
+                          || workdir.join(&candidate).exists()
+                      {
+                          Some(candidate)
+                      } else {
+                          None
+                      }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected exactly one Clippy-reported identical-branch pattern")
+          path.write_text(text.replace(old, new))
+          PY
+          cargo +nightly fmt --all
+          cargo +nightly fmt --all -- --check
+          git diff --check
+          tar --exclude=.git --exclude=target -czf /tmp/review6-candidate-source.tar.gz .
+          sha256sum /tmp/review6-candidate-source.tar.gz > /tmp/SHA256SUMS
+
+      - name: Upload candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: review6-candidate-source
+          path: |
+            /tmp/review6-candidate-source.tar.gz
+            /tmp/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
