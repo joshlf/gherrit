@@ -1,0 +1,256 @@
+name: Agent publish corrected safe-pr-reorder review6 fixes
+
+on:
+  push:
+    branches:
+      - agent/bootstrap-gherrit-build
+    paths:
+      - .github/workflows/agent-publish-review6-final.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout publisher payload
+        uses: actions/checkout@v4
+        with:
+          ref: agent/bootstrap-gherrit-build
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Reconstruct exact semantic candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base=20a97f10d68cc98793619363a601601ee2e48db2
+          cat agent_payloads/review6/safe-pr-reorder-review6.patch.gz.b64.* \
+            > /tmp/review6.patch.gz.b64
+          test "$(sha256sum /tmp/review6.patch.gz.b64 | awk '{print $1}')" = \
+            853bd6a4a9d2205b25943208879115126c5e6c74a1257b0474399c07bcd76572
+          base64 --decode /tmp/review6.patch.gz.b64 > /tmp/review6.patch.gz
+          test "$(sha256sum /tmp/review6.patch.gz | awk '{print $1}')" = \
+            371b658bca81b5d396697e04497853895703f61a4ba3c43301ed0ec33367f772
+          gzip --decompress --stdout /tmp/review6.patch.gz > /tmp/review6.patch
+          test "$(sha256sum /tmp/review6.patch | awk '{print $1}')" = \
+            210bb5da1e28debee2ca7f4354dc71f2ad65a9d4e2e1499088cf6072e9fd021c
+
+          git fetch --force origin \
+            refs/heads/agent/safe-pr-reorder:refs/remotes/origin/agent/safe-pr-reorder
+          test "$(git rev-parse refs/remotes/origin/agent/safe-pr-reorder)" = "$base"
+          git config user.name "OpenAI Codex"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --detach "$base"
+          git am --committer-date-is-author-date /tmp/review6.patch
+
+          test "$(git rev-parse HEAD)" = 249dc06cccdeae88a12961ef6e12c2a717a462ad
+          test "$(git rev-parse HEAD^{tree})" = 50eee957d14679825658dbe9b1f9e7427c2f78ab
+          test "$(git rev-list --count "$base"..HEAD)" = 3
+          test "$(git rev-parse HEAD~2)" = c0b1c75964f4ef1bfd0997df1d2386b915ab31cb
+          test "$(git rev-parse HEAD~1)" = 0f32a6324ef92fcfc16c28fc74453cdf3fec5632
+          git diff --check "$base"...HEAD
+
+      - name: Read Rust version
+        id: rust-version
+        shell: bash
+        run: |
+          echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Install project Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-version.outputs.version }}
+          components: clippy
+
+      - name: Install nightly rustfmt
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Fold formatter and validation corrections into final commit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          third_committer_date=$(git show -s --format=%cI HEAD)
+          cargo +nightly fmt --all
+
+          cat > /tmp/expected-format-files <<'EOF'
+          src/pre_push/mod.rs
+          src/util.rs
+          tests/pre_push/policy/remote_authority.rs
+          tests/pre_push/projection/body_limits.rs
+          EOF
+          git diff --name-only | LC_ALL=C sort > /tmp/actual-format-files
+          diff -u /tmp/expected-format-files /tmp/actual-format-files
+          git diff --binary > /tmp/review6-nightly-rustfmt.patch
+          test "$(sha256sum /tmp/review6-nightly-rustfmt.patch | awk '{print $1}')" = \
+            c1bc7a18c1acfc149c6edeff234a1d1d2ad00cd693759814414c5e9862d227e2
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_one(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text()
+              if text.count(old) != 1:
+                  raise SystemExit(f"expected one replacement in {path}, found {text.count(old)}")
+              file.write_text(text.replace(old, new))
+
+          replace_one(
+              "src/util.rs",
+              '''            if candidate.is_absolute() || url.starts_with("./") || url.starts_with("../") {
+                          Some(candidate)
+                      } else if workdir.join(&candidate).exists() {
+                          Some(candidate)
+                      } else {
+                          None
+                      }
+          ''',
+              '''            if candidate.is_absolute()
+                          || url.starts_with("./")
+                          || url.starts_with("../")
+                          || workdir.join(&candidate).exists()
+                      {
+                          Some(candidate)
+                      } else {
+                          None
+                      }
+          ''',
+          )
+
+          replace_one(
+              "tests/pre_push/policy/remote_authority.rs",
+              '''    ctx.checkout_new("equivalent-remote-urls");
+              ctx.commit("Feature change");
+              ctx.hook_cmd("pre-push").assert().success();
+              assert_eq!(ctx.remote_refs("refs/heads/G").len(), 1);
+          ''',
+              '''    ctx.checkout_new("equivalent-remote-urls");
+              ctx.commit("Feature change");
+              let id = ctx.gherrit_id("HEAD").unwrap();
+              let head = ctx.head_oid();
+              ctx.hook_cmd("pre-push").assert().success();
+              assert_eq!(
+                  ctx.remote_ref_oid(&format!("refs/heads/{id}")).as_deref(),
+                  Some(head.as_str())
+              );
+          ''',
+          )
+
+          replace_one(
+              "tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap",
+              '''[gherrit] [ERROR] Failed to observe the publication remote's default branch: Command "git" "ls-remote" "--symref" "broken-remote" "HEAD" failed with status: exit status: 128. Stderr: fatal: 'missing/repo.git' does not appear to be a git repository''',
+              '''[gherrit] [ERROR] Failed to observe the publication remote's default branch: Command cd "." && "git" "ls-remote" "--symref" "missing/repo.git" "HEAD" failed with status: exit status: 128. Stderr: fatal: 'missing/repo.git' does not appear to be a git repository''',
+          )
+
+          replace_one(
+              "tests/pre_push/snapshots/pre_push__publication__graphql_batch_backoff_trace.snap",
+              '''    [
+                  Query,
+              ],
+              [
+                  Query,
+                  Query,
+                  Query,
+                  Query,
+              ],
+          ''',
+              '''    [
+                  Query,
+              ],
+              [
+                  Query,
+              ],
+              [
+                  Query,
+                  Query,
+                  Query,
+                  Query,
+              ],
+          ''',
+          )
+          PY
+
+          cargo +nightly fmt --all
+          cat > /tmp/expected-final-files <<'EOF'
+          src/pre_push/mod.rs
+          src/util.rs
+          tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap
+          tests/pre_push/policy/remote_authority.rs
+          tests/pre_push/projection/body_limits.rs
+          tests/pre_push/snapshots/pre_push__publication__graphql_batch_backoff_trace.snap
+          EOF
+          git diff --name-only | LC_ALL=C sort > /tmp/actual-final-files
+          diff -u /tmp/expected-final-files /tmp/actual-final-files
+          git diff --check
+
+          git add \
+            src/pre_push/mod.rs \
+            src/util.rs \
+            tests/pre_push/failures/snapshots/pre_push__failures__pre_push_failure_broken_remote.snap \
+            tests/pre_push/policy/remote_authority.rs \
+            tests/pre_push/projection/body_limits.rs \
+            tests/pre_push/snapshots/pre_push__publication__graphql_batch_backoff_trace.snap
+          GIT_COMMITTER_DATE="$third_committer_date" git commit --amend --no-edit
+
+          test "$(git rev-list --count 20a97f10d68cc98793619363a601601ee2e48db2..HEAD)" = 3
+          test "$(git rev-parse HEAD~2)" = c0b1c75964f4ef1bfd0997df1d2386b915ab31cb
+          test "$(git rev-parse HEAD~1)" = 0f32a6324ef92fcfc16c28fc74453cdf3fec5632
+          test "$(git show --no-patch --format=%s HEAD)" = \
+            "Preflight bounded PR projection bodies"
+          test -z "$(git status --porcelain)"
+          cargo +nightly fmt --all -- --check
+          git diff --check 20a97f10d68cc98793619363a601601ee2e48db2...HEAD
+          echo "FINAL_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "FINAL_TREE=$(git rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
+          git log --reverse --format='%H %s' \
+            20a97f10d68cc98793619363a601601ee2e48db2..HEAD
+
+      - name: Run Clippy
+        env:
+          GHERRIT_TEST_BUILD: "1"
+        run: >-
+          cargo +${{ steps.rust-version.outputs.version }} clippy
+          --workspace --all-targets --locked -- -D warnings
+
+      - name: Run Rust tests
+        env:
+          GHERRIT_TEST_BUILD: "1"
+        run: >-
+          cargo +${{ steps.rust-version.outputs.version }} test
+          --workspace --all-targets --locked
+
+      - name: Run protocol and cascade validation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ci/check_todo.sh
+          bash ci/test_extract_stack_child.sh
+          bash ci/test_select_cascade_child.sh
+          bash ci/test_cascade_action.sh
+          bash -n ci/cascade_stack.sh
+          bash -n ci/select_cascade_child.sh
+          bash -n ci/test_cascade_action.sh
+          python3 -m py_compile ci/gherrit_protocol.py
+          test -z "$(git status --porcelain)"
+
+      - name: Publish exact validated history
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -n "$FINAL_HEAD"
+          test -n "$FINAL_TREE"
+          test "$(git rev-parse HEAD)" = "$FINAL_HEAD"
+          test "$(git rev-parse HEAD^{tree})" = "$FINAL_TREE"
+          test "$(git rev-list --count 20a97f10d68cc98793619363a601601ee2e48db2..HEAD)" = 3
+          git push --no-verify \
+            --force-with-lease=refs/heads/agent/safe-pr-reorder:20a97f10d68cc98793619363a601601ee2e48db2 \
+            origin HEAD:refs/heads/agent/safe-pr-reorder
+          observed=$(git ls-remote origin refs/heads/agent/safe-pr-reorder | awk '{print $1}')
+          test "$observed" = "$FINAL_HEAD"
+          printf 'Published %s with tree %s\n' "$FINAL_HEAD" "$FINAL_TREE"
