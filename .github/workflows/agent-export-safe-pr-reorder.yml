@@ -1,14 +1,47 @@
-name: Agent export reviewed safe-pr-reorder history
+name: Agent export current safe-pr-reorder history
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - agent/bootstrap-gherrit-build
+    paths:
+      - .github/workflows/agent-export-safe-pr-reorder.yml
 
 permissions:
   contents: read
 
 jobs:
-  disabled:
-    if: ${{ false }}
+  export:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - run: echo disabled
+      - name: Checkout exact reviewed branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/safe-pr-reorder
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Verify and bundle history
+        shell: bash
+        run: |
+          set -euxo pipefail
+          expected=20a97f10d68cc98793619363a601601ee2e48db2
+          test "$(git rev-parse HEAD)" = "$expected"
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          git bundle create /tmp/safe-pr-reorder.bundle HEAD refs/remotes/origin/main
+          git bundle verify /tmp/safe-pr-reorder.bundle
+          tar --exclude=.git -czf /tmp/safe-pr-reorder-source.tar.gz .
+          sha256sum /tmp/safe-pr-reorder.bundle /tmp/safe-pr-reorder-source.tar.gz > /tmp/SHA256SUMS
+
+      - name: Upload exact history
+        uses: actions/upload-artifact@v4
+        with:
+          name: safe-pr-reorder-20a97f
+          path: |
+            /tmp/safe-pr-reorder.bundle
+            /tmp/safe-pr-reorder-source.tar.gz
+            /tmp/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
