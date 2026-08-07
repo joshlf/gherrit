@@ -1,4 +1,4 @@
-name: Agent diagnose review6 Clippy failure
+name: Agent diagnose review6 Rust test failure
 
 on:
   push:
@@ -13,7 +13,7 @@ permissions:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Checkout publisher payload
         uses: actions/checkout@v4
@@ -23,7 +23,7 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
-      - name: Reconstruct formatted candidate
+      - name: Reconstruct semantic candidate
         shell: bash
         run: |
           set -euxo pipefail
@@ -51,14 +51,13 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.rust-version.outputs.version }}
-          components: clippy
 
       - name: Install nightly rustfmt
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
 
-      - name: Apply exact nightly formatting
+      - name: Apply exact formatting and Clippy repair
         shell: bash
         run: |
           set -euxo pipefail
@@ -66,35 +65,65 @@ jobs:
           git diff --binary > /tmp/review6-nightly-rustfmt.patch
           test "$(sha256sum /tmp/review6-nightly-rustfmt.patch | awk '{print $1}')" = \
             c1bc7a18c1acfc149c6edeff234a1d1d2ad00cd693759814414c5e9862d227e2
-          cargo +nightly fmt --all -- --check
+          python3 - <<'PY'
+          from pathlib import Path
 
-      - name: Capture Clippy diagnostics
-        id: clippy
+          path = Path("src/util.rs")
+          text = path.read_text()
+          old = '''            if candidate.is_absolute() || url.starts_with("./") || url.starts_with("../") {
+                          Some(candidate)
+                      } else if workdir.join(&candidate).exists() {
+                          Some(candidate)
+                      } else {
+                          None
+                      }
+          '''
+          new = '''            if candidate.is_absolute()
+                          || url.starts_with("./")
+                          || url.starts_with("../")
+                          || workdir.join(&candidate).exists()
+                      {
+                          Some(candidate)
+                      } else {
+                          None
+                      }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected exactly one Clippy-reported identical-branch pattern")
+          path.write_text(text.replace(old, new))
+          PY
+          cargo +nightly fmt --all
+          cargo +nightly fmt --all -- --check
+          git diff --check
+
+      - name: Capture Rust test diagnostics
+        id: tests
         shell: bash
         env:
           GHERRIT_TEST_BUILD: "1"
+          RUST_BACKTRACE: "1"
         run: |
           set +e
-          cargo +${{ steps.rust-version.outputs.version }} clippy \
-            --workspace --all-targets --locked -- -D warnings \
-            > /tmp/clippy.log 2>&1
+          cargo +${{ steps.rust-version.outputs.version }} test \
+            --workspace --all-targets --locked -- --nocapture \
+            > /tmp/tests.log 2>&1
           status=$?
           set -e
-          cat /tmp/clippy.log
-          printf '%s\n' "$status" > /tmp/clippy.status
+          cat /tmp/tests.log
+          printf '%s\n' "$status" > /tmp/tests.status
           echo "status=$status" >> "$GITHUB_OUTPUT"
 
       - name: Upload diagnostics
         uses: actions/upload-artifact@v4
         with:
-          name: review6-clippy-diagnostics
+          name: review6-test-diagnostics
           path: |
-            /tmp/clippy.log
-            /tmp/clippy.status
+            /tmp/tests.log
+            /tmp/tests.status
           if-no-files-found: error
           retention-days: 1
 
       - name: Preserve diagnostic failure status
-        if: steps.clippy.outputs.status != '0'
+        if: steps.tests.outputs.status != '0'
         shell: bash
         run: exit 1
