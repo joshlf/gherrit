@@ -29,11 +29,29 @@ jobs:
         run: |
           set -euxo pipefail
           base=fa30bb4a86cbb1dbab74e91fa9ba08a422424ec7
+          payload=agent_payloads/review7/safe-pr-reorder-review7.patch.gz.b64
 
-          cat agent_payloads/review7/safe-pr-reorder-review7.patch.gz.b64.* \
-            > /tmp/review7.patch.gz.b64
+          cat > /tmp/review7-chunk-hashes <<'EOF'
+          fab6d82b6fea1640d34bba556bcbcfe6261118d7dca1fb1eef6331346970aa68  000
+          2665c6b2b699a418832ea3bffaeb960b130e4d9134981bbbe994bb51aba258ab  001
+          1d15df491a9076312cb5f0978eb5599eb837e0c8bfd25730ea5b6eff58c33615  002
+          43af376827db74c13abab54aef364d0e1c146a393f26ab6aabe7c9992d786965  003
+          94aadee2363e09f1c112047b4e4d9ca49b965a6840e0b5c6d305fbffcaf4d0e7  004
+          844d9ccbaa416dd63fb7150eeb27b0ec4453d6f5acb7e027499cb2963c7dace5  005
+          b47e71bfab081f52c4cc539e390666a013896da449355758f1361384dbe19957  006
+          be195c81cd9db3947dbc2f9b28cde746983044abafdbb37aeddae5fd791effb1  007
+          010b76b6660423ed88bad6329144920f07ffc90288c30692e93cee7f1c2b20f2  008
+          EOF
+          while read -r expected suffix; do
+            file="$payload.$suffix"
+            test -f "$file"
+            test "$(sha256sum "$file" | awk '{print $1}')" = "$expected"
+          done < /tmp/review7-chunk-hashes
+
+          cat "$payload".??? > /tmp/review7.patch.gz.b64
+          test "$(wc -c < /tmp/review7.patch.gz.b64)" = 12996
           test "$(sha256sum /tmp/review7.patch.gz.b64 | awk '{print $1}')" = \
-            b3e9f2f1253b692ed0baf13dcf71ef4cd3d6861f6d21a82fe7e194b577852bf3
+            b07be4895c7ca6b89598816c300d2ec9132c7978039a0dd4c7f4fd158ce0e136
           base64 --decode /tmp/review7.patch.gz.b64 > /tmp/review7.patch.gz
           test "$(sha256sum /tmp/review7.patch.gz | awk '{print $1}')" = \
             84bb7ae64d33abb13c42515f8006c1d287b6e3bc05dc9fc35da8d031758b8bb3
