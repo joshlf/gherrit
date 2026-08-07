@@ -1,119 +1,14 @@
 name: Agent publish safe-pr-reorder fifth-review fixes
 
 on:
-  push:
-    branches:
-      - agent/bootstrap-gherrit-build
-    paths:
-      - .github/workflows/agent-publish-review5-fixes.yml
-      - agent_payloads/review5/safe-pr-reorder-review5.patch.gz.b64
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  publish:
+  disabled:
+    if: ${{ false }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
     steps:
-      - name: Checkout publisher payload
-        uses: actions/checkout@v4
-        with:
-          ref: agent/bootstrap-gherrit-build
-          fetch-depth: 0
-          fetch-tags: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Reconstruct exact candidate history
-        shell: bash
-        run: |
-          set -euxo pipefail
-          base=3592ac5e18b35e09212b7adcd0d8570ce3497a6f
-          expected_head=20a97f10d68cc98793619363a601601ee2e48db2
-          expected_tree=ae0d9dcb65553ecf37b494f309a2ac1c0ea94bca
-
-          cp agent_payloads/review5/safe-pr-reorder-review5.patch.gz.b64 \
-            /tmp/review5.patch.gz.b64
-          test "$(sha256sum /tmp/review5.patch.gz.b64 | awk '{print $1}')" = \
-            2e8af7b6b13fff05834c0a841c27ce382db9a5780ca2c69b0f257b7af3606811
-          base64 --decode /tmp/review5.patch.gz.b64 \
-            | gzip --decompress \
-            > /tmp/review5.patch
-          test "$(sha256sum /tmp/review5.patch | awk '{print $1}')" = \
-            f93b597c72e3e7102968534c2c66383c899e146033419169ca9213822ce246ea
-
-          git fetch --force origin \
-            refs/heads/agent/safe-pr-reorder:refs/remotes/origin/agent/safe-pr-reorder
-          test "$(git rev-parse refs/remotes/origin/agent/safe-pr-reorder)" = "$base"
-
-          git config user.name "OpenAI Codex"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout --detach "$base"
-          git am --committer-date-is-author-date /tmp/review5.patch
-
-          test "$(git rev-parse HEAD)" = "$expected_head"
-          test "$(git rev-parse HEAD^{tree})" = "$expected_tree"
-          test "$(git rev-list --count "$base"..HEAD)" = 1
-          test "$(git show --no-patch --format=%s HEAD)" = \
-            "Harden cascade consumer and projection safety"
-          git diff --check "$base"...HEAD
-          git log --reverse --format='%H %s' "$base"..HEAD
-
-      - name: Read Rust version
-        id: rust-version
-        shell: bash
-        run: |
-          echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" \
-            >> "$GITHUB_OUTPUT"
-
-      - name: Install project Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.rust-version.outputs.version }}
-          components: clippy
-
-      - name: Install nightly rustfmt
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-
-      - name: Check formatting
-        run: cargo +nightly fmt --all -- --check
-
-      - name: Run Clippy
-        env:
-          GHERRIT_TEST_BUILD: "1"
-        run: >-
-          cargo +${{ steps.rust-version.outputs.version }} clippy
-          --workspace --all-targets --locked -- -D warnings
-
-      - name: Run Rust tests
-        env:
-          GHERRIT_TEST_BUILD: "1"
-        run: >-
-          cargo +${{ steps.rust-version.outputs.version }} test
-          --workspace --all-targets --locked
-
-      - name: Run protocol and cascade validation
-        shell: bash
-        run: |
-          set -euxo pipefail
-          ci/check_todo.sh
-          bash ci/test_extract_stack_child.sh
-          bash ci/test_select_cascade_child.sh
-          bash ci/test_cascade_action.sh
-          bash -n ci/cascade_stack.sh
-          bash -n ci/test_cascade_action.sh
-          python3 -m py_compile ci/gherrit_protocol.py
-
-      - name: Publish exact validated history
-        shell: bash
-        run: |
-          set -euxo pipefail
-          test "$(git rev-parse HEAD)" = \
-            20a97f10d68cc98793619363a601601ee2e48db2
-          test "$(git rev-parse HEAD^{tree})" = \
-            ae0d9dcb65553ecf37b494f309a2ac1c0ea94bca
-          git push \
-            --force-with-lease=refs/heads/agent/safe-pr-reorder:3592ac5e18b35e09212b7adcd0d8570ce3497a6f \
-            origin HEAD:refs/heads/agent/safe-pr-reorder
+      - run: echo disabled
