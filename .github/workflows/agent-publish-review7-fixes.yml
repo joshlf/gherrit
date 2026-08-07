@@ -33,7 +33,7 @@ jobs:
           cat agent_payloads/review7/safe-pr-reorder-review7.patch.gz.b64.* \
             > /tmp/review7.patch.gz.b64
           test "$(sha256sum /tmp/review7.patch.gz.b64 | awk '{print $1}')" = \
-            62784325d28b171f288637289bfb7a5b7293a2c6727582664e936e74ab73f3cf
+            b3e9f2f1253b692ed0baf13dcf71ef4cd3d6861f6d21a82fe7e194b577852bf3
           base64 --decode /tmp/review7.patch.gz.b64 > /tmp/review7.patch.gz
           test "$(sha256sum /tmp/review7.patch.gz | awk '{print $1}')" = \
             84bb7ae64d33abb13c42515f8006c1d287b6e3bc05dc9fc35da8d031758b8bb3
