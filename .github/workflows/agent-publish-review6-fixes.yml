@@ -84,7 +84,7 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Fold exact nightly-rustfmt delta into final commit
+      - name: Fold exact formatting and Clippy repair into final commit
         shell: bash
         run: |
           set -euxo pipefail
@@ -103,6 +103,43 @@ jobs:
           git diff --binary > /tmp/review6-nightly-rustfmt.patch
           test "$(sha256sum /tmp/review6-nightly-rustfmt.patch | awk '{print $1}')" = \
             c1bc7a18c1acfc149c6edeff234a1d1d2ad00cd693759814414c5e9862d227e2
+          git diff --check
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/util.rs")
+          text = path.read_text()
+          old = '''            if candidate.is_absolute() || url.starts_with("./") || url.starts_with("../") {
+                          Some(candidate)
+                      } else if workdir.join(&candidate).exists() {
+                          Some(candidate)
+                      } else {
+                          None
+                      }
+          '''
+          new = '''            if candidate.is_absolute()
+                          || url.starts_with("./")
+                          || url.starts_with("../")
+                          || workdir.join(&candidate).exists()
+                      {
+                          Some(candidate)
+                      } else {
+                          None
+                      }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected exactly one Clippy-reported identical-branch pattern")
+          path.write_text(text.replace(old, new))
+          PY
+
+          cargo +nightly fmt --all
+          if grep -Fq 'else if workdir.join(&candidate).exists()' src/util.rs; then
+            echo 'Clippy-reported duplicate branch remains in src/util.rs' >&2
+            exit 1
+          fi
+          git diff --name-only | LC_ALL=C sort > /tmp/actual-final-files
+          diff -u /tmp/expected-format-files /tmp/actual-final-files
           git diff --check
 
           git add \
