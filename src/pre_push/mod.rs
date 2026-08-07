@@ -49,8 +49,9 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     }
 
     validate_repository_dag_authority(repo)?;
-    let remote_default = observe_remote_default(repo)?;
-    fetch_remote_default(repo, &remote_default)?;
+    let remote = repo.default_remote()?;
+    let remote_default = observe_remote_default(repo, &remote)?;
+    fetch_remote_default(repo, &remote, &remote_default)?;
     let commits = collect_commits(repo, &remote_default).wrap_err("Failed to collect commits")?;
 
     if commits.is_empty() {
@@ -72,12 +73,34 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
     }
 
     let octocrab = builder.build()?;
-    let remote = repo.default_remote()?;
-    let repository = fetch_repository_identity(&octocrab, &remote).await?;
+    let repository = fetch_repository_identity(
+        &octocrab,
+        &remote.owner,
+        &remote.repo_name,
+        "fetch URL",
+    )
+    .await?;
+    let push_repository = fetch_repository_identity(
+        &octocrab,
+        &remote.push_owner,
+        &remote.push_repo_name,
+        "push URL",
+    )
+    .await?;
+    if push_repository.node_id != repository.node_id {
+        bail!(
+            "Remote `{}` fetch repository `{}` (node {}) differs from push repository `{}` (node {}). GHerrit refuses to observe one repository and publish to another.",
+            remote.name,
+            repository.name_with_owner,
+            repository.node_id,
+            push_repository.name_with_owner,
+            push_repository.node_id,
+        );
+    }
 
-    let publication = plan_publication(repo, &commits)?;
+    let publication = plan_publication(repo, &remote, &commits)?;
     validate_ids_against_remote_default(&commits, &remote_default)?;
-    validate_existing_branch_ownership(repo, &publication, &remote_default)?;
+    validate_existing_branch_ownership(repo, &remote, &publication, &remote_default)?;
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
     let candidates = batch_fetch_prs(&remote, &octocrab, &gherrit_ids).await?;
     let prs = select_canonical_prs(&repository, &gherrit_ids, candidates)?;
@@ -88,7 +111,7 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
         batch_fetch_base_consumers(&remote, &octocrab, &rewritten_branches).await?;
     validate_base_consumers(&repository, &prs, &rewritten_branches, &base_consumers)?;
 
-    let staging_bases = plan_pr_staging(repo, &commits, &prs, &publication, &remote_default)?;
+    let staging_bases = plan_pr_staging(repo, &remote, &commits, &prs, &publication, &remote_default)?;
     validate_operational_state(&prs)?;
     for staging in &staging_bases {
         log::debug!(
@@ -124,9 +147,10 @@ pub async fn run(repo: &util::Repo) -> Result<()> {
         &remote_default,
         &staging_bases,
     )?;
-    verify_publication_inputs(repo, &publication, &remote_default)?;
+    verify_publication_inputs(repo, &remote, &publication, &remote_default)?;
 
-    execute_publication(repo, &publication)?;
+    execute_publication(repo, &remote, &publication)?;
+        &remote,
     let latest_versions = publication.latest_versions.clone();
     let default_branch = remote_default.name;
 
@@ -201,8 +225,12 @@ fn validate_repository_dag_authority(repo: &util::Repo) -> Result<()> {
     Ok(())
 }
 
-fn fetch_remote_default(repo: &util::Repo, remote_default: &RemoteDefault) -> Result<()> {
-    fetch_remote_branch_objects(repo, std::slice::from_ref(&remote_default.name))
+fn fetch_remote_default(
+    repo: &util::Repo,
+    remote: &Remote,
+    remote_default: &RemoteDefault,
+) -> Result<()> {
+    fetch_remote_branch_objects(repo, remote, std::slice::from_ref(&remote_default.name))
         .wrap_err("Failed to fetch the publication remote's default branch")?;
     repo.rev_parse_single(remote_default.oid.as_str()).wrap_err_with(|| {
         format!(
@@ -211,7 +239,8 @@ fn fetch_remote_default(repo: &util::Repo, remote_default: &RemoteDefault) -> Re
         )
     })?;
 
-    let observed = get_remote_branch_states(repo, std::slice::from_ref(&remote_default.name))?;
+    let observed =
+        get_remote_branch_states(repo, remote, std::slice::from_ref(&remote_default.name))?;
     if observed.get(&remote_default.name).and_then(Option::as_deref)
         != Some(remote_default.oid.as_str())
     {
@@ -301,11 +330,12 @@ fn validate_existing_branch_ownership(
         .filter_map(|(branch, oid)| oid.as_ref().map(|oid| (branch, oid)))
         .collect::<Vec<_>>();
     if existing.is_empty() {
+    remote: &Remote,
         return Ok(());
     }
 
     let branches = existing.iter().map(|(branch, _)| (*branch).clone()).collect::<Vec<_>>();
-    fetch_remote_branch_objects(repo, &branches)
+    fetch_remote_branch_objects(repo, remote, &branches)
         .wrap_err("Failed to fetch existing managed branches for ownership validation")?;
 
     let default_oid = repo.rev_parse_single(remote_default.oid.as_str())?;
@@ -448,11 +478,15 @@ struct RemoteVersion {
     target_oid: String,
 }
 
-fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<PublicationPlan> {
+fn plan_publication(
+    repo: &util::Repo,
+    remote: &Remote,
+    commits: &[Commit],
+) -> Result<PublicationPlan> {
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
-    let expected_heads = get_remote_branch_states(repo, &gherrit_ids)
+    let expected_heads = get_remote_branch_states(repo, remote, &gherrit_ids)
         .wrap_err("Failed to observe remote GHerrit branches")?;
-    let remote_versions = get_remote_versions(repo, &gherrit_ids)
+    let remote_versions = get_remote_versions(repo, remote, &gherrit_ids)
         .wrap_err("Failed to observe remote GHerrit patch versions")?;
 
     let mut latest_versions = HashMap::new();
@@ -524,7 +558,7 @@ fn plan_publication(repo: &util::Repo, commits: &[Commit]) -> Result<Publication
         }
 
         if !targets.is_empty() {
-            batches.push(plan_push(&repo.default_remote_name(), &targets));
+            batches.push(plan_push(remote.git_url(), &targets));
         }
     }
 
@@ -544,7 +578,11 @@ fn rewritten_existing_branches(publication: &PublicationPlan) -> Vec<String> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn execute_publication(repo: &util::Repo, publication: &PublicationPlan) -> Result<()> {
+fn execute_publication(
+    repo: &util::Repo,
+    remote: &Remote,
+    publication: &PublicationPlan,
+) -> Result<()> {
     for plan in &publication.batches {
         log::info!("Pushing chunk to remote...");
         let mut child = util::cmd("git", &plan.arguments)
@@ -557,6 +595,7 @@ fn execute_publication(repo: &util::Repo, publication: &PublicationPlan) -> Resu
             use std::io::{BufRead, BufReader};
             let stderr = child.stderr.take().unwrap();
             let reader = BufReader::new(stderr);
+            .current_dir(repo.workdir().unwrap_or(repo.path()))
             let mut remote_buffer: Vec<String> = Vec::new();
             let flush_buffer = |buf: &mut Vec<String>| {
                 if buf.is_empty() {
@@ -586,7 +625,7 @@ fn execute_publication(repo: &util::Repo, publication: &PublicationPlan) -> Resu
 
         let status = child.wait().unwrap();
         if !status.success() {
-            match classify_push_outcome(repo, plan).wrap_err(
+            match classify_push_outcome(repo, remote, plan).wrap_err(
                 "`git push` failed and GHerrit could not determine the resulting remote state",
             )? {
                 PushOutcome::Applied => {
@@ -619,9 +658,13 @@ enum PushOutcome {
     Inconsistent(Vec<String>),
 }
 
-fn classify_push_outcome(repo: &util::Repo, plan: &PushPlan) -> Result<PushOutcome> {
+fn classify_push_outcome(
+    repo: &util::Repo,
+    remote: &Remote,
+    plan: &PushPlan,
+) -> Result<PushOutcome> {
     let refs = plan.ref_updates.iter().map(|update| update.ref_name.clone()).collect::<Vec<_>>();
-    let observed = get_remote_ref_states(repo, &refs)?;
+    let observed = get_remote_ref_states(repo, remote, &refs)?;
     let all_after = plan.ref_updates.iter().all(|update| {
         observed.get(&update.ref_name).and_then(Option::as_deref)
             == Some(update.desired_after.as_str())
@@ -661,10 +704,13 @@ fn get_remote_ref_states(
     let mut states =
         refs.iter().cloned().map(|reference| (reference, None)).collect::<HashMap<_, _>>();
     for chunk in remote_query_batches(refs) {
-        let mut args = vec!["ls-remote".to_string(), repo.default_remote_name()];
+        let mut args = vec!["ls-remote".to_string(), remote.git_url().to_string()];
         args.extend(chunk.iter().cloned());
-        let output = util::cmd("git", args).checked_output()?;
+        let mut command = util::cmd("git", args);
+        command.current_dir(repo.workdir().unwrap_or(repo.path()));
+        let output = command.checked_output()?;
         for line in core::str::from_utf8(&output.stdout)?.lines() {
+    remote: &Remote,
             let Some((oid, reference)) = line.split_once('\t') else {
                 continue;
             };
@@ -698,10 +744,13 @@ fn get_remote_branch_states(
     let mut states: HashMap<String, Option<String>> =
         gherrit_ids.iter().cloned().map(|id| (id, None)).collect();
     for chunk in remote_query_batches(gherrit_ids) {
-        let mut args = vec!["ls-remote".to_string(), repo.default_remote_name()];
+        let mut args = vec!["ls-remote".to_string(), remote.git_url().to_string()];
         args.extend(chunk.iter().map(|id| format!("refs/heads/{id}")));
 
-        let output = util::cmd("git", args).checked_output()?;
+        let mut command = util::cmd("git", args);
+        command.current_dir(repo.workdir().unwrap_or(repo.path()));
+        let output = command.checked_output()?;
+    remote: &Remote,
         let output = core::str::from_utf8(&output.stdout)?;
 
         for line in output.lines() {
@@ -734,10 +783,13 @@ fn get_remote_versions(
     let mut observations: HashMap<(String, usize), TagObservation> = HashMap::new();
     for chunk in remote_query_batches(gherrit_ids) {
         let mut args =
-            vec!["ls-remote".to_string(), "--tags".to_string(), repo.default_remote_name()];
+            vec!["ls-remote".to_string(), "--tags".to_string(), remote.git_url().to_string()];
         args.extend(chunk.iter().map(|id| format!("refs/tags/gherrit/{id}/v*")));
-        let output = util::cmd("git", args).checked_output()?;
+        let mut command = util::cmd("git", args);
+        command.current_dir(repo.workdir().unwrap_or(repo.path()));
+        let output = command.checked_output()?;
         parse_remote_version_lines(
+    remote: &Remote,
             core::str::from_utf8(&output.stdout)?,
             gherrit_ids,
             &mut observations,
@@ -850,9 +902,10 @@ fn parse_remote_version_lines(
     Ok(())
 }
 
-fn observe_remote_default(repo: &util::Repo) -> Result<RemoteDefault> {
-    let remote = repo.default_remote_name();
-    let output = util::cmd("git", ["ls-remote", "--symref", &remote, "HEAD"])
+fn observe_remote_default(repo: &util::Repo, remote: &Remote) -> Result<RemoteDefault> {
+    let mut command = util::cmd("git", ["ls-remote", "--symref", remote.git_url(), "HEAD"]);
+    command.current_dir(repo.workdir().unwrap_or(repo.path()));
+    let output = command
         .checked_output()
         .wrap_err("Failed to observe the publication remote's default branch")?;
     let output = core::str::from_utf8(&output.stdout)?;
@@ -886,13 +939,14 @@ fn plan_pr_staging(
     relevant_branches.extend(
         publication
             .expected_heads
+    remote: &Remote,
             .iter()
             .filter_map(|(branch, oid)| oid.as_ref().map(|_| branch.clone())),
     );
     relevant_branches.extend(prs.iter().map(|pr| pr.base_branch.clone()));
 
     let relevant_branches = relevant_branches.into_iter().collect::<Vec<_>>();
-    let observed = get_remote_branch_states(repo, &relevant_branches)
+    let observed = get_remote_branch_states(repo, remote, &relevant_branches)
         .wrap_err("Failed to re-observe candidate PR base branches")?;
     if observed.get(&remote_default.name).and_then(Option::as_deref)
         != Some(remote_default.oid.as_str())
@@ -912,7 +966,7 @@ fn plan_pr_staging(
         }
     }
 
-    fetch_remote_branch_objects(repo, &relevant_branches)?;
+    fetch_remote_branch_objects(repo, remote, &relevant_branches)?;
 
     let mut trajectories = HashMap::<String, Vec<String>>::new();
     insert_oid(trajectories.entry(remote_default.name.clone()).or_default(), &remote_default.oid);
@@ -962,17 +1016,23 @@ fn insert_oid(oids: &mut Vec<String>, oid: &str) {
     }
 }
 
-fn fetch_remote_branch_objects(repo: &util::Repo, branches: &[String]) -> Result<()> {
+fn fetch_remote_branch_objects(
+    repo: &util::Repo,
+    remote: &Remote,
+    branches: &[String],
+) -> Result<()> {
     for chunk in remote_query_batches(branches) {
         let mut args = vec![
             "fetch".to_string(),
             "--quiet".to_string(),
             "--no-tags".to_string(),
             "--no-write-fetch-head".to_string(),
-            repo.default_remote_name(),
+            remote.git_url().to_string(),
         ];
         args.extend(chunk.iter().map(|branch| format!("refs/heads/{branch}")));
-        util::cmd("git", args)
+        let mut command = util::cmd("git", args);
+        command.current_dir(repo.workdir().unwrap_or(repo.path()));
+        command
             .success()
             .wrap_err("Failed to fetch remote objects required for reachability checks")?;
     }
@@ -1140,9 +1200,10 @@ fn verify_staging_bases(
     remote_default: &RemoteDefault,
     expected: &[StagingBase],
 ) -> Result<()> {
-    let actual = plan_pr_staging(repo, commits, prs, publication, remote_default)?;
+    let actual = plan_pr_staging(repo, remote, commits, prs, publication, remote_default)?;
     for expected in expected {
         let actual = actual
+    remote: &Remote,
             .iter()
             .find(|actual| actual.head_branch == expected.head_branch)
             .ok_or_else(|| eyre!("Prepared PR #{} disappeared", expected.number))?;
@@ -1167,10 +1228,11 @@ fn verify_publication_inputs(
 ) -> Result<()> {
     let mut branches = publication.expected_heads.keys().cloned().collect::<Vec<_>>();
     branches.push(remote_default.name.clone());
-    let observed = get_remote_branch_states(repo, &branches)
+    let observed = get_remote_branch_states(repo, remote, &branches)
         .wrap_err("Failed to verify remote refs after preparing PR bases")?;
 
     for (branch, expected) in &publication.expected_heads {
+    remote: &Remote,
         if observed.get(branch) != Some(expected) {
             bail!("Remote branch `{branch}` changed after PR base preparation");
         }
@@ -1791,16 +1853,19 @@ async fn fetch_repository_identity(
     let query_body = json!({
         "query": query,
         "variables": {
-            "owner": remote.owner,
-            "name": remote.repo_name,
+            "owner": owner,
+            "name": repo_name,
         }
     });
     let response: serde_json::Value =
-        octocrab.graphql(&query_body).await.wrap_err("Failed to fetch repository ID")?;
+        octocrab
+            .graphql(&query_body)
+            .await
+            .wrap_err_with(|| format!("Failed to fetch repository ID for remote {source}"))?;
 
     if let Some(errors) = response.get("errors") {
         log::error!("GraphQL errors: {}", errors);
-        bail!("Failed to fetch repository ID: {:?}", errors);
+        bail!("Failed to fetch repository ID for remote {source}: {errors:?}");
     }
 
     let repository = json_get!(response["data"]["repository"])?;
@@ -1890,7 +1955,9 @@ async fn batch_create_prs(
 }
 
 async fn create_prs_recoverably(
-    remote: &Remote,
+    owner: &str,
+    repo_name: &str,
+    source: &str,
     repository: &RepositoryIdentity,
     octocrab: &Octocrab,
     creations: Vec<BatchCreate>,

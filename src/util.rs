@@ -184,12 +184,77 @@ impl Repo {
     }
 
     pub fn default_remote(&self) -> Result<Remote> {
-        let remote_name = self.default_remote_name();
-        let remote_url = self
-            .config_string(&format!("remote.{}.url", remote_name))?
-            .ok_or_else(|| eyre!("Remote '{}' missing URL", remote_name))?;
-        let (owner, repo_name) = get_repo_owner_name(remote_url.as_str())?;
-        Ok(Remote { owner, repo_name })
+        let name = self.default_remote_name();
+        let fetch_urls = self.effective_remote_urls(&name, false)?;
+        let push_urls = self.effective_remote_urls(&name, true)?;
+
+        let [fetch_url] = fetch_urls.as_slice() else {
+            bail!(
+                "Remote `{name}` has {} effective fetch URLs; GHerrit requires exactly one publication destination",
+                fetch_urls.len()
+            );
+        };
+        let [push_url] = push_urls.as_slice() else {
+            bail!(
+                "Remote `{name}` has {} effective push URLs; GHerrit refuses multi-destination publication",
+                push_urls.len()
+            );
+        };
+
+        let workdir = self.workdir().unwrap_or(self.path());
+        let fetch_endpoint = RemoteEndpoint::parse(fetch_url, workdir)?;
+        let push_endpoint = RemoteEndpoint::parse(push_url, workdir)?;
+        if !fetch_endpoint.same_authority(&push_endpoint) {
+            bail!(
+                "Remote `{name}` has effective fetch and push URLs that resolve to different Git authorities; GHerrit refuses to observe one repository and publish to another"
+            );
+        }
+        if !__TESTING && !fetch_endpoint.is_github_com() {
+            bail!(
+                "Remote `{name}` cannot be authenticated against GitHub.com. Use a direct github.com URL rather than a local path, mirror, or SSH host alias."
+            );
+        }
+
+        let (owner, repo_name) = get_repo_owner_name(&fetch_endpoint.git_url)?;
+        let (push_owner, push_repo_name) = get_repo_owner_name(&push_endpoint.git_url)?;
+        Ok(Remote {
+            name,
+            push_url: push_endpoint.git_url,
+            owner,
+            repo_name,
+            push_owner,
+            push_repo_name,
+        })
+    }
+
+    fn effective_remote_urls(&self, name: &str, push: bool) -> Result<Vec<String>> {
+        let mut args = vec!["remote", "get-url"];
+        if push {
+            args.push("--push");
+        }
+        args.extend(["--all", name]);
+
+        let mut command = cmd("git", args);
+        command.current_dir(self.workdir().unwrap_or(self.path()));
+        let output = command.checked_output().wrap_err_with(|| {
+            format!(
+                "Failed to resolve effective {} URLs for remote `{name}`",
+                if push { "push" } else { "fetch" }
+            )
+        })?;
+        let urls = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if urls.is_empty() {
+            bail!(
+                "Remote `{name}` has no effective {} URL",
+                if push { "push" } else { "fetch" }
+            );
+        }
+        Ok(urls)
     }
 
     fn find_default_branches(&self, remote_name: &str) -> Vec<String> {
@@ -305,12 +370,128 @@ impl std::ops::Deref for Repo {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteAuthority {
+    Local(PathBuf),
+    Network(String),
+    Unqualified(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteEndpoint {
+    authority: RemoteAuthority,
+    git_url: String,
+}
+
+impl RemoteEndpoint {
+    fn parse(url: &str, workdir: &std::path::Path) -> Result<Self> {
+        let path = if let Some(path) = url.strip_prefix("file://") {
+            Some(PathBuf::from(path))
+        } else {
+            let candidate = PathBuf::from(url);
+            if candidate.is_absolute() || url.starts_with("./") || url.starts_with("../") {
+                Some(candidate)
+            } else if workdir.join(&candidate).exists() {
+                Some(candidate)
+            } else {
+                None
+            }
+        };
+        if let Some(path) = path {
+            let path = if path.is_absolute() { path } else { workdir.join(path) };
+            let path = path.canonicalize().unwrap_or(path);
+            return Ok(Self {
+                git_url: path.to_string_lossy().into_owned(),
+                authority: RemoteAuthority::Local(path),
+            });
+        }
+
+        if let Some((scheme, remainder)) = url.split_once("://") {
+            if scheme.eq_ignore_ascii_case("file") {
+                return Err(eyre!("Invalid file remote URL `{url}`"));
+            }
+            let authority = remainder.split('/').next().unwrap_or_default();
+            let authority = authority.rsplit('@').next().unwrap_or(authority);
+            if authority.is_empty() {
+                return Err(eyre!("Remote URL `{url}` has no network authority"));
+            }
+            let mut authority = authority.trim_end_matches('.').to_ascii_lowercase();
+            let default_port = match scheme.to_ascii_lowercase().as_str() {
+                "http" => Some(":80"),
+                "https" => Some(":443"),
+                "ssh" => Some(":22"),
+                _ => None,
+            };
+            if let Some(port) = default_port
+                && authority.ends_with(port)
+            {
+                authority.truncate(authority.len() - port.len());
+            }
+            return Ok(Self {
+                authority: RemoteAuthority::Network(authority),
+                git_url: url.to_string(),
+            });
+        }
+
+        if let Some((authority, _)) = url.split_once(':')
+            && !authority.contains('/')
+        {
+            let authority = authority.rsplit('@').next().unwrap_or(authority);
+            if !authority.is_empty() {
+                return Ok(Self {
+                    authority: RemoteAuthority::Network(
+                        authority.trim_end_matches('.').to_ascii_lowercase(),
+                    ),
+                    git_url: url.to_string(),
+                });
+            }
+        }
+
+        Ok(Self {
+            authority: RemoteAuthority::Unqualified(url.to_string()),
+            git_url: url.to_string(),
+        })
+    }
+
+    fn same_authority(&self, other: &Self) -> bool {
+        match (&self.authority, &other.authority) {
+            (RemoteAuthority::Network(left), RemoteAuthority::Network(right)) => {
+                github_authority(left) == github_authority(right)
+            }
+            _ => self.authority == other.authority,
+        }
+    }
+
+    fn is_github_com(&self) -> bool {
+        matches!(
+            &self.authority,
+            RemoteAuthority::Network(authority) if github_authority(authority) == "github.com"
+        )
+    }
+}
+
+fn github_authority(authority: &str) -> &str {
+    match authority {
+        "ssh.github.com" => "github.com",
+        authority => authority,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Remote {
+    pub name: String,
+    pub push_url: String,
     pub owner: String,
     pub repo_name: String,
+    pub push_owner: String,
+    pub push_repo_name: String,
 }
 
 impl Remote {
+    pub fn git_url(&self) -> &str {
+        &self.push_url
+    }
+
     pub fn pr_url(&self, pr_number: u64) -> String {
         format!("https://github.com/{}/{}/pull/{}", self.owner, self.repo_name, pr_number)
     }
@@ -434,6 +615,42 @@ mod tests {
     #[should_panic(expected = "Command cannot be empty")]
     fn test_cmd_macro_whitespace_panic() {
         cmd!("   ");
+    }
+
+    #[test]
+    fn remote_endpoints_pin_one_github_authority() {
+        let workdir = std::path::Path::new(".");
+        let https = RemoteEndpoint::parse(
+            "https://github.com/owner/repository.git",
+            workdir,
+        )
+        .unwrap();
+        let ssh = RemoteEndpoint::parse("git@ssh.github.com:owner/repository.git", workdir)
+            .unwrap();
+        assert!(https.same_authority(&ssh));
+        assert!(https.is_github_com());
+        assert!(ssh.is_github_com());
+
+        let other = RemoteEndpoint::parse("git@example.com:owner/repository.git", workdir)
+            .unwrap();
+        assert!(!https.same_authority(&other));
+        assert!(!other.is_github_com());
+    }
+
+    #[test]
+    fn remote_endpoints_canonicalize_equivalent_local_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("owner/repository.git");
+        std::fs::create_dir_all(&repository).unwrap();
+        let relative = repository.strip_prefix(root.path()).unwrap().to_string_lossy();
+        let path = RemoteEndpoint::parse(&relative, root.path()).unwrap();
+        let file = RemoteEndpoint::parse(
+            &format!("file://{}", repository.display()),
+            root.path(),
+        )
+        .unwrap();
+        assert!(path.same_authority(&file));
+        assert_eq!(path.git_url, file.git_url);
     }
 
     #[test]

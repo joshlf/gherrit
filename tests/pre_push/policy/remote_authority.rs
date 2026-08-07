@@ -129,3 +129,111 @@ fn rejects_common_grafts_from_a_linked_worktree_before_mutation() {
         .stderr(predicate::str::contains(".git/info/grafts"));
     assert!(ctx.remote_refs("refs/heads/G").is_empty());
 }
+
+#[test]
+fn rejects_a_pushurl_that_targets_a_different_repository_before_mutation() {
+    let ctx = context();
+    ctx.checkout_new("different-pushurl");
+    ctx.commit("Feature change");
+
+    let other = ctx.dir.path().join("other-owner").join("other-repository.git");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    ctx.init_bare_repo(&other);
+    ctx.git_cmd()
+        .arg("push")
+        .args(["--quiet", "--no-verify"])
+        .arg(&other)
+        .arg("main:refs/heads/main")
+        .assert()
+        .success();
+    ctx.git_cmd()
+        .args(["remote", "set-url", "--push", "origin"])
+        .arg(&other)
+        .assert()
+        .success();
+
+    let original_refs = ctx.remote_refs("refs");
+    let other_refs = ctx
+        .git_cmd()
+        .arg("--git-dir")
+        .arg(&other)
+        .args(["for-each-ref", "--format=%(refname)", "refs"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("different Git authorities"));
+    assert_eq!(ctx.remote_refs("refs"), original_refs);
+    assert_eq!(
+        ctx.git_cmd()
+            .arg("--git-dir")
+            .arg(&other)
+            .args(["for-each-ref", "--format=%(refname)", "refs"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+        other_refs
+    );
+}
+
+#[test]
+fn rejects_multiple_pushurls_before_mutation() {
+    let ctx = context();
+    ctx.checkout_new("multiple-pushurls");
+    ctx.commit("Feature change");
+
+    let first = ctx.dir.path().join("first.git");
+    let second = ctx.dir.path().join("second.git");
+    ctx.init_bare_repo(&first);
+    ctx.init_bare_repo(&second);
+    ctx.git_cmd()
+        .args(["remote", "set-url", "--push", "origin"])
+        .arg(&first)
+        .assert()
+        .success();
+    ctx.git_cmd()
+        .args(["remote", "set-url", "--add", "--push", "origin"])
+        .arg(&second)
+        .assert()
+        .success();
+
+    let original_refs = ctx.remote_refs("refs");
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("effective push URLs"))
+        .stderr(predicate::str::contains("multi-destination"));
+    assert_eq!(ctx.remote_refs("refs"), original_refs);
+}
+
+#[test]
+fn accepts_equivalent_file_and_path_urls_for_one_repository() {
+    let ctx = context();
+    let remote = ctx
+        .dir
+        .path()
+        .join(testutil::DEFAULT_OWNER)
+        .join(format!("{}.git", testutil::DEFAULT_REPO));
+    ctx.git_cmd()
+        .args(["remote", "set-url", "origin"])
+        .arg(format!("file://{}", remote.display()))
+        .assert()
+        .success();
+    ctx.git_cmd()
+        .args(["remote", "set-url", "--push", "origin"])
+        .arg(&remote)
+        .assert()
+        .success();
+
+    ctx.checkout_new("equivalent-remote-urls");
+    ctx.commit("Feature change");
+    ctx.hook_cmd("pre-push").assert().success();
+    assert_eq!(ctx.remote_refs("refs/heads/G").len(), 1);
+}
