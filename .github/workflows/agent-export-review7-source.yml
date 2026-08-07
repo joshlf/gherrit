@@ -29,7 +29,7 @@ jobs:
           set -euxo pipefail
           expected=fa30bb4a86cbb1dbab74e91fa9ba08a422424ec7
           test "$(git rev-parse HEAD)" = "$expected"
-          git branch -f agent/safe-pr-reorder HEAD
+          test "$(git rev-parse refs/heads/agent/safe-pr-reorder)" = "$expected"
           git bundle create /tmp/safe-pr-reorder-review7.bundle \
             refs/heads/agent/safe-pr-reorder
           git bundle verify /tmp/safe-pr-reorder-review7.bundle
