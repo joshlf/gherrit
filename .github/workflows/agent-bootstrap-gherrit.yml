@@ -1,102 +1,14 @@
 name: Agent publish safe-pr-reorder fourth-review fixes
 
 on:
-  push:
-    branches:
-      - agent/bootstrap-gherrit-build
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  publish:
+  disabled:
+    if: ${{ false }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
-      - name: Checkout publisher payload
-        uses: actions/checkout@v4
-        with:
-          ref: agent/bootstrap-gherrit-build
-          fetch-depth: 0
-          fetch-tags: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Reconstruct and verify candidate history
-        run: |
-          set -euxo pipefail
-
-          cat agent_payloads/review3/safe-pr-reorder-review3.patch.gz.b64.* \
-            > /tmp/review3.patch.gz.b64
-          test "$(sha256sum /tmp/review3.patch.gz.b64 | awk '{print $1}')" = \
-            a4f14777c5260965eb484f20f42d05118f38d9acd7d10714760b0150fd8e1f1b
-          base64 --decode /tmp/review3.patch.gz.b64 \
-            | gzip --decompress \
-            > /tmp/review3.patch
-          test "$(sha256sum /tmp/review3.patch | awk '{print $1}')" = \
-            a97b2e99bd0212899a9fb08f9c85e99b8c6709903cabc79e57c819b328cac199
-
-          git fetch --force origin \
-            refs/heads/agent/safe-pr-reorder:refs/remotes/origin/agent/safe-pr-reorder
-          test "$(git rev-parse refs/remotes/origin/agent/safe-pr-reorder)" = \
-            42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout --detach 42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6
-          git am /tmp/review3.patch
-
-          test "$(git rev-list --count 42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6..HEAD)" = 2
-          test "$(git rev-parse HEAD^{tree})" = 4e16322fc842949550d6a0c0efef24b385b86eab
-          test "$(git show --no-patch --format=%s HEAD~1)" = \
-            "Protect and recover cascade transitions"
-          test "$(git show --no-patch --format=%s HEAD)" = \
-            "Check grafts in the common Git directory"
-          git diff --check 42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6...HEAD
-          git log --reverse --format='%H %s' \
-            42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6..HEAD
-
-      - name: Read Rust version
-        id: rust-version
-        run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
-
-      - name: Install project Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.rust-version.outputs.version }}
-          components: clippy
-
-      - name: Install nightly rustfmt
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-
-      - name: Check formatting
-        run: cargo +nightly fmt --all -- --check
-
-      - name: Run Clippy
-        env:
-          GHERRIT_TEST_BUILD: "1"
-        run: cargo +${{ steps.rust-version.outputs.version }} clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: Run Rust tests
-        env:
-          GHERRIT_TEST_BUILD: "1"
-        run: cargo +${{ steps.rust-version.outputs.version }} test --workspace --all-targets --locked
-
-      - name: Run protocol and cascade validation
-        run: |
-          set -euxo pipefail
-          ci/check_todo.sh
-          bash ci/test_extract_stack_child.sh
-          bash ci/test_select_cascade_child.sh
-          bash ci/test_cascade_action.sh
-          bash -n ci/cascade_stack.sh
-          python3 -m py_compile ci/gherrit_protocol.py
-
-      - name: Publish exact validated history
-        run: |
-          set -euxo pipefail
-          test "$(git rev-parse HEAD^{tree})" = 4e16322fc842949550d6a0c0efef24b385b86eab
-          git push \
-            --force-with-lease=refs/heads/agent/safe-pr-reorder:42e1ff1e5a99f8d7a4a966ca60b9245cbc1609a6 \
-            origin HEAD:refs/heads/agent/safe-pr-reorder
+      - run: echo disabled
