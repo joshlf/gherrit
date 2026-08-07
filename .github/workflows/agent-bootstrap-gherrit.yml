@@ -76,12 +76,12 @@ jobs:
       - name: Run Clippy
         env:
           GHERRIT_TEST_BUILD: "1"
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo +${{ steps.rust-version.outputs.version }} clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run Rust tests
         env:
           GHERRIT_TEST_BUILD: "1"
-        run: cargo test --workspace --all-targets --locked
+        run: cargo +${{ steps.rust-version.outputs.version }} test --workspace --all-targets --locked
 
       - name: Run protocol and cascade validation
         run: |
