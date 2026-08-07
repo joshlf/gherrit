@@ -27,7 +27,7 @@ jobs:
           cat agent_payloads/review3/safe-pr-reorder-review3.patch.gz.b64.* \
             > /tmp/review3.patch.gz.b64
           test "$(sha256sum /tmp/review3.patch.gz.b64 | awk '{print $1}')" = \
-            50d14daf2ca0328733e32d4c3a9d924466db5cb95c8996c6e066f657a3e05388
+            a4f14777c5260965eb484f20f42d05118f38d9acd7d10714760b0150fd8e1f1b
           base64 --decode /tmp/review3.patch.gz.b64 \
             | gzip --decompress \
             > /tmp/review3.patch
