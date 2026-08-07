@@ -16,6 +16,119 @@ for name in "${required[@]}"; do
   fi
 done
 
+configure_github_cli() {
+  local token
+  GH_HOST=$(
+    python3 - "$GITHUB_SERVER_URL" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+parsed = urlparse(sys.argv[1])
+scheme = parsed.scheme.casefold()
+try:
+    port = parsed.port
+except ValueError:
+    port = None
+    invalid_port = True
+else:
+    invalid_port = False
+if (
+    scheme not in ("http", "https")
+    or parsed.hostname is None
+    or parsed.username is not None
+    or parsed.password is not None
+    or parsed.path not in ("", "/")
+    or parsed.params
+    or parsed.query
+    or parsed.fragment
+    or invalid_port
+):
+    print("::error::GITHUB_SERVER_URL is not a canonical HTTP(S) server URL.", file=sys.stderr)
+    raise SystemExit(1)
+host = parsed.hostname.rstrip(".").casefold()
+default_port = 80 if scheme == "http" else 443
+if port is not None and port != default_port:
+    host = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+print(host)
+PY
+  )
+  token=${GHERRIT_TOKEN:-${GH_TOKEN:-${GH_ENTERPRISE_TOKEN:-}}}
+  if [[ -z $token ]]; then
+    echo "::error::Missing GitHub API token."
+    exit 1
+  fi
+
+  export GH_HOST
+  if [[ $GH_HOST == github.com ]]; then
+    export GH_TOKEN=$token
+    unset GH_ENTERPRISE_TOKEN
+  else
+    export GH_ENTERPRISE_TOKEN=$token
+    unset GH_TOKEN
+  fi
+  REPOSITORY_URL=${GITHUB_SERVER_URL%/}/$TARGET_REPOSITORY
+}
+
+gh_graphql() {
+  gh api graphql --hostname "$GH_HOST" "$@"
+}
+
+validate_pinned_git_url() {
+  local url=$1 role=$2 resolved rewrite_file status
+
+  resolved=$(git ls-remote --get-url "$url") || {
+    echo "::error::Could not validate the pinned $role URL '$url'."
+    exit 1
+  }
+  if [[ "$resolved" != "$url" ]]; then
+    echo "::error::Pinned $role URL '$url' is not a fixed point under active Git URL rewrites; Git would resolve it again to '$resolved'."
+    exit 1
+  fi
+
+  [[ $role == push ]] || return 0
+  rewrite_file=$(mktemp)
+  if git config --null --includes --get-regexp '^url\..*\.pushinsteadof$' \
+    >"$rewrite_file"; then
+    :
+  else
+    status=$?
+    if (( status != 1 )); then
+      rm -f "$rewrite_file"
+      echo "::error::Could not inspect active pushInsteadOf rewrites."
+      exit 1
+    fi
+  fi
+  if ! python3 - "$url" "$rewrite_file" <<'PY'
+import sys
+from pathlib import Path
+
+url = sys.argv[1]
+for entry in Path(sys.argv[2]).read_bytes().split(b"\0"):
+    if not entry:
+        continue
+    if b"\n" not in entry:
+        print("::error::Git returned a malformed pushInsteadOf configuration entry.", file=sys.stderr)
+        raise SystemExit(1)
+    key, prefix = entry.split(b"\n", 1)
+    key_text = key.decode("utf-8", "surrogateescape")
+    prefix_text = prefix.decode("utf-8", "surrogateescape")
+    if not prefix_text or url.startswith(prefix_text):
+        print(
+            f"::error::Pinned push URL '{url}' can still be rewritten by active Git configuration "
+            f"'{key_text}' with prefix '{prefix_text}'.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+PY
+  then
+    rm -f "$rewrite_file"
+    exit 1
+  fi
+  rm -f "$rewrite_file"
+}
+
+configure_github_cli
+
 validate_repository_dag_authority() {
   local shallow common_dir grafts
 
@@ -65,6 +178,9 @@ resolve_publication_remote() {
     exit 1
   fi
 
+  validate_pinned_git_url "${fetch_urls[0]}" fetch
+  validate_pinned_git_url "${push_urls[0]}" push
+
   remote_target=$(
     python3 "$action_path/ci/gherrit_protocol.py" remote-target \
       --fetch "${fetch_urls[0]}" \
@@ -87,7 +203,7 @@ resolve_publication_remote() {
   push_owner=$(jq -er '.pushOwner' <<<"$remote_target")
   push_repository=$(jq -er '.pushRepository' <<<"$remote_target")
   lookup=$(
-    gh api graphql \
+    gh_graphql \
       -f fetchOwner="$fetch_owner" \
       -f fetchName="$fetch_repository" \
       -f pushOwner="$push_owner" \
@@ -139,7 +255,7 @@ PUBLISH_URL=
 resolve_publication_remote
 
 MERGED_LOOKUP=$(
-  gh api graphql \
+  gh_graphql \
     -f owner="$OWNER" \
     -f name="$REPOSITORY_NAME" \
     -F number="$MERGED_PR_NUMBER" \
@@ -215,7 +331,7 @@ export GIT_NO_REPLACE_OBJECTS=1
 echo "Merged PR indicates next child is ID: $CHILD_ID"
 
 query_child() {
-  gh api graphql \
+  gh_graphql \
     -f owner="$OWNER" \
     -f name="$REPOSITORY_NAME" \
     -f head="$CHILD_ID" \
@@ -436,7 +552,7 @@ DESIRED_BODY=$(
       --id "$CHILD_ID" \
       --parent "$MERGED_PR_HEAD" \
       --latest "$PROSPECTIVE_VERSION" \
-      --repo-url "https://github.com/$TARGET_REPOSITORY" \
+      --repo-url "$REPOSITORY_URL" \
       --base "$DEFAULT_BRANCH"
 )
 
@@ -461,7 +577,7 @@ verify_child_association() {
 }
 
 query_base_consumers() {
-  gh api graphql \
+  gh_graphql \
     -f owner="$OWNER" \
     -f name="$REPOSITORY_NAME" \
     -f base="$CHILD_ID" \
@@ -637,7 +753,7 @@ if [[ $needs_projection_update == true ]]; then
         }
       }' \
       '{query: $query, variables: {prId: $prId, base: $base, body: .}}' |
-    gh api graphql --input - >/dev/null; then
+    gh_graphql --input - >/dev/null; then
     update_failed=true
   fi
 fi

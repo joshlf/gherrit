@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use predicates::prelude::*;
 
 fn context() -> testutil::TestContext {
@@ -7,6 +9,39 @@ fn context() -> testutil::TestContext {
         .with_initial_commit()
         .with_mock_github()
         .build()
+}
+
+fn remote_path(ctx: &testutil::TestContext) -> PathBuf {
+    ctx.dir.path().join(testutil::DEFAULT_OWNER).join(format!("{}.git", testutil::DEFAULT_REPO))
+}
+
+fn ref_state(ctx: &testutil::TestContext, git_dir: &Path) -> Vec<u8> {
+    ctx.git_cmd()
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["for-each-ref", "--format=%(refname) %(objectname)", "refs"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone()
+}
+
+fn prepare_two_stage_rewrite(ctx: &testutil::TestContext) -> (PathBuf, String) {
+    let evil_root = ctx.dir.path().join("rewrite-target");
+    let evil =
+        evil_root.join(testutil::DEFAULT_OWNER).join(format!("{}.git", testutil::DEFAULT_REPO));
+    std::fs::create_dir_all(evil.parent().unwrap()).unwrap();
+    ctx.git_cmd().arg("clone").arg("--bare").arg(remote_path(ctx)).arg(&evil).assert().success();
+
+    ctx.git_cmd().args(["remote", "set-url", "origin", "alias:owner/repo.git"]).assert().success();
+    ctx.git_cmd()
+        .args(["config", "--local", "--add", "url.https://github.com/.insteadOf", "alias:"])
+        .assert()
+        .success();
+
+    let replacement = format!("file://{}/", evil_root.display());
+    (evil, replacement)
 }
 
 #[test]
@@ -226,4 +261,85 @@ fn accepts_equivalent_file_and_path_urls_for_one_repository() {
     let head = ctx.head_oid();
     ctx.hook_cmd("pre-push").assert().success();
     assert_eq!(ctx.remote_ref_oid(&format!("refs/heads/{id}")).as_deref(), Some(head.as_str()));
+}
+
+#[test]
+fn rejects_second_stage_url_rewrites_from_every_active_config_scope() {
+    for rewrite_kind in ["insteadOf", "pushInsteadOf"] {
+        for scope in ["system", "global", "local", "included", "environment"] {
+            let ctx = context();
+            ctx.checkout_new(&format!("rewrite-{rewrite_kind}-{scope}"));
+            ctx.commit("Feature change");
+            let (evil, replacement) = prepare_two_stage_rewrite(&ctx);
+            let key = format!("url.{replacement}.{rewrite_kind}");
+            let intended_before = ref_state(&ctx, &remote_path(&ctx));
+            let evil_before = ref_state(&ctx, &evil);
+
+            let mut hook = ctx.hook_cmd("pre-push");
+            match scope {
+                "system" => {
+                    let config = ctx.dir.path().join("system-gitconfig");
+                    ctx.git_cmd()
+                        .args(["config", "-f"])
+                        .arg(&config)
+                        .args(["--add", &key, "https://github.com/"])
+                        .assert()
+                        .success();
+                    hook.env("GIT_CONFIG_NOSYSTEM", "0").env("GIT_CONFIG_SYSTEM", &config);
+                }
+                "global" => {
+                    ctx.git_cmd()
+                        .args(["config", "--global", "--add", &key, "https://github.com/"])
+                        .assert()
+                        .success();
+                }
+                "local" => {
+                    ctx.git_cmd()
+                        .args(["config", "--local", "--add", &key, "https://github.com/"])
+                        .assert()
+                        .success();
+                }
+                "included" => {
+                    let include = ctx.dir.path().join("included-gitconfig");
+                    ctx.git_cmd()
+                        .args(["config", "-f"])
+                        .arg(&include)
+                        .args(["--add", &key, "https://github.com/"])
+                        .assert()
+                        .success();
+                    ctx.git_cmd()
+                        .args(["config", "--local", "--add", "include.path"])
+                        .arg(&include)
+                        .assert()
+                        .success();
+                }
+                "environment" => {
+                    hook.env("GIT_CONFIG_COUNT", "1")
+                        .env("GIT_CONFIG_KEY_0", &key)
+                        .env("GIT_CONFIG_VALUE_0", "https://github.com/");
+                }
+                _ => unreachable!(),
+            }
+
+            let expected = if rewrite_kind == "insteadOf" {
+                "not a fixed point under active Git URL rewrites"
+            } else {
+                "can still be rewritten"
+            };
+            hook.assert()
+                .failure()
+                .stderr(predicate::str::contains(expected))
+                .stderr(predicate::str::contains("file://"));
+            assert_eq!(
+                ref_state(&ctx, &remote_path(&ctx)),
+                intended_before,
+                "{rewrite_kind} from {scope} rewrote the intended repository"
+            );
+            assert_eq!(
+                ref_state(&ctx, &evil),
+                evil_before,
+                "{rewrite_kind} from {scope} rewrote the attacker repository"
+            );
+        }
+    }
 }

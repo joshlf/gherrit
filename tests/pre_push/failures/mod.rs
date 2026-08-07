@@ -76,8 +76,8 @@ fn test_pre_push_ls_remote_failure() {
     ctx.checkout_new("feature-ls-remote-fail");
     ctx.commit("Work");
 
-    // Remote observation is a safety prerequisite. A failed ls-remote must
-    // abort before GHerrit mutates either Git or GitHub.
+    // Endpoint validation and remote observation are safety prerequisites. A
+    // failed ls-remote must abort before GHerrit mutates either Git or GitHub.
     let remote_refs = ctx.remote_refs("refs");
     ctx.gherrit_cmd()
         .args(["hook", "pre-push"])
@@ -85,7 +85,7 @@ fn test_pre_push_ls_remote_failure() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "Failed to observe the publication remote's default branch",
+            "Failed to validate the pinned fetch URL for remote `origin`",
         ));
     assert_eq!(ctx.remote_refs("refs"), remote_refs);
     ctx.inspect_mock_state(|state| {

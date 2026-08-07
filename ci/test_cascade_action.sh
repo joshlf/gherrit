@@ -85,6 +85,23 @@ get_arg() {
 }
 
 if [[ ${1:-} == api && ${2:-} == graphql ]]; then
+  hostname=$(get_arg --hostname "$@") || {
+    echo "missing explicit --hostname on gh api graphql" >&2
+    exit 1
+  }
+  if [[ $hostname != "${EXPECTED_GH_HOST:?}" || ${GH_HOST:-} != "$EXPECTED_GH_HOST" ]]; then
+    echo "GraphQL request targeted '$hostname' with GH_HOST='${GH_HOST:-}', expected '$EXPECTED_GH_HOST'" >&2
+    exit 1
+  fi
+  if [[ $EXPECTED_GH_HOST == github.com ]]; then
+    if [[ ${GH_TOKEN:-} != test-token || ${GH_ENTERPRISE_TOKEN+x} == x ]]; then
+      echo "github.com request did not use only GH_TOKEN" >&2
+      exit 1
+    fi
+  elif [[ ${GH_ENTERPRISE_TOKEN:-} != test-token || ${GH_TOKEN+x} == x ]]; then
+    echo "enterprise request did not use only GH_ENTERPRISE_TOKEN" >&2
+    exit 1
+  fi
   input_payload=
   if [[ " $* " == *' --input - '* ]]; then
     input_payload=$(cat)
@@ -395,11 +412,13 @@ mark_merged() {
 run_action() {
   local work=$1 state=$2 merged_id=$3 merged_number=$4 merged_body=$5
   (
+    local server_url expected_host
     cd "$work"
     export REAL_GIT="$real_git"
     export PATH="$TEST_BIN:$PATH"
     export ACTION_PATH="$repo_root"
-    export GH_TOKEN=test-token
+    unset GH_TOKEN GH_ENTERPRISE_TOKEN
+    export GHERRIT_TOKEN=test-token
     export MERGED_PR_BODY="$merged_body"
     export MERGED_PR_NUMBER="$merged_number"
     export MERGED_PR_HEAD="$merged_id"
@@ -407,7 +426,12 @@ run_action() {
     export MERGED_HEAD_REPOSITORY_ID="$repository_id"
     export MERGED_BASE_REPOSITORY_ID="$repository_id"
     export DEFAULT_BRANCH=main
-    export GITHUB_SERVER_URL=https://github.com
+    server_url=${TEST_GITHUB_SERVER_URL:-https://github.com}
+    expected_host=${server_url#*://}
+    expected_host=${expected_host%%/*}
+    expected_host=$(printf '%s' "$expected_host" | tr '[:upper:]' '[:lower:]')
+    export GITHUB_SERVER_URL=$server_url
+    export EXPECTED_GH_HOST=$expected_host
     export TARGET_REPOSITORY="$repository_name"
     export TARGET_REPOSITORY_ID="$repository_id"
     export TEST_STATE="$state"
@@ -418,7 +442,7 @@ run_action() {
 
 assert_promoted() {
   local remote=$1 state=$2 id=$3 expected_version=$4
-  local head main body
+  local head main body server_url repository_url
   head=$("$real_git" --git-dir="$remote" rev-parse "refs/heads/$id")
   main=$("$real_git" --git-dir="$remote" rev-parse refs/heads/main)
   if [[ $head == "$main" ]]; then
@@ -438,20 +462,23 @@ assert_promoted() {
     exit 1
   fi
   body=$(jq -er --arg id "$id" '.prs[] | select(.head == $id) | .body' "$state")
+  server_url=${TEST_GITHUB_SERVER_URL:-https://github.com}
+  repository_url=${server_url%/}/$repository_name
   metadata=$(printf '%s' "$body" | bash "$repo_root/ci/extract_stack_metadata.sh")
   if [[ $(jq -r '.parent // ""' <<<"$metadata") != "" ]]; then
     echo "promoted child '$id' retained parent metadata" >&2
     exit 1
   fi
-  grep -Fq "[Current](https://github.com/$repository_name/compare/main..$id)" <<<"$body"
+  grep -Fq "[Current]($repository_url/compare/main..$id)" <<<"$body"
   if grep -Fq -- '- 👉 #1' <<<"$body"; then
     echo "promoted child '$id' retained stale stack navigation" >&2
     exit 1
   fi
   child=$(jq -r '.child // ""' <<<"$metadata")
   if [[ -n $child ]]; then
-    grep -Fq "[Next](https://github.com/$repository_name/compare/$id..$child)" <<<"$body"
+    grep -Fq "[Next]($repository_url/compare/$id..$child)" <<<"$body"
   fi
+  grep -Fq "$repository_url/compare/gherrit/$id/v1..gherrit/$id/v$expected_version" <<<"$body"
 }
 
 test_group=${CASCADE_TEST_GROUP:-all}
@@ -1279,4 +1306,69 @@ if run_group remote-authority; then
       exit 1
     fi
   done
+fi
+
+# Reusing a once-resolved URL must not permit a second insteadOf or
+# pushInsteadOf hop to an identical-ref attacker repository.
+if run_group chained-url-rewrite; then
+  for rewrite_kind in insteadOf pushInsteadOf; do
+    case_dir=$root/chained-url-rewrite-$rewrite_kind
+    remote=$case_dir/remote.git; work=$case_dir/work; state=$case_dir/state.json
+    setup_repository "$case_dir" "$current_a" "$current_b"
+    initialize_state "$work" "$state" "$current_a" "$current_b"
+    merge_equivalent "$work" "$current_a" squash
+    merged_body=$(mark_merged "$state" "$current_a")
+    old_child=$("$real_git" --git-dir="$remote" rev-parse "refs/heads/$current_b")
+
+    evil_root=$case_dir/evil
+    evil=$evil_root/remote.git
+    mkdir -p "$evil_root"
+    "$real_git" clone --bare "$remote" "$evil" >/dev/null 2>&1
+    intended_before=$("$real_git" --git-dir="$remote" for-each-ref --format='%(refname) %(objectname)' refs)
+    evil_before=$("$real_git" --git-dir="$evil" for-each-ref --format='%(refname) %(objectname)' refs)
+    [[ "$intended_before" == "$evil_before" ]]
+
+    "$real_git" -C "$work" remote set-url origin alias:remote.git
+    "$real_git" -C "$work" config --local --add \
+      "url.file://$case_dir/.insteadOf" alias:
+    "$real_git" -C "$work" config --local --add \
+      "url.file://$evil_root/.$rewrite_kind" "file://$case_dir/"
+
+    TEST_BIN=$case_dir/bin TEST_REMOTE=$remote
+    export TEST_BIN TEST_REMOTE TEST_PUSH_MODE=none TEST_UPDATE_MODE=none
+    write_fake_tools "$TEST_BIN"
+    if run_action "$work" "$state" "$current_a" 1 "$merged_body" \
+      >/dev/null 2>&1; then
+      echo "$rewrite_kind chained URL rewrite unexpectedly succeeded" >&2
+      exit 1
+    fi
+    [[ $("$real_git" --git-dir="$remote" rev-parse "refs/heads/$current_b") == "$old_child" ]]
+    [[ $("$real_git" --git-dir="$remote" for-each-ref --format='%(refname) %(objectname)' refs) == "$intended_before" ]]
+    [[ $("$real_git" --git-dir="$evil" for-each-ref --format='%(refname) %(objectname)' refs) == "$evil_before" ]]
+  done
+fi
+
+# Enterprise-server runs must route every GraphQL call and every generated
+# repository link through GITHUB_SERVER_URL, using the enterprise token slot.
+if run_group alternate-server; then
+  case_dir=$root/alternate-server
+  remote=$case_dir/remote.git; work=$case_dir/work; state=$case_dir/state.json
+  setup_repository "$case_dir" "$current_a" "$current_b"
+  initialize_state "$work" "$state" "$current_a" "$current_b"
+  merge_equivalent "$work" "$current_a" squash
+  merged_body=$(mark_merged "$state" "$current_a")
+  TEST_BIN=$case_dir/bin TEST_REMOTE=$remote
+  export TEST_BIN TEST_REMOTE TEST_PUSH_MODE=none TEST_UPDATE_MODE=none
+  export TEST_GITHUB_SERVER_URL=https://github.enterprise.example
+  write_fake_tools "$TEST_BIN"
+  run_action "$work" "$state" "$current_a" 1 "$merged_body"
+  assert_promoted "$remote" "$state" "$current_b" 2
+  promoted=$(jq -er --arg id "$current_b" '.prs[] | select(.head == $id) | .body' "$state")
+  grep -Fq "https://github.enterprise.example/$repository_name/compare/main..$current_b" <<<"$promoted"
+  grep -Fq "https://github.enterprise.example/$repository_name/compare/gherrit/$current_b/v1..gherrit/$current_b/v2" <<<"$promoted"
+  if grep -Fq "https://github.com/$repository_name" <<<"$promoted"; then
+    echo "enterprise promotion retained a github.com repository link" >&2
+    exit 1
+  fi
+  unset TEST_GITHUB_SERVER_URL
 fi

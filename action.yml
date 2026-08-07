@@ -2,7 +2,7 @@ name: GHerrit – Rebase Stack
 description: 'Automatically rebase the next PR in a GHerrit stack.'
 inputs:
   token:
-    description: '`GITHUB_TOKEN` to allow rebase and push'
+    description: 'GitHub API token used to authenticate PR updates and Git publication'
     required: true
   pr_body:
     description: 'The body/description of the PR that was just merged. Used to authenticate the GHerrit stack relationship.'
@@ -14,7 +14,7 @@ runs:
     - shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
-        GH_TOKEN: ${{ inputs.token }}
+        GHERRIT_TOKEN: ${{ inputs.token }}
         MERGED_PR_BODY: ${{ inputs.pr_body }}
         MERGED_PR_NUMBER: ${{ github.event.pull_request.number }}
         MERGED_PR_HEAD: ${{ github.event.pull_request.head.ref }}

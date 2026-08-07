@@ -215,6 +215,16 @@ impl Repo {
             );
         }
 
+        // `git remote get-url` expands at most one URL-rewrite step. Reusing
+        // that returned string as an explicit URL in a later `fetch`,
+        // `ls-remote`, or `push` subjects it to URL rewriting again. An
+        // attacker-controlled second rewrite could therefore redirect the
+        // authenticated-looking URL to another repository while preserving
+        // identical leases. Prove that both pinned URLs are fixed points under
+        // the complete active Git configuration before any network operation.
+        self.validate_pinned_remote_url(&name, "fetch", &fetch_endpoint.git_url, false)?;
+        self.validate_pinned_remote_url(&name, "push", &push_endpoint.git_url, true)?;
+
         let (owner, repo_name) = get_repo_owner_name(&fetch_endpoint.git_url)?;
         let (push_owner, push_repo_name) = get_repo_owner_name(&push_endpoint.git_url)?;
         Ok(Remote {
@@ -252,6 +262,83 @@ impl Repo {
             bail!("Remote `{name}` has no effective {} URL", if push { "push" } else { "fetch" });
         }
         Ok(urls)
+    }
+
+    fn validate_pinned_remote_url(
+        &self,
+        remote_name: &str,
+        role: &str,
+        url: &str,
+        push: bool,
+    ) -> Result<()> {
+        let workdir = self.workdir().unwrap_or(self.path());
+
+        // Ask Git itself to apply `url.*.insteadOf`, including values from
+        // system, global, local, worktree, included, and environment-injected
+        // configuration. The URL is safe to reuse only if Git returns it
+        // byte-for-byte unchanged.
+        let mut command = cmd("git", ["ls-remote", "--get-url", url]);
+        command.current_dir(workdir);
+        let output = command.checked_output().wrap_err_with(|| {
+            format!("Failed to validate the pinned {role} URL for remote `{remote_name}`")
+        })?;
+        let resolved = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        let [resolved] = resolved.as_slice() else {
+            bail!(
+                "Pinned {role} URL for remote `{remote_name}` resolved to {} URLs during fixed-point validation",
+                resolved.len()
+            );
+        };
+        if *resolved != url {
+            bail!(
+                "Pinned {role} URL `{url}` for remote `{remote_name}` is not a fixed point under active Git URL rewrites; Git would resolve it again to `{resolved}`"
+            );
+        }
+
+        if !push {
+            return Ok(());
+        }
+
+        // `git ls-remote --get-url` models `insteadOf`, but an explicit
+        // `git push <url>` also applies `pushInsteadOf`. Enumerate the complete
+        // active config (with includes) and reject every prefix which could
+        // rewrite the pinned push URL. Rejecting all matching prefixes is
+        // intentionally stricter than reproducing Git's longest-prefix choice:
+        // it proves that no push rewrite can apply at all.
+        let mut command = cmd(
+            "git",
+            ["config", "--null", "--includes", "--get-regexp", r"^url\..*\.pushinsteadof$"],
+        );
+        command.current_dir(workdir);
+        let output = command.output()?;
+        match output.status.code() {
+            Some(0 | 1) => {}
+            code => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!(
+                    "Failed to inspect active pushInsteadOf rewrites for remote `{remote_name}`: exit {code:?}. Stderr: {stderr}"
+                );
+            }
+        }
+
+        for entry in output.stdout.split(|byte| *byte == b'\0').filter(|entry| !entry.is_empty()) {
+            let Some(separator) = entry.iter().position(|byte| *byte == b'\n') else {
+                bail!("Git returned a malformed pushInsteadOf configuration entry");
+            };
+            let key = std::str::from_utf8(&entry[..separator])?;
+            let prefix = std::str::from_utf8(&entry[separator + 1..])?;
+            if prefix.is_empty() || url.starts_with(prefix) {
+                bail!(
+                    "Pinned push URL `{url}` for remote `{remote_name}` can still be rewritten by active Git configuration `{key}` with prefix `{prefix}`"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     fn find_default_branches(&self, remote_name: &str) -> Vec<String> {
@@ -471,7 +558,10 @@ impl RemoteEndpoint {
 
 fn github_authority(authority: &str) -> &str {
     match authority {
-        "ssh.github.com" => "github.com",
+        // GitHub documents ssh.github.com:443 as its SSH-over-HTTPS-port
+        // endpoint. `ssh://` URLs retain the non-default port during parsing,
+        // while scp-like URLs have no separate port field.
+        "ssh.github.com" | "ssh.github.com:443" => "github.com",
         authority => authority,
     }
 }
@@ -623,9 +713,14 @@ mod tests {
             RemoteEndpoint::parse("https://github.com/owner/repository.git", workdir).unwrap();
         let ssh =
             RemoteEndpoint::parse("git@ssh.github.com:owner/repository.git", workdir).unwrap();
+        let ssh_over_443 =
+            RemoteEndpoint::parse("ssh://git@ssh.github.com:443/owner/repository.git", workdir)
+                .unwrap();
         assert!(https.same_authority(&ssh));
+        assert!(https.same_authority(&ssh_over_443));
         assert!(https.is_github_com());
         assert!(ssh.is_github_com());
+        assert!(ssh_over_443.is_github_com());
 
         let other = RemoteEndpoint::parse("git@example.com:owner/repository.git", workdir).unwrap();
         assert!(!https.same_authority(&other));
@@ -652,6 +747,7 @@ mod tests {
             ("https://github.com/owner/repo", ("owner", "repo")),
             ("git@github.com:owner/repo.git", ("owner", "repo")),
             ("git@github.com:owner/repo", ("owner", "repo")),
+            ("ssh://git@ssh.github.com:443/owner/repo.git", ("owner", "repo")),
             ("alias:owner/repo.git", ("owner", "repo")),
             ("alias:owner/repo", ("owner", "repo")),
             ("http://localhost:3000/owner/repo.git", ("owner", "repo")),
