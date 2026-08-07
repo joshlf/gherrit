@@ -24,24 +24,24 @@ jobs:
           fetch-tags: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Reconstruct exact reviewed candidate
+      - name: Reconstruct exact validated candidate
         shell: bash
         run: |
           set -euxo pipefail
           base=fa30bb4a86cbb1dbab74e91fa9ba08a422424ec7
           payload=agent_payloads/review7/safe-pr-reorder-review7.patch.gz.b64
 
-          cat > /tmp/review7-chunk-hashes <<'EOF'
-          fab6d82b6fea1640d34bba556bcbcfe6261118d7dca1fb1eef6331346970aa68  000
-          2665c6b2b699a418832ea3bffaeb960b130e4d9134981bbbe994bb51aba258ab  001
-          1d15df491a9076312cb5f0978eb5599eb837e0c8bfd25730ea5b6eff58c33615  002
-          43af376827db74c13abab54aef364d0e1c146a393f26ab6aabe7c9992d786965  003
-          94aadee2363e09f1c112047b4e4d9ca49b965a6840e0b5c6d305fbffcaf4d0e7  004
-          844d9ccbaa416dd63fb7150eeb27b0ec4453d6f5acb7e027499cb2963c7dace5  005
-          b47e71bfab081f52c4cc539e390666a013896da449355758f1361384dbe19957  006
-          be195c81cd9db3947dbc2f9b28cde746983044abafdbb37aeddae5fd791effb1  007
-          010b76b6660423ed88bad6329144920f07ffc90288c30692e93cee7f1c2b20f2  008
-          EOF
+          cat > /tmp/review7-chunk-hashes <<'HASHES'
+          533c4ea3371d488fa1c4a200211c1aa07e4a3c6f3318c1589d3a61b60d390fd2  000
+          1547b76da8517a3d2328a71c6fb22fafb32cb4b2a457523857e7b3761e6e1157  001
+          9e99245e040c2622b07db602e095dc68a149c80b0930deb69e8f550640aee449  002
+          c2ecf2a09d0593c50dc856d25af3c55d487d7d89286a26660926900c300fb27d  003
+          eb32603478b0c6efa8e40540c64b17b616b12ace478209b6f9d9f62f224b546f  004
+          61e241bdd013a28f2b33053cd6c4fb191bad7d95b3075950703c6601fbb9991c  005
+          c9b77f63b5167fc42b4c3de6e0b5d96e4a3ba6af6ff5283dd3e60cdf614e2ee8  006
+          2e4bde6383d941c04b4586a12c7cd2a225184cdd62b1ad703a8234ed94d09ae6  007
+          58430e011117660314e18b9230298155f1141661807a4369133edebe6a72dde4  008
+          HASHES
           while read -r expected suffix; do
             file="$payload.$suffix"
             test -f "$file"
@@ -49,15 +49,15 @@ jobs:
           done < /tmp/review7-chunk-hashes
 
           cat "$payload".??? > /tmp/review7.patch.gz.b64
-          test "$(wc -c < /tmp/review7.patch.gz.b64)" = 12996
+          test "$(wc -c < /tmp/review7.patch.gz.b64)" = 13392
           test "$(sha256sum /tmp/review7.patch.gz.b64 | awk '{print $1}')" = \
-            b07be4895c7ca6b89598816c300d2ec9132c7978039a0dd4c7f4fd158ce0e136
+            2cf870450b7cc356c78a0c281212a30f5455e7eff8145a725b3a5f160cc5bf31
           base64 --decode /tmp/review7.patch.gz.b64 > /tmp/review7.patch.gz
           test "$(sha256sum /tmp/review7.patch.gz | awk '{print $1}')" = \
-            84bb7ae64d33abb13c42515f8006c1d287b6e3bc05dc9fc35da8d031758b8bb3
+            fb35852ab9bcddec2de8120024a06f11fb1375aa8064a565104213aed5b5ee6e
           gzip --decompress --stdout /tmp/review7.patch.gz > /tmp/review7.patch
           test "$(sha256sum /tmp/review7.patch | awk '{print $1}')" = \
-            0594b9b3fd08717027440dd0f108ac0f257ae78528d7ee6e02e851a6726381ec
+            d6a0a1a2a2001421a56e76f7cabcc10b97ce2830a9a6ffcb97e5ff7a67b9fd18
 
           git fetch --force origin \
             refs/heads/agent/safe-pr-reorder:refs/remotes/origin/agent/safe-pr-reorder
@@ -68,14 +68,20 @@ jobs:
           git checkout --detach "$base"
           git am --committer-date-is-author-date /tmp/review7.patch
 
-          test "$(git rev-parse HEAD~1)" = 962499ba2379c937419d47f57a8402485cb2e7de
-          test "$(git rev-parse HEAD)" = cebccc08d66e3fe07bac33c7678c94dba316e89a
+          test "$(git rev-parse HEAD~1)" = 31e16491927867be1450f72d5d3891cc9e8a119e
+          test "$(git rev-parse HEAD)" = 35f6e55d6fbc325756a902357f1a9aed2e545745
+          test "$(git rev-parse HEAD^{tree})" = 59e7236449167b5b51a2e54a14fd06d5e5b9450f
           test "$(git rev-list --count "$base"..HEAD)" = 2
           test "$(git show --no-patch --format=%s HEAD~1)" = \
             "Harden publication endpoint resolution"
           test "$(git show --no-patch --format=%s HEAD)" = \
             "Preflight GitHub pull-request titles"
+          test "$(git log -1 --format=%B HEAD~1 | grep -Ec '^gherrit-pr-id: Gbedy6ab4hfciypecnfuiorthhm4uyidn$')" = 1
+          test "$(git log -1 --format=%B HEAD | grep -Ec '^gherrit-pr-id: Gmtdxst2u4a7vjxawl37cb2kzlgjvww4d$')" = 1
           git diff --check "$base"...HEAD
+          echo "FINAL_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "FINAL_TREE=$(git rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
+          git log --reverse --format='%H %s' "$base"..HEAD
 
       - name: Read Rust version
         id: rust-version
@@ -95,68 +101,13 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Fold formatting into the originating commits
+      - name: Check formatting and patch integrity
         shell: bash
         run: |
           set -euxo pipefail
-          base=fa30bb4a86cbb1dbab74e91fa9ba08a422424ec7
-          endpoint_date=$(git show -s --format=%cI HEAD~1)
-          title_date=$(git show -s --format=%cI HEAD)
-
-          cargo +nightly fmt --all
-          cat > /tmp/allowed-format-files <<'EOF'
-          src/pre_push/mod.rs
-          src/util.rs
-          tests/pre_push/policy/remote_authority.rs
-          tests/pre_push/projection/body_limits.rs
-          EOF
-          git diff --name-only | LC_ALL=C sort > /tmp/actual-format-files
-          comm -23 /tmp/actual-format-files /tmp/allowed-format-files \
-            > /tmp/unexpected-format-files
-          test ! -s /tmp/unexpected-format-files
-
-          git diff --binary -- \
-            src/util.rs \
-            tests/pre_push/policy/remote_authority.rs \
-            > /tmp/endpoint-format.patch
-          git diff --binary -- \
-            src/pre_push/mod.rs \
-            tests/pre_push/projection/body_limits.rs \
-            > /tmp/title-format.patch
-
-          if test -s /tmp/title-format.patch; then
-            git add \
-              src/pre_push/mod.rs \
-              tests/pre_push/projection/body_limits.rs
-            GIT_COMMITTER_DATE="$title_date" git commit --amend --no-edit
-          fi
-          git format-patch -1 --stdout --full-index --binary HEAD \
-            > /tmp/formatted-title-commit.patch
-
-          git reset --hard HEAD^
-          if test -s /tmp/endpoint-format.patch; then
-            git apply /tmp/endpoint-format.patch
-            git add \
-              src/util.rs \
-              tests/pre_push/policy/remote_authority.rs
-            GIT_COMMITTER_DATE="$endpoint_date" git commit --amend --no-edit
-          fi
-          git am --committer-date-is-author-date /tmp/formatted-title-commit.patch
-
-          test "$(git rev-list --count "$base"..HEAD)" = 2
-          test "$(git show --no-patch --format=%s HEAD~1)" = \
-            "Harden publication endpoint resolution"
-          test "$(git show --no-patch --format=%s HEAD)" = \
-            "Preflight GitHub pull-request titles"
-          test "$(git log -1 --format=%B HEAD~1 | grep -Ec '^gherrit-pr-id: Gbedy6ab4hfciypecnfuiorthhm4uyidn$')" = 1
-          test "$(git log -1 --format=%B HEAD | grep -Ec '^gherrit-pr-id: Gmtdxst2u4a7vjxawl37cb2kzlgjvww4d$')" = 1
-          test -z "$(git status --porcelain)"
           cargo +nightly fmt --all -- --check
-          git diff --check "$base"...HEAD
-
-          echo "FINAL_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "FINAL_TREE=$(git rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
-          git log --reverse --format='%H %s' "$base"..HEAD
+          git diff --check fa30bb4a86cbb1dbab74e91fa9ba08a422424ec7...HEAD
+          test -z "$(git status --porcelain)"
 
       - name: Run Clippy
         env:
