@@ -1,0 +1,188 @@
+name: Agent publish safe-pr-reorder review7 fixes
+
+on:
+  push:
+    branches:
+      - agent/bootstrap-gherrit-build
+    paths:
+      - .github/workflows/agent-publish-review7-fixes.yml
+      - agent_payloads/review7/**
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout publisher payload
+        uses: actions/checkout@v4
+        with:
+          ref: agent/bootstrap-gherrit-build
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Reconstruct exact reviewed candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base=fa30bb4a86cbb1dbab74e91fa9ba08a422424ec7
+
+          cat agent_payloads/review7/safe-pr-reorder-review7.patch.gz.b64.* \
+            > /tmp/review7.patch.gz.b64
+          test "$(sha256sum /tmp/review7.patch.gz.b64 | awk '{print $1}')" = \
+            62784325d28b171f288637289bfb7a5b7293a2c6727582664e936e74ab73f3cf
+          base64 --decode /tmp/review7.patch.gz.b64 > /tmp/review7.patch.gz
+          test "$(sha256sum /tmp/review7.patch.gz | awk '{print $1}')" = \
+            84bb7ae64d33abb13c42515f8006c1d287b6e3bc05dc9fc35da8d031758b8bb3
+          gzip --decompress --stdout /tmp/review7.patch.gz > /tmp/review7.patch
+          test "$(sha256sum /tmp/review7.patch | awk '{print $1}')" = \
+            0594b9b3fd08717027440dd0f108ac0f257ae78528d7ee6e02e851a6726381ec
+
+          git fetch --force origin \
+            refs/heads/agent/safe-pr-reorder:refs/remotes/origin/agent/safe-pr-reorder
+          test "$(git rev-parse refs/remotes/origin/agent/safe-pr-reorder)" = "$base"
+
+          git config user.name "OpenAI Codex"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --detach "$base"
+          git am --committer-date-is-author-date /tmp/review7.patch
+
+          test "$(git rev-parse HEAD~1)" = 962499ba2379c937419d47f57a8402485cb2e7de
+          test "$(git rev-parse HEAD)" = cebccc08d66e3fe07bac33c7678c94dba316e89a
+          test "$(git rev-list --count "$base"..HEAD)" = 2
+          test "$(git show --no-patch --format=%s HEAD~1)" = \
+            "Harden publication endpoint resolution"
+          test "$(git show --no-patch --format=%s HEAD)" = \
+            "Preflight GitHub pull-request titles"
+          git diff --check "$base"...HEAD
+
+      - name: Read Rust version
+        id: rust-version
+        shell: bash
+        run: |
+          echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Install project Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-version.outputs.version }}
+          components: clippy
+
+      - name: Install nightly rustfmt
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Fold formatting into the originating commits
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base=fa30bb4a86cbb1dbab74e91fa9ba08a422424ec7
+          endpoint_date=$(git show -s --format=%cI HEAD~1)
+          title_date=$(git show -s --format=%cI HEAD)
+
+          cargo +nightly fmt --all
+          cat > /tmp/allowed-format-files <<'EOF'
+          src/pre_push/mod.rs
+          src/util.rs
+          tests/pre_push/policy/remote_authority.rs
+          tests/pre_push/projection/body_limits.rs
+          EOF
+          git diff --name-only | LC_ALL=C sort > /tmp/actual-format-files
+          comm -23 /tmp/actual-format-files /tmp/allowed-format-files \
+            > /tmp/unexpected-format-files
+          test ! -s /tmp/unexpected-format-files
+
+          git diff --binary -- \
+            src/util.rs \
+            tests/pre_push/policy/remote_authority.rs \
+            > /tmp/endpoint-format.patch
+          git diff --binary -- \
+            src/pre_push/mod.rs \
+            tests/pre_push/projection/body_limits.rs \
+            > /tmp/title-format.patch
+
+          if test -s /tmp/title-format.patch; then
+            git add \
+              src/pre_push/mod.rs \
+              tests/pre_push/projection/body_limits.rs
+            GIT_COMMITTER_DATE="$title_date" git commit --amend --no-edit
+          fi
+          git format-patch -1 --stdout --full-index --binary HEAD \
+            > /tmp/formatted-title-commit.patch
+
+          git reset --hard HEAD^
+          if test -s /tmp/endpoint-format.patch; then
+            git apply /tmp/endpoint-format.patch
+            git add \
+              src/util.rs \
+              tests/pre_push/policy/remote_authority.rs
+            GIT_COMMITTER_DATE="$endpoint_date" git commit --amend --no-edit
+          fi
+          git am --committer-date-is-author-date /tmp/formatted-title-commit.patch
+
+          test "$(git rev-list --count "$base"..HEAD)" = 2
+          test "$(git show --no-patch --format=%s HEAD~1)" = \
+            "Harden publication endpoint resolution"
+          test "$(git show --no-patch --format=%s HEAD)" = \
+            "Preflight GitHub pull-request titles"
+          test "$(git log -1 --format=%B HEAD~1 | grep -Ec '^gherrit-pr-id: Gbedy6ab4hfciypecnfuiorthhm4uyidn$')" = 1
+          test "$(git log -1 --format=%B HEAD | grep -Ec '^gherrit-pr-id: Gmtdxst2u4a7vjxawl37cb2kzlgjvww4d$')" = 1
+          test -z "$(git status --porcelain)"
+          cargo +nightly fmt --all -- --check
+          git diff --check "$base"...HEAD
+
+          echo "FINAL_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "FINAL_TREE=$(git rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
+          git log --reverse --format='%H %s' "$base"..HEAD
+
+      - name: Run Clippy
+        env:
+          GHERRIT_TEST_BUILD: "1"
+        run: >-
+          cargo +${{ steps.rust-version.outputs.version }} clippy
+          --workspace --all-targets --locked -- -D warnings
+
+      - name: Run Rust tests
+        env:
+          GHERRIT_TEST_BUILD: "1"
+        run: >-
+          cargo +${{ steps.rust-version.outputs.version }} test
+          --workspace --all-targets --locked
+
+      - name: Run protocol and cascade validation
+        shell: bash
+        env:
+          PYTHONPYCACHEPREFIX: /tmp/review7-pycache
+        run: |
+          set -euxo pipefail
+          ci/check_todo.sh
+          bash ci/test_extract_stack_child.sh
+          bash ci/test_select_cascade_child.sh
+          bash ci/test_cascade_action.sh
+          bash -n ci/cascade_stack.sh
+          bash -n ci/select_cascade_child.sh
+          bash -n ci/test_cascade_action.sh
+          python3 -m py_compile ci/gherrit_protocol.py
+          test -z "$(git status --porcelain)"
+
+      - name: Publish exact validated history
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base=fa30bb4a86cbb1dbab74e91fa9ba08a422424ec7
+          test -n "$FINAL_HEAD"
+          test -n "$FINAL_TREE"
+          test "$(git rev-parse HEAD)" = "$FINAL_HEAD"
+          test "$(git rev-parse HEAD^{tree})" = "$FINAL_TREE"
+          test "$(git rev-list --count "$base"..HEAD)" = 2
+          git push --no-verify \
+            --force-with-lease=refs/heads/agent/safe-pr-reorder:$base \
+            origin HEAD:refs/heads/agent/safe-pr-reorder
+          observed=$(git ls-remote origin refs/heads/agent/safe-pr-reorder | awk '{print $1}')
+          test "$observed" = "$FINAL_HEAD"
+          printf 'Published %s with tree %s\n' "$FINAL_HEAD" "$FINAL_TREE"
