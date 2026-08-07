@@ -32,7 +32,7 @@ jobs:
             | gzip --decompress \
             > /tmp/review3.patch
           test "$(sha256sum /tmp/review3.patch | awk '{print $1}')" = \
-            79f2684f87c75bd4ac0e58d9fa961767eb7563eebf3639945ce409cfd8e4da7f
+            a97b2e99bd0212899a9fb08f9c85e99b8c6709903cabc79e57c819b328cac199
 
           git fetch --force origin \
             refs/heads/agent/safe-pr-reorder:refs/remotes/origin/agent/safe-pr-reorder
