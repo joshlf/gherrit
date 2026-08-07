@@ -22,6 +22,7 @@ runs:
         MERGED_HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.node_id }}
         MERGED_BASE_REPOSITORY_ID: ${{ github.event.pull_request.base.repo.node_id }}
         DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        GITHUB_SERVER_URL: ${{ github.server_url }}
         TARGET_REPOSITORY: ${{ github.repository }}
         TARGET_REPOSITORY_ID: ${{ github.event.repository.node_id }}
       run: bash "$ACTION_PATH/ci/cascade_stack.sh"

@@ -30,6 +30,7 @@ candidate() {
   local cross=$7
   local oid=${8:-0123456789012345678901234567890123456789}
   local blocker=${9:-none}
+  local base_oid=${10:-1111111111111111111111111111111111111111}
   jq -cn \
     --argjson number "$number" \
     --arg nodeId "PR_$number" \
@@ -40,6 +41,7 @@ candidate() {
     --arg baseRepository "$base_repository" \
     --argjson cross "$cross" \
     --arg oid "$oid" \
+    --arg base_oid "$base_oid" \
     --arg blocker "$blocker" '
       {
         id: $nodeId,
@@ -47,6 +49,7 @@ candidate() {
         headRefName: $head,
         headRefOid: $oid,
         baseRefName: $base,
+        baseRefOid: $base_oid,
         body: $body,
         isCrossRepository: $cross,
         isInMergeQueue: ($blocker == "queue"),
@@ -66,7 +69,8 @@ assert_selected() {
   selected=$(printf '%s\n' "$json" | bash "$selector" \
     "$child" "$parent" "$default" "$repository" "$parent_exists")
   if [[ $(jq -er '.number' <<<"$selected") != "$expected_number" ||
-        $(jq -er '.mode' <<<"$selected") != "$expected_mode" ]]; then
+        $(jq -er '.mode' <<<"$selected") != "$expected_mode" ||
+        $(jq -er '.baseRefOid' <<<"$selected") != 1111111111111111111111111111111111111111 ]]; then
     echo "unexpected child selection: $selected" >&2
     exit 1
   fi
@@ -106,4 +110,7 @@ assert_rejected true "$(printf '%s\n' "$(candidate 42 "$child" "$parent" "$canon
 for blocker in queue auto stack; do
   assert_rejected true "$(printf '%s\n' "$(candidate 42 "$child" "$parent" "$canonical_body" "$repository" "$repository" false '' "$blocker")" | array)"
 done
+
+missing_base_oid=$(jq 'del(.baseRefOid)' <<<"$canonical_parent")
+assert_rejected true "$(printf '%s\n' "$missing_base_oid" | array)"
 assert_rejected true '{}'

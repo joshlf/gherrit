@@ -47,6 +47,7 @@ number=$(jq -er '.number | numbers' <<<"$candidate")
 node_id=$(jq -er '.id | strings | select(length > 0)' <<<"$candidate")
 base=$(jq -er '.baseRefName | strings' <<<"$candidate")
 head_oid=$(jq -er '.headRefOid | strings | select(length > 0)' <<<"$candidate")
+base_oid=$(jq -er '.baseRefOid | strings | select(length > 0)' <<<"$candidate")
 body=$(jq -er '.body | strings' <<<"$candidate")
 
 if jq -e '.isInMergeQueue == true' >/dev/null <<<"$candidate"; then
@@ -94,7 +95,8 @@ jq -cn \
   --arg nodeId "$node_id" \
   --arg baseRefName "$base" \
   --arg headRefOid "$head_oid" \
+  --arg baseRefOid "$base_oid" \
   --arg mode "$mode" \
   --arg body "$body" \
   --arg metadataParent "$metadata_parent" \
-  '{number: $number, nodeId: $nodeId, baseRefName: $baseRefName, headRefOid: $headRefOid, mode: $mode, body: $body, metadataParent: $metadataParent}'
+  '{number: $number, nodeId: $nodeId, baseRefName: $baseRefName, baseRefOid: $baseRefOid, headRefOid: $headRefOid, mode: $mode, body: $body, metadataParent: $metadataParent}'

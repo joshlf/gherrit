@@ -6,6 +6,8 @@ import argparse
 import json
 import re
 import sys
+from pathlib import Path
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import NoReturn
 
@@ -42,6 +44,120 @@ def validate_id(value: str, context: str = "GHerrit ID") -> str:
     if not valid_id(value):
         fail(f"{context} is not a supported GHerrit ID.")
     return value
+
+
+@dataclass(frozen=True)
+class RemoteEndpoint:
+    kind: str
+    git_url: str
+    authority: str
+    owner: str | None = None
+    repository: str | None = None
+
+
+def normalize_network_authority(authority: str, server_authority: str) -> str:
+    normalized = authority.rstrip(".").casefold()
+    if server_authority == "github.com" and normalized == "ssh.github.com":
+        return "github.com"
+    return normalized
+
+
+def parse_remote_endpoint(value: str, *, workdir: Path, server_authority: str) -> RemoteEndpoint:
+    if not value:
+        fail("Git remote URL is empty.")
+
+    local_value: str | None = None
+    if value.startswith("file://"):
+        parsed = urlparse(value)
+        if parsed.netloc not in ("", "localhost"):
+            fail(f"Unsupported file remote authority in '{value}'.")
+        local_value = parsed.path
+    elif value.startswith(("/", "./", "../")):
+        local_value = value
+    elif (workdir / value).exists():
+        local_value = value
+
+    if local_value is not None:
+        path = Path(local_value)
+        if not path.is_absolute():
+            path = workdir / path
+        try:
+            path = path.resolve(strict=True)
+        except OSError as error:
+            fail(f"Could not resolve local Git remote '{value}': {error}")
+        return RemoteEndpoint("local", str(path), str(path))
+
+    parsed = urlparse(value)
+    path: str
+    authority: str
+    if parsed.scheme:
+        if parsed.scheme.casefold() == "file":
+            fail(f"Invalid file remote URL '{value}'.")
+        if parsed.hostname is None:
+            fail(f"Remote URL '{value}' has no network authority.")
+        authority = parsed.hostname
+        path = parsed.path
+    else:
+        match = re.fullmatch(r"(?:[^@/:]+@)?([^/:]+):(.+)", value)
+        if match is None:
+            fail(
+                f"Remote URL '{value}' is neither a resolvable local path nor a supported network Git URL."
+            )
+        authority, path = match.groups()
+
+    normalized_authority = normalize_network_authority(authority, server_authority)
+    if normalized_authority != server_authority:
+        fail(
+            f"Git remote authority '{authority}' cannot be authenticated against GitHub server '{server_authority}'."
+        )
+
+    components = [component for component in path.split("/") if component]
+    if len(components) != 2:
+        fail(f"Remote URL '{value}' does not identify exactly one owner/repository pair.")
+    owner, repository = components
+    if repository.endswith(".git"):
+        repository = repository[:-4]
+    if not owner or not repository:
+        fail(f"Remote URL '{value}' has an empty owner or repository name.")
+    return RemoteEndpoint(
+        "network",
+        value,
+        normalized_authority,
+        owner=owner,
+        repository=repository,
+    )
+
+
+def command_remote_target(args: argparse.Namespace) -> None:
+    server = urlparse(args.server_url)
+    if server.scheme not in ("http", "https") or server.hostname is None:
+        fail("GITHUB_SERVER_URL is not a valid HTTP(S) URL.")
+    server_authority = server.hostname.rstrip(".").casefold()
+    workdir = Path(args.workdir).resolve()
+    fetch = parse_remote_endpoint(
+        args.fetch, workdir=workdir, server_authority=server_authority
+    )
+    push = parse_remote_endpoint(
+        args.push, workdir=workdir, server_authority=server_authority
+    )
+    if fetch.kind != push.kind:
+        fail("Fetch and push URLs resolve to different kinds of Git authority.")
+    if fetch.kind == "local":
+        if fetch.authority != push.authority:
+            fail(
+                f"Fetch URL '{args.fetch}' and push URL '{args.push}' resolve to different local repositories."
+            )
+        result = {"kind": "local", "gitUrl": push.git_url}
+    else:
+        result = {
+            "kind": "network",
+            "gitUrl": push.git_url,
+            "fetchOwner": fetch.owner,
+            "fetchRepository": fetch.repository,
+            "pushOwner": push.owner,
+            "pushRepository": push.repository,
+        }
+    print(json.dumps(result, separators=(",", ":")))
 
 
 def parse_metadata(body: str) -> tuple[dict[str, str | None], int]:
@@ -544,6 +660,13 @@ def command_authenticate_version(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
+
+    remote_target = commands.add_parser("remote-target")
+    remote_target.add_argument("--fetch", required=True)
+    remote_target.add_argument("--push", required=True)
+    remote_target.add_argument("--server-url", required=True)
+    remote_target.add_argument("--workdir", default=".")
+    remote_target.set_defaults(function=command_remote_target)
 
     metadata = commands.add_parser("metadata")
     metadata.set_defaults(function=command_metadata)
