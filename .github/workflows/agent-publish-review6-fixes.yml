@@ -1,0 +1,125 @@
+name: Agent publish safe-pr-reorder review6 fixes
+
+on:
+  push:
+    branches:
+      - agent/bootstrap-gherrit-build
+    paths:
+      - .github/workflows/agent-publish-review6-fixes.yml
+      - agent_payloads/review6/**
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout publisher payload
+        uses: actions/checkout@v4
+        with:
+          ref: agent/bootstrap-gherrit-build
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Reconstruct exact candidate history
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base=20a97f10d68cc98793619363a601601ee2e48db2
+          expected_head=249dc06cccdeae88a12961ef6e12c2a717a462ad
+          expected_tree=50eee957d14679825658dbe9b1f9e7427c2f78ab
+
+          cat agent_payloads/review6/safe-pr-reorder-review6.patch.gz.b64.* \
+            > /tmp/review6.patch.gz.b64
+          test "$(sha256sum /tmp/review6.patch.gz.b64 | awk '{print $1}')" = \
+            853bd6a4a9d2205b25943208879115126c5e6c74a1257b0474399c07bcd76572
+          base64 --decode /tmp/review6.patch.gz.b64 > /tmp/review6.patch.gz
+          test "$(sha256sum /tmp/review6.patch.gz | awk '{print $1}')" = \
+            371b658bca81b5d396697e04497853895703f61a4ba3c43301ed0ec33367f772
+          gzip --decompress --stdout /tmp/review6.patch.gz > /tmp/review6.patch
+          test "$(sha256sum /tmp/review6.patch | awk '{print $1}')" = \
+            210bb5da1e28debee2ca7f4354dc71f2ad65a9d4e2e1499088cf6072e9fd021c
+
+          git fetch --force origin \
+            refs/heads/agent/safe-pr-reorder:refs/remotes/origin/agent/safe-pr-reorder
+          test "$(git rev-parse refs/remotes/origin/agent/safe-pr-reorder)" = "$base"
+
+          git config user.name "OpenAI Codex"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --detach "$base"
+          git am --committer-date-is-author-date /tmp/review6.patch
+
+          test "$(git rev-parse HEAD)" = "$expected_head"
+          test "$(git rev-parse HEAD^{tree})" = "$expected_tree"
+          test "$(git rev-list --count "$base"..HEAD)" = 3
+          test "$(git show --no-patch --format=%s HEAD~2)" = \
+            "Pin publication to one authenticated remote"
+          test "$(git show --no-patch --format=%s HEAD~1)" = \
+            "Authenticate cascade publication state"
+          test "$(git show --no-patch --format=%s HEAD)" = \
+            "Preflight bounded PR projection bodies"
+          git diff --check "$base"...HEAD
+          git log --reverse --format='%H %s' "$base"..HEAD
+
+      - name: Read Rust version
+        id: rust-version
+        shell: bash
+        run: |
+          echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Install project Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-version.outputs.version }}
+          components: clippy
+
+      - name: Install nightly rustfmt
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo +nightly fmt --all -- --check
+
+      - name: Run Clippy
+        env:
+          GHERRIT_TEST_BUILD: "1"
+        run: >-
+          cargo +${{ steps.rust-version.outputs.version }} clippy
+          --workspace --all-targets --locked -- -D warnings
+
+      - name: Run Rust tests
+        env:
+          GHERRIT_TEST_BUILD: "1"
+        run: >-
+          cargo +${{ steps.rust-version.outputs.version }} test
+          --workspace --all-targets --locked
+
+      - name: Run protocol and cascade validation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ci/check_todo.sh
+          bash ci/test_extract_stack_child.sh
+          bash ci/test_select_cascade_child.sh
+          bash ci/test_cascade_action.sh
+          bash -n ci/cascade_stack.sh
+          bash -n ci/select_cascade_child.sh
+          bash -n ci/test_cascade_action.sh
+          python3 -m py_compile ci/gherrit_protocol.py
+
+      - name: Publish exact validated history
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse HEAD)" = \
+            249dc06cccdeae88a12961ef6e12c2a717a462ad
+          test "$(git rev-parse HEAD^{tree})" = \
+            50eee957d14679825658dbe9b1f9e7427c2f78ab
+          git push --no-verify \
+            --force-with-lease=refs/heads/agent/safe-pr-reorder:20a97f10d68cc98793619363a601601ee2e48db2 \
+            origin HEAD:refs/heads/agent/safe-pr-reorder
