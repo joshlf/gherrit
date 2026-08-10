@@ -15,6 +15,7 @@ use crate::{
     util::{self, CommandExt as _, HeadState},
 };
 
+mod autosquash;
 mod batching;
 mod github;
 mod publication;
@@ -116,26 +117,21 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
         util::CommitsBetweenError::Eyre(e) => e,
     })?;
 
-    let remote = repo.default_remote_name();
-    commits
+    let commits = commits
         .into_iter()
-        .map(|c| -> Result<Commit> {
-            let msg = c.message()?;
-            let title = core::str::from_utf8(msg.title)?;
-
-            if ["fixup!", "squash!", "amend!"].iter().any(|p| title.starts_with(p)) {
-                // FIXME: Currently, the indent before `git rebase` is not
-                // preserved.
-                bail!(
-                    "Stack contains pending fixup/squash/amend commits.\n\
-                    Please squash your history before syncing:\n\
-                        git rebase -i --autosquash {remote}/{default_branch}",
-                );
-            }
-
-            c.try_into()
+        .map(|commit| -> Result<_> {
+            let title = core::str::from_utf8(commit.message()?.title)?.to_owned();
+            Ok((commit, title))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    autosquash::ensure_publishable(
+        commits.iter().map(|(_, title)| title.as_str()),
+        &repo.default_remote_name(),
+        &default_branch,
+    )?;
+
+    commits.into_iter().map(|(commit, _)| commit.try_into()).collect()
 }
 
 #[allow(clippy::too_many_lines)]
