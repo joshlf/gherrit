@@ -45,6 +45,57 @@ fn test_full_stack_lifecycle_mocked() {
 }
 
 #[test]
+fn test_stack_id_comes_only_from_the_trailer_block() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("trailer-block");
+    ctx.run_git(&[
+        "commit",
+        "--allow-empty",
+        "--no-verify",
+        "--cleanup=verbatim",
+        "-m",
+        "Document an example\n\ngherrit-pr-id: Gexample\n\nExplanation.\n\ngherrit-pr-id: Greal",
+    ]);
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    assert!(ctx.remote_ref_oid("refs/heads/Gexample").is_none());
+    assert_eq!(ctx.remote_ref_oid("refs/heads/Greal").as_deref(), Some(ctx.head_oid().as_str()));
+    let pull_requests = ctx.github().pull_requests();
+    assert_eq!(pull_requests.len(), 1);
+    let body = pull_requests[0].body.as_deref().expect("created PR body");
+    assert!(body.contains("gherrit-pr-id: Gexample"));
+    assert!(!body.contains("\ngherrit-pr-id: Greal\n"));
+}
+
+#[test]
+fn test_unrelated_continued_trailer_does_not_hide_stack_id() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("continued-trailer");
+    ctx.run_git(&[
+        "commit",
+        "--allow-empty",
+        "--no-verify",
+        "--cleanup=verbatim",
+        "-m",
+        "Work\n\nReviewed-by: First\n continuation\ngherrit-pr-id: Gone",
+    ]);
+
+    ctx.hook_cmd("pre-push").assert().success();
+    assert!(ctx.remote_ref_oid("refs/heads/Gone").is_some());
+}
+
+#[test]
 fn test_version_increment() {
     let ctx = testutil::test_context!()
         .with_remote()
