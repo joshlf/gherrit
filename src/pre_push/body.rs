@@ -186,7 +186,7 @@ impl PrBody<'_> {
 }
 
 pub(super) fn gherrit_pr_id_re() -> &'static regex::Regex {
-    re!(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]*)$")
+    re!(r"(?m)^gherrit-pr-id: ([a-zA-Z0-9]+)$")
 }
 
 fn metadata_comment(id: &str, parent: Option<&str>, child: Option<&str>) -> String {
@@ -216,6 +216,12 @@ mod tests {
     use super::*;
 
     const STACK: &[u64] = &[11, 22, 33];
+
+    #[test]
+    fn gherrit_id_trailers_require_a_nonempty_identifier() {
+        assert!(gherrit_pr_id_re().is_match("gherrit-pr-id: Gone"));
+        assert!(!gherrit_pr_id_re().is_match("gherrit-pr-id: "));
+    }
 
     fn body<'a>(
         commit_body: &'a str,

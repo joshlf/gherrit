@@ -1,4 +1,8 @@
-use std::{collections::HashMap, process::Stdio, str};
+use std::{
+    collections::{HashMap, HashSet},
+    process::Stdio,
+    str,
+};
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
 use gix::{ObjectId, reference::Category, refs::transaction::PreviousValue};
@@ -151,7 +155,20 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
         &default_branch,
     )?;
 
-    commits.into_iter().map(|(commit, _)| commit.try_into()).collect()
+    let commits: Vec<Commit> =
+        commits.into_iter().map(|(commit, _)| commit.try_into()).collect::<Result<Vec<_>>>()?;
+    ensure_unique_gherrit_ids(commits.iter().map(|commit| commit.gherrit_id.as_str()))?;
+    Ok(commits)
+}
+
+fn ensure_unique_gherrit_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    ids.into_iter().try_fold(HashSet::new(), |mut seen, id| {
+        if !seen.insert(id) {
+            bail!("Stack contains multiple commits with gherrit-pr-id '{id}'");
+        }
+        Ok(seen)
+    })?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -467,13 +484,16 @@ impl TryFrom<gix::Commit<'_>> for Commit {
         let message_title = core::str::from_utf8(message.title)?.to_string();
         let message_body =
             message.body.map(|body| core::str::from_utf8(body).unwrap()).unwrap_or("").to_string();
-        let gherrit_id = {
-            let re = gherrit_pr_id_re();
-            let captures = re
-                .captures(&message_body)
-                .ok_or_else(|| eyre!("Commit {} missing gherrit-pr-id trailer", c.id))?;
-            captures.get(1).unwrap().as_str().to_string()
-        };
+        let mut gherrit_ids = gherrit_pr_id_re()
+            .captures_iter(&message_body)
+            .map(|captures| captures.get(1).unwrap().as_str());
+        let gherrit_id = gherrit_ids
+            .next()
+            .ok_or_else(|| eyre!("Commit {} missing gherrit-pr-id trailer", c.id))?;
+        if gherrit_ids.next().is_some() {
+            bail!("Commit {} has multiple gherrit-pr-id trailers", c.id);
+        }
+        let gherrit_id = gherrit_id.to_string();
 
         Ok(Commit { id: c.id, gherrit_id, message_title, message_body })
     }
