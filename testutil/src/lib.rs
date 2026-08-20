@@ -450,6 +450,7 @@ pub enum GitOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     GraphQl,
+    GraphQlResourceLimit { mutation: GraphQlMutation, applied: usize },
     CreatePr,
     UpdatePr,
     Git(GitOperation),
@@ -460,6 +461,21 @@ pub enum GraphQlOperation {
     Query,
     CreatePr,
     UpdatePr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphQlMutation {
+    CreatePr,
+    UpdatePr,
+}
+
+impl GraphQlMutation {
+    fn operation(self) -> GraphQlOperation {
+        match self {
+            Self::CreatePr => GraphQlOperation::CreatePr,
+            Self::UpdatePr => GraphQlOperation::UpdatePr,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

@@ -53,7 +53,7 @@ impl BatchPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResponseDisposition {
     Success,
-    RetryLimit,
+    ResourceLimit,
     Fatal,
 }
 
@@ -65,13 +65,12 @@ pub(super) fn classify_response(response: &Value) -> ResponseDisposition {
     let Some(errors) = response.get("errors") else {
         return ResponseDisposition::Success;
     };
-    let has_no_data = response.get("data").is_none_or(Value::is_null);
     let has_only_resource_errors = errors
         .as_array()
         .is_some_and(|errors| !errors.is_empty() && errors.iter().all(is_resource_limit_error));
 
-    if has_no_data && has_only_resource_errors {
-        ResponseDisposition::RetryLimit
+    if has_only_resource_errors {
+        ResponseDisposition::ResourceLimit
     } else {
         ResponseDisposition::Fatal
     }
@@ -183,17 +182,30 @@ mod tests {
         ] {
             assert_eq!(
                 classify_response(&json!({ "errors": [error] })),
-                ResponseDisposition::RetryLimit
+                ResponseDisposition::ResourceLimit
             );
             assert_eq!(
                 classify_response(&json!({ "data": null, "errors": [error] })),
-                ResponseDisposition::RetryLimit
+                ResponseDisposition::ResourceLimit
             );
         }
     }
 
     #[test]
-    fn treats_partial_or_mixed_errors_as_fatal() {
+    fn treats_partial_resource_limit_responses_as_resource_limits() {
+        let response = json!({
+            "data": { "op0": { "value": 1 }, "op1": null },
+            "errors": [{
+                "path": ["op1"],
+                "type": "RESOURCE_LIMITS_EXCEEDED"
+            }]
+        });
+
+        assert_eq!(classify_response(&response), ResponseDisposition::ResourceLimit);
+    }
+
+    #[test]
+    fn treats_mixed_or_malformed_errors_as_fatal() {
         let resource_error = json!({ "type": "RESOURCE_LIMITS_EXCEEDED" });
         let fatal_error = json!({ "type": "FORBIDDEN" });
 
@@ -202,7 +214,6 @@ mod tests {
             json!({ "errors": [resource_error.clone(), fatal_error] }),
             json!({ "errors": [] }),
             json!({ "errors": "not an array" }),
-            json!({ "data": {}, "errors": [resource_error] }),
         ] {
             assert_eq!(classify_response(&response), ResponseDisposition::Fatal);
         }
