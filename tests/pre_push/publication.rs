@@ -141,8 +141,7 @@ fn test_optimistic_locking_conflict() {
     );
 }
 
-#[test]
-fn test_ambiguous_mutation_batch_fails_closed() {
+fn drifted_update_stack(branch: &str, count: usize) -> (testutil::TestContext, Vec<String>) {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_initial_commit()
@@ -150,37 +149,147 @@ fn test_ambiguous_mutation_batch_fails_closed() {
         .with_git_interceptor()
         .build();
 
+    ctx.checkout_managed_private(branch);
+
+    let commits = (1..=count)
+        .map(|index| {
+            let title = format!("Commit {index}");
+            let id = ctx.commit_with_gherrit_id(&title);
+            ctx.github().seed_pull_request(testutil::PullRequestSeed {
+                number: index,
+                title,
+                body: "stale".to_string(),
+                head: id.clone(),
+                base: "main".to_string(),
+            });
+            id
+        })
+        .collect::<Vec<_>>();
+
+    (ctx, commits)
+}
+
+fn absent_stack(branch: &str, count: usize) -> (testutil::TestContext, Vec<String>) {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+
+    ctx.checkout_managed_private(branch);
+    let commits =
+        (1..=count).map(|index| ctx.commit_with_gherrit_id(&format!("Commit {index}"))).collect();
+    (ctx, commits)
+}
+
+fn operation_batch_lengths(
+    requests: &[Vec<testutil::GraphQlOperation>],
+    operation: testutil::GraphQlOperation,
+) -> Vec<usize> {
+    requests
+        .iter()
+        .filter(|operations| {
+            !operations.is_empty() && operations.iter().all(|candidate| *candidate == operation)
+        })
+        .map(Vec::len)
+        .collect()
+}
+
+fn ambiguous_batch_index(
+    requests: &[Vec<testutil::GraphQlOperation>],
+    operation: testutil::GraphQlOperation,
+    attempted: usize,
+) -> usize {
+    requests
+        .iter()
+        .position(|operations| {
+            operations.len() == attempted
+                && operations.iter().all(|candidate| *candidate == operation)
+        })
+        .unwrap()
+}
+
+fn assert_reobserved_after(
+    requests: &[Vec<testutil::GraphQlOperation>],
+    operation: testutil::GraphQlOperation,
+    attempted: usize,
+    stack_len: usize,
+) {
+    let ambiguous = ambiguous_batch_index(requests, operation, attempted);
+    assert!(
+        requests[ambiguous + 1..].iter().any(|operations| {
+            operations.len() == stack_len
+                && operations
+                    .iter()
+                    .all(|candidate| *candidate == testutil::GraphQlOperation::Query)
+        }),
+        "GHerrit must reobserve the complete stack after an ambiguous {operation:?} batch: {requests:?}"
+    );
+}
+
+fn assert_reobserved_before_retry(
+    requests: &[Vec<testutil::GraphQlOperation>],
+    operation: testutil::GraphQlOperation,
+    attempted: usize,
+    retry: usize,
+    stack_len: usize,
+) {
+    let ambiguous = ambiguous_batch_index(requests, operation, attempted);
+    let first_retry = requests
+        .iter()
+        .enumerate()
+        .skip(ambiguous + 1)
+        .find(|(_, operations)| {
+            operations.len() == retry && operations.iter().all(|candidate| *candidate == operation)
+        })
+        .map(|(index, _)| index)
+        .unwrap();
+    assert!(
+        requests[ambiguous + 1..first_retry].iter().any(|operations| {
+            operations.len() == stack_len
+                && operations
+                    .iter()
+                    .all(|candidate| *candidate == testutil::GraphQlOperation::Query)
+        }),
+        "GHerrit must reobserve the complete stack before retrying an ambiguous {operation:?} batch: {requests:?}"
+    );
+}
+
+fn assert_stack_converged(ctx: &testutil::TestContext, commits: &[String]) {
+    let pull_requests = ctx.github().pull_requests();
+    assert_eq!(pull_requests.len(), commits.len());
+    assert!(
+        pull_requests.iter().all(|pr| pr.body != "stale"),
+        "Expected every PR to be reconciled"
+    );
+    let expected_bases = std::iter::once("main".to_string())
+        .chain(commits.iter().take(commits.len().saturating_sub(1)).cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(pull_requests.iter().map(|pr| pr.base.clone()).collect::<Vec<_>>(), expected_bases);
+}
+
+#[test]
+fn test_update_batch_reobserves_before_backoff_retry() {
+    let (ctx, commits) = drifted_update_stack("batch-backoff", 4);
     ctx.limit_graphql_operations_per_request(2);
-    ctx.checkout_managed_private("batch-backoff");
 
-    for i in 1..=4 {
-        ctx.commit_with_gherrit_id(&format!("Commit {i}"));
-    }
-
-    ctx.hook_cmd("pre-push")
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("cannot safely retry the ambiguous write"));
+    testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "graphql_batch_backoff");
 
     assert_eq!(
         ctx.recorded_pushes().iter().filter(|push| push.succeeded()).count(),
         1,
         "GraphQL backoff must not alter the independent Git publication batch"
     );
-    assert!(ctx.github().pull_requests().is_empty());
+    assert_stack_converged(&ctx, &commits);
     let requests = ctx.github().requests();
+    insta::assert_debug_snapshot!("graphql_batch_backoff_trace", &requests);
     assert_eq!(
-        requests
-            .iter()
-            .filter(|operations| {
-                operations
-                    .iter()
-                    .all(|operation| *operation == testutil::GraphQlOperation::CreatePr)
-            })
-            .count(),
-        1,
-        "an ambiguously acknowledged mutation batch must not be replayed"
+        operation_batch_lengths(&requests, testutil::GraphQlOperation::UpdatePr),
+        [4, 2, 2],
+        "the ambiguous batch must be retried at the reduced ceiling"
     );
+    assert_reobserved_before_retry(&requests, testutil::GraphQlOperation::UpdatePr, 4, 2, 4);
 
     let v1_refs = ctx
         .remote_refs("refs/tags/gherrit")
@@ -188,4 +297,172 @@ fn test_ambiguous_mutation_batch_fails_closed() {
         .filter(|ref_name| ref_name.ends_with("/v1"))
         .count();
     assert_eq!(v1_refs, 4, "Expected every v1 tag on the remote");
+}
+
+#[test]
+fn test_partial_update_reobserves_before_retry() {
+    let (ctx, commits) = drifted_update_stack("partial-update", 4);
+    ctx.inject_failure(testutil::FailureKind::GraphQlResourceLimit {
+        mutation: testutil::GraphQlMutation::UpdatePr,
+        applied: 2,
+    });
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    ctx.assert_failure_consumed();
+    assert_stack_converged(&ctx, &commits);
+    let requests = ctx.github().requests();
+    assert_eq!(
+        operation_batch_lengths(&requests, testutil::GraphQlOperation::UpdatePr),
+        [4, 2],
+        "the applied prefix must disappear when the update batch is replanned"
+    );
+    assert_reobserved_before_retry(&requests, testutil::GraphQlOperation::UpdatePr, 4, 2, 4);
+}
+
+#[test]
+fn test_fully_applied_update_batch_is_not_replayed() {
+    let (ctx, commits) = drifted_update_stack("fully-applied-update", 4);
+    ctx.inject_failure(testutil::FailureKind::GraphQlResourceLimit {
+        mutation: testutil::GraphQlMutation::UpdatePr,
+        applied: 4,
+    });
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    ctx.assert_failure_consumed();
+    assert_stack_converged(&ctx, &commits);
+    let requests = ctx.github().requests();
+    assert_eq!(operation_batch_lengths(&requests, testutil::GraphQlOperation::UpdatePr), [4]);
+    assert_reobserved_after(&requests, testutil::GraphQlOperation::UpdatePr, 4, 4);
+}
+
+#[test]
+fn test_applied_singleton_update_is_not_replayed() {
+    let (ctx, commits) = drifted_update_stack("applied-singleton-update", 1);
+    ctx.inject_failure(testutil::FailureKind::GraphQlResourceLimit {
+        mutation: testutil::GraphQlMutation::UpdatePr,
+        applied: 1,
+    });
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    ctx.assert_failure_consumed();
+    assert_stack_converged(&ctx, &commits);
+    assert_eq!(
+        operation_batch_lengths(&ctx.github().requests(), testutil::GraphQlOperation::UpdatePr),
+        [1]
+    );
+}
+
+#[test]
+fn test_unapplied_singleton_update_fails_without_replay() {
+    let (ctx, _) = drifted_update_stack("unapplied-singleton-update", 1);
+    ctx.inject_failure(testutil::FailureKind::GraphQlResourceLimit {
+        mutation: testutil::GraphQlMutation::UpdatePr,
+        applied: 0,
+    });
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("still unchanged after reobservation"));
+
+    ctx.assert_failure_consumed();
+    assert_eq!(ctx.github().pull_requests()[0].body, "stale");
+    assert_eq!(
+        operation_batch_lengths(&ctx.github().requests(), testutil::GraphQlOperation::UpdatePr),
+        [1]
+    );
+}
+
+#[test]
+fn test_creation_batch_reobserves_before_backoff_retry() {
+    let (ctx, commits) = absent_stack("create-batch-backoff", 4);
+    ctx.limit_graphql_operations_per_request(2);
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    assert_stack_converged(&ctx, &commits);
+    let requests = ctx.github().requests();
+    assert_eq!(operation_batch_lengths(&requests, testutil::GraphQlOperation::CreatePr), [4, 2, 2]);
+    assert_eq!(
+        operation_batch_lengths(&requests, testutil::GraphQlOperation::UpdatePr),
+        [2, 2],
+        "the reduced mutation ceiling must carry into the update phase"
+    );
+    assert_reobserved_before_retry(&requests, testutil::GraphQlOperation::CreatePr, 4, 2, 4);
+}
+
+#[test]
+fn test_partial_creation_reobserves_before_retry() {
+    let (ctx, commits) = absent_stack("partial-create", 4);
+    ctx.inject_failure(testutil::FailureKind::GraphQlResourceLimit {
+        mutation: testutil::GraphQlMutation::CreatePr,
+        applied: 2,
+    });
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    ctx.assert_failure_consumed();
+    assert_stack_converged(&ctx, &commits);
+    let requests = ctx.github().requests();
+    assert_eq!(operation_batch_lengths(&requests, testutil::GraphQlOperation::CreatePr), [4, 2]);
+    assert_reobserved_before_retry(&requests, testutil::GraphQlOperation::CreatePr, 4, 2, 4);
+}
+
+#[test]
+fn test_fully_applied_creation_batch_is_not_replayed() {
+    let (ctx, commits) = absent_stack("fully-applied-create", 4);
+    ctx.inject_failure(testutil::FailureKind::GraphQlResourceLimit {
+        mutation: testutil::GraphQlMutation::CreatePr,
+        applied: 4,
+    });
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    ctx.assert_failure_consumed();
+    assert_stack_converged(&ctx, &commits);
+    let requests = ctx.github().requests();
+    assert_eq!(operation_batch_lengths(&requests, testutil::GraphQlOperation::CreatePr), [4]);
+    assert_reobserved_after(&requests, testutil::GraphQlOperation::CreatePr, 4, 4);
+}
+
+#[test]
+fn test_applied_singleton_creation_is_not_replayed() {
+    let (ctx, commits) = absent_stack("applied-singleton-create", 1);
+    ctx.inject_failure(testutil::FailureKind::GraphQlResourceLimit {
+        mutation: testutil::GraphQlMutation::CreatePr,
+        applied: 1,
+    });
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    ctx.assert_failure_consumed();
+    assert_stack_converged(&ctx, &commits);
+    assert_eq!(
+        operation_batch_lengths(&ctx.github().requests(), testutil::GraphQlOperation::CreatePr),
+        [1]
+    );
+}
+
+#[test]
+fn test_unapplied_singleton_creation_fails_without_replay() {
+    let (ctx, _) = absent_stack("unapplied-singleton-create", 1);
+    ctx.inject_failure(testutil::FailureKind::GraphQlResourceLimit {
+        mutation: testutil::GraphQlMutation::CreatePr,
+        applied: 0,
+    });
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("still absent after reobservation"));
+
+    ctx.assert_failure_consumed();
+    assert!(ctx.github().pull_requests().is_empty());
+    assert_eq!(
+        operation_batch_lengths(&ctx.github().requests(), testutil::GraphQlOperation::CreatePr),
+        [1]
+    );
 }

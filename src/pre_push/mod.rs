@@ -322,15 +322,10 @@ async fn sync_prs(
         .flatten();
     let repo_url = remote.repo_url_relative();
 
-    if commits.len() != prs.len() {
-        bail!("GitHub returned {} PR observations for {} stack commits", prs.len(), commits.len());
-    }
     let mut entries = commits
         .into_iter()
-        .zip(prs)
-        .map(|(commit, pull_request)| ProjectionEntry {
-            pull_request: pull_request
-                .map(|pr| KnownPr::new(pr.number, pr.node_id, pr.title, pr.body, pr.base_branch)),
+        .map(|commit| ProjectionEntry {
+            pull_request: None,
             commit: ProjectionCommit {
                 latest_version: latest_versions.get(&commit.gherrit_id).copied().unwrap_or(1),
                 gherrit_id: commit.gherrit_id,
@@ -339,6 +334,8 @@ async fn sync_prs(
             },
         })
         .collect::<Vec<_>>();
+    replace_pull_requests(&mut entries, prs)?;
+    let mut mutation_batch_len = INITIAL_GRAPHQL_BATCH_LEN;
     entries.iter().for_each(|entry| match &entry.pull_request {
         Some(pr) => {
             log::debug!(
@@ -363,13 +360,36 @@ async fn sync_prs(
                 let num_creations = creations.len();
                 log::info!("Creating {num_creations} PRs...");
                 let repo_id = fetch_repo_id(octocrab, &remote).await?;
-                let created =
-                    match batch_create_prs(octocrab, &repo_id, creations.iter().cloned()).await? {
-                        MutationExecution::Complete(created) => created,
-                        MutationExecution::Ambiguous(ambiguity) => {
-                            bail!("{}", ambiguity.failure("creating pull requests"));
+                let created = match batch_create_prs(
+                    octocrab,
+                    &repo_id,
+                    creations.iter().cloned(),
+                    mutation_batch_len,
+                )
+                .await?
+                {
+                    MutationExecution::Complete(created) => created,
+                    MutationExecution::Ambiguous(ambiguity) => {
+                        let singleton_head = ambiguity
+                            .singleton(&creations)
+                            .map(|creation| creation.head_branch.clone());
+                        mutation_batch_len = ambiguity.retry_batch_len();
+                        log::warn!(
+                            "GitHub may have applied part of the PR creation batch; reobserving before continuing."
+                        );
+                        reobserve_pull_requests(repo, octocrab, &mut entries).await?;
+                        if let Some(head) = singleton_head.filter(|head| {
+                            entries.iter().any(|entry| {
+                                entry.commit.gherrit_id == *head && entry.pull_request.is_none()
+                            })
+                        }) {
+                            bail!(
+                                "GitHub reported a resource limit while creating the PR for head branch '{head}', and the PR was still absent after reobservation. GHerrit cannot safely retry the ambiguous operation in this invocation."
+                            );
                         }
-                    };
+                        continue;
+                    }
+                };
                 if created.len() != num_creations {
                     bail!(
                         "GitHub returned {} PRs for {num_creations} creation actions",
@@ -405,13 +425,31 @@ async fn sync_prs(
             ProjectionStep::Update(updates) => {
                 log_projection_updates(&remote, &entries, &updates);
                 log::info!("Updating batch of {} PRs...", updates.len());
-                match batch_update_prs(octocrab, updates).await? {
+                match batch_update_prs(octocrab, &updates, mutation_batch_len).await? {
                     MutationExecution::Complete(_) => {
                         log::info!("Batch update complete.");
                         return Ok(());
                     }
                     MutationExecution::Ambiguous(ambiguity) => {
-                        bail!("{}", ambiguity.failure("updating pull requests"));
+                        let attempted = ambiguity.singleton(&updates).cloned();
+                        mutation_batch_len = ambiguity.retry_batch_len();
+                        log::warn!(
+                            "GitHub may have applied part of the PR update batch; reobserving before continuing."
+                        );
+                        reobserve_pull_requests(repo, octocrab, &mut entries).await?;
+                        if let Some(attempted) = attempted {
+                            let replanned = plan_projection(context, &entries);
+                            if matches!(
+                                replanned,
+                                ProjectionStep::Update(ref updates)
+                                    if updates.contains(&attempted)
+                            ) {
+                                bail!(
+                                    "GitHub reported a resource limit while updating PR #{}, and the requested update was still unchanged after reobservation. GHerrit cannot safely retry the ambiguous operation in this invocation.",
+                                    attempted.number()
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -421,6 +459,35 @@ async fn sync_prs(
             }
         }
     }
+}
+
+async fn reobserve_pull_requests(
+    repo: &util::Repo,
+    octocrab: &Octocrab,
+    entries: &mut [ProjectionEntry],
+) -> Result<()> {
+    let head_refs = entries.iter().map(|entry| entry.commit.gherrit_id.clone()).collect::<Vec<_>>();
+    let pull_requests = batch_fetch_prs(repo, octocrab, &head_refs).await?;
+    ensure_pull_requests_open(pull_requests.iter().flatten().map(|pr| (pr.number, pr.state)))?;
+    replace_pull_requests(entries, pull_requests)
+}
+
+fn replace_pull_requests(
+    entries: &mut [ProjectionEntry],
+    pull_requests: Vec<Option<PrState>>,
+) -> Result<()> {
+    if entries.len() != pull_requests.len() {
+        bail!(
+            "GitHub returned {} PR observations for {} stack commits",
+            pull_requests.len(),
+            entries.len()
+        );
+    }
+    entries.iter_mut().zip(pull_requests).for_each(|(entry, pull_request)| {
+        entry.pull_request = pull_request
+            .map(|pr| KnownPr::new(pr.number, pr.node_id, pr.title, pr.body, pr.base_branch));
+    });
+    Ok(())
 }
 
 fn log_projection_updates(
@@ -503,13 +570,14 @@ async fn fetch_repo_id(octocrab: &Octocrab, remote: &util::Remote) -> Result<Str
 /// adaptive batches and sending each batch as one GraphQL operation.
 async fn batch_update_prs(
     octocrab: &Octocrab,
-    updates: impl IntoIterator<Item = UpdatePr>,
+    updates: &[UpdatePr],
+    max_batch_len: NonZeroUsize,
 ) -> Result<MutationExecution<()>> {
-    let updates = updates.into_iter().map(|update| {
+    let updates = updates.iter().cloned().map(|update| {
         let (node_id, title, body, base_branch) = update.into_parts();
         UpdatePullRequest::new(node_id, title, body, base_branch)
     });
-    run_batched_mutations(octocrab, updates, INITIAL_GRAPHQL_BATCH_LEN).await
+    run_batched_mutations(octocrab, updates, max_batch_len).await
 }
 
 /// Performs batched creation of PRs using GitHub's GraphQL API.
@@ -522,6 +590,7 @@ async fn batch_create_prs(
     octocrab: &Octocrab,
     repo_id: &str,
     creations: impl IntoIterator<Item = CreatePr>,
+    max_batch_len: NonZeroUsize,
 ) -> Result<MutationExecution<PrState>> {
     let creations = creations.into_iter().map(|create| {
         CreatePullRequest::new(
@@ -532,7 +601,7 @@ async fn batch_create_prs(
             create.body,
         )
     });
-    run_batched_mutations(octocrab, creations, INITIAL_GRAPHQL_BATCH_LEN).await
+    run_batched_mutations(octocrab, creations, max_batch_len).await
 }
 
 async fn batch_fetch_prs(
@@ -568,12 +637,16 @@ struct AmbiguousMutation {
 }
 
 impl AmbiguousMutation {
-    fn failure(&self, action: &str) -> String {
-        format!(
-            "GitHub may have applied a batch of {} mutations while {action}. GHerrit cannot safely retry the ambiguous write in this invocation (reduced batch ceiling: {}).",
-            self.attempted.len(),
-            self.retry_batch_len
-        )
+    fn retry_batch_len(&self) -> NonZeroUsize {
+        self.retry_batch_len
+    }
+
+    fn singleton<'a, T>(&self, actions: &'a [T]) -> Option<&'a T> {
+        (self.attempted.len() == 1).then(|| {
+            actions
+                .get(self.attempted.start)
+                .expect("ambiguous mutation range identifies its input action")
+        })
     }
 }
 
