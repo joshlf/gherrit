@@ -1,10 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroUsize,
-    ops::Range,
-    process::Stdio,
-    str,
-};
+use std::{collections::HashSet, num::NonZeroUsize, ops::Range, process::Stdio};
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
 use gix::{ObjectId, reference::Category, refs::transaction::PreviousValue};
@@ -34,12 +28,15 @@ use github::{
     OperationType, PullRequest as PrState, RepositoryIdQuery, UpdatePullRequest, batch_document,
     decode_batch_response,
 };
-use publication::{PushTarget, plan_push, push_batches};
+use publication::{
+    Checkpoint, CheckpointTarget, PublicationAction, PushTarget, parse_version, plan_publication,
+    plan_push, push_batches,
+};
 use reconcile::{
     CreatePr, KnownPr, ProjectionCommit, ProjectionContext, ProjectionEntry, ProjectionStep,
     UpdatePr, ensure_pull_requests_open, plan_projection,
 };
-use remote::observe_managed_branches;
+use remote::observe_publications;
 
 #[derive(Eq, PartialEq)]
 pub(crate) enum GithubEndpoint {
@@ -116,11 +113,11 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
     ensure_pull_requests_open(prs.iter().flatten().map(|pr| (pr.number, pr.state)))?;
 
-    let latest_versions = push_to_origin(repo, &commits)?;
+    let num_commits = commits.len();
+    let published_commits = push_to_origin(repo, commits)?;
     let default_branch = repo.find_default_branch_on_default_remote();
 
-    let num_commits = commits.len();
-    sync_prs(repo, &octocrab, branch_name, &default_branch, commits, latest_versions, prs).await?;
+    sync_prs(repo, &octocrab, branch_name, &default_branch, published_commits, prs).await?;
 
     log::info!("Successfully synced {num_commits} commits.");
     Ok(())
@@ -173,49 +170,66 @@ fn ensure_unique_gherrit_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Resu
     Ok(())
 }
 
+struct PublishedCommit {
+    commit: Commit,
+    version: NonZeroUsize,
+}
+
 #[allow(clippy::too_many_lines)]
-fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<String, usize>> {
-    let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
+fn push_to_origin(repo: &util::Repo, commits: Vec<Commit>) -> Result<Vec<PublishedCommit>> {
+    let local_checkpoints = commits
+        .iter()
+        .map(|commit| get_local_checkpoint(repo, &commit.gherrit_id))
+        .collect::<Result<Vec<_>>>()?;
+    let gherrit_ids = commits.iter().map(|commit| commit.gherrit_id.as_str()).collect::<Vec<_>>();
+    let remote_publications = observe_publications(repo, &gherrit_ids)?;
+    if remote_publications.len() != commits.len() {
+        bail!(
+            "Git returned {} publication observations for {} commits",
+            remote_publications.len(),
+            commits.len()
+        );
+    }
 
-    // Fetch remote branch states to ensure we don't act on stale information.
-    let remote_branch_states = observe_managed_branches(repo, &gherrit_ids)?;
+    let remote_name = repo.default_remote_name();
+    let actions = commits
+        .iter()
+        .zip(local_checkpoints)
+        .zip(remote_publications)
+        .map(|((commit, local), remote)| {
+            plan_publication(&remote_name, &commit.gherrit_id, commit.id, local, remote)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    let mut next_versions = HashMap::new();
+    let recoveries = actions
+        .iter()
+        .filter_map(|action| match action {
+            PublicationAction::Recover(target) => Some(*target),
+            PublicationAction::Current(_) | PublicationAction::Push(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if !recoveries.is_empty() {
+        log::info!("Recovering {} remote publication checkpoints...", recoveries.len());
+        recoveries.iter().try_for_each(|target| persist_local_checkpoint(repo, *target))?;
+    }
 
-    for chunk in push_batches(commits) {
-        let mut targets = Vec::with_capacity(chunk.len());
-
-        for c in chunk {
-            // Determine the next version based on local tags (Optimistic
-            // Locking).
-            let local_max = get_local_version(repo, &c.gherrit_id).unwrap_or(0);
-            let next_ver = local_max + 1;
-            next_versions.insert(c.gherrit_id.clone(), next_ver);
-
-            // Lease the branch to ensure it hasn't changed since our fetch.
-            // If we know the remote SHA, we expect it. If we don't (None), we
-            // expect "" (creation).
-            let expected_sha =
-                remote_branch_states.get(&c.gherrit_id).map(String::as_str).unwrap_or("");
-
-            targets.push(PushTarget {
-                object_id: c.id,
-                gherrit_id: &c.gherrit_id,
-                version: next_ver,
-                expected_remote_sha: expected_sha,
-            });
-        }
-
-        let plan = plan_push(&repo.default_remote_name(), &targets);
+    let pending = actions
+        .iter()
+        .filter_map(|action| match action {
+            PublicationAction::Push(target) => Some(*target),
+            PublicationAction::Current(_) | PublicationAction::Recover(_) => None,
+        })
+        .collect::<Vec<PushTarget<'_>>>();
+    for chunk in push_batches(&pending) {
+        let arguments = plan_push(&remote_name, chunk);
 
         log::info!("Pushing chunk to remote...");
-        let mut child = util::cmd("git", plan.arguments)
+        let mut child = util::cmd("git", arguments)
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
             .spawn()
             .wrap_err("Failed to run `git push`")?;
 
-        // Filter output logic (elided for brevity, same as before)
         {
             use std::io::{BufRead, BufReader};
             let stderr = child.stderr.take().unwrap();
@@ -249,52 +263,70 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
 
         let status = child.wait().unwrap();
         if !status.success() {
-            // If the push failed, it's likely due to a lease failure
-            // (concurrent modification). If failed, it might be due to the tag
-            // lock or branch lease.
-            let r = repo.default_remote_name();
             bail!(
-                "`git push` failed. The remote might be ahead or changed. Run `git fetch {r}` to sync."
+                "`git push` failed. The remote might be ahead or changed. Run `git fetch {remote_name}` to sync."
             );
         }
 
-        // Persist the local tags now that the push succeeded.
-        for tag in plan.persisted_tags {
-            let _ = repo.reference(
-                format!("refs/tags/gherrit/{}/v{}", tag.gherrit_id, tag.version),
-                tag.object_id,
-                PreviousValue::Any,
-                "gherrit: persist local version state",
-            );
-        }
+        chunk.iter().try_for_each(|target| persist_local_checkpoint(repo, target.checkpoint))?;
     }
 
-    Ok(next_versions)
+    let versions = actions.iter().map(PublicationAction::version).collect::<Vec<_>>();
+    drop(recoveries);
+    drop(pending);
+    drop(actions);
+    drop(gherrit_ids);
+    Ok(commits
+        .into_iter()
+        .zip(versions)
+        .map(|(commit, version)| PublishedCommit { commit, version })
+        .collect())
 }
 
-fn get_local_version(repo: &util::Repo, gherrit_id: &str) -> Result<usize> {
-    let prefix = format!("refs/tags/gherrit/{}/v", gherrit_id);
-    let mut max_ver = 0;
+fn persist_local_checkpoint(repo: &util::Repo, target: CheckpointTarget<'_>) -> Result<()> {
+    let ref_name =
+        format!("refs/tags/gherrit/{}/v{}", target.gherrit_id, target.checkpoint.version.get());
+    repo.reference(
+        ref_name.clone(),
+        target.checkpoint.object_id,
+        PreviousValue::MustNotExist,
+        "gherrit: record remote publication checkpoint",
+    )
+    .wrap_err_with(|| {
+        format!(
+            "Remote publication {ref_name} already exists, but GHerrit could not record the matching local checkpoint. Retry is safe and will recover any remaining checkpoints."
+        )
+    })?;
+    Ok(())
+}
 
-    // Use .all() and manual filtering to avoid `prefixed` API type issues.
-    let references = repo.references().map_err(|e| eyre!(e))?;
+fn get_local_checkpoint(repo: &util::Repo, gherrit_id: &str) -> Result<Option<Checkpoint>> {
+    let prefix = format!("refs/tags/gherrit/{gherrit_id}/v").into_bytes();
+    let mut latest = None;
+    let references = repo.references().map_err(|error| eyre!(error))?;
 
-    for reference in references.all().map_err(|e| eyre!(e))? {
-        let reference = reference.map_err(|e| eyre!(e))?;
-        let name = reference.name().as_bstr().to_string();
-
-        if name.starts_with(&prefix) {
-            // Parse "refs/tags/gherrit/<id>/v<ver>"
-            if let Some(ver_str) = name.rsplit('v').next()
-                && let Ok(ver) = ver_str.parse::<usize>()
-                && ver > max_ver
-            {
-                max_ver = ver;
-            }
+    for reference in references.all().map_err(|error| eyre!(error))? {
+        let reference = reference.map_err(|error| eyre!(error))?;
+        let name: &[u8] = reference.name().as_bstr().as_ref();
+        let Some(version) = name.strip_prefix(prefix.as_slice()) else {
+            continue;
+        };
+        let version = core::str::from_utf8(version).wrap_err_with(|| {
+            format!("Malformed local GHerrit version tag: {}", String::from_utf8_lossy(name))
+        })?;
+        let version = parse_version(version).ok_or_else(|| {
+            eyre!("Malformed local GHerrit version tag: {}", String::from_utf8_lossy(name))
+        })?;
+        let object_id = reference.try_id().ok_or_else(|| {
+            eyre!("Local GHerrit version tag is symbolic: {}", String::from_utf8_lossy(name))
+        })?;
+        let checkpoint = Checkpoint { object_id: object_id.detach(), version };
+        if latest.is_none_or(|latest: Checkpoint| checkpoint.version > latest.version) {
+            latest = Some(checkpoint);
         }
     }
 
-    Ok(max_ver)
+    Ok(latest)
 }
 
 /// Syncs the local stack of commits with GitHub Pull Requests.
@@ -308,8 +340,7 @@ async fn sync_prs(
     octocrab: &Octocrab,
     branch_name: &str,
     base_branch: &str,
-    commits: Vec<Commit>,
-    latest_versions: HashMap<String, usize>,
+    commits: Vec<PublishedCommit>,
     prs: Vec<Option<PrState>>,
 ) -> Result<()> {
     let remote = repo.default_remote()?;
@@ -324,13 +355,13 @@ async fn sync_prs(
 
     let mut entries = commits
         .into_iter()
-        .map(|commit| ProjectionEntry {
+        .map(|published| ProjectionEntry {
             pull_request: None,
             commit: ProjectionCommit {
-                latest_version: latest_versions.get(&commit.gherrit_id).copied().unwrap_or(1),
-                gherrit_id: commit.gherrit_id,
-                title: commit.message_title,
-                commit_body: commit.message_body,
+                latest_version: published.version,
+                gherrit_id: published.commit.gherrit_id,
+                title: published.commit.message_title,
+                commit_body: published.commit.message_body,
             },
         })
         .collect::<Vec<_>>();
