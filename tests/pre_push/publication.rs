@@ -142,7 +142,7 @@ fn test_optimistic_locking_conflict() {
 }
 
 #[test]
-fn test_graphql_batch_backoff() {
+fn test_ambiguous_mutation_batch_fails_closed() {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_initial_commit()
@@ -157,15 +157,30 @@ fn test_graphql_batch_backoff() {
         ctx.commit_with_gherrit_id(&format!("Commit {i}"));
     }
 
-    testutil::assert_success_snapshot!(ctx, ctx.hook_cmd("pre-push"), "graphql_batch_backoff");
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot safely retry the ambiguous write"));
 
     assert_eq!(
         ctx.recorded_pushes().iter().filter(|push| push.succeeded()).count(),
         1,
         "GraphQL backoff must not alter the independent Git publication batch"
     );
-    assert_eq!(ctx.github().pull_requests().len(), 4, "Expected every commit to have a PR");
-    insta::assert_debug_snapshot!("graphql_batch_backoff_trace", ctx.github().requests());
+    assert!(ctx.github().pull_requests().is_empty());
+    let requests = ctx.github().requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|operations| {
+                operations
+                    .iter()
+                    .all(|operation| *operation == testutil::GraphQlOperation::CreatePr)
+            })
+            .count(),
+        1,
+        "an ambiguously acknowledged mutation batch must not be replayed"
+    );
 
     let v1_refs = ctx
         .remote_refs("refs/tags/gherrit")

@@ -36,20 +36,25 @@ impl OperationType {
 pub(super) trait BatchedOperation {
     type Output;
 
-    const TYPE: OperationType;
-
     fn document(&self) -> String;
     fn decode(&self, response: Value) -> Result<Self::Output>;
 }
 
+pub(super) trait BatchedQuery: BatchedOperation {}
+
+pub(super) trait BatchedMutation: BatchedOperation {}
+
 /// Builds the exact GraphQL document sent for one adaptive batch.
-pub(super) fn batch_document<O: BatchedOperation>(operations: &[O]) -> String {
+pub(super) fn batch_document<O: BatchedOperation>(
+    operation_type: OperationType,
+    operations: &[O],
+) -> String {
     let body = operations
         .iter()
         .enumerate()
         .map(|(index, operation)| format!("op{index}: {}", operation.document()))
         .collect::<String>();
-    format!("{} {{ {body} }}", O::TYPE.keyword())
+    format!("{} {{ {body} }}", operation_type.keyword())
 }
 
 /// Decodes every aliased operation in a successful adaptive batch response.
@@ -142,8 +147,6 @@ impl FindPullRequest {
 
 impl BatchedOperation for FindPullRequest {
     type Output = Option<PullRequest>;
-
-    const TYPE: OperationType = OperationType::Query;
 
     fn document(&self) -> String {
         let connection = |alias: &str, states: &str| {
@@ -240,6 +243,8 @@ impl BatchedOperation for FindPullRequest {
     }
 }
 
+impl BatchedQuery for FindPullRequest {}
+
 /// A request to create a PR for one commit in the stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CreatePullRequest {
@@ -264,8 +269,6 @@ impl CreatePullRequest {
 
 impl BatchedOperation for CreatePullRequest {
     type Output = PullRequest;
-
-    const TYPE: OperationType = OperationType::Mutation;
 
     fn document(&self) -> String {
         let fields = [
@@ -320,6 +323,8 @@ impl BatchedOperation for CreatePullRequest {
     }
 }
 
+impl BatchedMutation for CreatePullRequest {}
+
 /// A minimal update to an existing PR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct UpdatePullRequest {
@@ -343,8 +348,6 @@ impl UpdatePullRequest {
 impl BatchedOperation for UpdatePullRequest {
     type Output = ();
 
-    const TYPE: OperationType = OperationType::Mutation;
-
     fn document(&self) -> String {
         let fields = std::iter::once(("pullRequestId", &self.node_id))
             .chain(self.base_branch.as_ref().map(|value| ("baseRefName", value)))
@@ -366,6 +369,8 @@ impl BatchedOperation for UpdatePullRequest {
         Ok(())
     }
 }
+
+impl BatchedMutation for UpdatePullRequest {}
 
 #[cfg(test)]
 mod tests {
@@ -396,6 +401,16 @@ mod tests {
 
     fn empty_connection() -> Value {
         connection(Vec::new(), false)
+    }
+
+    #[test]
+    fn batching_roles_are_explicit() {
+        fn query<O: BatchedQuery>() {}
+        fn mutation<O: BatchedMutation>() {}
+
+        query::<FindPullRequest>();
+        mutation::<CreatePullRequest>();
+        mutation::<UpdatePullRequest>();
     }
 
     #[test]
@@ -467,7 +482,7 @@ mod tests {
         ];
 
         assert_eq!(
-            batch_document(&operations),
+            batch_document(OperationType::Mutation, &operations),
             r#"mutation { op0: updatePullRequest(input: { pullRequestId: "PR_1" }) { clientMutationId }op1: updatePullRequest(input: { pullRequestId: "PR_2" }) { clientMutationId } }"#
         );
     }
