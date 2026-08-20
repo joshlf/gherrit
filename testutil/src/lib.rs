@@ -453,7 +453,7 @@ pub enum FailureKind {
     GraphQlResourceLimit { mutation: GraphQlMutation, applied: usize },
     CreatePr,
     UpdatePr,
-    Git(GitOperation),
+    Git { operation: GitOperation, matching_calls_before_failure: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -829,7 +829,7 @@ impl TestContext {
 
     pub fn inject_failure(&self, kind: FailureKind) {
         match kind {
-            FailureKind::Git(_) => assert!(
+            FailureKind::Git { .. } => assert!(
                 self.has_git_interceptor,
                 "missing test capability: .with_git_interceptor()"
             ),
@@ -839,7 +839,15 @@ impl TestContext {
     }
 
     pub fn expect_git_failure(&self, operation: GitOperation) {
-        self.inject_failure(FailureKind::Git(operation));
+        self.expect_git_failure_after(operation, 0);
+    }
+
+    pub fn expect_git_failure_after(
+        &self,
+        operation: GitOperation,
+        matching_calls_before_failure: usize,
+    ) {
+        self.inject_failure(FailureKind::Git { operation, matching_calls_before_failure });
     }
 
     fn enqueue_failure(&self, kind: FailureKind) {
@@ -1333,7 +1341,7 @@ mod tests {
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .expect("fixture panic must have a string message");
         assert!(message.contains("was poisoned"), "unexpected teardown panic: {message}");
-        assert!(message.contains("Git(Var)"), "unexpected teardown panic: {message}");
+        assert!(message.contains("operation: Var"), "unexpected teardown panic: {message}");
     }
 
     #[test]
@@ -1381,7 +1389,7 @@ mod tests {
             .map(String::as_str)
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .expect("fixture panic must have a string message");
-        assert!(message.contains("Git(Var)"), "unexpected teardown panic: {message}");
+        assert!(message.contains("operation: Var"), "unexpected teardown panic: {message}");
     }
 
     #[test]

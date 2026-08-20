@@ -1,4 +1,4 @@
-use std::ops::Deref;
+use std::{num::NonZeroUsize, ops::Deref};
 
 use serde::Deserialize;
 
@@ -72,7 +72,7 @@ pub(super) struct ProjectionCommit {
     pub(super) gherrit_id: String,
     pub(super) title: String,
     pub(super) commit_body: String,
-    pub(super) latest_version: usize,
+    pub(super) latest_version: NonZeroUsize,
 }
 
 /// The two GitHub identifiers for one pull request.
@@ -396,7 +396,7 @@ mod tests {
                 gherrit_id: id.to_string(),
                 title: format!("Title {id}"),
                 commit_body: format!("Body {id}\n\ngherrit-pr-id: {id}"),
-                latest_version: 1,
+                latest_version: NonZeroUsize::MIN,
             })
             .collect()
     }

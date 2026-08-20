@@ -1,3 +1,5 @@
+use std::fs;
+
 #[test]
 fn test_full_stack_lifecycle_mocked() {
     let ctx = testutil::test_context!()
@@ -141,6 +143,71 @@ fn test_version_increment() {
 }
 
 #[test]
+fn test_unchanged_publication_is_a_git_noop() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("unchanged-publication");
+    ctx.commit_with_gherrit_id("Unchanged commit");
+
+    let gherrit_id = ctx.gherrit_id("HEAD").unwrap();
+    let v1_ref = format!("refs/tags/gherrit/{gherrit_id}/v1");
+    let v2_ref = format!("refs/tags/gherrit/{gherrit_id}/v2");
+    ctx.hook_cmd("pre-push").assert().success();
+    let requests_after_first_run = ctx.github().requests().len();
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    assert_eq!(ctx.recorded_pushes().len(), 1, "An unchanged retry must not republish Git refs");
+    assert!(ctx.remote_ref_oid(&v1_ref).is_some());
+    assert!(ctx.remote_ref_oid(&v2_ref).is_none());
+    assert!(
+        ctx.github().requests().len() > requests_after_first_run,
+        "A Git no-op must still reobserve and reconcile the PR projection"
+    );
+}
+
+#[test]
+fn test_final_remote_observation_gates_checkpointing_and_pr_projection() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("confirm-publication");
+    let gherrit_id = ctx.commit_with_gherrit_id("Confirm published state");
+    let oid = ctx.head_oid();
+    let managed_ref = format!("refs/heads/{gherrit_id}");
+    let version_ref = format!("refs/tags/gherrit/{gherrit_id}/v1");
+
+    ctx.expect_git_failure_after(testutil::GitOperation::LsRemote, 1);
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Simulated failure for git ls-remote"));
+
+    assert_eq!(ctx.remote_ref_oid(&managed_ref).as_deref(), Some(oid.as_str()));
+    assert_eq!(ctx.remote_ref_oid(&version_ref).as_deref(), Some(oid.as_str()));
+    ctx.git_cmd().args(["rev-parse", "--verify", "--quiet", &version_ref]).assert().code(1);
+    assert!(ctx.github().pull_requests().is_empty());
+    assert_eq!(ctx.recorded_pushes().len(), 1);
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    ctx.git_cmd()
+        .args(["rev-parse", "--verify", &version_ref])
+        .assert()
+        .success()
+        .stdout(format!("{oid}\n"));
+    assert_eq!(ctx.recorded_pushes().len(), 1, "Recovery must not republish the remote refs");
+    assert_eq!(ctx.github().pull_requests().len(), 1);
+}
+
+#[test]
 fn test_optimistic_locking_conflict() {
     let ctx = testutil::test_context!()
         .with_remote()
@@ -178,18 +245,138 @@ fn test_optimistic_locking_conflict() {
     let new_msg = format!("Commit V1 (Amended)\n\ngherrit-pr-id: {}", gherrit_id);
     ctx.amend_with_message(&new_msg);
 
-    // Attempt push - should fail due to atomic lock
+    // The known-occupied next version is rejected before any remote write.
     testutil::assert_failure_snapshot!(ctx, ctx.hook_cmd("pre-push"), "optimistic_locking_v2_fail");
 
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 2, "Expected one successful and one failed push");
+    assert_eq!(pushes.len(), 1, "The conflicting version must be rejected before pushing");
     assert!(pushes[0].succeeded(), "Initial push should succeed");
-    assert!(!pushes[1].succeeded(), "Conflicting push should fail");
     assert_eq!(
         ctx.remote_ref_oid(&managed_ref).as_deref(),
         Some(pushed_oid.as_str()),
         "Failed atomic push must not update the managed ref"
     );
+}
+
+#[test]
+fn test_recovers_a_partially_persisted_publication_without_republishing() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("recover-version");
+    let first_id = ctx.commit_with_gherrit_id("First recoverable commit");
+    let first_oid = ctx.head_oid();
+    let second_id = ctx.commit_with_gherrit_id("Second recoverable commit");
+    let second_oid = ctx.head_oid();
+
+    let first_branch = format!("refs/heads/{first_id}");
+    let second_branch = format!("refs/heads/{second_id}");
+    let first_version = format!("refs/tags/gherrit/{first_id}/v1");
+    let second_version = format!("refs/tags/gherrit/{second_id}/v1");
+    let lock_path = ctx.repo_path.join(".git/refs/tags/gherrit").join(&second_id).join("v1.lock");
+    fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    fs::write(&lock_path, "held by test").unwrap();
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("could not record the matching local checkpoint"));
+
+    assert_eq!(ctx.remote_ref_oid(&first_branch).as_deref(), Some(first_oid.as_str()));
+    assert_eq!(ctx.remote_ref_oid(&second_branch).as_deref(), Some(second_oid.as_str()));
+    assert_eq!(ctx.remote_ref_oid(&first_version).as_deref(), Some(first_oid.as_str()));
+    assert_eq!(ctx.remote_ref_oid(&second_version).as_deref(), Some(second_oid.as_str()));
+    ctx.git_cmd().args(["rev-parse", "--verify", &first_version]).assert().success();
+    ctx.git_cmd().args(["rev-parse", "--verify", "--quiet", &second_version]).assert().code(1);
+    assert!(ctx.github().pull_requests().is_empty());
+    assert_eq!(ctx.recorded_pushes().len(), 1);
+
+    fs::remove_file(lock_path).unwrap();
+    ctx.hook_cmd("pre-push").assert().success();
+
+    ctx.git_cmd()
+        .args(["rev-parse", "--verify", &second_version])
+        .assert()
+        .success()
+        .stdout(format!("{second_oid}\n"));
+    assert_eq!(ctx.recorded_pushes().len(), 1, "Recovery must not republish the remote refs");
+    assert_eq!(ctx.github().pull_requests().len(), 2);
+}
+
+#[test]
+fn test_rejects_incoherent_remote_publication_before_writing() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("incoherent-remote");
+    ctx.commit_with_gherrit_id("Published commit");
+    ctx.hook_cmd("pre-push").assert().success();
+
+    let gherrit_id = ctx.gherrit_id("HEAD").unwrap();
+    let managed_ref = format!("refs/heads/{gherrit_id}");
+    let push_count = ctx.recorded_pushes().len();
+    let mutation_count = ctx
+        .github()
+        .requests()
+        .into_iter()
+        .flatten()
+        .filter(|operation| *operation != testutil::GraphQlOperation::Query)
+        .count();
+
+    ctx.remote_git_cmd().args(["update-ref", "-d", &managed_ref]).assert().success();
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("has version tags but no managed branch"));
+
+    let commit_oid = ctx.head_oid();
+    ctx.remote_git_cmd().args(["update-ref", &managed_ref, &commit_oid]).assert().success();
+    ctx.remote_git_cmd().args(["update-ref", &managed_ref, "refs/heads/main"]).assert().success();
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("does not match latest version tag v1"));
+
+    assert_eq!(ctx.recorded_pushes().len(), push_count);
+    assert_eq!(
+        ctx.github()
+            .requests()
+            .into_iter()
+            .flatten()
+            .filter(|operation| *operation != testutil::GraphQlOperation::Query)
+            .count(),
+        mutation_count,
+        "Invalid remote state must not reach a PR mutation"
+    );
+}
+
+#[test]
+fn test_rejects_malformed_local_checkpoint_names() {
+    let overflow = ((usize::MAX as u128) + 1).to_string();
+    for suffix in ["0", "01", "1/child", &overflow] {
+        let ctx = testutil::test_context!()
+            .with_remote()
+            .with_initial_commit()
+            .with_mock_github()
+            .with_git_interceptor()
+            .build();
+        ctx.checkout_managed_private("malformed-local-checkpoint");
+        let gherrit_id = ctx.commit_with_gherrit_id("Unpublished commit");
+        let malformed_ref = format!("refs/tags/gherrit/{gherrit_id}/v{suffix}");
+        ctx.git_cmd().args(["update-ref", &malformed_ref, "HEAD"]).assert().success();
+
+        ctx.hook_cmd("pre-push")
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("Malformed local GHerrit version tag"));
+        assert!(ctx.recorded_pushes().is_empty());
+    }
 }
 
 fn drifted_update_stack(branch: &str, count: usize) -> (testutil::TestContext, Vec<String>) {

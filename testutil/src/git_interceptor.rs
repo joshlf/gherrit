@@ -91,14 +91,21 @@ fn check_and_apply_failure(
     mock_state: &mut MockState,
     operation: GitOperation,
 ) -> Option<GitOperation> {
-    let FailureKind::Git(expected) = mock_state.faults.front()? else {
+    let FailureKind::Git { operation: expected, matching_calls_before_failure } =
+        mock_state.faults.front_mut()?
+    else {
         return None;
     };
     if *expected != operation {
         return None;
     }
+    if *matching_calls_before_failure > 0 {
+        *matching_calls_before_failure -= 1;
+        return None;
+    }
 
-    let FailureKind::Git(consumed) = mock_state.faults.pop_front().unwrap() else {
+    let FailureKind::Git { operation: consumed, .. } = mock_state.faults.pop_front().unwrap()
+    else {
         unreachable!("the front fault was just matched as a Git fault")
     };
     Some(consumed)
@@ -220,8 +227,11 @@ mod tests {
     #[test]
     fn git_faults_match_in_script_order() {
         let expected = VecDeque::from([
-            FailureKind::Git(GitOperation::Var),
-            FailureKind::Git(GitOperation::LsRemote),
+            FailureKind::Git { operation: GitOperation::Var, matching_calls_before_failure: 0 },
+            FailureKind::Git {
+                operation: GitOperation::LsRemote,
+                matching_calls_before_failure: 0,
+            },
         ]);
         let mut state = MockState { faults: expected.clone(), ..Default::default() };
 
@@ -236,11 +246,32 @@ mod tests {
 
         let expected = VecDeque::from([
             FailureKind::CreatePr,
-            FailureKind::Git(GitOperation::InterpretTrailers),
+            FailureKind::Git {
+                operation: GitOperation::InterpretTrailers,
+                matching_calls_before_failure: 0,
+            },
         ]);
         let mut state = MockState { faults: expected.clone(), ..Default::default() };
         assert_eq!(check_and_apply_failure(&mut state, GitOperation::InterpretTrailers), None);
         assert_eq!(state.faults, expected);
+    }
+
+    #[test]
+    fn git_faults_can_skip_matching_calls() {
+        let mut state = MockState {
+            faults: VecDeque::from([FailureKind::Git {
+                operation: GitOperation::LsRemote,
+                matching_calls_before_failure: 1,
+            }]),
+            ..Default::default()
+        };
+
+        assert_eq!(check_and_apply_failure(&mut state, GitOperation::LsRemote), None);
+        assert_eq!(
+            check_and_apply_failure(&mut state, GitOperation::LsRemote),
+            Some(GitOperation::LsRemote)
+        );
+        assert!(state.faults.is_empty());
     }
 
     #[tokio::test]
@@ -269,7 +300,10 @@ mod tests {
     #[tokio::test]
     async fn failure_injection_uses_product_subcommand() {
         let handler = handler_state();
-        handler.shared.write().unwrap().faults.push_back(FailureKind::Git(GitOperation::Var));
+        handler.shared.write().unwrap().faults.push_back(FailureKind::Git {
+            operation: GitOperation::Var,
+            matching_calls_before_failure: 0,
+        });
         let request = GitRequest { args: args(&["git", "var", "GIT_COMMITTER_IDENT"]) };
 
         let Json(response) = handle_git(AxumState(handler.clone()), Json(request)).await;
