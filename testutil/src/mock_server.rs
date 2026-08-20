@@ -204,7 +204,7 @@ fn check_and_apply_graphql_failure(
         GraphQlResourceLimit { mutation, .. } => operations.contains(&mutation.operation()),
         CreatePr => operations.contains(&GraphQlOperation::CreatePr),
         UpdatePr => operations.contains(&GraphQlOperation::UpdatePr),
-        Git(_) => false,
+        Git { .. } => false,
     };
 
     if !matches {
