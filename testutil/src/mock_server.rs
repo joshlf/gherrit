@@ -201,6 +201,7 @@ fn check_and_apply_graphql_failure(
     let fail_action = mock_state.faults.front()?;
     let matches = match fail_action {
         GraphQl => true,
+        GraphQlResourceLimit { mutation, .. } => operations.contains(&mutation.operation()),
         CreatePr => operations.contains(&GraphQlOperation::CreatePr),
         UpdatePr => operations.contains(&GraphQlOperation::UpdatePr),
         Git(_) => false,
@@ -577,25 +578,50 @@ async fn graphql(
             })),
         );
     }
-    if let Some(failure) = check_and_apply_graphql_failure(&mut mock_state, &operations) {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "errors": [
-                    { "message": format!("Injected {failure:?} failure") }
-                ]
-            })),
-        );
-    }
+    let partial_limit = match check_and_apply_graphql_failure(&mut mock_state, &operations) {
+        Some(FailureKind::GraphQlResourceLimit { applied, .. }) => {
+            assert!(
+                applied <= operations.len(),
+                "partial GraphQL fault cannot apply {applied} of {} operations",
+                operations.len()
+            );
+            Some(applied)
+        }
+        Some(failure) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "errors": [
+                        { "message": format!("Injected {failure:?} failure") }
+                    ]
+                })),
+            );
+        }
+        None => None,
+    };
 
     let mut response_data = serde_json::Map::new();
 
     let mut errors = Vec::new();
+    let mut operation_index = 0;
 
     for operation in document.operations.iter() {
         for selection in operation.selection_set.selections.iter() {
             if let executable::Selection::Field(field) = selection {
                 let alias = response_key(field);
+                let current_index = operation_index;
+                operation_index += 1;
+                if partial_limit.is_some_and(|limit| current_index >= limit) {
+                    if partial_limit == Some(current_index) {
+                        response_data.insert(alias.clone(), serde_json::Value::Null);
+                        errors.push(serde_json::json!({
+                            "type": "RESOURCE_LIMITS_EXCEEDED",
+                            "message": "Request exceeds the mock GraphQL operation limit",
+                            "path": [alias],
+                        }));
+                    }
+                    continue;
+                }
 
                 let result = match field.name.as_str() {
                     "updatePullRequest" => handle_update_pr(&mut mock_state, field, &|branch| {
@@ -621,6 +647,13 @@ async fn graphql(
                 }
             }
         }
+    }
+
+    if partial_limit == Some(operations.len()) {
+        errors.push(serde_json::json!({
+            "type": "RESOURCE_LIMITS_EXCEEDED",
+            "message": "Injected resource limit after applying every operation",
+        }));
     }
 
     let mut response_json = serde_json::Map::new();
