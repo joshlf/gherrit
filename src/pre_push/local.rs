@@ -4,7 +4,7 @@
 //! `HEAD`. Its order is the source of parent, child, and root relationships.
 //! Those relationships are deliberately not stored alongside each change.
 
-use std::{collections::HashSet, str};
+use std::{borrow::Borrow, collections::HashSet, str};
 
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::ObjectId;
@@ -20,6 +20,17 @@ use crate::util::{self, CommandExt as _};
 pub(super) struct ChangeId(String);
 
 impl ChangeId {
+    /// Decodes the same identity grammar from a managed remote ref component.
+    ///
+    /// Unlike a trailer error, this has no local commit to identify. Callers
+    /// add the remote-ref context appropriate to the namespace they parse.
+    pub(super) fn from_ref_component(value: &[u8]) -> Result<Self> {
+        if value.is_empty() || !value.iter().all(u8::is_ascii_alphanumeric) {
+            bail!("invalid GHerrit change ID");
+        }
+        Ok(Self(str::from_utf8(value)?.to_owned()))
+    }
+
     fn from_trailer(commit: ObjectId, value: &[u8]) -> Result<Self> {
         if value.is_empty() {
             bail!("Commit {commit} missing gherrit-pr-id trailer");
@@ -28,11 +39,17 @@ impl ChangeId {
             bail!("Commit {commit} has invalid gherrit-pr-id trailer");
         }
 
-        Ok(Self(str::from_utf8(value)?.to_owned()))
+        Self::from_ref_component(value)
     }
 
     pub(super) fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl Borrow<str> for ChangeId {
+    fn borrow(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -108,6 +125,30 @@ pub(super) struct LocalStack {
 }
 
 impl LocalStack {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        default_tip: ObjectId,
+        changes: impl IntoIterator<Item = (ChangeId, ObjectId)>,
+    ) -> Self {
+        let mut first_parent = default_tip;
+        let changes = changes
+            .into_iter()
+            .map(|(id, head)| {
+                let change = LocalChange {
+                    id,
+                    head,
+                    first_parent,
+                    title: String::new(),
+                    body: String::new(),
+                };
+                first_parent = head;
+                change
+            })
+            .collect();
+
+        Self::new(default_tip, "main", changes).expect("valid test stack")
+    }
+
     /// Reads and validates the local managed stack without performing network
     /// writes.
     pub(super) fn collect(
@@ -192,10 +233,6 @@ impl LocalStack {
 
     pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = &LocalChange> {
         self.changes.iter()
-    }
-
-    pub(super) fn as_slice(&self) -> &[LocalChange] {
-        &self.changes
     }
 }
 

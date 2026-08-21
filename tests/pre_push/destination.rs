@@ -81,7 +81,9 @@ fn push_destination_controls_observation_publication_and_github_identity() {
     ctx.checkout_managed_private("split-remote");
     let id = ctx.commit_with_gherrit_id("Publish through the push destination");
     let managed_ref = format!("refs/heads/{id}");
+    let version_ref = format!("refs/tags/gherrit/{id}/v1");
     ctx.remote_git_cmd().args(["update-ref", &managed_ref, "refs/heads/main"]).assert().success();
+    ctx.remote_git_cmd().args(["update-ref", &version_ref, "refs/heads/main"]).assert().success();
 
     ctx.hook_cmd("pre-push").assert().success();
 
@@ -195,9 +197,7 @@ fn git_observation_does_not_follow_an_http_redirect() {
     ctx.hook_cmd("pre-push")
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "`git ls-remote --symref` failed for GHerrit remote 'origin'",
-        ))
+        .stderr(predicate::str::contains("`git ls-remote` failed for GHerrit remote 'origin'"))
         .stderr(predicate::str::contains(&destination).not());
 
     assert_eq!(ctx.github().git_redirect_source_requests(), 1);
@@ -266,9 +266,10 @@ fn unrelated_url_scoped_redirect_configuration_is_accepted() {
     ctx.checkout_managed_private("unrelated-redirect-configuration");
     ctx.commit_with_gherrit_id("Ignore an unrelated redirect override");
 
-    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
-        "`git ls-remote --symref` failed for GHerrit remote 'origin'",
-    ));
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("`git ls-remote` failed for GHerrit remote 'origin'"));
 
     assert_eq!(ctx.github().git_redirect_source_requests(), 1);
     assert_eq!(ctx.github().git_redirect_trap_requests(), 0);
@@ -292,9 +293,10 @@ fn every_false_redirect_spelling_is_accepted() {
         ctx.checkout_managed_private(&format!("false-redirect-{value}"));
         ctx.commit_with_gherrit_id("Accept a disabled redirect policy");
 
-        ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
-            "`git ls-remote --symref` failed for GHerrit remote 'origin'",
-        ));
+        ctx.hook_cmd("pre-push")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("`git ls-remote` failed for GHerrit remote 'origin'"));
 
         assert_eq!(ctx.github().git_redirect_source_requests(), 1, "value: {value}");
         assert_eq!(ctx.github().git_redirect_trap_requests(), 0, "value: {value}");
@@ -766,9 +768,7 @@ fn a_failed_local_destination_does_not_disclose_any_path_spelling() {
     ctx.hook_cmd("pre-push")
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "`git ls-remote --symref` failed for GHerrit remote 'origin'",
-        ))
+        .stderr(predicate::str::contains("`git ls-remote` failed for GHerrit remote 'origin'"))
         .stderr(predicate::str::contains("raw-secret").not())
         .stderr(predicate::str::contains("normalized-secret").not())
         .stderr(predicate::str::contains("repo.git").not());

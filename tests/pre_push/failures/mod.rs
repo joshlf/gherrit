@@ -302,7 +302,7 @@ fn test_pre_push_ls_remote_failure() {
     ctx.commit_with_gherrit_id("Work");
 
     let refs_before = ctx.remote_refs("refs");
-    ctx.expect_git_failure(testutil::GitOperation::LsRemoteDefaultBranch);
+    ctx.expect_git_failure(testutil::GitOperation::LsRemoteHeads);
     testutil::assert_failure_snapshot!(
         ctx,
         ctx.hook_cmd("pre-push"),
@@ -317,6 +317,169 @@ fn test_pre_push_ls_remote_failure() {
 }
 
 #[test]
+fn test_pre_push_active_history_observation_failure_precedes_writes() {
+    let ctx = unpublished_managed_commit("active-history-failure");
+    let refs_before = ctx.remote_refs("refs");
+    ctx.expect_git_failure(testutil::GitOperation::LsRemoteActiveVersions);
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("observing active version history"));
+
+    ctx.assert_failure_consumed();
+    assert_eq!(ctx.remote_refs("refs"), refs_before);
+    assert!(ctx.recorded_pushes().is_empty());
+    assert!(ctx.github().requests().is_empty());
+}
+
+#[test]
+fn test_later_active_history_observation_failure_precedes_writes() {
+    let ctx = unpublished_managed_commit("later-active-history-failure");
+    for index in 0..40 {
+        let id = format!("G{index:03}{}", "a".repeat(196));
+        ctx.commit_with_explicit_gherrit_id(&format!("Work {index}"), &id);
+    }
+    let refs_before = ctx.remote_refs("refs");
+    ctx.expect_git_failure_on_invocation(testutil::GitOperation::LsRemoteActiveVersions, 2);
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("observing active version history"));
+
+    ctx.assert_failure_consumed();
+    assert_eq!(
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions).len(),
+        2
+    );
+    assert_eq!(ctx.remote_refs("refs"), refs_before);
+    assert!(ctx.recorded_pushes().is_empty());
+    assert!(ctx.github().requests().is_empty());
+}
+
+#[test]
+fn test_pre_push_rejects_an_oversized_late_id_before_any_history_request() {
+    let ctx = unpublished_managed_commit("oversized-active-id");
+    let oversized = format!("G{}", "a".repeat(20_000));
+    ctx.commit_with_explicit_gherrit_id("Oversized later change", &oversized);
+    let refs_before = ctx.remote_refs("refs");
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("too long to observe its remote version history"));
+
+    assert_eq!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads).len(), 1);
+    assert!(
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions).is_empty()
+    );
+    assert_eq!(ctx.remote_refs("refs"), refs_before);
+    assert!(ctx.recorded_pushes().is_empty());
+    assert!(ctx.github().requests().is_empty());
+}
+
+#[test]
+fn test_pre_push_rejects_an_oversized_late_push_tuple_before_any_action() {
+    let ctx = unpublished_managed_commit("oversized-push-tuple");
+    // This ID fits one active-history observation query but its four rendered
+    // branch/tag lease and refspec arguments do not fit one push batch.
+    let oversized = format!("G{}", "a".repeat(5_000));
+    ctx.commit_with_explicit_gherrit_id("Oversized later push", &oversized);
+    let refs_before = ctx.remote_refs("refs");
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("variable push arguments"))
+        .stderr(predicate::str::contains("5001-byte change ID"));
+
+    assert_eq!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads).len(), 1);
+    assert_eq!(
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions).len(),
+        1
+    );
+    assert_eq!(ctx.remote_refs("refs"), refs_before);
+    assert!(ctx.recorded_pushes().is_empty());
+    assert!(ctx.github().requests().is_empty());
+}
+
+#[test]
+fn test_pre_push_stops_after_a_later_push_batch_fails() {
+    let ctx = unpublished_managed_commit("later-push-batch-failure");
+    // Long but filesystem-safe ref components make three byte-budgeted push
+    // batches without requiring hundreds of process-level fixture commits.
+    let mut last_id = String::new();
+    for index in 0..40 {
+        let id = format!("G{index:03}{}", "a".repeat(196));
+        ctx.commit_with_explicit_gherrit_id(&format!("Work {index}"), &id);
+        last_id = id;
+    }
+    ctx.expect_git_failure_on_invocation(testutil::GitOperation::Push, 2);
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("`git push` failed"));
+
+    ctx.assert_failure_consumed();
+    assert_eq!(ctx.recorded_git_invocations(testutil::GitOperation::Push).len(), 2);
+    assert_eq!(ctx.recorded_pushes().len(), 1);
+    assert!(ctx.recorded_pushes()[0].succeeded());
+    let published_versions = ctx
+        .remote_refs("refs/tags/gherrit")
+        .into_iter()
+        .filter(|name| name.ends_with("/v1"))
+        .count();
+    assert!(published_versions > 0, "the first batch must have committed");
+    assert!(published_versions < 41, "no batch after the failure may run");
+    let requests = ctx.github().requests();
+    assert!(!requests.is_empty(), "GitHub state must be observed before publication");
+    assert!(
+        requests.iter().flatten().all(|operation| *operation == testutil::GraphQlOperation::Query),
+        "a failed Git batch must stop before any GitHub mutation"
+    );
+    let events = ctx.boundary_events();
+    let observation = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                testutil::BoundaryEvent::GraphQl(operations)
+                    if operations.iter().all(|operation| *operation == testutil::GraphQlOperation::Query)
+            )
+        })
+        .expect("GitHub observation event");
+    let first_push = events
+        .iter()
+        .position(|event| {
+            matches!(event, testutil::BoundaryEvent::Git(testutil::GitOperation::Push))
+        })
+        .expect("first push event");
+    assert!(observation < first_push, "GitHub observation must precede the first Git write");
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    let version_refs = ctx.remote_refs("refs/tags/gherrit");
+    assert_eq!(version_refs.iter().filter(|name| name.ends_with("/v1")).count(), 41);
+    assert_eq!(version_refs.iter().filter(|name| name.ends_with("/v2")).count(), 0);
+    assert_eq!(ctx.github().pull_requests().len(), 41);
+    assert_eq!(ctx.recorded_pushes().len(), 3, "retry publishes only the two missing batches");
+
+    let history_queries =
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions).len();
+    ctx.amend();
+    ctx.hook_cmd("pre-push").assert().success();
+
+    assert!(
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions).len()
+            >= history_queries + 2,
+        "nonempty histories from multiple active-version requests must form one observation"
+    );
+    assert!(ctx.remote_ref_oid(&format!("refs/tags/gherrit/{last_id}/v2")).is_some());
+}
+
+#[test]
 fn test_pre_push_rejects_a_null_managed_branch_object_id() {
     let ctx = testutil::test_context!()
         .with_remote()
@@ -328,19 +491,38 @@ fn test_pre_push_rejects_a_null_managed_branch_object_id() {
     ctx.commit_with_explicit_gherrit_id("Work", "Gnull");
     let refs_before = ctx.remote_refs("refs");
     ctx.expect_git_output(
-        testutil::GitOperation::LsRemoteManagedBranches,
+        testutil::GitOperation::LsRemoteHeads,
         "0000000000000000000000000000000000000000\trefs/heads/Gnull\n",
     );
 
     ctx.hook_cmd("pre-push")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("null object ID in `git ls-remote` line"));
+        .stderr(predicate::str::contains("remote ref has a null object ID"));
 
     ctx.assert_failure_consumed();
     assert_eq!(ctx.remote_refs("refs"), refs_before);
     assert!(ctx.recorded_pushes().is_empty());
     assert!(ctx.github().pull_requests().is_empty());
+}
+
+#[test]
+fn test_pre_push_rejects_an_owned_base_as_the_default_branch_before_writes() {
+    let ctx = unpublished_managed_commit("owned-base-default");
+    let id = ctx.gherrit_id("HEAD").unwrap();
+    let owned_base = format!("refs/heads/gherrit-bases/{id}");
+    ctx.remote_git_cmd().args(["update-ref", &owned_base, "refs/heads/main"]).assert().success();
+    ctx.remote_git_cmd().args(["symbolic-ref", "HEAD", &owned_base]).assert().success();
+    let refs_before = ctx.remote_refs("refs");
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("reserved owned-base namespace"));
+
+    assert_eq!(ctx.remote_refs("refs"), refs_before);
+    assert!(ctx.recorded_pushes().is_empty());
+    assert!(ctx.github().requests().is_empty());
 }
 
 #[test]
