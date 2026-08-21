@@ -448,10 +448,37 @@ pub enum GitOperation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryableHttpStatus {
+    TooManyRequests,
+    ServiceUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectStatus {
+    Temporary,
+    Permanent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MalformedJson {
+    DuplicateObjectMember,
+    TrailingValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     GraphQl,
+    QueryTransport,
+    QueryHttp(RetryableHttpStatus),
+    RepositoryIdHttp(RetryableHttpStatus),
     CreatePr,
+    CreatePrMalformedJson(MalformedJson),
+    CreatePrHttp(RetryableHttpStatus),
+    SecondCreatePrHttp(RetryableHttpStatus),
+    CreatePrRedirect(RedirectStatus),
     UpdatePr,
+    UpdatePrMalformedJson(MalformedJson),
+    UpdatePrConcurrentClose,
     Git(GitOperation),
 }
 
@@ -557,6 +584,10 @@ impl MockGithub<'_> {
         self.context.inspect_mock_state(|state| state.graphql_requests.clone())
     }
 
+    pub fn redirect_trap_requests(&self) -> usize {
+        self.context.inspect_mock_state(|state| state.graphql_redirect_trap_requests)
+    }
+
     pub fn seed_pull_request(&self, seed: PullRequestSeed) {
         self.context.mutate_mock_state(|state| {
             let pr = mock_server::PrEntry::mock(mock_server::MockPrArgs {
@@ -580,6 +611,17 @@ impl MockGithub<'_> {
                 .find(|pr| pr.number == number)
                 .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
             pr.state = new_state.as_str().to_string();
+        });
+    }
+
+    pub fn set_pull_request_title(&self, number: usize, new_title: &str) {
+        self.context.mutate_mock_state(|state| {
+            let pr = state
+                .prs
+                .iter_mut()
+                .find(|pr| pr.number == number)
+                .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
+            pr.title = Some(new_title.to_string());
         });
     }
 }
@@ -824,10 +866,10 @@ impl TestContext {
         self.mock_state().write().unwrap().faults.push_back(kind);
     }
 
-    pub fn limit_graphql_operations_per_request(&self, limit: usize) {
+    pub fn limit_graphql_query_operations_per_request(&self, limit: usize) {
         assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
-        assert_ne!(limit, 0, "GraphQL operation limit must be nonzero");
-        self.mock_state().write().unwrap().max_graphql_operations_per_request = Some(limit);
+        assert_ne!(limit, 0, "GraphQL query operation limit must be nonzero");
+        self.mock_state().write().unwrap().max_graphql_query_operations_per_request = Some(limit);
     }
 
     pub fn assert_failure_consumed(&self) {
