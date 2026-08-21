@@ -9,7 +9,7 @@ use std::{collections::HashSet, str};
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::ObjectId;
 
-use super::{autosquash, body::gherrit_pr_id_re};
+use super::{autosquash, body::gherrit_pr_id_re, destination::DefaultBranch};
 use crate::util::{self, CommandExt as _};
 
 /// A nonempty ASCII alphanumeric identifier from a `gherrit-pr-id` trailer.
@@ -110,15 +110,19 @@ pub(super) struct LocalStack {
 impl LocalStack {
     /// Reads and validates the local managed stack without performing network
     /// writes.
-    pub(super) fn collect(repo: &util::Repo) -> Result<Self> {
+    pub(super) fn collect(
+        repo: &util::Repo,
+        default_branch: &DefaultBranch,
+        remote_name: &str,
+    ) -> Result<Self> {
         repo.ensure_publishable_history()?;
 
         let head = repo.rev_parse_single("HEAD")?;
-        let default_branch = repo.find_default_branch_on_default_remote();
-        let default_ref = repo.rev_parse_single(format!("refs/heads/{default_branch}").as_str())?;
+        let default_ref = repo.rev_parse_single(default_branch.full_ref_name().as_str())?;
         let commits = repo.first_parent_commits_between(default_ref, head).map_err(|err| match err {
             util::FirstParentCommitsBetweenError::NotOnFirstParentPath => {
                 let branch_name = repo.current_branch().name().unwrap_or("current branch");
+                let default_branch = default_branch.name();
                 eyre!(
                     "The branch '{branch_name}' does not descend from '{default_branch}' on its first-parent path.\n\
                      GHerrit defines stack order using first-parent ancestry.\n\
@@ -140,8 +144,8 @@ impl LocalStack {
 
         autosquash::ensure_publishable(
             commits.iter().map(|(_, title)| title.as_str()),
-            &repo.default_remote_name(),
-            &default_branch,
+            remote_name,
+            default_branch.name(),
         )?;
 
         let trailers = read_commit_trailers(&commits)?;
@@ -151,12 +155,18 @@ impl LocalStack {
             .map(|((commit, title), trailers)| LocalChange::from_git(commit, title, &trailers))
             .collect::<Result<Vec<_>>>()?;
 
-        Self::new(default_ref.detach(), changes)
+        Self::new(default_ref.detach(), default_branch.name(), changes)
     }
 
-    fn new(default_tip: ObjectId, changes: Vec<LocalChange>) -> Result<Self> {
+    fn new(default_tip: ObjectId, default_branch: &str, changes: Vec<LocalChange>) -> Result<Self> {
         let ids = changes.iter().map(|change| change.id.as_str());
         ensure_unique_change_ids(ids)?;
+        if let Some(change) = changes.iter().find(|change| change.id.as_str() == default_branch) {
+            bail!(
+                "Commit {} has gherrit-pr-id '{default_branch}', which conflicts with the repository default branch",
+                change.head
+            );
+        }
 
         let mut expected_parent = default_tip;
         for change in &changes {
@@ -294,9 +304,12 @@ mod tests {
 
     #[test]
     fn stacks_require_unique_change_ids() {
-        let error =
-            LocalStack::new(object_id(0), vec![change("Gsame", 1, 0), change("Gsame", 2, 1)])
-                .unwrap_err();
+        let error = LocalStack::new(
+            object_id(0),
+            "main",
+            vec![change("Gsame", 1, 0), change("Gsame", 2, 1)],
+        )
+        .unwrap_err();
 
         assert_eq!(error.to_string(), "Stack contains multiple commits with gherrit-pr-id 'Gsame'");
     }
@@ -305,6 +318,7 @@ mod tests {
     fn stacks_require_one_contiguous_first_parent_path() {
         let stack = LocalStack::new(
             object_id(0),
+            "main",
             vec![change("Gone", 1, 0), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
         )
         .unwrap();
@@ -314,8 +328,9 @@ mod tests {
             ["Gone", "Gtwo", "Gthree"]
         );
 
-        let error = LocalStack::new(object_id(0), vec![change("Gone", 1, 0), change("Gtwo", 2, 0)])
-            .unwrap_err();
+        let error =
+            LocalStack::new(object_id(0), "main", vec![change("Gone", 1, 0), change("Gtwo", 2, 0)])
+                .unwrap_err();
         assert_eq!(
             error.to_string(),
             format!(
@@ -329,6 +344,7 @@ mod tests {
     fn stack_order_derives_root_parent_and_child_positions() {
         let stack = LocalStack::new(
             object_id(0),
+            "main",
             vec![change("Gone", 1, 0), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
         )
         .unwrap();
@@ -339,6 +355,19 @@ mod tests {
         assert_eq!(
             ids.windows(2).map(|pair| (pair[0], pair[1])).collect::<Vec<_>>(),
             [("Gone", "Gtwo"), ("Gtwo", "Gthree")]
+        );
+    }
+
+    #[test]
+    fn stack_ids_cannot_name_the_default_branch() {
+        let error = LocalStack::new(object_id(0), "main", vec![change("main", 1, 0)]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Commit {} has gherrit-pr-id 'main', which conflicts with the repository default branch",
+                object_id(1)
+            )
         );
     }
 

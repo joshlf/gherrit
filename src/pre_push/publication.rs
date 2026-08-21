@@ -24,7 +24,8 @@ pub(super) struct PersistedTag {
 }
 
 pub(super) struct PushPlan {
-    pub arguments: Vec<String>,
+    pub options: Vec<String>,
+    pub refspecs: Vec<String>,
     pub persisted_tags: Vec<PersistedTag>,
 }
 
@@ -36,25 +37,37 @@ pub(super) fn remote_query_batches<T>(items: &[T]) -> slice::Chunks<'_, T> {
     items.chunks(REMOTE_QUERY_BATCH_LEN)
 }
 
-pub(super) fn plan_push(remote: &str, targets: &[PushTarget<'_>]) -> PushPlan {
+pub(super) fn plan_push(targets: &[PushTarget<'_>]) -> PushPlan {
     assert!(!targets.is_empty(), "cannot plan an empty push");
-    let refspecs = targets.iter().flat_map(|target| {
-        let branch = format!("refs/heads/{}", target.gherrit_id);
-        let tag = format!("refs/tags/gherrit/{}/v{}", target.gherrit_id, target.version);
+    let ref_names = targets
+        .iter()
+        .map(|target| {
+            (
+                target,
+                format!("refs/heads/{}", target.gherrit_id),
+                format!("refs/tags/gherrit/{}/v{}", target.gherrit_id, target.version),
+            )
+        })
+        .collect::<Vec<_>>();
+    let leases = ref_names.iter().flat_map(|(target, branch, tag)| {
         // Branch updates are leased against the observed remote value. A tag
         // lease with an empty expected value requires that the version tag not
         // exist, making it a lock rather than an overwrite.
         [
-            format!("{}:{branch}", target.object_id),
             format!("--force-with-lease={branch}:{}", target.expected_remote_sha),
-            format!("{}:{tag}", target.object_id),
             format!("--force-with-lease={tag}:"),
         ]
     });
-    let arguments = ["push", "--quiet", "--no-verify", "--atomic", remote]
+    let refspecs = ref_names
+        .iter()
+        .flat_map(|(target, branch, tag)| {
+            [format!("{}:{branch}", target.object_id), format!("{}:{tag}", target.object_id)]
+        })
+        .collect();
+    let options = ["--quiet", "--no-verify", "--atomic"]
         .into_iter()
         .map(ToString::to_string)
-        .chain(refspecs)
+        .chain(leases)
         .collect();
     let persisted_tags = targets
         .iter()
@@ -65,7 +78,7 @@ pub(super) fn plan_push(remote: &str, targets: &[PushTarget<'_>]) -> PushPlan {
         })
         .collect();
 
-    PushPlan { arguments, persisted_tags }
+    PushPlan { options, refspecs, persisted_tags }
 }
 
 #[cfg(test)]
@@ -123,24 +136,27 @@ mod tests {
             },
         ];
 
-        let plan = plan_push("origin", &targets);
+        let plan = plan_push(&targets);
 
         assert_eq!(
-            plan.arguments,
+            plan.options,
             [
-                "push".to_string(),
                 "--quiet".to_string(),
                 "--no-verify".to_string(),
                 "--atomic".to_string(),
-                "origin".to_string(),
-                format!("{}:refs/heads/Gone", object_id(0x11)),
                 "--force-with-lease=refs/heads/Gone:abc123".to_string(),
-                format!("{}:refs/tags/gherrit/Gone/v2", object_id(0x11)),
                 "--force-with-lease=refs/tags/gherrit/Gone/v2:".to_string(),
-                format!("{}:refs/heads/Gtwo", object_id(0x22)),
                 "--force-with-lease=refs/heads/Gtwo:".to_string(),
-                format!("{}:refs/tags/gherrit/Gtwo/v1", object_id(0x22)),
                 "--force-with-lease=refs/tags/gherrit/Gtwo/v1:".to_string(),
+            ]
+        );
+        assert_eq!(
+            plan.refspecs,
+            [
+                format!("{}:refs/heads/Gone", object_id(0x11)),
+                format!("{}:refs/tags/gherrit/Gone/v2", object_id(0x11)),
+                format!("{}:refs/heads/Gtwo", object_id(0x22)),
+                format!("{}:refs/tags/gherrit/Gtwo/v1", object_id(0x22)),
             ]
         );
         assert_eq!(plan.persisted_tags.len(), 2);

@@ -9,9 +9,4 @@ STDOUT:
 
 STDERR:
 [gherrit] Branch feature-fail is MANAGED. Syncing stack...
-[gherrit] [WARN] Using custom GitHub API URL: [MOCK_SERVER_URL]
-[gherrit] [ERROR] Command env -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_GRAFT_FILE -u GIT_OBJECT_DIRECTORY -u GIT_REPLACE_REF_BASE -u GIT_SHALLOW_FILE GIT_NO_LAZY_FETCH="1" GIT_NO_REPLACE_OBJECTS="1" "git" "--no-replace-objects" "ls-remote" "broken-remote" "refs/heads/[GHERRIT_ID_1]" failed with status: exit status: 128. Stderr: fatal: 'missing/repo.git' does not appear to be a git repository
-[gherrit] [ERROR] fatal: Could not read from remote repository.
-[gherrit] [ERROR]
-[gherrit] [ERROR] Please make sure you have the correct access rights
-[gherrit] [ERROR] and the repository exists.
+[gherrit] [ERROR] `git ls-remote --symref` failed for GHerrit remote 'broken-remote'
