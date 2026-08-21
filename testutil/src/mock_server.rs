@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::{
-    git_interceptor, FailureKind, GraphQlOperation, RedirectStatus, RetryableHttpStatus,
-    TestEnvironment,
+    git_interceptor, BoundaryEvent, FailureKind, GraphQlOperation, RedirectStatus,
+    RetryableHttpStatus, TestEnvironment,
 };
 
 const MAX_PULL_REQUEST_CANDIDATES: usize = 100;
@@ -38,6 +38,7 @@ pub struct MockState {
     pub(super) cross_repository_prs: HashSet<usize>,
     pub(super) git: git_interceptor::State,
     pub graphql_requests: Vec<Vec<GraphQlOperation>>,
+    pub(super) boundary_events: Vec<BoundaryEvent>,
     pub graphql_redirect_trap_requests: usize,
     pub git_redirect_source_requests: usize,
     pub git_redirect_trap_requests: usize,
@@ -190,7 +191,12 @@ pub(super) async fn run_mock_server(
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
 
-    let git_routes = git_interceptor::routes(state.clone());
+    let git_routes = git_interceptor::routes(
+        state.clone(),
+        remote_path.clone(),
+        system_git.clone(),
+        test_environment.clone(),
+    );
     let app_state = AppState { state, remote_path, system_git, test_environment };
 
     let app = Router::new()
@@ -232,7 +238,7 @@ fn check_and_apply_graphql_failure(
             create_request_number == 2 && operations.contains(&GraphQlOperation::CreatePr)
         }
         UpdatePr => operations.contains(&GraphQlOperation::UpdatePr),
-        Git(_) | GitOutput { .. } => false,
+        Git(_) | GitOnInvocation { .. } | GitOutput { .. } => false,
     };
 
     if !matches {
@@ -637,6 +643,7 @@ async fn graphql(
 
     let operations = graphql_operations(&document);
     let mut mock_state = app_state.state.write().unwrap();
+    mock_state.boundary_events.push(BoundaryEvent::GraphQl(operations.clone()));
     mock_state.graphql_requests.push(operations.clone());
     let create_request_number = mock_state
         .graphql_requests
@@ -762,7 +769,7 @@ fn graphql_failure_response(failure: FailureKind) -> Response {
         CreatePrRedirect(status) => redirect_status(status),
         GraphQl | CreatePr | UpdatePr => StatusCode::OK,
         QueryTransport => unreachable!("handled above"),
-        Git(_) | GitOutput { .. } => {
+        Git(_) | GitOnInvocation { .. } | GitOutput { .. } => {
             unreachable!("Git failures are not handled by the GraphQL endpoint")
         }
     };

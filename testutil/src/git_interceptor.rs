@@ -1,13 +1,19 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 use axum::{extract::State as AxumState, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::{mock_server::MockState, FailureKind, GitOperation};
+use crate::{mock_server::MockState, BoundaryEvent, FailureKind, GitOperation, TestEnvironment};
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct State {
     pushes: Vec<Push>,
+    invocations: Vec<(GitOperation, Vec<String>)>,
+    before_push_updates: VecDeque<RemoteRefUpdate>,
 }
 
 impl State {
@@ -15,9 +21,43 @@ impl State {
         &self.pushes
     }
 
+    pub(super) fn invocations(&self, operation: GitOperation) -> Vec<Vec<String>> {
+        self.invocations
+            .iter()
+            .filter(|(observed, _)| *observed == operation)
+            .map(|(_, arguments)| arguments.clone())
+            .collect()
+    }
+
+    fn record_invocation(&mut self, operation: GitOperation, args: Vec<String>) {
+        self.invocations.push((operation, args));
+    }
+
+    fn invocation_count(&self, operation: GitOperation) -> usize {
+        self.invocations.iter().filter(|(observed, _)| *observed == operation).count()
+    }
+
     fn record_push(&mut self, args: Vec<String>, exit_code: i32) {
         self.pushes.push(Push { args, exit_code });
     }
+
+    pub(super) fn schedule_remote_ref_update(&mut self, update: RemoteRefUpdate) {
+        self.before_push_updates.push_back(update);
+    }
+
+    pub(super) fn pending_remote_ref_updates(&self) -> &VecDeque<RemoteRefUpdate> {
+        &self.before_push_updates
+    }
+
+    fn take_remote_ref_update(&mut self) -> Option<RemoteRefUpdate> {
+        self.before_push_updates.pop_front()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RemoteRefUpdate {
+    pub(super) ref_name: String,
+    pub(super) target: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +79,14 @@ impl Push {
 #[derive(Clone)]
 struct HandlerState {
     shared: Arc<RwLock<MockState>>,
+    remote: Option<RemoteRepository>,
+}
+
+#[derive(Clone)]
+struct RemoteRepository {
+    path: PathBuf,
+    system_git: PathBuf,
+    environment: TestEnvironment,
 }
 
 #[derive(Deserialize)]
@@ -61,11 +109,19 @@ struct GitCompletion {
     exit_code: i32,
 }
 
-pub(super) fn routes(shared: Arc<RwLock<MockState>>) -> Router {
+pub(super) fn routes(
+    shared: Arc<RwLock<MockState>>,
+    remote_path: PathBuf,
+    system_git: PathBuf,
+    environment: TestEnvironment,
+) -> Router {
     Router::new()
         .route("/_internal/git", post(handle_git))
         .route("/_internal/git/complete", post(complete_git))
-        .with_state(HandlerState { shared })
+        .with_state(HandlerState {
+            shared,
+            remote: Some(RemoteRepository { path: remote_path, system_git, environment }),
+        })
 }
 
 impl GitOperation {
@@ -73,6 +129,7 @@ impl GitOperation {
         match subcommand {
             "var" => Some(Self::Var),
             "interpret-trailers" => Some(Self::InterpretTrailers),
+            "push" => Some(Self::Push),
             _ => None,
         }
     }
@@ -86,9 +143,14 @@ impl GitOperation {
                 Some(Self::LsRemoteUrl)
             }
             "ls-remote" if args.iter().any(|argument| argument == "--symref") => {
-                Some(Self::LsRemoteDefaultBranch)
+                Some(Self::LsRemoteHeads)
             }
-            "ls-remote" => Some(Self::LsRemoteManagedBranches),
+            "ls-remote"
+                if args.iter().any(|argument| argument.starts_with("refs/tags/gherrit/")) =>
+            {
+                Some(Self::LsRemoteActiveVersions)
+            }
+            "ls-remote" => Some(Self::LsRemoteOther),
             subcommand => Self::from_subcommand(subcommand),
         }
     }
@@ -98,9 +160,11 @@ impl GitOperation {
             Self::Var => "var",
             Self::InterpretTrailers => "interpret-trailers",
             Self::HttpRedirectPolicy => "config --get-urlmatch",
-            Self::LsRemoteUrl | Self::LsRemoteDefaultBranch | Self::LsRemoteManagedBranches => {
-                "ls-remote"
-            }
+            Self::LsRemoteUrl
+            | Self::LsRemoteHeads
+            | Self::LsRemoteActiveVersions
+            | Self::LsRemoteOther => "ls-remote",
+            Self::Push => "push",
         }
     }
 }
@@ -111,6 +175,9 @@ fn check_and_apply_failure(
 ) -> Option<FailureKind> {
     let matches = match mock_state.faults.front()? {
         FailureKind::Git(expected) => *expected == operation,
+        FailureKind::GitOnInvocation { operation: expected, occurrence } => {
+            *expected == operation && mock_state.git.invocation_count(operation) == *occurrence
+        }
         FailureKind::GitOutput { operation: expected, .. } => *expected == operation,
         _ => false,
     };
@@ -149,12 +216,22 @@ async fn handle_git(
 ) -> Json<GitResponse> {
     let subcommand = subcommand(&request.args);
     let is_push = subcommand == Some("push");
+    let is_production =
+        request.args.get(1).is_some_and(|argument| argument == "--no-replace-objects");
 
-    let failure = GitOperation::from_args(&request.args).and_then(|operation| {
+    let operation = GitOperation::from_args(&request.args);
+    if is_production {
+        if let Some(operation) = operation {
+            let mut state = handler.shared.write().unwrap();
+            state.git.record_invocation(operation, request.args.clone());
+            state.boundary_events.push(BoundaryEvent::Git(operation));
+        }
+    }
+    let failure = operation.and_then(|operation| {
         check_and_apply_failure(&mut handler.shared.write().unwrap(), operation)
     });
     match failure {
-        Some(FailureKind::Git(operation)) => {
+        Some(FailureKind::Git(operation) | FailureKind::GitOnInvocation { operation, .. }) => {
             return Json(GitResponse {
                 stdout: String::new(),
                 stderr: format!("Simulated failure for git {}", operation.subcommand()),
@@ -177,6 +254,24 @@ async fn handle_git(
     }
 
     if is_push {
+        if is_production {
+            let update = handler.shared.write().unwrap().git.take_remote_ref_update();
+            if let Some(update) = update {
+                let remote = handler
+                    .remote
+                    .as_ref()
+                    .expect("production push interception requires a remote repository");
+                remote
+                    .environment
+                    .command(&remote.system_git)
+                    .current_dir(&remote.path)
+                    .arg("update-ref")
+                    .arg(&update.ref_name)
+                    .arg(&update.target)
+                    .assert()
+                    .success();
+            }
+        }
         let state = handler.shared.read().unwrap();
         let stderr = format!(
             "remote: \nremote: Create a pull request for 'feature' on GitHub by visiting:\nremote:      https://github.com/{}/{}/pull/new/feature\nremote: \n",
@@ -230,6 +325,7 @@ mod tests {
     fn handler_state() -> HandlerState {
         HandlerState {
             shared: Arc::new(RwLock::new(MockState::new("owner".to_string(), "repo".to_string()))),
+            remote: None,
         }
     }
 
@@ -270,7 +366,7 @@ mod tests {
             ("var", Some(GitOperation::Var)),
             ("interpret-trailers", Some(GitOperation::InterpretTrailers)),
             ("ls-remote", None),
-            ("push", None),
+            ("push", Some(GitOperation::Push)),
             ("status", None),
         ] {
             assert_eq!(GitOperation::from_subcommand(subcommand), expected);
@@ -295,11 +391,15 @@ mod tests {
             ),
             (
                 &["git", "--no-replace-objects", "ls-remote", "--symref"][..],
-                Some(GitOperation::LsRemoteDefaultBranch),
+                Some(GitOperation::LsRemoteHeads),
+            ),
+            (
+                &["git", "--no-replace-objects", "ls-remote", "refs/tags/gherrit/Gone/*"][..],
+                Some(GitOperation::LsRemoteActiveVersions),
             ),
             (
                 &["git", "--no-replace-objects", "ls-remote", "refs/heads/Gone"][..],
-                Some(GitOperation::LsRemoteManagedBranches),
+                Some(GitOperation::LsRemoteOther),
             ),
         ] {
             assert_eq!(GitOperation::from_args(&args(arguments)), expected);
@@ -310,19 +410,19 @@ mod tests {
     fn git_faults_match_in_script_order() {
         let expected = VecDeque::from([
             FailureKind::Git(GitOperation::Var),
-            FailureKind::Git(GitOperation::LsRemoteDefaultBranch),
+            FailureKind::Git(GitOperation::LsRemoteHeads),
         ]);
         let mut state = MockState { faults: expected.clone(), ..Default::default() };
 
-        assert_eq!(check_and_apply_failure(&mut state, GitOperation::LsRemoteDefaultBranch), None);
+        assert_eq!(check_and_apply_failure(&mut state, GitOperation::LsRemoteHeads), None);
         assert_eq!(state.faults, expected);
         assert_eq!(
             check_and_apply_failure(&mut state, GitOperation::Var),
             Some(FailureKind::Git(GitOperation::Var))
         );
         assert_eq!(
-            check_and_apply_failure(&mut state, GitOperation::LsRemoteDefaultBranch),
-            Some(FailureKind::Git(GitOperation::LsRemoteDefaultBranch))
+            check_and_apply_failure(&mut state, GitOperation::LsRemoteHeads),
+            Some(FailureKind::Git(GitOperation::LsRemoteHeads))
         );
         assert!(state.faults.is_empty());
 
@@ -333,6 +433,15 @@ mod tests {
         let mut state = MockState { faults: expected.clone(), ..Default::default() };
         assert_eq!(check_and_apply_failure(&mut state, GitOperation::InterpretTrailers), None);
         assert_eq!(state.faults, expected);
+
+        let expected =
+            FailureKind::GitOnInvocation { operation: GitOperation::Push, occurrence: 2 };
+        let mut state = MockState { faults: VecDeque::from([expected]), ..Default::default() };
+        state.git.record_invocation(GitOperation::Push, vec![]);
+        assert_eq!(check_and_apply_failure(&mut state, GitOperation::Push), None);
+        state.git.record_invocation(GitOperation::Push, vec![]);
+        assert_eq!(check_and_apply_failure(&mut state, GitOperation::Push), Some(expected));
+        assert!(state.faults.is_empty());
     }
 
     #[tokio::test]

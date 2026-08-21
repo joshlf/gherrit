@@ -2,6 +2,7 @@ use std::fmt::{self, Write};
 
 use serde::Serialize;
 
+use super::version::Version;
 use crate::re;
 
 // Per https://github.com/orgs/community/discussions/27190#discussioncomment-3254953,
@@ -15,7 +16,7 @@ pub(super) struct PrBody<'a> {
     pub public_branch: Option<&'a str>,
     pub stack_pr_numbers: &'a [u64],
     pub current_pr_number: u64,
-    pub latest_version: usize,
+    pub latest_version: Version,
     pub base_branch: &'a str,
     pub gherrit_id: &'a str,
     pub parent_id: Option<&'a str>,
@@ -85,20 +86,21 @@ impl PrBody<'_> {
         mut output: impl Write,
         format: HistoryTableFormat,
     ) -> fmt::Result {
-        if self.latest_version <= 1 || self.repo_url.is_empty() {
+        let latest_version = self.latest_version.get();
+        if latest_version == 1 || self.repo_url.is_empty() {
             return Ok(());
         }
 
         write!(
             output,
             "\n\n**Latest Update:** v{} — [Compare vs v{}]({}/compare/gherrit/{}/v{}..gherrit/{}/v{})\n\n",
-            self.latest_version,
-            self.latest_version - 1,
+            latest_version,
+            latest_version - 1,
             self.repo_url,
             self.gherrit_id,
-            self.latest_version - 1,
+            latest_version - 1,
             self.gherrit_id,
-            self.latest_version
+            latest_version
         )?;
 
         output.write_str(
@@ -109,23 +111,23 @@ impl PrBody<'_> {
         )?;
 
         output.write_str("|Version|")?;
-        for version in (1..self.latest_version).rev() {
+        for version in (1..latest_version).rev() {
             write!(output, " v{version} |")?;
         }
         output.write_str("Base|")?;
 
         output.write_str("\n|:---|")?;
-        for _ in 1..self.latest_version {
+        for _ in 1..latest_version {
             output.write_str(":---|")?;
         }
         output.write_str(":---|\n")?;
 
-        let prefix = if self.latest_version <= 8 { "vs " } else { "" };
+        let prefix = if latest_version <= 8 { "vs " } else { "" };
 
-        for row in (1..=self.latest_version).rev() {
+        for row in (1..=latest_version).rev() {
             write!(output, "|v{row}|")?;
 
-            for column in (1..self.latest_version).rev() {
+            for column in (1..latest_version).rev() {
                 if column >= row {
                     output.write_str("|")?;
                     continue;
@@ -133,7 +135,7 @@ impl PrBody<'_> {
 
                 let show_link = match format {
                     HistoryTableFormat::Full => true,
-                    HistoryTableFormat::Sparse => row == self.latest_version || row == column + 1,
+                    HistoryTableFormat::Sparse => row == latest_version || row == column + 1,
                 };
 
                 if show_link {
@@ -225,7 +227,7 @@ mod tests {
         commit_body: &'a str,
         public_branch: Option<&'a str>,
         current_pr_number: u64,
-        latest_version: usize,
+        latest_version: u64,
         gherrit_id: &'a str,
         parent_id: Option<&'a str>,
         child_id: Option<&'a str>,
@@ -236,7 +238,7 @@ mod tests {
             public_branch,
             stack_pr_numbers: STACK,
             current_pr_number,
-            latest_version,
+            latest_version: Version::new(latest_version).expect("test version must be nonzero"),
             base_branch: parent_id.unwrap_or("main"),
             gherrit_id,
             parent_id,

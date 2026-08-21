@@ -9,7 +9,7 @@
 use std::{env, process::Command, str};
 
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
-use gix::{ObjectId, bstr::ByteSlice as _};
+use gix::ObjectId;
 
 use crate::util;
 
@@ -301,27 +301,6 @@ impl PushDestination {
     pub(super) fn repo_url_relative(&self) -> String {
         format!("/{}/{}", self.resolved.owner, self.resolved.repository)
     }
-
-    /// Observes the symbolic default branch and its exact tip from this
-    /// destination. No local remote-tracking ref participates in the result.
-    pub(super) fn observe_default_branch(&self) -> Result<DefaultBranch> {
-        let output =
-            self.ls_remote(["--symref".to_string()], ["HEAD".to_string()]).output().wrap_err_with(
-                || format!("Failed to observe GHerrit remote '{}'", self.configured_remote()),
-            )?;
-        if !output.status.success() {
-            bail!(
-                "`git ls-remote --symref` failed for GHerrit remote '{}'",
-                self.configured_remote()
-            );
-        }
-        parse_default_branch(&output.stdout).wrap_err_with(|| {
-            format!(
-                "GHerrit remote '{}' did not report one valid symbolic default branch",
-                self.configured_remote()
-            )
-        })
-    }
 }
 
 impl ResolvedDestination {
@@ -542,7 +521,7 @@ fn is_git_transport_diagnostic(name: &[u8]) -> bool {
 }
 
 /// One repository default branch, including the exact commit it names.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DefaultBranch {
     name: String,
     tip: ObjectId,
@@ -713,68 +692,6 @@ fn valid_repository_component(component: &str) -> bool {
         && component
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
-fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
-    let mut symbolic_head = None;
-    let mut direct_head = None;
-
-    for record in git_output_records(output) {
-        let mut fields = record.split(|byte| *byte == b'\t');
-        let (Some(value), Some(name), None) = (fields.next(), fields.next(), fields.next()) else {
-            bail!("malformed `git ls-remote --symref` record");
-        };
-        if let Some(target) = value.strip_prefix(b"ref: ") {
-            validate_advertised_ref_name(name)?;
-            let target = gix::refs::FullName::try_from(target.as_bstr())
-                .wrap_err("symbolic remote ref has an invalid target")?;
-            if name == b"HEAD" && symbolic_head.replace(target).is_some() {
-                bail!("duplicate symbolic HEAD");
-            }
-        } else {
-            validate_direct_advertised_ref_name(name)?;
-            let object_id =
-                ObjectId::from_hex(value).wrap_err("remote ref value is not an object ID")?;
-            if object_id.is_null() {
-                bail!("remote ref has a null object ID");
-            }
-            if name == b"HEAD" && direct_head.replace(object_id).is_some() {
-                bail!("duplicate direct HEAD");
-            }
-        }
-    }
-
-    let symbolic_head = symbolic_head.ok_or_else(|| eyre!("missing symbolic HEAD"))?;
-    let direct_head = direct_head.ok_or_else(|| eyre!("missing direct HEAD"))?;
-    if symbolic_head.category() != Some(gix::refs::Category::LocalBranch) {
-        bail!("symbolic HEAD does not target a local branch");
-    }
-    let branch = symbolic_head
-        .as_bstr()
-        .strip_prefix(b"refs/heads/")
-        .ok_or_else(|| eyre!("symbolic HEAD does not target a local branch"))?;
-    let branch = str::from_utf8(branch).wrap_err("default branch name is not UTF-8")?.to_owned();
-    DefaultBranch::new(branch, direct_head)
-}
-
-fn validate_advertised_ref_name(name: &[u8]) -> Result<()> {
-    if name == b"HEAD" {
-        return Ok(());
-    }
-    gix::refs::FullName::try_from(name.as_bstr()).wrap_err("remote ref has an invalid name")?;
-    Ok(())
-}
-
-fn validate_direct_advertised_ref_name(name: &[u8]) -> Result<()> {
-    let Some(tag) = name.strip_suffix(b"^{}") else {
-        return validate_advertised_ref_name(name);
-    };
-    let tag = gix::refs::FullName::try_from(tag.as_bstr())
-        .wrap_err("peeled remote ref has an invalid tag name")?;
-    if tag.category() != Some(gix::refs::Category::Tag) {
-        bail!("peeled remote ref is not a tag");
-    }
-    Ok(())
 }
 
 /// Splits Git's line-oriented output while accepting native Windows CRLF.
@@ -1062,16 +979,6 @@ mod tests {
         let destination = resolved(b"https://github.com/owner/repo.git\r\n");
         assert_eq!(destination.owner, "owner");
         assert_eq!(destination.repository, "repo");
-
-        let oid = "1111111111111111111111111111111111111111";
-        assert_eq!(
-            parse_default_branch(
-                format!("ref: refs/heads/main\tHEAD\r\n{oid}\tHEAD\r\n").as_bytes()
-            )
-            .unwrap(),
-            DefaultBranch::new("main".to_string(), ObjectId::from_hex(oid.as_bytes()).unwrap())
-                .unwrap()
-        );
     }
 
     #[test]
@@ -1141,100 +1048,5 @@ mod tests {
         );
         assert!(!error.to_string().contains(secret));
         assert!(!error.to_string().contains("secret"));
-    }
-
-    #[test]
-    fn parses_exact_symbolic_default_branch_observation() {
-        let oid = "1111111111111111111111111111111111111111";
-        assert_eq!(
-            parse_default_branch(format!("ref: refs/heads/master\tHEAD\n{oid}\tHEAD\n").as_bytes())
-                .unwrap(),
-            DefaultBranch::new("master".to_string(), ObjectId::from_hex(oid.as_bytes()).unwrap())
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn default_branch_record_order_is_irrelevant() {
-        let oid = "1111111111111111111111111111111111111111";
-        let expected =
-            DefaultBranch::new("main".to_string(), ObjectId::from_hex(oid.as_bytes()).unwrap())
-                .unwrap();
-
-        for output in [
-            format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n"),
-            format!("{oid}\tHEAD\nref: refs/heads/main\tHEAD\n"),
-        ] {
-            assert_eq!(parse_default_branch(output.as_bytes()).unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn ignores_valid_unrelated_remote_records_including_non_utf8_names() {
-        let oid = "1111111111111111111111111111111111111111";
-        let other = "2222222222222222222222222222222222222222";
-        let mut output = format!(
-            "{other}\trefs/heads/HEAD\n\
-             {other}\trefs/tags/HEAD\n\
-             {other}\trefs/tags/HEAD^{{}}\n\
-             ref: refs/heads/elsewhere\trefs/remotes/origin/HEAD\n\
-             {oid}\tHEAD\n\
-             ref: refs/heads/main\tHEAD\n"
-        )
-        .into_bytes();
-        output.extend_from_slice(format!("{other}\trefs/heads/").as_bytes());
-        output.extend_from_slice(b"\xff-HEAD\n");
-
-        assert_eq!(
-            parse_default_branch(&output).unwrap(),
-            DefaultBranch::new("main".to_string(), ObjectId::from_hex(oid.as_bytes()).unwrap(),)
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn rejects_every_malformed_default_branch_observation() {
-        let oid = "1111111111111111111111111111111111111111";
-        let null_oid = "0000000000000000000000000000000000000000";
-        for output in [
-            Vec::new(),
-            format!("{oid}\tHEAD\n").into_bytes(),
-            format!("ref: refs/tags/main\tHEAD\n{oid}\tHEAD\n").into_bytes(),
-            format!("ref: refs/heads/main\r\tHEAD\n{oid}\tHEAD\n").into_bytes(),
-            "ref: refs/heads/main\tHEAD\nxyz\tHEAD\n".to_string().into_bytes(),
-            format!("ref: refs/heads/main\tHEAD\n{null_oid}\tHEAD\n").into_bytes(),
-            format!("ref: refs/heads/main\tHEAD\n{oid}\tOTHER\n").into_bytes(),
-            format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\nextra\n").into_bytes(),
-            format!(
-                "ref: refs/heads/main\tHEAD\n\
-                 ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n"
-            )
-            .into_bytes(),
-            format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n{oid}\tHEAD\n").into_bytes(),
-            format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\nxyz\trefs/heads/other\n")
-                .into_bytes(),
-            format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n{null_oid}\trefs/heads/other\n")
-                .into_bytes(),
-            format!("ref: invalid\trefs/heads/other\n{oid}\tHEAD\n").into_bytes(),
-            format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n{oid}\tinvalid\n").into_bytes(),
-            format!(
-                "ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n\
-                 {oid}\trefs/heads/other^{{}}\n"
-            )
-            .into_bytes(),
-            format!(
-                "ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n\
-                 ref: refs/heads/other\trefs/tags/HEAD^{{}}\n"
-            )
-            .into_bytes(),
-            {
-                let mut output = b"ref: refs/heads/".to_vec();
-                output.extend_from_slice(b"\xff\tHEAD\n");
-                output.extend_from_slice(format!("{oid}\tHEAD\n").as_bytes());
-                output
-            },
-        ] {
-            assert!(parse_default_branch(&output).is_err(), "output: {output:?}");
-        }
     }
 }
