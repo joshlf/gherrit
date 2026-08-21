@@ -50,6 +50,9 @@ It achieves this by:
 When developing code changes, you **MUST** read
 [agent_docs/development.md](./agent_docs/development.md).
 
+Before changing pre-push publication behavior, you **MUST** read
+[design/pre-push.md](./design/pre-push.md).
+
 ### Before submitting
 
 Once you have made a change, you **MUST** read the relevant documents to ensure
