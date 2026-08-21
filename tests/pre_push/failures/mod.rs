@@ -26,7 +26,7 @@ fn unpublished_managed_commit(branch: &str) -> testutil::TestContext {
     ctx
 }
 
-fn assert_identity_failure_before_external_io(ctx: testutil::TestContext, diagnostic: &str) {
+fn assert_identity_failure_before_github_or_writes(ctx: testutil::TestContext, diagnostic: &str) {
     ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(diagnostic));
 
     assert!(ctx.github().requests().is_empty());
@@ -70,17 +70,17 @@ fn linked_managed_stack(ctx: &testutil::TestContext, branch: &str, id: &str) -> 
 }
 
 #[test]
-fn test_empty_stack_id_fails_before_external_io() {
+fn test_empty_stack_id_fails_before_github_or_writes() {
     let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: ");
 
-    assert_identity_failure_before_external_io(ctx, "missing gherrit-pr-id trailer");
+    assert_identity_failure_before_github_or_writes(ctx, "missing gherrit-pr-id trailer");
 }
 
 #[test]
-fn test_multiple_stack_ids_fail_before_external_io() {
+fn test_multiple_stack_ids_fail_before_github_or_writes() {
     let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: Gone\ngherrit-pr-id: Gtwo");
 
-    assert_identity_failure_before_external_io(ctx, "multiple gherrit-pr-id trailers");
+    assert_identity_failure_before_github_or_writes(ctx, "multiple gherrit-pr-id trailers");
 }
 
 #[test]
@@ -89,25 +89,25 @@ fn test_body_lookalike_is_not_a_stack_id() {
         "Work\n\ngherrit-pr-id: Gexample\n\nThis final paragraph is not a trailer.",
     );
 
-    assert_identity_failure_before_external_io(ctx, "missing gherrit-pr-id trailer");
+    assert_identity_failure_before_github_or_writes(ctx, "missing gherrit-pr-id trailer");
 }
 
 #[test]
-fn test_continued_stack_id_fails_before_external_io() {
+fn test_continued_stack_id_fails_before_github_or_writes() {
     let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: Gone\n continuation");
 
-    assert_identity_failure_before_external_io(ctx, "invalid gherrit-pr-id trailer");
+    assert_identity_failure_before_github_or_writes(ctx, "invalid gherrit-pr-id trailer");
 }
 
 #[test]
 fn test_empty_and_valid_stack_ids_are_multiple() {
     let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: \ngherrit-pr-id: Gvalid");
 
-    assert_identity_failure_before_external_io(ctx, "multiple gherrit-pr-id trailers");
+    assert_identity_failure_before_github_or_writes(ctx, "multiple gherrit-pr-id trailers");
 }
 
 #[test]
-fn test_duplicate_stack_ids_fail_before_external_io() {
+fn test_duplicate_stack_ids_fail_before_github_or_writes() {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_initial_commit()
@@ -135,13 +135,17 @@ fn test_default_branch_must_be_on_the_first_parent_stack_path() {
         .with_mock_github()
         .with_git_interceptor()
         .build();
-    ctx.checkout_managed_private("first-parent");
-    ctx.commit_with_gherrit_id("Stack change");
-
-    ctx.run_git(&["checkout", "main"]);
-    ctx.commit("Advance the default branch");
-    ctx.run_git(&["checkout", "first-parent"]);
-    ctx.run_git(&["merge", "--no-ff", "main", "-m", "Merge the default branch"]);
+    ctx.run_git(&["checkout", "--orphan", "first-parent"]);
+    ctx.configure_managed_private("first-parent");
+    ctx.commit_with_gherrit_id("Unrelated first parent");
+    ctx.run_git(&[
+        "merge",
+        "--allow-unrelated-histories",
+        "--no-ff",
+        "main",
+        "-m",
+        "Reach the default branch only through the second parent",
+    ]);
 
     ctx.hook_cmd("pre-push")
         .assert()
@@ -298,7 +302,7 @@ fn test_pre_push_ls_remote_failure() {
     ctx.commit_with_gherrit_id("Work");
 
     let refs_before = ctx.remote_refs("refs");
-    ctx.expect_git_failure(testutil::GitOperation::LsRemote);
+    ctx.expect_git_failure(testutil::GitOperation::LsRemoteDefaultBranch);
     testutil::assert_failure_snapshot!(
         ctx,
         ctx.hook_cmd("pre-push"),
@@ -309,7 +313,34 @@ fn test_pre_push_ls_remote_failure() {
     assert_eq!(ctx.remote_refs("refs"), refs_before);
     assert!(ctx.recorded_pushes().is_empty());
     assert!(ctx.github().pull_requests().is_empty());
-    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]]);
+    assert!(ctx.github().requests().is_empty());
+}
+
+#[test]
+fn test_pre_push_rejects_a_null_managed_branch_object_id() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("feature-null-remote-object");
+    ctx.commit_with_explicit_gherrit_id("Work", "Gnull");
+    let refs_before = ctx.remote_refs("refs");
+    ctx.expect_git_output(
+        testutil::GitOperation::LsRemoteManagedBranches,
+        "0000000000000000000000000000000000000000\trefs/heads/Gnull\n",
+    );
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("null object ID in `git ls-remote` line"));
+
+    ctx.assert_failure_consumed();
+    assert_eq!(ctx.remote_refs("refs"), refs_before);
+    assert!(ctx.recorded_pushes().is_empty());
+    assert!(ctx.github().pull_requests().is_empty());
 }
 
 #[test]
@@ -350,7 +381,6 @@ fn test_pre_push_pr_list_retries_a_transient_http_failure() {
     assert_eq!(
         ctx.github().requests(),
         [
-            vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::CreatePr],
@@ -394,7 +424,6 @@ fn test_pre_push_pr_list_retries_a_response_transport_failure() {
         [
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::CreatePr],
             vec![testutil::GraphQlOperation::UpdatePr],
         ]
@@ -412,50 +441,6 @@ fn test_pre_push_pr_list_stops_after_three_response_transport_retries() {
     assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]; 4]);
     assert!(ctx.github().pull_requests().is_empty());
     assert!(ctx.recorded_pushes().is_empty());
-}
-
-#[test]
-fn test_repository_id_query_retries_a_transient_http_failure() {
-    let ctx = unpublished_managed_commit("feature-repository-id-transient");
-    ctx.inject_failure(testutil::FailureKind::RepositoryIdHttp(
-        testutil::RetryableHttpStatus::TooManyRequests,
-    ));
-
-    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
-
-    ctx.assert_failure_consumed();
-    assert_eq!(
-        ctx.github().requests(),
-        [
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::CreatePr],
-            vec![testutil::GraphQlOperation::UpdatePr],
-        ]
-    );
-    assert_eq!(ctx.github().pull_requests().len(), 1);
-}
-
-#[test]
-fn test_repository_id_query_stops_after_three_transient_http_retries() {
-    let ctx = unpublished_managed_commit("feature-repository-id-retries-exhausted");
-    (0..=3).for_each(|_| {
-        ctx.inject_failure(testutil::FailureKind::RepositoryIdHttp(
-            testutil::RetryableHttpStatus::ServiceUnavailable,
-        ));
-    });
-
-    ctx.gherrit_cmd()
-        .args(["hook", "pre-push"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Injected RepositoryIdHttp(ServiceUnavailable) failure"));
-
-    ctx.assert_failure_consumed();
-    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]; 5]);
-    assert!(ctx.github().pull_requests().is_empty());
-    assert_eq!(ctx.recorded_pushes().iter().filter(|push| push.succeeded()).count(), 1);
 }
 
 #[test]
@@ -480,11 +465,7 @@ fn test_pre_push_pr_create_failure() {
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),
-        [
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::CreatePr],
-        ],
+        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::CreatePr],],
         "an indeterminate create response must stop without replay or continuation"
     );
     assert!(ctx.github().pull_requests().is_empty());
@@ -514,11 +495,7 @@ fn test_pre_push_pr_create_service_unavailable_is_not_replayed() {
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),
-        [
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::CreatePr],
-        ],
+        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::CreatePr],],
         "a retryable HTTP response must not replay a mutation request"
     );
     assert!(ctx.github().pull_requests().is_empty());
