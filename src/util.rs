@@ -1,4 +1,12 @@
-use std::{ffi::OsStr, process::Command};
+use std::{
+    env,
+    ffi::OsStr,
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    process::Command,
+    str,
+};
 
 use eyre::{OptionExt, Result, WrapErr, bail, eyre};
 use gix::{Commit, Id, bstr::ByteSlice, state::InProgress};
@@ -80,11 +88,27 @@ pub(crate) use re as re_macro;
 
 pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Command {
     let mut c = Command::new(name);
+    if name == "git" {
+        // Replacement objects and implicit promisor fetches can make Git
+        // subprocesses observe a different graph from the one sent to the
+        // remote. Keep every production Git invocation on the literal local
+        // graph.
+        c.arg("--no-replace-objects");
+        c.env("GIT_NO_REPLACE_OBJECTS", "1");
+        c.env("GIT_NO_LAZY_FETCH", "1");
+        for variable in [
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_GRAFT_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_SHALLOW_FILE",
+        ] {
+            c.env_remove(variable);
+        }
+    }
     c.args(args);
     c
 }
-
-use std::path::PathBuf;
 
 /// Represents the state of the HEAD reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,13 +138,131 @@ pub struct Repo {
     current_branch: HeadState,
 }
 
+fn literal_graph_open_options() -> gix::sec::trust::Mapping<gix::open::Options> {
+    fn harden(mut options: gix::open::Options) -> gix::open::Options {
+        // Object-related environment variables include replacement controls
+        // and alternate object databases. Denying the whole category prevents
+        // an inherited variable from taking precedence over the explicit
+        // replacement-free setting below.
+        options.permissions.env.objects = gix::sec::Permission::Deny;
+
+        // In gix 0.75, `true` here means that replacement-object discovery is
+        // disabled. The polarity is intentionally the opposite of the value
+        // which makes this release load replacements.
+        options.cli_overrides(["core.useReplaceRefs=true"])
+    }
+
+    let mut options = gix::sec::trust::Mapping::<gix::open::Options>::default();
+    options.full.modify(harden);
+    options.reduced.modify(harden);
+    options
+}
+
 impl Repo {
     pub fn open(path: &str) -> Result<Self> {
         // NOTE: `gix::discover` is used instead of `gix::open` so that
         // `gherrit` doesn't need to be run from the root of the repository.
-        let inner = gix::discover(path)?;
+        let inner = gix::ThreadSafeRepository::discover_opts(
+            path,
+            Default::default(),
+            literal_graph_open_options(),
+        )?
+        .to_thread_local();
         let current_branch = get_current_branch(&inner)?;
         Ok(Self { inner, current_branch })
+    }
+
+    /// Rejects repository state which can rewrite or truncate publication
+    /// history.
+    ///
+    /// The safety checks performed by the pre-push hook are meaningful only
+    /// for the graph GitHub receives. Git has no flag which disables legacy
+    /// graft files, and a shallow boundary hides real ancestry. This check must
+    /// therefore run before publication graph traversal.
+    pub fn ensure_publishable_history(&self) -> Result<()> {
+        let common_dir = self.inner.common_dir();
+        reject_nonempty_history_file(
+            &common_dir.join("info/grafts"),
+            "the common Git directory's info/grafts file",
+            "grafts rewrite commit ancestry",
+        )?;
+        if let Some(grafts) = env::var_os("GIT_GRAFT_FILE").filter(|path| !path.is_empty()) {
+            reject_nonempty_history_file(
+                &self.git_environment_path(grafts)?,
+                "the file named by GIT_GRAFT_FILE",
+                "the enclosing Git push retains that graft setting after the hook returns",
+            )?;
+        }
+
+        // Always inspect the real common shallow file. gix permits its
+        // effective shallow path to be redirected, which must not hide the
+        // ordinary Git boundary from publication validation.
+        reject_nonempty_history_file(
+            &common_dir.join("shallow"),
+            "the common Git directory's shallow file",
+            "shallow history omits commit ancestry",
+        )?;
+        reject_nonempty_history_file(
+            &self.inner.shallow_file(),
+            "the effective shallow file",
+            "shallow history omits commit ancestry",
+        )?;
+        if let Some(shallow) = env::var_os("GIT_SHALLOW_FILE").filter(|path| !path.is_empty()) {
+            reject_nonempty_history_file(
+                &self.git_environment_path(shallow)?,
+                "the file named by GIT_SHALLOW_FILE",
+                "the enclosing Git push retains that shallow boundary after the hook returns",
+            )?;
+        }
+
+        if self.has_promisor_remote()? {
+            let output = cmd("git", ["--version"])
+                .checked_output()
+                .wrap_err("Failed to determine the installed Git version")?;
+            require_git_no_lazy_fetch(&output.stdout)?;
+        }
+
+        Ok(())
+    }
+
+    fn git_environment_path(&self, path: std::ffi::OsString) -> Result<PathBuf> {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            return Ok(path);
+        }
+
+        // Git runs an installed hook from the worktree root in a non-bare
+        // repository and from the Git directory in a bare repository. Resolve
+        // the enclosing push's relative environment path from the same place.
+        Ok(match self.inner.workdir() {
+            Some(workdir) => workdir.join(path),
+            None => env::current_dir()?.join(path),
+        })
+    }
+
+    fn has_promisor_remote(&self) -> Result<bool> {
+        let config = self.inner.config_snapshot();
+        if config.string("extensions.partialClone").is_some() {
+            return Ok(true);
+        }
+
+        let Some(remotes) = config.sections_by_name("remote") else {
+            return Ok(false);
+        };
+        for remote in remotes {
+            match remote.value_implicit("promisor") {
+                Some(None) => return Ok(true),
+                Some(Some(value)) => {
+                    let value = gix::config::Boolean::try_from(value)
+                        .wrap_err("Invalid remote promisor configuration")?;
+                    if bool::from(value) {
+                        return Ok(true);
+                    }
+                }
+                None => {}
+            }
+        }
+        Ok(false)
     }
 
     pub fn current_branch(&self) -> &HeadState {
@@ -264,6 +406,50 @@ impl Repo {
         let state = State::read_from(self, branch_name)?;
         Ok((branch_name.clone(), state))
     }
+}
+
+fn reject_nonempty_history_file(path: &Path, description: &str, reason: &str) -> Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            bail!("GHerrit cannot publish because {description} is not a regular file");
+        }
+        Ok(metadata) if metadata.len() != 0 => {
+            bail!("GHerrit cannot publish while {description} is nonempty because {reason}");
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).wrap_err_with(|| format!("Failed to inspect {description}")),
+    }
+}
+
+fn parse_git_version(output: &[u8]) -> Result<(u64, u64)> {
+    let version = str::from_utf8(output)?
+        .trim()
+        .strip_prefix("git version ")
+        .ok_or_else(|| eyre!("Unexpected `git --version` output"))?;
+    let mut components = version.split('.');
+    let major = components
+        .next()
+        .ok_or_else(|| eyre!("Git version omitted its major component"))?
+        .parse()
+        .wrap_err("Git reported an invalid major version")?;
+    let minor = components
+        .next()
+        .ok_or_else(|| eyre!("Git version omitted its minor component"))?
+        .parse()
+        .wrap_err("Git reported an invalid minor version")?;
+    Ok((major, minor))
+}
+
+fn require_git_no_lazy_fetch(output: &[u8]) -> Result<()> {
+    let (major, minor) = parse_git_version(output)?;
+    if (major, minor) < (2, 45) {
+        bail!(
+            "GHerrit requires Git 2.45 or newer for a promisor repository so implicit object \
+             fetches can be disabled; found Git {major}.{minor}"
+        );
+    }
+    Ok(())
 }
 
 pub enum FirstParentCommitsBetweenError {
@@ -426,6 +612,65 @@ fn get_repo_owner_name(remote_url: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_commands_use_the_literal_local_graph_without_lazy_fetches() {
+        let command = cmd("git", ["status"]);
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(arguments, ["--no-replace-objects", "status"]);
+        let environment = command.get_envs().collect::<std::collections::HashMap<_, _>>();
+        for variable in ["GIT_NO_LAZY_FETCH", "GIT_NO_REPLACE_OBJECTS"] {
+            assert_eq!(environment[OsStr::new(variable)], Some(OsStr::new("1")));
+        }
+        for variable in [
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_GRAFT_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_SHALLOW_FILE",
+        ] {
+            assert_eq!(environment[OsStr::new(variable)], None);
+        }
+
+        let command = cmd("gh", ["auth", "token"]);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [OsStr::new("auth"), OsStr::new("token")]
+        );
+        assert!(command.get_envs().next().is_none());
+    }
+
+    #[test]
+    fn literal_graph_open_options_deny_object_environment_at_every_trust_level() {
+        let options = literal_graph_open_options();
+        for trust in [gix::sec::Trust::Full, gix::sec::Trust::Reduced] {
+            assert_eq!(options.by_level(trust).permissions.env.objects, gix::sec::Permission::Deny);
+        }
+    }
+
+    #[test]
+    fn git_versions_are_parsed_for_no_lazy_fetch_support() {
+        for (output, expected) in [
+            ("git version 2.44.0\n", (2, 44)),
+            ("git version 2.45.0\n", (2, 45)),
+            ("git version 2.48.1 (Apple Git-154)\n", (2, 48)),
+            ("git version 3.0.0.windows.1\n", (3, 0)),
+        ] {
+            assert_eq!(parse_git_version(output.as_bytes()).unwrap(), expected);
+        }
+
+        for output in [b"2.45.0\n".as_slice(), b"git version invalid\n", b"git version 2\n"] {
+            assert!(parse_git_version(output).is_err());
+        }
+
+        let error = require_git_no_lazy_fetch(b"git version 2.44.9\n").unwrap_err();
+        assert!(error.to_string().contains("requires Git 2.45 or newer"));
+        require_git_no_lazy_fetch(b"git version 2.45.0\n").unwrap();
+        require_git_no_lazy_fetch(b"git version 3.0.0\n").unwrap();
+    }
 
     #[test]
     #[should_panic(expected = "Command cannot be empty")]
