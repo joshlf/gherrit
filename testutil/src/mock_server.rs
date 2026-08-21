@@ -6,11 +6,21 @@ use std::{
 };
 
 use apollo_compiler::{ast, executable, validation::Valid, ExecutableDocument, Name, Node};
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{
+    body::{Body, Bytes},
+    extract::State,
+    http::{header::LOCATION, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{any, post},
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::{git_interceptor, FailureKind, GraphQlOperation, TestEnvironment};
+use crate::{
+    git_interceptor, FailureKind, GraphQlOperation, RedirectStatus, RetryableHttpStatus,
+    TestEnvironment,
+};
 
 const MAX_PULL_REQUEST_CANDIDATES: usize = 100;
 
@@ -28,7 +38,8 @@ pub struct MockState {
     pub(super) cross_repository_prs: HashSet<usize>,
     pub(super) git: git_interceptor::State,
     pub graphql_requests: Vec<Vec<GraphQlOperation>>,
-    pub max_graphql_operations_per_request: Option<usize>,
+    pub graphql_redirect_trap_requests: usize,
+    pub max_graphql_query_operations_per_request: Option<usize>,
     pub repo_owner: String,
     pub repo_name: String,
     pub faults: VecDeque<FailureKind>,
@@ -179,8 +190,11 @@ pub(super) async fn run_mock_server(
     let git_routes = git_interceptor::routes(state.clone());
     let app_state = AppState { state, remote_path, system_git, test_environment };
 
-    let app =
-        Router::new().route("/graphql", post(graphql)).with_state(app_state).merge(git_routes);
+    let app = Router::new()
+        .route("/graphql", post(graphql))
+        .route("/graphql-redirect-trap", any(graphql_redirect_trap))
+        .with_state(app_state)
+        .merge(git_routes);
 
     ready_tx.send(url).expect("Failed to send mock server URL");
 
@@ -195,13 +209,25 @@ pub(super) async fn run_mock_server(
 fn check_and_apply_graphql_failure(
     mock_state: &mut MockState,
     operations: &[GraphQlOperation],
+    is_repository_id_query: bool,
+    create_request_number: usize,
 ) -> Option<FailureKind> {
     use FailureKind::*;
 
     let fail_action = mock_state.faults.front()?;
     let matches = match fail_action {
         GraphQl => true,
-        CreatePr => operations.contains(&GraphQlOperation::CreatePr),
+        QueryTransport | QueryHttp(_) => {
+            !operations.is_empty()
+                && operations.iter().all(|operation| *operation == GraphQlOperation::Query)
+        }
+        RepositoryIdHttp(_) => is_repository_id_query,
+        CreatePr | CreatePrHttp(_) | CreatePrRedirect(_) => {
+            operations.contains(&GraphQlOperation::CreatePr)
+        }
+        SecondCreatePrHttp(_) => {
+            create_request_number == 2 && operations.contains(&GraphQlOperation::CreatePr)
+        }
         UpdatePr => operations.contains(&GraphQlOperation::UpdatePr),
         Git(_) => false,
     };
@@ -470,9 +496,9 @@ fn validate_create_field(field: &executable::Field) -> Result<(), String> {
     validate_input_fields(
         input,
         PATH,
-        &["repositoryId", "baseRefName", "headRefName", "title", "body"],
+        &["repositoryId", "baseRefName", "headRefName", "title", "body", "clientMutationId"],
     )?;
-    for required in ["repositoryId", "baseRefName", "headRefName", "title"] {
+    for required in ["repositoryId", "baseRefName", "headRefName", "title", "clientMutationId"] {
         required_string_field(input, required, PATH)?;
     }
 
@@ -482,7 +508,7 @@ fn validate_create_field(field: &executable::Field) -> Result<(), String> {
             "pullRequest" => validate_scalar_fields(
                 &field.selection_set,
                 "createPullRequest.pullRequest",
-                &["number", "url", "id"],
+                &["number", "url", "id", "headRefName"],
             )?,
             _ => {
                 return Err(format!(
@@ -499,13 +525,34 @@ fn validate_update_field(field: &executable::Field) -> Result<(), String> {
     const PATH: &str = "updatePullRequest";
     validate_argument_names(field, PATH, &["input"])?;
     let input = input_object(field, PATH)?;
-    validate_input_fields(input, PATH, &["pullRequestId", "baseRefName", "title", "body"])?;
+    validate_input_fields(
+        input,
+        PATH,
+        &["pullRequestId", "baseRefName", "title", "body", "clientMutationId"],
+    )?;
     required_string_field(input, "pullRequestId", PATH)?;
+    required_string_field(input, "clientMutationId", PATH)?;
     if !["baseRefName", "title", "body"].iter().any(|name| get_string_field(input, name).is_some())
     {
         return Err("The mock GitHub API requires at least one pull request update".to_string());
     }
-    validate_scalar_fields(&field.selection_set, PATH, &["clientMutationId"])
+    for field in selected_fields(&field.selection_set, PATH)? {
+        match field.name.as_str() {
+            "clientMutationId" => {}
+            "pullRequest" => validate_scalar_fields(
+                &field.selection_set,
+                "updatePullRequest.pullRequest",
+                &["id"],
+            )?,
+            _ => {
+                return Err(format!(
+                    "The mock GitHub API does not support field `{PATH}.{}`",
+                    field.name
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_supported_document(
@@ -542,7 +589,7 @@ fn validate_supported_document(
 async fn graphql(
     State(app_state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response {
     let Some(query) = payload.get("query").and_then(|value| value.as_str()) else {
         return graphql_http_error("Invalid GraphQL payload: missing string field `query`");
     };
@@ -566,26 +613,33 @@ async fn graphql(
     let operations = graphql_operations(&document);
     let mut mock_state = app_state.state.write().unwrap();
     mock_state.graphql_requests.push(operations.clone());
-    if mock_state.max_graphql_operations_per_request.is_some_and(|limit| operations.len() > limit) {
-        return (
+    let create_request_number = mock_state
+        .graphql_requests
+        .iter()
+        .filter(|request| request.contains(&GraphQlOperation::CreatePr))
+        .count();
+    if operations.iter().all(|operation| *operation == GraphQlOperation::Query)
+        && mock_state
+            .max_graphql_query_operations_per_request
+            .is_some_and(|limit| operations.len() > limit)
+    {
+        return graphql_response(
             StatusCode::OK,
-            Json(serde_json::json!({
+            serde_json::json!({
                 "errors": [{
                     "type": "RESOURCE_LIMITS_EXCEEDED",
                     "message": "Request exceeds the mock GraphQL operation limit",
                 }]
-            })),
+            }),
         );
     }
-    if let Some(failure) = check_and_apply_graphql_failure(&mut mock_state, &operations) {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "errors": [
-                    { "message": format!("Injected {failure:?} failure") }
-                ]
-            })),
-        );
+    if let Some(failure) = check_and_apply_graphql_failure(
+        &mut mock_state,
+        &operations,
+        query.trim_start().starts_with("query RepositoryID("),
+        create_request_number,
+    ) {
+        return graphql_failure_response(failure);
     }
 
     let mut response_data = serde_json::Map::new();
@@ -629,15 +683,78 @@ async fn graphql(
         response_json.insert("errors".to_string(), serde_json::Value::Array(errors));
     }
 
-    (StatusCode::OK, Json(serde_json::Value::Object(response_json)))
+    graphql_response(StatusCode::OK, serde_json::Value::Object(response_json))
 }
 
-fn graphql_http_error(message: &str) -> (StatusCode, Json<serde_json::Value>) {
+async fn graphql_redirect_trap(State(app_state): State<AppState>) -> Response {
+    app_state.state.write().unwrap().graphql_redirect_trap_requests += 1;
+    graphql_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({ "message": "Mutation redirect trap was reached" }),
+    )
+}
+
+fn retryable_status(status: RetryableHttpStatus) -> StatusCode {
+    match status {
+        RetryableHttpStatus::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+        RetryableHttpStatus::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+fn redirect_status(status: RedirectStatus) -> StatusCode {
+    match status {
+        RedirectStatus::Temporary => StatusCode::TEMPORARY_REDIRECT,
+        RedirectStatus::Permanent => StatusCode::PERMANENT_REDIRECT,
+    }
+}
+
+fn graphql_failure_response(failure: FailureKind) -> Response {
+    use FailureKind::*;
+
+    if matches!(failure, QueryTransport) {
+        let body = Body::from_stream(futures_util::stream::once(async {
+            Err::<Bytes, _>(std::io::Error::other("Injected GraphQL response transport failure"))
+        }));
+        return Response::new(body);
+    }
+
+    let status = match failure {
+        QueryHttp(status)
+        | RepositoryIdHttp(status)
+        | CreatePrHttp(status)
+        | SecondCreatePrHttp(status) => retryable_status(status),
+        CreatePrRedirect(status) => redirect_status(status),
+        GraphQl | CreatePr | UpdatePr => StatusCode::OK,
+        QueryTransport => unreachable!("handled above"),
+        Git(_) => unreachable!("Git failures are not handled by the GraphQL endpoint"),
+    };
+    let mut headers = HeaderMap::new();
+    if matches!(failure, CreatePrRedirect(_)) {
+        headers.insert(LOCATION, HeaderValue::from_static("/graphql-redirect-trap"));
+    }
+    let message = format!("Injected {failure:?} failure");
     (
-        StatusCode::BAD_REQUEST,
+        status,
+        headers,
         Json(serde_json::json!({
+            "message": message,
             "errors": [{ "message": message }],
         })),
+    )
+        .into_response()
+}
+
+fn graphql_response(status: StatusCode, value: serde_json::Value) -> Response {
+    (status, Json(value)).into_response()
+}
+
+fn graphql_http_error(message: &str) -> Response {
+    graphql_response(
+        StatusCode::BAD_REQUEST,
+        serde_json::json!({
+            "message": message,
+            "errors": [{ "message": message }],
+        }),
     )
 }
 
@@ -698,6 +815,7 @@ fn handle_update_pr(
     const PATH: &str = "updatePullRequest";
     let input = input_object(field, PATH)?;
     let node_id = required_string_field(input, "pullRequestId", PATH)?;
+    let client_mutation_id = required_string_field(input, "clientMutationId", PATH)?;
     let title = get_string_field(input, "title");
     let body = get_string_field(input, "body");
     let base = get_string_field(input, "baseRefName");
@@ -728,7 +846,20 @@ fn handle_update_pr(
     for field in selected_fields(&field.selection_set, PATH)? {
         match field.name.as_str() {
             "clientMutationId" => {
-                response.insert(response_key(field), serde_json::Value::Null);
+                response.insert(response_key(field), serde_json::json!(client_mutation_id));
+            }
+            "pullRequest" => {
+                let mut pull_request = serde_json::Map::new();
+                for field in selected_fields(&field.selection_set, "updatePullRequest.pullRequest")?
+                {
+                    match field.name.as_str() {
+                        "id" => {
+                            pull_request.insert(response_key(field), serde_json::json!(node_id));
+                        }
+                        _ => unreachable!("request was checked by validate_update_field"),
+                    }
+                }
+                response.insert(response_key(field), serde_json::Value::Object(pull_request));
             }
             _ => unreachable!("request was checked by validate_update_field"),
         }
@@ -748,6 +879,7 @@ fn handle_create_pr(
     let head = required_string_field(input, "headRefName", PATH)?;
     let title = required_string_field(input, "title", PATH)?;
     let body = get_string_field(input, "body").unwrap_or_default();
+    let client_mutation_id = required_string_field(input, "clientMutationId", PATH)?;
 
     if repository_id != "REPO_NODE_ID" {
         return Err(format!("Repository node `{repository_id}` does not exist"));
@@ -776,7 +908,7 @@ fn handle_create_pr(
         id: number,
         title,
         body,
-        head,
+        head: head.clone(),
         base,
         repo_owner: &owner,
         repo_name: &repo,
@@ -789,7 +921,7 @@ fn handle_create_pr(
     for field in selected_fields(&field.selection_set, PATH)? {
         match field.name.as_str() {
             "clientMutationId" => {
-                response.insert(response_key(field), serde_json::Value::Null);
+                response.insert(response_key(field), serde_json::json!(client_mutation_id));
             }
             "pullRequest" => {
                 let mut pull_request = serde_json::Map::new();
@@ -799,6 +931,7 @@ fn handle_create_pr(
                         "number" => serde_json::json!(number),
                         "url" => serde_json::json!(html_url),
                         "id" => serde_json::json!(node_id),
+                        "headRefName" => serde_json::json!(head),
                         _ => unreachable!("request was checked by validate_create_field"),
                     };
                     pull_request.insert(response_key(field), value);
@@ -951,6 +1084,13 @@ mod tests {
         field
     }
 
+    fn apply_failure(
+        state: &mut MockState,
+        operations: &[GraphQlOperation],
+    ) -> Option<FailureKind> {
+        check_and_apply_graphql_failure(state, operations, false, 0)
+    }
+
     #[test]
     fn operation_failure_only_matches_the_requested_operation() {
         let mut state = MockState {
@@ -958,16 +1098,13 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(check_and_apply_graphql_failure(&mut state, &[GraphQlOperation::Query]), None);
+        assert_eq!(apply_failure(&mut state, &[GraphQlOperation::Query]), None);
         assert_eq!(state.faults, VecDeque::from([FailureKind::UpdatePr, FailureKind::CreatePr]));
 
-        assert_eq!(
-            check_and_apply_graphql_failure(&mut state, &[GraphQlOperation::CreatePr]),
-            None
-        );
+        assert_eq!(apply_failure(&mut state, &[GraphQlOperation::CreatePr]), None);
 
         assert_eq!(
-            check_and_apply_graphql_failure(&mut state, &[GraphQlOperation::UpdatePr]),
+            apply_failure(&mut state, &[GraphQlOperation::UpdatePr]),
             Some(FailureKind::UpdatePr)
         );
         assert_eq!(state.faults, VecDeque::from([FailureKind::CreatePr]));
@@ -979,7 +1116,7 @@ mod tests {
             MockState { faults: VecDeque::from([FailureKind::GraphQl]), ..Default::default() };
 
         assert_eq!(
-            check_and_apply_graphql_failure(&mut state, &[GraphQlOperation::Query]),
+            apply_failure(&mut state, &[GraphQlOperation::Query]),
             Some(FailureKind::GraphQl)
         );
         assert!(state.faults.is_empty());
@@ -1011,13 +1148,16 @@ mod tests {
         let create = parse_document(
             "mutation { op0: createPullRequest(input: { repositoryId: \
              \"REPO_NODE_ID\", baseRefName: \"main\", headRefName: \"Ghead\", \
-             title: \"Title\", body: \"Body\" }) { pullRequest { number, url, id } } }",
+             title: \"Title\", body: \"Body\", clientMutationId: \
+             \"gherrit:create:Ghead\" }) { clientMutationId, pullRequest { \
+             number, url, id, headRefName } } }",
         );
         validate_supported_document(&create, &None).unwrap();
 
         let update = parse_document(
             "mutation { op0: updatePullRequest(input: { pullRequestId: \"PR_1\", \
-             title: \"Updated\" }) { clientMutationId } }",
+             title: \"Updated\", clientMutationId: \"gherrit:update:PR_1\" }) { \
+             clientMutationId, pullRequest { id } } }",
         );
         validate_supported_document(&update, &None).unwrap();
     }
@@ -1051,10 +1191,12 @@ mod tests {
 
         let duplicate_mutation = parse_document(
             "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
-             baseRefName: \"main\", headRefName: \"Ghead\", title: \"Title\" }) { \
+             baseRefName: \"main\", headRefName: \"Ghead\", title: \"Title\", \
+             clientMutationId: \"first\" }) { \
              pullRequest { number } } createPullRequest(input: { repositoryId: \
              \"REPO_NODE_ID\", baseRefName: \"main\", headRefName: \"Ghead\", \
-             title: \"Title\" }) { pullRequest { number } } }",
+             title: \"Title\", clientMutationId: \"first\" }) { \
+             pullRequest { number } } }",
         );
         assert!(validate_supported_document(&duplicate_mutation, &None)
             .unwrap_err()
@@ -1143,7 +1285,8 @@ mod tests {
     fn create_validates_same_repository_refs_uniqueness_and_numbering() {
         let document = parse_document(
             "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
-             baseRefName: \"main\", headRefName: \"Gnew\", title: \"Title\" }) { \
+             baseRefName: \"main\", headRefName: \"Gnew\", title: \"Title\", \
+             clientMutationId: \"create\" }) { \
              pullRequest { number } } }",
         );
         let mut state = MockState::new("owner".to_string(), "repo".to_string());
@@ -1175,10 +1318,35 @@ mod tests {
     }
 
     #[test]
+    fn mutation_fields_are_not_modeled_as_an_atomic_transaction() {
+        let document = parse_document(
+            "mutation { first: createPullRequest(input: { repositoryId: \
+             \"REPO_NODE_ID\", baseRefName: \"main\", headRefName: \"Gnew\", \
+             title: \"First\", clientMutationId: \"first\" }) { \
+             clientMutationId } second: createPullRequest(input: { \
+             repositoryId: \"REPO_NODE_ID\", baseRefName: \"main\", \
+             headRefName: \"Gnew\", title: \"Second\", clientMutationId: \
+             \"second\" }) { clientMutationId } }",
+        );
+        validate_supported_document(&document, &None).unwrap();
+        let operation = document.operations.iter().next().unwrap();
+        let fields = selected_fields(&operation.selection_set, "operation").unwrap();
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
+
+        handle_create_pr(&mut state, fields[0], &|_| Ok(true)).unwrap();
+        let error = handle_create_pr(&mut state, fields[1], &|_| Ok(true)).unwrap_err();
+
+        assert!(error.contains("already exists"));
+        assert_eq!(state.prs.len(), 1, "the acknowledged first field remains applied");
+        assert_eq!(state.prs[0].title.as_deref(), Some("First"));
+    }
+
+    #[test]
     fn mutations_reject_unknown_repository_and_pull_request_ids() {
         let create = parse_document(
             "mutation { createPullRequest(input: { repositoryId: \"WRONG\", \
-             baseRefName: \"main\", headRefName: \"Ghead\", title: \"Title\" }) { \
+             baseRefName: \"main\", headRefName: \"Ghead\", title: \"Title\", \
+             clientMutationId: \"create\" }) { \
              pullRequest { number } } }",
         );
         let mut state = MockState::new("owner".to_string(), "repo".to_string());
@@ -1188,7 +1356,8 @@ mod tests {
 
         let update = parse_document(
             "mutation { updatePullRequest(input: { pullRequestId: \"PR_missing\", \
-             title: \"Updated\" }) { clientMutationId } }",
+             title: \"Updated\", clientMutationId: \"update\" }) { \
+             clientMutationId } }",
         );
         let error = handle_update_pr(&mut state, root_field(&update), &|_| Ok(true)).unwrap_err();
         assert!(error.contains("Pull request node `PR_missing` does not exist"));
@@ -1204,7 +1373,8 @@ mod tests {
         }));
         let update = parse_document(
             "mutation { updatePullRequest(input: { pullRequestId: \"PR_1\", \
-             baseRefName: \"Ghead\" }) { clientMutationId } }",
+             baseRefName: \"Ghead\", clientMutationId: \"update\" }) { \
+             clientMutationId } }",
         );
         let error = handle_update_pr(&mut state, root_field(&update), &|_| Ok(true)).unwrap_err();
         assert!(error.contains("head and base branches must differ"));
