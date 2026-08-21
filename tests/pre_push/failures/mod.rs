@@ -1,5 +1,82 @@
 use predicates::prelude::*;
 
+fn stack_with_raw_commit_message(message: &str) -> testutil::TestContext {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("invalid-id");
+    ctx.run_git(&["commit", "--allow-empty", "--no-verify", "--cleanup=verbatim", "-m", message]);
+    ctx
+}
+
+fn assert_identity_failure_before_external_io(ctx: testutil::TestContext, diagnostic: &str) {
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(diagnostic));
+
+    assert!(ctx.github().requests().is_empty());
+    assert!(ctx.recorded_pushes().is_empty());
+}
+
+#[test]
+fn test_empty_stack_id_fails_before_external_io() {
+    let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: ");
+
+    assert_identity_failure_before_external_io(ctx, "missing gherrit-pr-id trailer");
+}
+
+#[test]
+fn test_multiple_stack_ids_fail_before_external_io() {
+    let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: Gone\ngherrit-pr-id: Gtwo");
+
+    assert_identity_failure_before_external_io(ctx, "multiple gherrit-pr-id trailers");
+}
+
+#[test]
+fn test_body_lookalike_is_not_a_stack_id() {
+    let ctx = stack_with_raw_commit_message(
+        "Work\n\ngherrit-pr-id: Gexample\n\nThis final paragraph is not a trailer.",
+    );
+
+    assert_identity_failure_before_external_io(ctx, "missing gherrit-pr-id trailer");
+}
+
+#[test]
+fn test_continued_stack_id_fails_before_external_io() {
+    let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: Gone\n continuation");
+
+    assert_identity_failure_before_external_io(ctx, "invalid gherrit-pr-id trailer");
+}
+
+#[test]
+fn test_empty_and_valid_stack_ids_are_multiple() {
+    let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: \ngherrit-pr-id: Gvalid");
+
+    assert_identity_failure_before_external_io(ctx, "multiple gherrit-pr-id trailers");
+}
+
+#[test]
+fn test_duplicate_stack_ids_fail_before_external_io() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("duplicate-ids");
+    ctx.commit_with_explicit_gherrit_id("First", "Gduplicate");
+    ctx.commit_with_explicit_gherrit_id("Second", "Gduplicate");
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("multiple commits with gherrit-pr-id 'Gduplicate'"));
+
+    assert!(ctx.github().requests().is_empty());
+    assert!(ctx.recorded_pushes().is_empty());
+}
+
 #[test]
 fn test_unavailable_remote_observation_failure() {
     let ctx = testutil::test_context!().repository("missing", "repo").with_mock_github().build();
