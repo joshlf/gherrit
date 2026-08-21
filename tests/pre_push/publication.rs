@@ -287,7 +287,7 @@ fn test_graphql_batch_backoff() {
         .with_git_interceptor()
         .build();
 
-    ctx.limit_graphql_operations_per_request(2);
+    ctx.limit_graphql_query_operations_per_request(2);
     ctx.checkout_managed_private("batch-backoff");
 
     for i in 1..=4 {
@@ -302,7 +302,15 @@ fn test_graphql_batch_backoff() {
         "GraphQL backoff must not alter the independent Git publication batch"
     );
     assert_eq!(ctx.github().pull_requests().len(), 4, "Expected every commit to have a PR");
-    insta::assert_debug_snapshot!("graphql_batch_backoff_trace", ctx.github().requests());
+    let requests = ctx.github().requests();
+    insta::assert_debug_snapshot!("graphql_batch_backoff_trace", requests);
+    assert!(
+        ctx.github()
+            .requests()
+            .iter()
+            .any(|request| { request == &vec![testutil::GraphQlOperation::CreatePr; 4] }),
+        "query backoff must not impose its learned limit on mutation batches"
+    );
 
     let v1_refs = ctx
         .remote_refs("refs/tags/gherrit")
