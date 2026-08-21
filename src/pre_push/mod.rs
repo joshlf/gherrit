@@ -1,4 +1,8 @@
-use std::{collections::HashMap, process::Stdio};
+use std::{
+    collections::{HashMap, HashSet},
+    process::Stdio,
+    time::Duration,
+};
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
 use gix::{reference::Category, refs::transaction::PreviousValue};
@@ -20,14 +24,15 @@ mod reconcile;
 mod remote;
 
 use batching::{
-    BatchPlan, INITIAL_GRAPHQL_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
+    BatchPlan, INITIAL_QUERY_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
     classify_response, query_exceeds_limit,
 };
 use body::PrBody;
 use github::{
-    BatchedOperation, CreatePullRequest, CreatedPullRequest, FindPullRequest,
-    PullRequest as PrState, RepositoryIdQuery, UpdatePullRequest, batch_document,
-    decode_batch_response,
+    CreatePullRequest, CreatedPullRequest, FindPullRequest, MutationOperation,
+    PullRequest as PrState, QueryOperation, RepositoryIdQuery, UpdatePullRequest,
+    decode_mutation_batch_response, decode_query_batch_response, prepare_mutation_batches,
+    query_batch_document,
 };
 use local::LocalStack;
 use publication::{PushTarget, plan_push, push_batches};
@@ -36,6 +41,8 @@ use reconcile::{
     plan_update,
 };
 use remote::observe_managed_branches;
+
+const INDETERMINATE_GRAPHQL_MUTATION: &str = "GraphQL mutation acknowledgement is indeterminate; stop this publication attempt and retry the push to reobserve GitHub state";
 
 #[derive(Eq, PartialEq)]
 pub(crate) enum GithubEndpoint {
@@ -110,14 +117,25 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
 
     let gherrit_ids =
         commits.iter().map(|commit| commit.id().as_str().to_owned()).collect::<Vec<_>>();
-    let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
-    ensure_pull_requests_open(prs.iter().map(|pr| (pr.number, pr.state)))?;
+    let github_observation = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
+    ensure_pull_requests_open(
+        github_observation.local_pull_requests.iter().map(|pr| (pr.number, pr.state)),
+    )?;
 
     let latest_versions = push_to_origin(repo, &commits)?;
     let default_branch = repo.find_default_branch_on_default_remote();
 
     let num_commits = commits.len();
-    sync_prs(repo, &octocrab, branch_name, &default_branch, &commits, latest_versions, prs).await?;
+    sync_prs(
+        repo,
+        &octocrab,
+        branch_name,
+        &default_branch,
+        &commits,
+        latest_versions,
+        github_observation,
+    )
+    .await?;
 
     log::info!("Successfully synced {num_commits} commits.");
     Ok(())
@@ -248,6 +266,12 @@ fn get_local_version(repo: &util::Repo, gherrit_id: &str) -> Result<usize> {
     Ok(max_ver)
 }
 
+/// Pull requests whose number and node ID namespaces are each unique.
+struct GithubObservation {
+    local_pull_requests: Vec<PrState>,
+    known_pull_request_identities: KnownPullRequestIdentities,
+}
+
 /// Syncs the local stack of commits with GitHub Pull Requests.
 ///
 /// This function:
@@ -261,8 +285,10 @@ async fn sync_prs(
     base_branch: &str,
     commits: &LocalStack,
     latest_versions: HashMap<String, usize>,
-    prs: Vec<PrState>,
+    github_observation: GithubObservation,
 ) -> Result<()> {
+    let GithubObservation { local_pull_requests, known_pull_request_identities } =
+        github_observation;
     let remote = repo.default_remote()?;
 
     let commits = link_stack(base_branch, commits.iter(), |commit| commit.id().as_str().to_owned());
@@ -278,7 +304,9 @@ async fn sync_prs(
         .map(|entry| {
             let c = &entry.item;
 
-            if let Some(pr) = prs.iter().find(|pr| pr.head_branch == c.id().as_str()) {
+            if let Some(pr) =
+                local_pull_requests.iter().find(|pr| pr.head_branch == c.id().as_str())
+            {
                 log::debug!(
                     "Found existing PR #{} for {}",
                     pr.number.green().bold(),
@@ -310,10 +338,11 @@ async fn sync_prs(
     let new_prs = if !creations.is_empty() {
         log::info!("Creating {num_creations} PRs...");
         let repo_id = fetch_repo_id(octocrab, &remote).await?;
-        let created = batch_create_prs(octocrab, &repo_id, creations).await?;
+        let created =
+            batch_create_prs(octocrab, &repo_id, creations, known_pull_request_identities).await?;
         assert_eq!(created.len(), num_creations);
         log::info!("Created {num_creations} PRs.");
-        created
+        created.into_iter().map(|created| (created.head_branch.clone(), created)).collect()
     } else {
         HashMap::new()
     };
@@ -335,7 +364,7 @@ async fn sync_prs(
                     log::info!(
                         "Created PR #{}: {}",
                         created.number.green().bold(),
-                        created.url.blue().underline()
+                        remote.pr_url(created.number).blue().underline()
                     );
                     PrState {
                         number: created.number,
@@ -435,6 +464,51 @@ struct BatchCreate {
     head_branch: String,
 }
 
+/// Pull request numbers and node IDs which are already occupied.
+///
+/// The two namespaces are independent: publication needs only to prove that
+/// each value is new, not to recover a number-to-node pairing from these sets.
+#[derive(Default)]
+struct KnownPullRequestIdentities {
+    numbers: HashSet<u64>,
+    node_ids: HashSet<String>,
+}
+
+impl KnownPullRequestIdentities {
+    fn from_observed(observed: impl IntoIterator<Item = (u64, String)>) -> Result<Self> {
+        let mut known = Self::default();
+        for (number, node_id) in observed {
+            if !known.numbers.insert(number) {
+                bail!("GitHub returned duplicate observed pull request number {number}");
+            }
+            if !known.node_ids.insert(node_id.clone()) {
+                bail!("GitHub returned duplicate observed pull request node ID '{node_id}'");
+            }
+        }
+        Ok(known)
+    }
+
+    fn insert_created(&mut self, receipts: &[CreatedPullRequest]) -> Result<()> {
+        for receipt in receipts {
+            if !self.numbers.insert(receipt.number) {
+                bail!(
+                    "createPullRequest receipt for '{}' repeats known pull request number {}",
+                    receipt.head_branch,
+                    receipt.number
+                );
+            }
+            if !self.node_ids.insert(receipt.node_id.clone()) {
+                bail!(
+                    "createPullRequest receipt for '{}' repeats known pull request node ID '{}'",
+                    receipt.head_branch,
+                    receipt.node_id
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Fetches the global Repository Node ID for the given owner and repo.
 ///
 /// This ID (e.g., "R_kgDOL...") is required for creating PRs via the GraphQL
@@ -443,34 +517,38 @@ struct BatchCreate {
 async fn fetch_repo_id(octocrab: &Octocrab, remote: &util::Remote) -> Result<String> {
     let query = RepositoryIdQuery::new(remote.owner.clone(), remote.repo_name.clone());
     let request = query.request();
-    let response: serde_json::Value =
-        octocrab.graphql(&request).await.wrap_err("Failed to fetch repository ID")?;
+    let response =
+        run_graphql_query(octocrab, &request).await.wrap_err("Failed to fetch repository ID")?;
     query.decode(response)
 }
 
 /// Performs batched updates of PRs using GitHub's GraphQL API.
 ///
 /// This avoids rate limits and network latency by grouping updates into
-/// adaptive batches and sending each batch as one GraphQL operation.
+/// bounded batches and sending each batch as one GraphQL operation.
 async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<PrUpdate>) -> Result<()> {
-    let updates = updates.into_iter().map(|update| {
-        UpdatePullRequest::new(update.node_id, update.title, update.body, update.base_branch)
-    });
-    run_batched_graphql(octocrab, updates).await?;
+    let updates = updates
+        .into_iter()
+        .map(|update| {
+            UpdatePullRequest::new(update.node_id, update.title, update.body, update.base_branch)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    run_graphql_mutations(octocrab, updates).await?;
     Ok(())
 }
 
 /// Performs batched creation of PRs using GitHub's GraphQL API.
 ///
 /// This avoids rate limits and network latency by grouping creations into
-/// adaptive batches and sending each batch as one GraphQL operation.
+/// bounded batches and sending each batch as one GraphQL operation.
 ///
-/// Returns the newly-created PRs keyed by their head branches.
+/// Returns acknowledged created PRs in request order.
 async fn batch_create_prs(
     octocrab: &Octocrab,
     repo_id: &str,
     creations: impl IntoIterator<Item = BatchCreate>,
-) -> Result<HashMap<String, CreatedPullRequest>> {
+    mut known_identities: KnownPullRequestIdentities,
+) -> Result<Vec<CreatedPullRequest>> {
     let creations = creations.into_iter().map(|create| {
         CreatePullRequest::new(
             repo_id.to_string(),
@@ -480,18 +558,17 @@ async fn batch_create_prs(
             create.body,
         )
     });
-    Ok(run_batched_graphql(octocrab, creations)
-        .await?
-        .into_iter()
-        .map(|created| (created.head_branch.clone(), created))
-        .collect())
+    run_graphql_mutations_with_receipt_validation(octocrab, creations, move |receipts| {
+        known_identities.insert_created(receipts)
+    })
+    .await
 }
 
 async fn batch_fetch_prs(
     repo: &util::Repo,
     octocrab: &Octocrab,
     head_refs: &[String],
-) -> Result<Vec<PrState>> {
+) -> Result<GithubObservation> {
     let remote = repo.default_remote()?;
     let owner = remote.owner;
     let repo_name = remote.repo_name;
@@ -500,19 +577,164 @@ async fn batch_fetch_prs(
         .cloned()
         .map(|head_ref| FindPullRequest::new(owner.clone(), repo_name.clone(), head_ref));
 
-    Ok(run_batched_graphql(octocrab, queries).await?.into_iter().flatten().collect())
+    let local_pull_requests =
+        run_batched_queries(octocrab, queries).await?.into_iter().flatten().collect::<Vec<_>>();
+    // Constructing the observation validates aggregate identity before the
+    // caller can expose a Git publication action. The registry is then moved
+    // forward unchanged to validate create receipts against the same facts.
+    let known_pull_request_identities = KnownPullRequestIdentities::from_observed(
+        local_pull_requests.iter().map(|pr| (pr.number, pr.node_id.clone())),
+    )?;
+    Ok(GithubObservation { local_pull_requests, known_pull_request_identities })
 }
 
-/// Executes batched GraphQL operations (queries or mutations).
+/// Executes mutation batches without retrying after transmission.
 ///
-/// Builds a combined query for each adaptive batch and decodes each operation
-/// in a successful response.
-async fn run_batched_graphql<O>(
+/// Every request is prepared before the first write. Once a request has been
+/// sent, any failure to validate its complete receipt is indeterminate, so the
+/// caller stops and a later pre-push attempt must start from fresh observation.
+async fn run_graphql_mutations<O>(
     octocrab: &Octocrab,
     operations: impl IntoIterator<Item = O>,
 ) -> Result<Vec<O::Output>>
 where
-    O: BatchedOperation,
+    O: MutationOperation,
+{
+    run_graphql_mutations_with_receipt_validation(octocrab, operations, |_| Ok(())).await
+}
+
+/// Executes mutation batches and validates each receipt batch before another
+/// batch can be transmitted.
+///
+/// `decode_mutation_batch_response` validates the receipt fields and any
+/// identities shared within one response. The callback can retain additional
+/// state to validate facts shared with prior observation or prior batches.
+async fn run_graphql_mutations_with_receipt_validation<O>(
+    octocrab: &Octocrab,
+    operations: impl IntoIterator<Item = O>,
+    mut validate_receipts: impl FnMut(&[O::Output]) -> Result<()>,
+) -> Result<Vec<O::Output>>
+where
+    O: MutationOperation,
+{
+    let operations = operations.into_iter().collect::<Vec<_>>();
+    let batches = prepare_mutation_batches(&operations)?;
+    let mut outputs = Vec::with_capacity(operations.len());
+
+    for batch in batches {
+        let operations = &operations[batch.operation_range];
+        log::trace!(
+            "Sending GraphQL mutation batch ({} operations, {} bytes)",
+            operations.len(),
+            batch.serialized_bytes
+        );
+        let response =
+            octocrab.graphql(&batch.request).await.wrap_err(INDETERMINATE_GRAPHQL_MUTATION)?;
+        let receipts = decode_mutation_batch_response(operations, response)
+            .wrap_err(INDETERMINATE_GRAPHQL_MUTATION)?;
+        validate_receipts(&receipts).wrap_err(INDETERMINATE_GRAPHQL_MUTATION)?;
+        outputs.extend(receipts);
+    }
+
+    Ok(outputs)
+}
+
+// These delays pace only transient transport and HTTP response retries. They
+// are deliberately small because a pre-push hook is interactive. Adaptive
+// query-size reduction changes the request instead of waiting, and mutations
+// do not call this policy and remain at-most-once.
+const GRAPHQL_QUERY_RETRY_DELAYS: [Duration; 3] =
+    [Duration::from_millis(100), Duration::from_millis(200), Duration::from_millis(400)];
+
+fn graphql_query_retry_delay(completed_retries: usize) -> Option<Duration> {
+    GRAPHQL_QUERY_RETRY_DELAYS.get(completed_retries).copied()
+}
+
+/// The asynchronous delay boundary for transient read-request retries.
+async fn wait_before_graphql_query_retry(completed_retries: &mut usize, failure: &str) -> bool {
+    let Some(delay) = graphql_query_retry_delay(*completed_retries) else {
+        return false;
+    };
+    *completed_retries += 1;
+    log::warn!(
+        "Retrying read-only GraphQL request after {failure} ({}/{}) in {} ms",
+        *completed_retries,
+        GRAPHQL_QUERY_RETRY_DELAYS.len(),
+        delay.as_millis()
+    );
+    tokio::time::sleep(delay).await;
+    true
+}
+
+fn is_retryable_query_transport_error(error: &octocrab::Error) -> bool {
+    matches!(error, octocrab::Error::Service { .. } | octocrab::Error::Hyper { .. })
+}
+
+/// Executes one read-only GraphQL request with bounded transport retries.
+///
+/// Octocrab's method-agnostic retry middleware is disabled because it can
+/// replay mutation POSTs. Keeping retries here makes read-only intent explicit:
+/// connection failures, response-body transport failures, HTTP 429, and HTTP
+/// 5xx responses get three paced retries. Redirects are never followed.
+async fn run_graphql_query(
+    octocrab: &Octocrab,
+    request: &serde_json::Value,
+) -> octocrab::Result<serde_json::Value> {
+    let mut retries = 0;
+
+    loop {
+        let response = match octocrab._post("/graphql", Some(request)).await {
+            Ok(response) => response,
+            Err(error) if is_retryable_query_transport_error(&error) => {
+                if wait_before_graphql_query_retry(&mut retries, "a transport failure").await {
+                    continue;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+
+        let status = response.status();
+        if status.is_server_error() || status.as_u16() == 429 {
+            let failure = format!("HTTP {status}");
+            if wait_before_graphql_query_retry(&mut retries, &failure).await {
+                continue;
+            }
+        }
+
+        let response = octocrab::map_github_error(response).await;
+        let response = match response {
+            Ok(response) => {
+                <serde_json::Value as octocrab::FromResponse>::from_response(response).await
+            }
+            Err(error) => Err(error),
+        };
+        match response {
+            Err(error) if is_retryable_query_transport_error(&error) => {
+                if !wait_before_graphql_query_retry(
+                    &mut retries,
+                    "a response-body transport failure",
+                )
+                .await
+                {
+                    return Err(error);
+                }
+            }
+            response => return response,
+        }
+    }
+}
+
+/// Executes adaptively sized, read-only GraphQL query batches.
+///
+/// Builds a combined query for each adaptive batch and decodes each operation
+/// in a successful response.
+async fn run_batched_queries<O>(
+    octocrab: &Octocrab,
+    operations: impl IntoIterator<Item = O>,
+) -> Result<Vec<O::Output>>
+where
+    O: QueryOperation,
 {
     let operations: Vec<O> = operations.into_iter().collect();
     if operations.is_empty() {
@@ -532,10 +754,10 @@ where
     //
     // [1] https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit
     // [2] https://github.blog/changelog/2025-09-01-graphql-api-resource-limits/
-    let mut batches = BatchPlan::new(operations.len(), INITIAL_GRAPHQL_BATCH_LEN);
+    let mut batches = BatchPlan::new(operations.len(), INITIAL_QUERY_BATCH_LEN);
     while let Some(range) = batches.current() {
         let chunk = &operations[range];
-        let query = batch_document(chunk);
+        let query = query_batch_document(chunk);
 
         // Attempt to perform the query. Returns:
         // - Ok(Some(response)): Success
@@ -558,8 +780,7 @@ where
 
             log::trace!("Sending GraphQL Query (Length: {}): {}", query.len(), query);
             let request_payload = serde_json::json!({ "query": query });
-            let response: serde_json::Value = octocrab
-                .graphql(&request_payload)
+            let response = run_graphql_query(octocrab, &request_payload)
                 .await
                 .wrap_err("GraphQL batched operation failed")?;
 
@@ -598,9 +819,624 @@ where
             continue;
         };
 
-        outputs.extend(decode_batch_response(chunk, response)?);
+        outputs.extend(decode_query_batch_response(chunk, response)?);
 
         batches.accept();
     }
     Ok(outputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::{TcpListener, TcpStream},
+        sync::oneshot,
+        time::Instant,
+    };
+
+    use super::*;
+    use crate::pre_push::batching::MAX_MUTATION_ALIASES;
+
+    const ADAPTER_TIMEOUT: Duration = Duration::from_secs(5);
+    const MAX_TEST_REQUEST_BYTES: usize = 1024 * 1024;
+
+    async fn read_json_request(stream: &mut TcpStream) -> Value {
+        let mut request = Vec::new();
+        let (body_start, content_length) = loop {
+            let mut chunk = [0; 4096];
+            let read = stream.read(&mut chunk).await.expect("read HTTP request");
+            assert_ne!(read, 0, "connection closed before request headers completed");
+            request.extend_from_slice(&chunk[..read]);
+            assert!(
+                request.len() <= MAX_TEST_REQUEST_BYTES,
+                "HTTP request exceeded the test server limit"
+            );
+
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).expect("ASCII HTTP headers");
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse::<usize>().expect("numeric Content-Length"))
+                .expect("Octocrab request has Content-Length");
+            break (header_end + 4, content_length);
+        };
+
+        while request.len() < body_start + content_length {
+            let mut chunk = [0; 4096];
+            let read = stream.read(&mut chunk).await.expect("read HTTP request body");
+            assert_ne!(read, 0, "connection closed before request body completed");
+            request.extend_from_slice(&chunk[..read]);
+            assert!(
+                request.len() <= MAX_TEST_REQUEST_BYTES,
+                "HTTP request exceeded the test server limit"
+            );
+        }
+
+        serde_json::from_slice(&request[body_start..body_start + content_length])
+            .expect("JSON request body")
+    }
+
+    fn http_response_bytes(status: &str, body: &[u8], content_length: usize) -> Vec<u8> {
+        let headers = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+        );
+        [headers.as_bytes(), body].concat()
+    }
+
+    async fn write_http_response_bytes(
+        stream: &mut TcpStream,
+        status: &str,
+        body: &[u8],
+        content_length: usize,
+    ) {
+        stream
+            .write_all(&http_response_bytes(status, body, content_length))
+            .await
+            .expect("write HTTP response");
+    }
+
+    async fn write_http_response(
+        stream: &mut TcpStream,
+        status: &str,
+        body: &[u8],
+        content_length: usize,
+    ) {
+        write_http_response_bytes(stream, status, body, content_length).await;
+        stream.shutdown().await.expect("finish HTTP response");
+    }
+
+    async fn write_json_response(stream: &mut TcpStream, response: &Value) {
+        let body = serde_json::to_vec(response).expect("serialize JSON response");
+        write_http_response(stream, "200 OK", &body, body.len()).await;
+    }
+
+    fn test_octocrab(listener: &TcpListener) -> Octocrab {
+        Octocrab::builder()
+            .base_uri(format!("http://{}", listener.local_addr().expect("listener address")))
+            .expect("valid test endpoint")
+            .build()
+            .expect("build test client")
+    }
+
+    #[test]
+    fn query_retry_delay_policy_is_exact_nonzero_and_bounded() {
+        assert_eq!(
+            (0..=GRAPHQL_QUERY_RETRY_DELAYS.len())
+                .map(graphql_query_retry_delay)
+                .collect::<Vec<_>>(),
+            [
+                Some(Duration::from_millis(100)),
+                Some(Duration::from_millis(200)),
+                Some(Duration::from_millis(400)),
+                None,
+            ]
+        );
+        assert_eq!(graphql_query_retry_delay(usize::MAX), None);
+        assert!(GRAPHQL_QUERY_RETRY_DELAYS.into_iter().all(|delay| !delay.is_zero()));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum RetryableQueryFailure {
+        BeforeHeaders,
+        DuringBody,
+        TooManyRequests,
+        ServerError,
+    }
+
+    impl RetryableQueryFailure {
+        async fn respond(self, stream: TcpStream) -> Instant {
+            let response = match self {
+                Self::BeforeHeaders => None,
+                Self::DuringBody => Some(http_response_bytes("200 OK", b"{", 100)),
+                Self::TooManyRequests => Some(http_response_bytes("429 Too Many Requests", b"", 0)),
+                Self::ServerError => Some(http_response_bytes("503 Service Unavailable", b"", 0)),
+            };
+            if let Some(response) = response {
+                stream.writable().await.expect("failure response socket became writable");
+                assert_eq!(
+                    stream.try_write(&response).expect("write failure response without yielding"),
+                    response.len(),
+                    "small local failure response was written atomically"
+                );
+            }
+
+            // Writing, closing, and observing this instant do not yield. The
+            // single-threaded test runtime therefore cannot begin the retry
+            // before the recorded failure completion.
+            drop(stream);
+            Instant::now()
+        }
+    }
+
+    struct RetryObservation {
+        requests: Vec<Value>,
+        inter_attempt_gaps: Vec<Duration>,
+    }
+
+    async fn assert_query_failure_is_paced(failure: RetryableQueryFailure) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
+        let octocrab = test_octocrab(&listener);
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut inter_attempt_gaps = Vec::new();
+            let mut previous_failure_completed_at = None;
+            for _ in 0..=GRAPHQL_QUERY_RETRY_DELAYS.len() {
+                let (mut stream, _) = listener.accept().await.expect("accept query request");
+                let request_arrived_at = Instant::now();
+                if let Some(completed_at) = previous_failure_completed_at {
+                    inter_attempt_gaps.push(request_arrived_at.duration_since(completed_at));
+                }
+                requests.push(read_json_request(&mut stream).await);
+                previous_failure_completed_at = Some(failure.respond(stream).await);
+            }
+            RetryObservation { requests, inter_attempt_gaps }
+        });
+        let request = json!({ "query": "query { viewer { login } }" });
+
+        let (result, observation) = tokio::time::timeout(ADAPTER_TIMEOUT, async {
+            tokio::join!(run_graphql_query(&octocrab, &request), server)
+        })
+        .await
+        .expect("persistent query failure completed before the real timeout");
+        result.expect_err("the fourth persistent failure exhausts the retry policy");
+        let observation = observation.expect("test server completed");
+
+        assert_eq!(
+            observation.requests,
+            vec![request; GRAPHQL_QUERY_RETRY_DELAYS.len() + 1],
+            "{failure:?}"
+        );
+        assert_eq!(
+            observation.inter_attempt_gaps.len(),
+            GRAPHQL_QUERY_RETRY_DELAYS.len(),
+            "{failure:?}"
+        );
+        for (retry, (gap, expected)) in
+            observation.inter_attempt_gaps.iter().zip(GRAPHQL_QUERY_RETRY_DELAYS).enumerate()
+        {
+            assert!(
+                *gap >= expected,
+                "{failure:?} retry {} arrived after {gap:?}, before the required {expected:?}",
+                retry + 1
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_retryable_query_failure_waits_before_the_next_attempt() {
+        tokio::join!(
+            assert_query_failure_is_paced(RetryableQueryFailure::BeforeHeaders),
+            assert_query_failure_is_paced(RetryableQueryFailure::DuringBody),
+            assert_query_failure_is_paced(RetryableQueryFailure::TooManyRequests),
+            assert_query_failure_is_paced(RetryableQueryFailure::ServerError),
+        );
+    }
+
+    #[derive(Debug)]
+    struct TestMutation {
+        index: usize,
+        client_mutation_id: String,
+    }
+
+    impl TestMutation {
+        fn new(index: usize) -> Self {
+            Self { index, client_mutation_id: format!("test-{index}") }
+        }
+    }
+
+    impl MutationOperation for TestMutation {
+        type Output = usize;
+
+        fn client_mutation_id(&self) -> &str {
+            &self.client_mutation_id
+        }
+
+        fn document(&self) -> String {
+            format!(
+                "testMutation(input: {{ clientMutationId: {} }}) {{ clientMutationId }}",
+                json!(self.client_mutation_id)
+            )
+        }
+
+        fn decode_receipt(&self, response: Value) -> Result<Self::Output> {
+            let receipt = response
+                .get("clientMutationId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| eyre!("missing test mutation receipt"))?;
+            if receipt != self.client_mutation_id {
+                bail!(
+                    "test mutation echoed clientMutationId '{receipt}', expected '{}'",
+                    self.client_mutation_id
+                );
+            }
+            Ok(self.index)
+        }
+    }
+
+    fn mutation_ids(request: &Value) -> Vec<usize> {
+        const PREFIX: &str = "clientMutationId: \"test-";
+
+        let query = request.get("query").and_then(Value::as_str).expect("mutation request query");
+        query
+            .split(PREFIX)
+            .skip(1)
+            .map(|suffix| {
+                suffix
+                    .split_once('"')
+                    .expect("clientMutationId closing quote")
+                    .0
+                    .parse()
+                    .expect("numeric test mutation ID")
+            })
+            .collect()
+    }
+
+    fn mutation_response(ids: &[usize]) -> Value {
+        let data = ids
+            .iter()
+            .enumerate()
+            .map(|(alias, index)| {
+                (format!("op{alias}"), json!({ "clientMutationId": format!("test-{index}") }))
+            })
+            .collect();
+        json!({ "data": Value::Object(data) })
+    }
+
+    #[derive(Debug)]
+    struct MutationObservation {
+        requests: Vec<Vec<usize>>,
+        effects: Vec<usize>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum CreateReceiptCollision {
+        Number,
+        NodeId,
+    }
+
+    fn create_mutation_ids(request: &Value) -> Vec<usize> {
+        const PREFIX: &str = "clientMutationId: \"gherrit:create:G";
+
+        let query = request.get("query").and_then(Value::as_str).expect("mutation request query");
+        query
+            .split(PREFIX)
+            .skip(1)
+            .map(|suffix| {
+                suffix
+                    .split_once('"')
+                    .expect("clientMutationId closing quote")
+                    .0
+                    .parse()
+                    .expect("numeric create mutation ID")
+            })
+            .collect()
+    }
+
+    fn create_mutation_response(ids: &[usize], collision: Option<CreateReceiptCollision>) -> Value {
+        let data = ids
+            .iter()
+            .enumerate()
+            .map(|(alias, index)| {
+                let mut number = index + 1;
+                let mut node_id = format!("PR_{number}");
+                if alias == 0 {
+                    match collision {
+                        Some(CreateReceiptCollision::Number) => number = 1,
+                        Some(CreateReceiptCollision::NodeId) => node_id = "PR_1".to_string(),
+                        None => {}
+                    }
+                }
+                (
+                    format!("op{alias}"),
+                    json!({
+                        "clientMutationId": format!("gherrit:create:G{index}"),
+                        "pullRequest": {
+                            "number": number,
+                            "id": node_id,
+                            "headRefName": format!("G{index}"),
+                        },
+                    }),
+                )
+            })
+            .collect();
+        json!({ "data": Value::Object(data) })
+    }
+
+    async fn assert_cross_batch_create_receipt_collision(collision: CreateReceiptCollision) {
+        const OPERATION_COUNT: usize = MAX_MUTATION_ALIASES * 2 + 1;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
+        let octocrab = test_octocrab(&listener);
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut effects = Vec::new();
+
+            for request_index in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept mutation request");
+                let ids = create_mutation_ids(&read_json_request(&mut stream).await);
+                effects.extend(ids.iter().copied());
+                requests.push(ids.clone());
+                let collision = (request_index == 1).then_some(collision);
+                write_json_response(&mut stream, &create_mutation_response(&ids, collision)).await;
+            }
+
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut stream, _) = accepted.expect("accept unexpected third request");
+                    let ids = create_mutation_ids(&read_json_request(&mut stream).await);
+                    effects.extend(ids.iter().copied());
+                    requests.push(ids.clone());
+                    write_json_response(&mut stream, &create_mutation_response(&ids, None)).await;
+                }
+                _ = finished_rx => {}
+            }
+
+            MutationObservation { requests, effects }
+        });
+        let creations = (0..OPERATION_COUNT).map(|index| BatchCreate {
+            title: format!("Title {index}"),
+            body: format!("Body {index}"),
+            base_branch: "main".to_owned(),
+            head_branch: format!("G{index}"),
+        });
+
+        let result = tokio::time::timeout(
+            ADAPTER_TIMEOUT,
+            batch_create_prs(
+                &octocrab,
+                "REPO_NODE_ID",
+                creations,
+                KnownPullRequestIdentities::default(),
+            ),
+        )
+        .await
+        .expect("mutation attempt completed");
+        let _ = finished_tx.send(());
+        let observation = tokio::time::timeout(ADAPTER_TIMEOUT, server)
+            .await
+            .expect("test server stopped")
+            .expect("test server completed");
+
+        let error = result.expect_err("duplicate receipt identity must end the attempt");
+        assert!(error.to_string().contains("indeterminate"), "error={error:?}");
+        let expected = match collision {
+            CreateReceiptCollision::Number => "repeats known pull request number 1",
+            CreateReceiptCollision::NodeId => "repeats known pull request node ID 'PR_1'",
+        };
+        assert!(format!("{error:?}").contains(expected), "error={error:?}");
+        assert_eq!(
+            observation.requests,
+            [
+                (0..MAX_MUTATION_ALIASES).collect::<Vec<_>>(),
+                (MAX_MUTATION_ALIASES..MAX_MUTATION_ALIASES * 2).collect::<Vec<_>>(),
+            ],
+            "the third mutation batch must not be transmitted"
+        );
+        assert_eq!(
+            observation.effects,
+            (0..MAX_MUTATION_ALIASES * 2).collect::<Vec<_>>(),
+            "the peer committed distinct effects before corrupting the receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_identities_across_batches_are_indeterminate() {
+        for collision in [CreateReceiptCollision::Number, CreateReceiptCollision::NodeId] {
+            assert_cross_batch_create_receipt_collision(collision).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_identity_collision_stops_before_the_next_create_batch() {
+        const OPERATION_COUNT: usize = MAX_MUTATION_ALIASES + 1;
+
+        for collision in [CreateReceiptCollision::Number, CreateReceiptCollision::NodeId] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
+            let octocrab = test_octocrab(&listener);
+            let (finished_tx, finished_rx) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept mutation request");
+                let first = create_mutation_ids(&read_json_request(&mut stream).await);
+                write_json_response(&mut stream, &create_mutation_response(&first, None)).await;
+
+                let mut requests = vec![first.clone()];
+                let mut effects = first;
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.expect("accept unexpected second request");
+                        let ids = create_mutation_ids(&read_json_request(&mut stream).await);
+                        effects.extend(ids.iter().copied());
+                        requests.push(ids.clone());
+                        write_json_response(
+                            &mut stream,
+                            &create_mutation_response(&ids, None),
+                        )
+                        .await;
+                    }
+                    _ = finished_rx => {}
+                }
+                MutationObservation { requests, effects }
+            });
+            let creations = (0..OPERATION_COUNT).map(|index| BatchCreate {
+                title: format!("Title {index}"),
+                body: format!("Body {index}"),
+                base_branch: "main".to_owned(),
+                head_branch: format!("G{index}"),
+            });
+            let observed = match collision {
+                CreateReceiptCollision::Number => vec![(1, "PR_observed".to_owned())],
+                CreateReceiptCollision::NodeId => vec![(999, "PR_1".to_owned())],
+            };
+            let known_identities = KnownPullRequestIdentities::from_observed(observed)
+                .expect("observed identities are distinct");
+
+            let result = tokio::time::timeout(
+                ADAPTER_TIMEOUT,
+                batch_create_prs(&octocrab, "REPO_NODE_ID", creations, known_identities),
+            )
+            .await
+            .expect("mutation attempt completed");
+            let _ = finished_tx.send(());
+            let observation = tokio::time::timeout(ADAPTER_TIMEOUT, server)
+                .await
+                .expect("test server stopped")
+                .expect("test server completed");
+
+            let error = result.expect_err("an observed identity collision must end the attempt");
+            assert!(error.to_string().contains("indeterminate"), "error={error:?}");
+            assert_eq!(observation.requests, [(0..MAX_MUTATION_ALIASES).collect::<Vec<_>>()]);
+            assert_eq!(observation.effects, (0..MAX_MUTATION_ALIASES).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn observed_pull_request_identities_are_unique_in_each_namespace() {
+        KnownPullRequestIdentities::from_observed([
+            (17, "PR_observed_17".to_owned()),
+            (18, "PR_observed_18".to_owned()),
+        ])
+        .expect("distinct identities are valid");
+
+        for (observed, expected) in [
+            (
+                vec![(17, "PR_observed_17".to_owned()), (17, "PR_observed_18".to_owned())],
+                "duplicate observed pull request number 17",
+            ),
+            (
+                vec![(17, "PR_observed".to_owned()), (18, "PR_observed".to_owned())],
+                "duplicate observed pull request node ID 'PR_observed'",
+            ),
+        ] {
+            let Err(error) = KnownPullRequestIdentities::from_observed(observed) else {
+                panic!("each identity namespace must be unique");
+            };
+            assert!(error.to_string().contains(expected), "error={error:?}");
+        }
+    }
+
+    #[test]
+    fn create_receipts_cannot_reuse_observed_pull_request_identities() {
+        for (number, node_id, expected) in [
+            (17, "PR_created", "repeats known pull request number 17"),
+            (18, "PR_observed", "repeats known pull request node ID 'PR_observed'"),
+        ] {
+            let created = [CreatedPullRequest {
+                head_branch: "Gnew".to_owned(),
+                number,
+                node_id: node_id.to_owned(),
+            }];
+            let mut known =
+                KnownPullRequestIdentities::from_observed([(17, "PR_observed".to_owned())])
+                    .expect("observed identities are distinct");
+            let error = known
+                .insert_created(&created)
+                .expect_err("a create receipt must not reuse an observed identity");
+            assert!(error.to_string().contains(expected), "error={error:?}");
+        }
+
+        KnownPullRequestIdentities::from_observed([(17, "PR_observed".to_owned())])
+            .expect("observed identities are distinct")
+            .insert_created(&[CreatedPullRequest {
+                head_branch: "Gnew".to_owned(),
+                number: 18,
+                node_id: "PR_created".to_owned(),
+            }])
+            .expect("distinct observed and created identities are valid");
+    }
+
+    #[tokio::test]
+    async fn partial_second_batch_effects_with_a_lost_acknowledgement_stop_the_attempt() {
+        const OPERATION_COUNT: usize = MAX_MUTATION_ALIASES * 2 + 1;
+        const PARTIAL_SECOND_BATCH_EFFECTS: usize = 7;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
+        let octocrab = test_octocrab(&listener);
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut effects = Vec::new();
+
+            for request_index in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept mutation request");
+                let ids = mutation_ids(&read_json_request(&mut stream).await);
+                requests.push(ids.clone());
+                if request_index == 0 {
+                    effects.extend(ids.iter().copied());
+                    write_json_response(&mut stream, &mutation_response(&ids)).await;
+                } else {
+                    effects.extend(ids.iter().copied().take(PARTIAL_SECOND_BATCH_EFFECTS));
+                    // Some mutation fields committed, but their acknowledgement
+                    // was lost before any response headers reached the client.
+                    drop(stream);
+                }
+            }
+
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut stream, _) = accepted.expect("accept unexpected third request");
+                    let ids = mutation_ids(&read_json_request(&mut stream).await);
+                    effects.extend(ids.iter().copied());
+                    requests.push(ids.clone());
+                    write_json_response(&mut stream, &mutation_response(&ids)).await;
+                }
+                _ = finished_rx => {}
+            }
+
+            MutationObservation { requests, effects }
+        });
+        let mutations = (0..OPERATION_COUNT).map(TestMutation::new).collect::<Vec<_>>();
+
+        let result =
+            tokio::time::timeout(ADAPTER_TIMEOUT, run_graphql_mutations(&octocrab, mutations))
+                .await
+                .expect("mutation attempt completed");
+        let _ = finished_tx.send(());
+        let observation = tokio::time::timeout(ADAPTER_TIMEOUT, server)
+            .await
+            .expect("test server stopped")
+            .expect("test server completed");
+
+        let error = result.expect_err("lost acknowledgement must end the attempt");
+        assert!(error.to_string().contains("indeterminate"), "error={error:?}");
+        assert_eq!(
+            observation.requests,
+            [
+                (0..MAX_MUTATION_ALIASES).collect::<Vec<_>>(),
+                (MAX_MUTATION_ALIASES..MAX_MUTATION_ALIASES * 2).collect::<Vec<_>>(),
+            ],
+            "the third mutation batch must not be transmitted"
+        );
+        assert_eq!(
+            observation.effects,
+            (0..MAX_MUTATION_ALIASES + PARTIAL_SECOND_BATCH_EFFECTS).collect::<Vec<_>>(),
+            "acknowledged and ambiguous partial effects remain committed"
+        );
+    }
 }
