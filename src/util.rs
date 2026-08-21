@@ -266,39 +266,39 @@ impl Repo {
     }
 }
 
-pub enum CommitsBetweenError {
-    NotAncestor,
+pub enum FirstParentCommitsBetweenError {
+    NotOnFirstParentPath,
     Eyre(eyre::Error),
 }
 
 impl Repo {
-    /// Returns the commits from `ancestor` to `descendant` (in that order).
-    pub fn commits_between(
+    /// Returns the first-parent commits from `ancestor` to `descendant`.
+    pub fn first_parent_commits_between(
         &self,
         ancestor: Id<'_>,
         descendant: Id<'_>,
-    ) -> Result<Vec<Commit<'_>>, CommitsBetweenError> {
-        // If there is no common ancestor (e.g., an orphan branch), `merge_base`
-        // returns an error. We treat this as "not an ancestor".
-        let is_ancestor = self
-            .inner
-            .merge_base(ancestor, descendant)
-            .map(|merge_base| merge_base.detach() == ancestor)
-            .unwrap_or(false);
-        if !is_ancestor {
-            return Err(CommitsBetweenError::NotAncestor);
+    ) -> Result<Vec<Commit<'_>>, FirstParentCommitsBetweenError> {
+        // A GHerrit stack is a first-parent path. A merge base is insufficient:
+        // it can be reachable only through another parent of a merge commit.
+        // Walk the one path that defines stack order and require it to reach the
+        // requested ancestor.
+        let mut commits = Vec::new();
+        for commit in self
+            .rev_walk([descendant])
+            .first_parent_only()
+            .all()
+            .map_err(|e| FirstParentCommitsBetweenError::Eyre(e.into()))?
+        {
+            let commit = commit.map_err(|e| FirstParentCommitsBetweenError::Eyre(e.into()))?;
+            if commit.id == ancestor {
+                commits.reverse();
+                return Ok(commits);
+            }
+            commits
+                .push(commit.object().map_err(|e| FirstParentCommitsBetweenError::Eyre(e.into()))?);
         }
 
-        let mut commits = self
-            .rev_walk([descendant])
-            .all()
-            .map_err(|e| CommitsBetweenError::Eyre(e.into()))?
-            .take_while(|res| res.as_ref().map(|info| info.id != ancestor).unwrap_or(true))
-            .map(|res| -> color_eyre::eyre::Result<_> { Ok(res?.object()?) })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(CommitsBetweenError::Eyre)?;
-        commits.reverse();
-        Ok(commits)
+        Err(FirstParentCommitsBetweenError::NotOnFirstParentPath)
     }
 }
 
