@@ -1,7 +1,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
-use gix::{reference::Category, refs::transaction::PreviousValue};
+use gix::reference::Category;
 use octocrab::Octocrab;
 use owo_colors::OwoColorize;
 
@@ -16,6 +16,7 @@ mod local;
 mod publication;
 mod reconcile;
 mod remote;
+mod version;
 
 use batching::{
     BatchPlan, INITIAL_QUERY_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
@@ -30,12 +31,12 @@ use github::{
     query_batch_document,
 };
 use local::LocalStack;
-use publication::{PushTarget, plan_push, push_batches};
+use publication::{GitPublicationPlan, PlannedChanges, plan_git_publication};
 use reconcile::{
     CurrentPr, DesiredPr, PrUpdate, PullRequestState, ensure_pull_requests_open, link_stack,
     plan_update,
 };
-use remote::observe_managed_branches;
+use remote::{observe_active_version_tags, observe_remote_heads};
 
 #[derive(Eq, PartialEq)]
 pub(crate) enum GithubEndpoint {
@@ -87,7 +88,8 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     let configured_remote =
         repo.default_remote_name().wrap_err("Failed to read the configured GHerrit remote")?;
     let destination = PushDestination::resolve(configured_remote)?;
-    let git_default_branch = destination.observe_default_branch()?;
+    let remote_heads = observe_remote_heads(&destination)?;
+    let git_default_branch = remote_heads.default_branch().clone();
     git_default_branch.ensure_local(repo)?;
     let commits = LocalStack::collect(repo, &git_default_branch, destination.configured_remote())
         .wrap_err("Failed to collect commits")?;
@@ -96,6 +98,19 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
         log::info!("No commits to sync.");
         return Ok(());
     }
+
+    let remote_versions =
+        observe_active_version_tags(&destination, commits.iter().map(|change| change.id()))?;
+    // The two reads are deliberately not treated as one snapshot. If they
+    // straddle another publisher's atomic push, an old head can disagree with
+    // newer tags; normalization then rejects the attempt and a retry observes
+    // both again. Leases protect only refs this attempt changes. They do not
+    // serialize later GitHub writes; publication assumes one publisher at a
+    // time, and another read could only narrow that unsupported race.
+    // Publication planning validates the complete active local stack before
+    // any external write. The resulting plan remains immutable while GitHub
+    // state is observed and checked below.
+    let publication = plan_git_publication(&commits, &remote_heads, &remote_versions)?;
 
     if github_endpoint.is_disabled() {
         bail!("The GHerrit test driver cannot sync PRs without a configured GitHub endpoint");
@@ -121,7 +136,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     let default_branch = DefaultBranch::agree(git_default_branch, github_default_branch)?;
     ensure_pull_requests_open(prs.iter().map(|pr| (pr.number, pr.state)))?;
 
-    let latest_versions = push_to_origin(repo, &destination, &commits)?;
+    let planned_changes = push_to_origin(&destination, publication)?;
     let public_branch = public_branch(repo, branch_name);
     let pr_repository = PrRepository {
         destination: &destination,
@@ -130,58 +145,22 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     };
 
     let num_commits = commits.len();
-    sync_prs(&octocrab, pr_repository, public_branch.as_deref(), &commits, latest_versions, prs)
-        .await?;
+    sync_prs(&octocrab, pr_repository, public_branch.as_deref(), planned_changes, prs).await?;
 
     log::info!("Successfully synced {num_commits} commits.");
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-fn push_to_origin(
-    repo: &util::Repo,
+fn push_to_origin<'stack>(
     destination: &PushDestination,
-    commits: &LocalStack,
-) -> Result<HashMap<String, usize>> {
-    let gherrit_ids =
-        commits.iter().map(|commit| commit.id().as_str().to_owned()).collect::<Vec<_>>();
-
-    // Fetch remote branch states to ensure we don't act on stale information.
-    let remote_branch_states = observe_managed_branches(destination, &gherrit_ids)?;
-
-    let mut next_versions = HashMap::new();
-
-    for chunk in push_batches(commits.as_slice()) {
-        let mut targets = Vec::with_capacity(chunk.len());
-
-        for c in chunk {
-            // Determine the next version based on local tags (Optimistic
-            // Locking).
-            let local_max = get_local_version(repo, c.id().as_str()).unwrap_or(0);
-            let next_ver = local_max + 1;
-            next_versions.insert(c.id().as_str().to_owned(), next_ver);
-
-            // Lease the branch to ensure it hasn't changed since our fetch.
-            // If we know the remote SHA, we expect it. If we don't (None), we
-            // expect "" (creation).
-            let expected_sha =
-                remote_branch_states.get(c.id().as_str()).map(String::as_str).unwrap_or("");
-
-            targets.push(PushTarget {
-                object_id: c.head(),
-                gherrit_id: c.id().as_str(),
-                version: next_ver,
-                expected_remote_sha: expected_sha,
-            });
-        }
-
-        let plan = plan_push(&targets);
-
+    publication: GitPublicationPlan<'stack>,
+) -> Result<PlannedChanges<'stack>> {
+    let (pushes, changes) = publication.into_parts();
+    for push in pushes {
+        let (options, refspecs) = push.into_arguments();
         log::info!("Pushing chunk to remote...");
-        let output = destination
-            .push(plan.options, plan.refspecs)
-            .output()
-            .wrap_err("Failed to run `git push`")?;
+        let output =
+            destination.push(options, refspecs).output().wrap_err("Failed to run `git push`")?;
 
         if !output.status.success() {
             // Git can normalize a URL or local path before printing it. There
@@ -198,44 +177,9 @@ fn push_to_origin(
                 destination.configured_remote()
             );
         }
-
-        // Persist the local tags now that the push succeeded.
-        for tag in plan.persisted_tags {
-            let _ = repo.reference(
-                format!("refs/tags/gherrit/{}/v{}", tag.gherrit_id, tag.version),
-                tag.object_id,
-                PreviousValue::Any,
-                "gherrit: persist local version state",
-            );
-        }
     }
 
-    Ok(next_versions)
-}
-
-fn get_local_version(repo: &util::Repo, gherrit_id: &str) -> Result<usize> {
-    let prefix = format!("refs/tags/gherrit/{}/v", gherrit_id);
-    let mut max_ver = 0;
-
-    // Use .all() and manual filtering to avoid `prefixed` API type issues.
-    let references = repo.references().map_err(|e| eyre!(e))?;
-
-    for reference in references.all().map_err(|e| eyre!(e))? {
-        let reference = reference.map_err(|e| eyre!(e))?;
-        let name = reference.name().as_bstr().to_string();
-
-        if name.starts_with(&prefix) {
-            // Parse "refs/tags/gherrit/<id>/v<ver>"
-            if let Some(ver_str) = name.rsplit('v').next()
-                && let Ok(ver) = ver_str.parse::<usize>()
-                && ver > max_ver
-            {
-                max_ver = ver;
-            }
-        }
-    }
-
-    Ok(max_ver)
+    Ok(changes)
 }
 
 /// Syncs the local stack of commits with GitHub Pull Requests.
@@ -254,12 +198,11 @@ async fn sync_prs(
     octocrab: &Octocrab,
     repository: PrRepository<'_>,
     public_branch: Option<&str>,
-    commits: &LocalStack,
-    latest_versions: HashMap<String, usize>,
+    planned_changes: PlannedChanges<'_>,
     prs: Vec<PrState>,
 ) -> Result<()> {
-    let commits = link_stack(repository.default_branch, commits.iter(), |commit| {
-        commit.id().as_str().to_owned()
+    let commits = link_stack(repository.default_branch, planned_changes, |change| {
+        change.change().id().as_str().to_owned()
     });
 
     enum PrResolution {
@@ -271,7 +214,7 @@ async fn sync_prs(
     let resolutions: Vec<_> = commits
         .iter()
         .map(|entry| {
-            let c = &entry.item;
+            let c = entry.item.change();
 
             if let Some(pr) = prs.iter().find(|pr| pr.head_branch == c.id().as_str()) {
                 log::debug!(
@@ -354,8 +297,8 @@ async fn sync_prs(
     let updates: Vec<PrUpdate> = commit_pr_states
         .iter()
         .filter_map(|(entry, pr_state)| {
-            let c = &entry.item;
-            let latest_version = latest_versions.get(c.id().as_str()).copied().unwrap_or(1);
+            let c = entry.item.change();
+            let latest_version = entry.item.version();
 
             let body = PrBody {
                 commit_body: c.body(),
