@@ -120,6 +120,11 @@ impl LocalStack {
         let head = repo.rev_parse_single("HEAD")?;
         let default_branch = repo.find_default_branch_on_default_remote();
         let default_ref = repo.rev_parse_single(format!("refs/heads/{default_branch}").as_str())?;
+        if head == default_ref {
+            return Self::new(default_ref.detach(), Vec::new());
+        }
+
+        repo.ensure_publishable_history()?;
         let commits = repo.first_parent_commits_between(default_ref, head).map_err(|err| match err {
             util::FirstParentCommitsBetweenError::NotOnFirstParentPath => {
                 let branch_name = repo.current_branch().name().unwrap_or("current branch");
@@ -264,7 +269,6 @@ fn ensure_change_ids_unique_in_head_ancestry(stack: &LocalStack, head: ObjectId)
     let output = util::cmd(
         "git",
         [
-            "--no-replace-objects",
             "log",
             "--no-patch",
             "--no-show-signature",
@@ -407,6 +411,23 @@ mod tests {
                 object_id(2)
             )
         );
+    }
+
+    #[test]
+    fn empty_stack_does_not_require_publishable_history() {
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let default_tip = repository.rev_parse_single("refs/heads/main").unwrap().detach();
+
+        std::fs::create_dir_all(context.repo_path.join(".git/info")).unwrap();
+        std::fs::write(context.repo_path.join(".git/info/grafts"), format!("{default_tip}\n"))
+            .unwrap();
+        std::fs::write(context.repo_path.join(".git/shallow"), format!("{default_tip}\n")).unwrap();
+        context.run_git(&["config", "remote.origin.promisor", "true"]);
+
+        let stack = LocalStack::collect(&repository).unwrap();
+
+        assert!(stack.is_empty());
     }
 
     #[test]
