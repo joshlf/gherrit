@@ -2,8 +2,14 @@ use std::{num::NonZeroUsize, ops::Range};
 
 use serde_json::Value;
 
-pub(super) const INITIAL_GRAPHQL_BATCH_LEN: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+pub(super) const INITIAL_QUERY_BATCH_LEN: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 pub(super) const MAX_GRAPHQL_QUERY_BYTES: usize = 256 * 1024;
+pub(super) const MAX_MUTATION_ALIASES: usize = 64;
+// A 131,072-byte pull-request body made entirely from U+0001 expands to
+// 917,504 bytes after GraphQL-string escaping and then outer-JSON escaping.
+// One MiB accommodates that worst case plus the mutation's other supported
+// fields while retaining a deterministic preflight request limit.
+pub(super) const MAX_MUTATION_REQUEST_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub(super) struct BatchPlan {
@@ -99,7 +105,7 @@ mod tests {
     use super::*;
 
     fn ranges(item_count: usize) -> Vec<Range<usize>> {
-        let mut plan = BatchPlan::new(item_count, INITIAL_GRAPHQL_BATCH_LEN);
+        let mut plan = BatchPlan::new(item_count, INITIAL_QUERY_BATCH_LEN);
         let mut ranges = Vec::new();
         while let Some(range) = plan.current() {
             ranges.push(range);
@@ -120,7 +126,7 @@ mod tests {
 
     #[test]
     fn backs_off_without_advancing() {
-        let mut plan = BatchPlan::new(64, INITIAL_GRAPHQL_BATCH_LEN);
+        let mut plan = BatchPlan::new(64, INITIAL_QUERY_BATCH_LEN);
 
         for (attempted, retry) in [(64, 32), (32, 16), (16, 8), (8, 4), (4, 2), (2, 1)] {
             assert_eq!(plan.current(), Some(0..attempted));
@@ -132,7 +138,7 @@ mod tests {
 
     #[test]
     fn halves_the_actual_tail_attempt() {
-        let mut plan = BatchPlan::new(100, INITIAL_GRAPHQL_BATCH_LEN);
+        let mut plan = BatchPlan::new(100, INITIAL_QUERY_BATCH_LEN);
         assert_eq!(plan.current(), Some(0..64));
         plan.accept();
 
@@ -143,7 +149,7 @@ mod tests {
 
     #[test]
     fn rejects_a_single_tail_item_immediately() {
-        let mut plan = BatchPlan::new(65, INITIAL_GRAPHQL_BATCH_LEN);
+        let mut plan = BatchPlan::new(65, INITIAL_QUERY_BATCH_LEN);
         plan.accept();
 
         assert_eq!(plan.current(), Some(64..65));
@@ -152,7 +158,7 @@ mod tests {
 
     #[test]
     fn preserves_a_reduced_batch_length_after_success() {
-        let mut plan = BatchPlan::new(100, INITIAL_GRAPHQL_BATCH_LEN);
+        let mut plan = BatchPlan::new(100, INITIAL_QUERY_BATCH_LEN);
         plan.reject().unwrap();
         assert_eq!(plan.current(), Some(0..32));
         plan.accept();
