@@ -1,3 +1,26 @@
+use std::{fs, path::Path};
+
+fn installed_git_version(ctx: &testutil::TestContext) -> (u64, u64) {
+    let output = ctx.git_cmd().arg("--version").assert().success().get_output().stdout.clone();
+    let version =
+        std::str::from_utf8(&output).unwrap().trim().strip_prefix("git version ").unwrap();
+    let mut components = version.split('.');
+    (components.next().unwrap().parse().unwrap(), components.next().unwrap().parse().unwrap())
+}
+
+fn locally_stored_objects(ctx: &testutil::TestContext, repository: &Path) -> Vec<String> {
+    let output = ctx
+        .git_cmd()
+        .current_dir(repository)
+        .args(["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output).unwrap().lines().map(ToOwned::to_owned).collect()
+}
+
 #[test]
 fn test_full_stack_lifecycle_mocked() {
     let ctx = testutil::test_context!()
@@ -179,6 +202,134 @@ fn test_replacement_ref_is_ignored_even_with_gix_075_false_polarity() {
     assert_eq!(pull_requests.len(), 1);
     assert_eq!(pull_requests[0].title.as_deref(), Some("Literal commit"));
     assert_eq!(&ctx.recorded_pushes()[0].arguments()[..3], ["git", "--no-replace-objects", "push"]);
+}
+
+#[test]
+fn test_real_partial_clone_does_not_lazy_fetch_an_omitted_blob() {
+    let ctx =
+        testutil::test_context!().with_remote().with_initial_commit().with_mock_github().build();
+    fs::write(ctx.repo_path.join("omitted.txt"), "This blob must remain remote-only.\n").unwrap();
+    ctx.run_git(&["add", "omitted.txt"]);
+    ctx.commit("Add a blob for the partial clone");
+    let omitted_blob = String::from_utf8(
+        ctx.git_cmd()
+            .args(["rev-parse", "HEAD:omitted.txt"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let omitted_blob = omitted_blob.trim();
+    ctx.run_git(&["push", "--no-verify", "origin", "main"]);
+    ctx.remote_git_cmd().args(["config", "uploadpack.allowFilter", "true"]).assert().success();
+
+    let origin = String::from_utf8(
+        ctx.git_cmd()
+            .args(["remote", "get-url", "origin"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let origin = origin.trim();
+    let filtered = ctx.dir.path().join("filtered");
+    ctx.git_cmd()
+        .current_dir(ctx.dir.path())
+        .args(["clone", "--filter=blob:none", "--no-checkout", "--no-local", origin])
+        .arg(&filtered)
+        .assert()
+        .success();
+
+    ctx.git_cmd()
+        .current_dir(&filtered)
+        .args(["remote", "rename", "origin", "promisor"])
+        .assert()
+        .success();
+    let unavailable_promisor = ctx.dir.path().join("unavailable-promisor.git");
+    ctx.git_cmd()
+        .current_dir(&filtered)
+        .args(["remote", "set-url", "promisor"])
+        .arg(&unavailable_promisor)
+        .assert()
+        .success();
+    ctx.git_cmd()
+        .current_dir(&filtered)
+        .args(["remote", "add", "origin", origin])
+        .assert()
+        .success();
+
+    let tree = String::from_utf8(
+        ctx.git_cmd()
+            .current_dir(&filtered)
+            .args(["rev-parse", "main^{tree}"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let head = String::from_utf8(
+        ctx.git_cmd()
+            .current_dir(&filtered)
+            .arg("commit-tree")
+            .arg(tree.trim())
+            .args(["-p", "main", "-m", "Locally available work\n\ngherrit-pr-id: Gpartial"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let head = head.trim();
+    ctx.git_cmd()
+        .current_dir(&filtered)
+        .args(["update-ref", "refs/heads/partial-feature", head])
+        .assert()
+        .success();
+    ctx.git_cmd()
+        .current_dir(&filtered)
+        .args(["symbolic-ref", "HEAD", "refs/heads/partial-feature"])
+        .assert()
+        .success();
+    for (suffix, value) in [
+        ("gherritManaged", testutil::MANAGED_PRIVATE),
+        ("pushRemote", "."),
+        ("remote", "."),
+        ("merge", "refs/heads/partial-feature"),
+    ] {
+        ctx.git_cmd()
+            .current_dir(&filtered)
+            .args(["config", &format!("branch.partial-feature.{suffix}"), value])
+            .assert()
+            .success();
+    }
+
+    assert!(!locally_stored_objects(&ctx, &filtered).iter().any(|oid| oid == omitted_blob));
+    let output =
+        ctx.gherrit_cmd().current_dir(&filtered).args(["hook", "pre-push"]).output().unwrap();
+
+    if installed_git_version(&ctx) >= (2, 45) {
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(ctx.remote_ref_oid("refs/heads/Gpartial").as_deref(), Some(head));
+        let pull_requests = ctx.github().pull_requests();
+        assert_eq!(pull_requests.len(), 1);
+        assert_eq!(pull_requests[0].title.as_deref(), Some("Locally available work"));
+    } else {
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("requires Git 2.45 or newer for a promisor repository")
+        );
+        assert!(ctx.remote_ref_oid("refs/heads/Gpartial").is_none());
+        assert!(ctx.github().requests().is_empty());
+    }
+    assert!(!locally_stored_objects(&ctx, &filtered).iter().any(|oid| oid == omitted_blob));
 }
 
 #[test]
