@@ -1,3 +1,5 @@
+use std::fs;
+
 use predicates::prelude::*;
 
 #[test]
@@ -49,5 +51,57 @@ fn installed_pre_push_blocks_the_enclosing_push() {
         .stderr(predicate::str::contains("Stack contains pending fixup/squash/amend commits"));
 
     assert_eq!(ctx.remote_ref_oid("refs/heads/blocked-boundary"), None);
+    assert_eq!(ctx.remote_ref_oid(&format!("refs/heads/{id}")), None);
+}
+
+#[test]
+fn installed_pre_push_blocks_an_inherited_custom_graft_file() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .build();
+
+    ctx.checkout_new("custom-graft-boundary");
+    ctx.commit("Feature with custom graft environment");
+    let id = ctx.gherrit_id("HEAD").unwrap();
+    fs::write(ctx.repo_path.join("custom-grafts"), format!("{}\n", ctx.head_oid())).unwrap();
+
+    ctx.git_cmd()
+        .env("GIT_GRAFT_FILE", "custom-grafts")
+        .args(["push", "origin", "custom-graft-boundary"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "file named by GIT_GRAFT_FILE is nonempty because the enclosing Git push retains",
+        ));
+
+    assert_eq!(ctx.remote_ref_oid("refs/heads/custom-graft-boundary"), None);
+    assert_eq!(ctx.remote_ref_oid(&format!("refs/heads/{id}")), None);
+}
+
+#[test]
+fn installed_pre_push_blocks_an_inherited_custom_shallow_file() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .build();
+
+    ctx.checkout_new("custom-shallow-boundary");
+    ctx.commit("Feature with custom shallow environment");
+    let id = ctx.gherrit_id("HEAD").unwrap();
+    fs::write(ctx.repo_path.join("custom-shallow"), format!("{}\n", ctx.head_oid())).unwrap();
+
+    ctx.git_cmd()
+        .env("GIT_SHALLOW_FILE", "custom-shallow")
+        .args(["push", "origin", "custom-shallow-boundary"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "file named by GIT_SHALLOW_FILE is nonempty because the enclosing Git push retains",
+        ));
+
+    assert_eq!(ctx.remote_ref_oid("refs/heads/custom-shallow-boundary"), None);
     assert_eq!(ctx.remote_ref_oid(&format!("refs/heads/{id}")), None);
 }
