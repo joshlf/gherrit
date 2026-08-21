@@ -26,10 +26,22 @@ It allows users to maintain a local stack of commits and forces them to be
 represented as a chain of Pull Requests on GitHub.
 
 It achieves this by:
-1.  Intercepting `git push` via the `pre-push` hook.
-2.  Pushing unique `refs/gherrit/<id>` refs for every commit to the remote.
-3.  Using the `gh` CLI tool to create/update PRs and chain them together
-    (setting the base of one PR to the head of the previous one).
+1.  Configuring every managed branch with a local loopback push and using the
+    `pre-push` hook to prove that the enclosing push has no ref update.
+2.  Publishing each changed revision as one atomic change-owned tuple:
+    `refs/heads/<id>` at the revision,
+    `refs/heads/gherrit-bases/<id>` at its literal first parent, and
+    `refs/tags/gherrit/<id>/vN` at the revision. An optional GHerrit-owned
+    public-branch projection is the final indivisible unit of the initial Git
+    stage and may share its final atomic batch with tuples.
+3.  Creating each missing PR with head `<id>` and the stable creation base
+    `gherrit-bases/<id>`.
+4.  Recording established PR existence with the immutable
+    `refs/tags/gherrit/<id>/pr` marker.
+5.  Selecting the lowest OPEN PR number as canonical during planning, then,
+    after the marker barrier, closing higher valid duplicates and projecting
+    the final title, body, and base only to that canonical PR. A root targets
+    the default branch; a nonroot remains on its owned base.
 
 ### Project Structure
 
@@ -49,6 +61,9 @@ It achieves this by:
 
 When developing code changes, you **MUST** read
 [agent_docs/development.md](./agent_docs/development.md).
+
+Before changing pre-push publication behavior, you **MUST** read
+[design/pre-push.md](./design/pre-push.md).
 
 ### Before submitting
 
