@@ -151,14 +151,24 @@ the PR description.
 #### Optimistic Concurrency Control
 
 GHerrit enforces optimistic locking to prevent race conditions when multiple
-users update the same stack. When pushing a new version tag (e.g., `v2`),
-GHerrit uses the atomic push option:
-`--force-with-lease=refs/tags/gherrit/<id>/v<ver>:`.
+users update the same stack. One remote observation establishes the default
+branch and all managed heads. After deriving the local stack, a second batched
+observation reads immutable version history only for its active changes. Work
+therefore scales with repository heads plus active histories, not every version
+ever published in the repository.
 
-The trailing colon (`:`) tells Git to ensure the ref does **not** already exist
-on the remote. If another user has already pushed `v2` in the interim, the
-assertion fails, the push is rejected, and the user is forced to fetch and
-rebase, preserving the integrity of the patch history.
+GHerrit derives the next version from that remote history, then atomically
+leases the observed branch and requires the new version tag to be absent. A
+concurrent publication between the two observations can make their evidence
+disagree; GHerrit fails safely, and a later attempt repeats both observations.
+If either leased ref changes later, the complete atomic push is rejected. No
+local version tags participate in either decision.
+
+Before observing GitHub or writing refs, GHerrit renders every variable push
+argument and partitions the complete branch-and-tag pair for each change into
+conservatively byte-budgeted batches. A pair is never split between pushes. An
+individually oversized change anywhere in the stack rejects the whole plan;
+an unchanged stack produces no push.
 
 #### `pre-push` Hook
 

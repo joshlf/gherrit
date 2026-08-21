@@ -168,9 +168,12 @@ call into `gix`, `Command`, Octocrab, or an HTTP client.
 The Git boundary should support:
 
 - observing the local stack and branch configuration;
-- observing relevant managed branches and tags;
-- publishing one atomic batch with explicit leases; and
-- recording locally any state required after confirmed publication.
+- observing all managed heads once and immutable tag history only for active
+  local changes;
+- preplanning byte-bounded atomic push batches with explicit leases while
+  keeping each change's complete ref update in one batch; and
+- treating immutable remote version tags as authoritative publication history,
+  without consulting or writing local version tags.
 
 The GitHub boundary should support:
 
