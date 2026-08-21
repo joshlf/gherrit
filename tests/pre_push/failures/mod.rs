@@ -1,3 +1,5 @@
+use std::fs;
+
 use predicates::prelude::*;
 
 fn stack_with_raw_commit_message(message: &str) -> testutil::TestContext {
@@ -29,6 +31,42 @@ fn assert_identity_failure_before_external_io(ctx: testutil::TestContext, diagno
 
     assert!(ctx.github().requests().is_empty());
     assert!(ctx.recorded_pushes().is_empty());
+}
+
+fn linked_managed_stack(ctx: &testutil::TestContext, branch: &str, id: &str) -> std::path::PathBuf {
+    let linked = ctx.dir.path().join(branch);
+    ctx.git_cmd()
+        .args(["worktree", "add", "-b", branch])
+        .arg(&linked)
+        .arg("main")
+        .assert()
+        .success();
+    for (suffix, value) in [
+        ("gherritManaged", testutil::MANAGED_PRIVATE),
+        ("pushRemote", "."),
+        ("remote", "."),
+        ("merge", &format!("refs/heads/{branch}")),
+    ] {
+        ctx.git_cmd()
+            .current_dir(&linked)
+            .arg("config")
+            .arg(format!("branch.{branch}.{suffix}"))
+            .arg(value)
+            .assert()
+            .success();
+    }
+    ctx.git_cmd()
+        .current_dir(&linked)
+        .args([
+            "commit",
+            "--allow-empty",
+            "--no-verify",
+            "-m",
+            &format!("Linked work\n\ngherrit-pr-id: {id}"),
+        ])
+        .assert()
+        .success();
+    linked
 }
 
 #[test]
@@ -157,6 +195,81 @@ fn test_default_branch_must_be_on_the_first_parent_stack_path() {
 
     assert!(ctx.github().requests().is_empty());
     assert!(ctx.recorded_pushes().is_empty());
+}
+
+#[test]
+fn test_nonempty_common_grafts_file_in_linked_worktree_blocks_publication() {
+    let ctx = testutil::test_context!().with_remote().with_initial_commit().build();
+    let linked = linked_managed_stack(&ctx, "linked-feature", "Glinked");
+    let linked_head = ctx
+        .git_cmd()
+        .current_dir(&linked)
+        .args(["rev-parse", "HEAD"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let grafts = ctx.repo_path.join(".git/info/grafts");
+    fs::write(grafts, linked_head).unwrap();
+
+    ctx.gherrit_cmd().current_dir(&linked).args(["hook", "pre-push"]).assert().failure().stderr(
+        predicate::str::contains(
+            "info/grafts file is nonempty because grafts rewrite commit ancestry",
+        ),
+    );
+    assert!(ctx.remote_ref_oid("refs/heads/Glinked").is_none());
+}
+
+#[test]
+fn test_common_shallow_file_is_checked_despite_gix_config_redirection() {
+    let ctx = testutil::test_context!().with_remote().with_initial_commit().build();
+    let linked = linked_managed_stack(&ctx, "shallow-feature", "Gshallow");
+    ctx.git_cmd()
+        .current_dir(&linked)
+        .args(["config", "gitoxide.core.shallowFile", "redirected-shallow"])
+        .assert()
+        .success();
+    let linked_head = ctx
+        .git_cmd()
+        .current_dir(&linked)
+        .args(["rev-parse", "HEAD"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    fs::write(ctx.repo_path.join(".git/shallow"), linked_head).unwrap();
+    ctx.git_cmd()
+        .current_dir(&linked)
+        .args(["rev-parse", "--is-shallow-repository"])
+        .assert()
+        .success()
+        .stdout("true\n");
+
+    ctx.gherrit_cmd().current_dir(&linked).args(["hook", "pre-push"]).assert().failure().stderr(
+        predicate::str::contains(
+            "common Git directory's shallow file is nonempty because shallow history omits",
+        ),
+    );
+    assert!(ctx.remote_ref_oid("refs/heads/Gshallow").is_none());
+}
+
+#[test]
+fn test_effective_shallow_file_from_gix_config_blocks_publication() {
+    let ctx = testutil::test_context!().with_remote().with_initial_commit().build();
+    ctx.checkout_managed_private("configured-shallow");
+    let id = ctx.commit_with_gherrit_id("Configured shallow work");
+    ctx.run_git(&["config", "gitoxide.core.shallowFile", "alternate-shallow"]);
+    fs::write(ctx.repo_path.join(".git/alternate-shallow"), format!("{}\n", ctx.head_oid()))
+        .unwrap();
+
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
+        "effective shallow file is nonempty because shallow history omits",
+    ));
+    assert!(ctx.remote_ref_oid(&format!("refs/heads/{id}")).is_none());
 }
 
 #[test]
