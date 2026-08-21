@@ -93,7 +93,6 @@ pub(super) fn link_stack<T>(
 
 /// Metadata currently stored on a PR.
 pub(super) struct CurrentPr<'a> {
-    pub(super) node_id: &'a str,
     pub(super) title: Option<&'a str>,
     pub(super) body: Option<&'a str>,
     pub(super) base_branch: &'a str,
@@ -109,8 +108,6 @@ pub(super) struct DesiredPr<'a> {
 /// The fields that must be changed to reconcile a PR.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct PrUpdate {
-    /// The global node ID of the PR to update.
-    pub(super) node_id: String,
     pub(super) title: Option<String>,
     pub(super) body: Option<String>,
     // Omitting an unchanged base branch is required for PRs in the merge queue:
@@ -128,8 +125,7 @@ pub(super) fn plan_update(current: CurrentPr<'_>, desired: DesiredPr<'_>) -> Opt
     let base_branch =
         (current.base_branch != desired.base_branch).then(|| desired.base_branch.to_string());
 
-    (title.is_some() || body.is_some() || base_branch.is_some()).then(|| PrUpdate {
-        node_id: current.node_id.to_string(),
+    (title.is_some() || body.is_some() || base_branch.is_some()).then_some(PrUpdate {
         title,
         body,
         base_branch,
@@ -275,7 +271,7 @@ mod tests {
         body: Option<&'a str>,
         base_branch: &'a str,
     ) -> CurrentPr<'a> {
-        CurrentPr { node_id: "PR_node", title, body, base_branch }
+        CurrentPr { title, body, base_branch }
     }
 
     fn desired<'a>(title: &'a str, body: &'a str, base_branch: &'a str) -> DesiredPr<'a> {
@@ -288,7 +284,6 @@ mod tests {
         base_branch: Option<&str>,
     ) -> Option<PrUpdate> {
         Some(PrUpdate {
-            node_id: "PR_node".to_string(),
             title: title.map(ToString::to_string),
             body: body.map(ToString::to_string),
             base_branch: base_branch.map(ToString::to_string),
