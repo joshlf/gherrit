@@ -39,9 +39,12 @@ pub struct MockState {
     pub(super) git: git_interceptor::State,
     pub graphql_requests: Vec<Vec<GraphQlOperation>>,
     pub graphql_redirect_trap_requests: usize,
+    pub git_redirect_source_requests: usize,
+    pub git_redirect_trap_requests: usize,
     pub max_graphql_query_operations_per_request: Option<usize>,
     pub repo_owner: String,
     pub repo_name: String,
+    pub github_default_branch: Option<(String, String)>,
     pub faults: VecDeque<FailureKind>,
 }
 
@@ -193,6 +196,8 @@ pub(super) async fn run_mock_server(
     let app = Router::new()
         .route("/graphql", post(graphql))
         .route("/graphql-redirect-trap", any(graphql_redirect_trap))
+        .route("/{owner}/{repository}/info/refs", any(git_redirect_source))
+        .route("/git-redirect-trap", any(git_redirect_trap))
         .with_state(app_state)
         .merge(git_routes);
 
@@ -209,7 +214,6 @@ pub(super) async fn run_mock_server(
 fn check_and_apply_graphql_failure(
     mock_state: &mut MockState,
     operations: &[GraphQlOperation],
-    is_repository_id_query: bool,
     create_request_number: usize,
 ) -> Option<FailureKind> {
     use FailureKind::*;
@@ -221,7 +225,6 @@ fn check_and_apply_graphql_failure(
             !operations.is_empty()
                 && operations.iter().all(|operation| *operation == GraphQlOperation::Query)
         }
-        RepositoryIdHttp(_) => is_repository_id_query,
         CreatePr | CreatePrHttp(_) | CreatePrRedirect(_) => {
             operations.contains(&GraphQlOperation::CreatePr)
         }
@@ -229,7 +232,7 @@ fn check_and_apply_graphql_failure(
             create_request_number == 2 && operations.contains(&GraphQlOperation::CreatePr)
         }
         UpdatePr => operations.contains(&GraphQlOperation::UpdatePr),
-        Git(_) => false,
+        Git(_) | GitOutput { .. } => false,
     };
 
     if !matches {
@@ -457,6 +460,27 @@ fn validate_pull_requests_field(field: &executable::Field) -> Result<(), String>
     Ok(())
 }
 
+fn validate_default_branch_ref_field(field: &executable::Field) -> Result<(), String> {
+    const PATH: &str = "repository.defaultBranchRef";
+    for field in selected_fields(&field.selection_set, PATH)? {
+        match field.name.as_str() {
+            "name" => {}
+            "target" => validate_scalar_fields(
+                &field.selection_set,
+                "repository.defaultBranchRef.target",
+                &["oid"],
+            )?,
+            _ => {
+                return Err(format!(
+                    "The mock GitHub API does not support field `{PATH}.{}`",
+                    field.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_repository_field(
     field: &executable::Field,
     variables: &GraphQlVariables,
@@ -469,6 +493,7 @@ fn validate_repository_field(
     for field in selected_fields(&field.selection_set, PATH)? {
         match field.name.as_str() {
             "id" => {}
+            "defaultBranchRef" => validate_default_branch_ref_field(field)?,
             "pullRequests" => {
                 validate_pull_requests_field(field)?;
                 resolve_string_argument(
@@ -633,12 +658,9 @@ async fn graphql(
             }),
         );
     }
-    if let Some(failure) = check_and_apply_graphql_failure(
-        &mut mock_state,
-        &operations,
-        query.trim_start().starts_with("query RepositoryID("),
-        create_request_number,
-    ) {
+    if let Some(failure) =
+        check_and_apply_graphql_failure(&mut mock_state, &operations, create_request_number)
+    {
         return graphql_failure_response(failure);
     }
 
@@ -658,7 +680,11 @@ async fn graphql(
                     "createPullRequest" => handle_create_pr(&mut mock_state, field, &|branch| {
                         remote_branch_exists(&app_state, branch)
                     }),
-                    "repository" => handle_repository_query(&mock_state, field, &variables),
+                    "repository" => {
+                        handle_repository_query(&mock_state, field, &variables, &|| {
+                            repository_default_branch(&app_state, &mock_state)
+                        })
+                    }
                     _ => unreachable!("request was checked by validate_supported_document"),
                 };
                 match result {
@@ -694,6 +720,17 @@ async fn graphql_redirect_trap(State(app_state): State<AppState>) -> Response {
     )
 }
 
+async fn git_redirect_source(State(app_state): State<AppState>) -> Response {
+    app_state.state.write().unwrap().git_redirect_source_requests += 1;
+    (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, HeaderValue::from_static("/git-redirect-trap"))])
+        .into_response()
+}
+
+async fn git_redirect_trap(State(app_state): State<AppState>) -> Response {
+    app_state.state.write().unwrap().git_redirect_trap_requests += 1;
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
 fn retryable_status(status: RetryableHttpStatus) -> StatusCode {
     match status {
         RetryableHttpStatus::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
@@ -719,14 +756,15 @@ fn graphql_failure_response(failure: FailureKind) -> Response {
     }
 
     let status = match failure {
-        QueryHttp(status)
-        | RepositoryIdHttp(status)
-        | CreatePrHttp(status)
-        | SecondCreatePrHttp(status) => retryable_status(status),
+        QueryHttp(status) | CreatePrHttp(status) | SecondCreatePrHttp(status) => {
+            retryable_status(status)
+        }
         CreatePrRedirect(status) => redirect_status(status),
         GraphQl | CreatePr | UpdatePr => StatusCode::OK,
         QueryTransport => unreachable!("handled above"),
-        Git(_) => unreachable!("Git failures are not handled by the GraphQL endpoint"),
+        Git(_) | GitOutput { .. } => {
+            unreachable!("Git failures are not handled by the GraphQL endpoint")
+        }
     };
     let mut headers = HeaderMap::new();
     if matches!(failure, CreatePrRedirect(_)) {
@@ -773,6 +811,41 @@ fn remote_branch_exists(app_state: &AppState, branch: &str) -> Result<bool, Stri
         Some(1) => Ok(false),
         code => Err(format!("Inspecting remote Git ref `{reference}` exited with {code:?}")),
     }
+}
+
+fn repository_default_branch(
+    app_state: &AppState,
+    mock_state: &MockState,
+) -> Result<(String, String), String> {
+    if let Some(default_branch) = &mock_state.github_default_branch {
+        return Ok(default_branch.clone());
+    }
+
+    let run = |arguments: &[&str]| {
+        app_state
+            .test_environment
+            .command(&app_state.system_git)
+            .arg("--git-dir")
+            .arg(&app_state.remote_path)
+            .args(arguments)
+            .output()
+            .map_err(|error| format!("Failed to inspect remote default branch: {error}"))
+    };
+    let symbolic = run(&["symbolic-ref", "HEAD"])?;
+    let tip = run(&["rev-parse", "HEAD"])?;
+    if !symbolic.status.success() || !tip.status.success() {
+        return Err("The mock repository has no default branch".to_string());
+    }
+    let symbolic = std::str::from_utf8(&symbolic.stdout)
+        .map_err(|_| "The mock repository default branch is not UTF-8".to_string())?
+        .trim_end_matches(['\r', '\n']);
+    let name = symbolic
+        .strip_prefix("refs/heads/")
+        .ok_or_else(|| "The mock repository HEAD is not a local branch".to_string())?;
+    let tip = std::str::from_utf8(&tip.stdout)
+        .map_err(|_| "The mock repository default branch tip is not UTF-8".to_string())?
+        .trim_end_matches(['\r', '\n']);
+    Ok((name.to_string(), tip.to_string()))
 }
 
 fn extract_input_field<'a>(
@@ -948,6 +1021,7 @@ fn handle_repository_query(
     mock_state: &MockState,
     field: &executable::Field,
     variables: &GraphQlVariables,
+    default_branch: &dyn Fn() -> Result<(String, String), String>,
 ) -> Result<serde_json::Value, String> {
     const PATH: &str = "repository";
     let owner = resolve_string_argument(field, "owner", PATH, variables)?;
@@ -961,6 +1035,37 @@ fn handle_repository_query(
 
     for field in selected_fields(&field.selection_set, PATH)? {
         match field.name.as_str() {
+            "defaultBranchRef" => {
+                let (name, oid) = default_branch()?;
+                let mut default_branch = serde_json::Map::new();
+                for field in selected_fields(&field.selection_set, "repository.defaultBranchRef")? {
+                    let value = match field.name.as_str() {
+                        "name" => serde_json::json!(name),
+                        "target" => {
+                            let mut target = serde_json::Map::new();
+                            for field in selected_fields(
+                                &field.selection_set,
+                                "repository.defaultBranchRef.target",
+                            )? {
+                                match field.name.as_str() {
+                                    "oid" => {
+                                        target.insert(response_key(field), serde_json::json!(oid));
+                                    }
+                                    _ => unreachable!(
+                                        "request was checked by validate_default_branch_ref_field"
+                                    ),
+                                }
+                            }
+                            serde_json::Value::Object(target)
+                        }
+                        _ => {
+                            unreachable!("request was checked by validate_default_branch_ref_field")
+                        }
+                    };
+                    default_branch.insert(response_key(field), value);
+                }
+                repo_data.insert(response_key(field), serde_json::Value::Object(default_branch));
+            }
             "pullRequests" => {
                 let head = resolve_string_argument(
                     field,
@@ -1088,7 +1193,7 @@ mod tests {
         state: &mut MockState,
         operations: &[GraphQlOperation],
     ) -> Option<FailureKind> {
-        check_and_apply_graphql_failure(state, operations, false, 0)
+        check_and_apply_graphql_failure(state, operations, 0)
     }
 
     #[test]
@@ -1128,11 +1233,12 @@ mod tests {
             ("owner".to_string(), serde_json::json!("owner")),
             ("name".to_string(), serde_json::json!("repo")),
         ]));
-        let repository_id = parse_document(
-            "query RepositoryID($owner: String!, $name: String!) { \
-             repository(owner: $owner, name: $name) { id } }",
+        let repository = parse_document(
+            "query Repository($owner: String!, $name: String!) { \
+             repository(owner: $owner, name: $name) { id, defaultBranchRef { \
+             name, target { oid } } } }",
         );
-        validate_supported_document(&repository_id, &variables).unwrap();
+        validate_supported_document(&repository, &variables).unwrap();
 
         let lookup = parse_document(
             "query { op0: repository(owner: \"owner\", name: \"repo\") { \
@@ -1233,6 +1339,7 @@ mod tests {
     fn repository_response_contains_only_selected_fields() {
         let document = parse_document(
             "query { repository(owner: \"owner\", name: \"repo\") { \
+             defaultBranchRef { name, target { oid } } \
              open: pullRequests(headRefName: \"Ghead\", first: 100, \
              states: [OPEN]) { nodes { number, isCrossRepository } \
              pageInfo { hasNextPage } } } }",
@@ -1250,10 +1357,17 @@ mod tests {
             repo_name: "repo",
         }));
         state.cross_repository_prs.insert(1);
-        let response = handle_repository_query(&state, root_field(&document), &None).unwrap();
+        let response = handle_repository_query(&state, root_field(&document), &None, &|| {
+            Ok(("main".to_string(), "1".repeat(40)))
+        })
+        .unwrap();
         assert_eq!(
             response,
             serde_json::json!({
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": { "oid": "1111111111111111111111111111111111111111" }
+                },
                 "open": {
                     "nodes": [{ "number": 1, "isCrossRepository": true }],
                     "pageInfo": { "hasNextPage": false }
@@ -1274,7 +1388,11 @@ mod tests {
             validate_supported_document(&document, &None).unwrap();
 
             assert_eq!(
-                handle_repository_query(&state, root_field(&document), &None).unwrap(),
+                handle_repository_query(&state, root_field(&document), &None, &|| Ok((
+                    "main".to_string(),
+                    "1".repeat(40)
+                )),)
+                .unwrap(),
                 serde_json::Value::Null,
                 "query: {query}"
             );
