@@ -5,6 +5,7 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     process::Command,
+    str,
 };
 
 use eyre::{OptionExt, Result, WrapErr, bail, eyre};
@@ -88,11 +89,13 @@ pub(crate) use re as re_macro;
 pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Command {
     let mut c = Command::new(name);
     if name == "git" {
-        // Replacement objects can make Git subprocesses observe a different
-        // graph from the one sent to the remote. Keep every production Git
-        // invocation on the literal local graph.
+        // Replacement objects and implicit promisor fetches can make Git
+        // subprocesses observe a different graph from the one sent to the
+        // remote. Keep every production Git invocation on the literal local
+        // graph.
         c.arg("--no-replace-objects");
         c.env("GIT_NO_REPLACE_OBJECTS", "1");
+        c.env("GIT_NO_LAZY_FETCH", "1");
         for variable in [
             "GIT_ALTERNATE_OBJECT_DIRECTORIES",
             "GIT_GRAFT_FILE",
@@ -212,6 +215,13 @@ impl Repo {
             )?;
         }
 
+        if self.has_promisor_remote()? {
+            let output = cmd("git", ["--version"])
+                .checked_output()
+                .wrap_err("Failed to determine the installed Git version")?;
+            require_git_no_lazy_fetch(&output.stdout)?;
+        }
+
         Ok(())
     }
 
@@ -228,6 +238,31 @@ impl Repo {
             Some(workdir) => workdir.join(path),
             None => env::current_dir()?.join(path),
         })
+    }
+
+    fn has_promisor_remote(&self) -> Result<bool> {
+        let config = self.inner.config_snapshot();
+        if config.string("extensions.partialClone").is_some() {
+            return Ok(true);
+        }
+
+        let Some(remotes) = config.sections_by_name("remote") else {
+            return Ok(false);
+        };
+        for remote in remotes {
+            match remote.value_implicit("promisor") {
+                Some(None) => return Ok(true),
+                Some(Some(value)) => {
+                    let value = gix::config::Boolean::try_from(value)
+                        .wrap_err("Invalid remote promisor configuration")?;
+                    if bool::from(value) {
+                        return Ok(true);
+                    }
+                }
+                None => {}
+            }
+        }
+        Ok(false)
     }
 
     pub fn current_branch(&self) -> &HeadState {
@@ -385,6 +420,36 @@ fn reject_nonempty_history_file(path: &Path, description: &str, reason: &str) ->
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).wrap_err_with(|| format!("Failed to inspect {description}")),
     }
+}
+
+fn parse_git_version(output: &[u8]) -> Result<(u64, u64)> {
+    let version = str::from_utf8(output)?
+        .trim()
+        .strip_prefix("git version ")
+        .ok_or_else(|| eyre!("Unexpected `git --version` output"))?;
+    let mut components = version.split('.');
+    let major = components
+        .next()
+        .ok_or_else(|| eyre!("Git version omitted its major component"))?
+        .parse()
+        .wrap_err("Git reported an invalid major version")?;
+    let minor = components
+        .next()
+        .ok_or_else(|| eyre!("Git version omitted its minor component"))?
+        .parse()
+        .wrap_err("Git reported an invalid minor version")?;
+    Ok((major, minor))
+}
+
+fn require_git_no_lazy_fetch(output: &[u8]) -> Result<()> {
+    let (major, minor) = parse_git_version(output)?;
+    if (major, minor) < (2, 45) {
+        bail!(
+            "GHerrit requires Git 2.45 or newer for a promisor repository so implicit object \
+             fetches can be disabled; found Git {major}.{minor}"
+        );
+    }
+    Ok(())
 }
 
 pub enum FirstParentCommitsBetweenError {
@@ -558,7 +623,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn git_commands_use_the_literal_local_graph() {
+    fn git_commands_use_the_literal_local_graph_without_lazy_fetches() {
         let command = cmd("git", ["status"]);
         let arguments = command
             .get_args()
@@ -566,7 +631,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(arguments, ["--no-replace-objects", "status"]);
         let environment = command.get_envs().collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(environment[OsStr::new("GIT_NO_REPLACE_OBJECTS")], Some(OsStr::new("1")));
+        for variable in ["GIT_NO_LAZY_FETCH", "GIT_NO_REPLACE_OBJECTS"] {
+            assert_eq!(environment[OsStr::new(variable)], Some(OsStr::new("1")));
+        }
         for variable in [
             "GIT_ALTERNATE_OBJECT_DIRECTORIES",
             "GIT_GRAFT_FILE",
@@ -601,6 +668,27 @@ mod tests {
         for trust in [gix::sec::Trust::Full, gix::sec::Trust::Reduced] {
             assert_eq!(options.by_level(trust).permissions.env.objects, gix::sec::Permission::Deny);
         }
+    }
+
+    #[test]
+    fn git_versions_are_parsed_for_no_lazy_fetch_support() {
+        for (output, expected) in [
+            ("git version 2.44.0\n", (2, 44)),
+            ("git version 2.45.0\n", (2, 45)),
+            ("git version 2.48.1 (Apple Git-154)\n", (2, 48)),
+            ("git version 3.0.0.windows.1\n", (3, 0)),
+        ] {
+            assert_eq!(parse_git_version(output.as_bytes()).unwrap(), expected);
+        }
+
+        for output in [b"2.45.0\n".as_slice(), b"git version invalid\n", b"git version 2\n"] {
+            assert!(parse_git_version(output).is_err());
+        }
+
+        let error = require_git_no_lazy_fetch(b"git version 2.44.9\n").unwrap_err();
+        assert!(error.to_string().contains("requires Git 2.45 or newer"));
+        require_git_no_lazy_fetch(b"git version 2.45.0\n").unwrap();
+        require_git_no_lazy_fetch(b"git version 3.0.0\n").unwrap();
     }
 
     #[test]
