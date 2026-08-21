@@ -201,7 +201,22 @@ fn test_replacement_ref_is_ignored_even_with_gix_075_false_polarity() {
     let pull_requests = ctx.github().pull_requests();
     assert_eq!(pull_requests.len(), 1);
     assert_eq!(pull_requests[0].title.as_deref(), Some("Literal commit"));
-    assert_eq!(&ctx.recorded_pushes()[0].arguments()[..3], ["git", "--no-replace-objects", "push"]);
+    assert_eq!(
+        &ctx.recorded_pushes()[0].arguments()[..11],
+        [
+            "git",
+            "--no-replace-objects",
+            "-c",
+            "remote.gherrit-publication.url=",
+            "-c",
+            "remote.gherrit-publication.pushurl=",
+            "--config-env=remote.gherrit-publication.url=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            "--config-env=remote.gherrit-publication.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            "-c",
+            "http.followRedirects=false",
+            "push",
+        ]
+    );
 }
 
 #[test]

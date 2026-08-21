@@ -9,5 +9,4 @@ STDOUT:
 
 STDERR:
 [gherrit] Branch feature-ls-remote-fail is MANAGED. Syncing stack...
-[gherrit] [WARN] Using custom GitHub API URL: [MOCK_SERVER_URL]
-[gherrit] [ERROR] Command env -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_GRAFT_FILE -u GIT_OBJECT_DIRECTORY -u GIT_REPLACE_REF_BASE -u GIT_SHALLOW_FILE GIT_NO_LAZY_FETCH="1" GIT_NO_REPLACE_OBJECTS="1" "git" "--no-replace-objects" "ls-remote" "origin" "refs/heads/[GHERRIT_ID_1]" failed with status: exit status: 1. Stderr: Simulated failure for git ls-remote
+[gherrit] [ERROR] `git ls-remote --symref` failed for GHerrit remote 'origin'

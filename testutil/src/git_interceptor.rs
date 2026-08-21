@@ -73,8 +73,23 @@ impl GitOperation {
         match subcommand {
             "var" => Some(Self::Var),
             "interpret-trailers" => Some(Self::InterpretTrailers),
-            "ls-remote" => Some(Self::LsRemote),
             _ => None,
+        }
+    }
+
+    fn from_args(args: &[String]) -> Option<Self> {
+        match subcommand(args)? {
+            "config" if args.iter().any(|argument| argument == "--get-urlmatch") => {
+                Some(Self::HttpRedirectPolicy)
+            }
+            "ls-remote" if args.iter().any(|argument| argument == "--get-url") => {
+                Some(Self::LsRemoteUrl)
+            }
+            "ls-remote" if args.iter().any(|argument| argument == "--symref") => {
+                Some(Self::LsRemoteDefaultBranch)
+            }
+            "ls-remote" => Some(Self::LsRemoteManagedBranches),
+            subcommand => Self::from_subcommand(subcommand),
         }
     }
 
@@ -82,7 +97,10 @@ impl GitOperation {
         match self {
             Self::Var => "var",
             Self::InterpretTrailers => "interpret-trailers",
-            Self::LsRemote => "ls-remote",
+            Self::HttpRedirectPolicy => "config --get-urlmatch",
+            Self::LsRemoteUrl | Self::LsRemoteDefaultBranch | Self::LsRemoteManagedBranches => {
+                "ls-remote"
+            }
         }
     }
 }
@@ -90,30 +108,38 @@ impl GitOperation {
 fn check_and_apply_failure(
     mock_state: &mut MockState,
     operation: GitOperation,
-) -> Option<GitOperation> {
-    let FailureKind::Git(expected) = mock_state.faults.front()? else {
-        return None;
+) -> Option<FailureKind> {
+    let matches = match mock_state.faults.front()? {
+        FailureKind::Git(expected) => *expected == operation,
+        FailureKind::GitOutput { operation: expected, .. } => *expected == operation,
+        _ => false,
     };
-    if *expected != operation {
+    if !matches {
         return None;
     }
-
-    let FailureKind::Git(consumed) = mock_state.faults.pop_front().unwrap() else {
-        unreachable!("the front fault was just matched as a Git fault")
-    };
-    Some(consumed)
+    mock_state.faults.pop_front()
 }
 
 /// Returns the subcommand from the command shape emitted by GHerrit.
 ///
-/// The harness recognizes the one global option required by production, but
-/// intentionally does not emulate Git's general global-option grammar. Direct
-/// fixture commands still use the ordinary `git <subcommand>` shape.
+/// The harness recognizes the global options required by production, but does
+/// not emulate Git's general global-option grammar. Direct fixture commands
+/// still use the ordinary `git <subcommand>` shape.
 fn subcommand(args: &[String]) -> Option<&str> {
-    match args.get(1).map(String::as_str) {
-        Some("--no-replace-objects") => args.get(2).map(String::as_str),
-        Some(argument) if !argument.starts_with('-') => Some(argument),
-        Some(_) | None => None,
+    let mut arguments = args.iter().skip(1).map(String::as_str);
+    if arguments.next()? != "--no-replace-objects" {
+        return args.get(1).map(String::as_str).filter(|argument| !argument.starts_with('-'));
+    }
+
+    loop {
+        match arguments.next()? {
+            "-c" => {
+                arguments.next()?;
+            }
+            argument if argument.starts_with("--config-env=") => {}
+            subcommand if !subcommand.starts_with('-') => return Some(subcommand),
+            _ => return None,
+        }
     }
 }
 
@@ -124,17 +150,30 @@ async fn handle_git(
     let subcommand = subcommand(&request.args);
     let is_push = subcommand == Some("push");
 
-    let failure = subcommand.and_then(GitOperation::from_subcommand).and_then(|operation| {
+    let failure = GitOperation::from_args(&request.args).and_then(|operation| {
         check_and_apply_failure(&mut handler.shared.write().unwrap(), operation)
     });
-    if let Some(operation) = failure {
-        return Json(GitResponse {
-            stdout: String::new(),
-            stderr: format!("Simulated failure for git {}", operation.subcommand()),
-            exit_code: 1,
-            passthrough: false,
-            report_exit_status: false,
-        });
+    match failure {
+        Some(FailureKind::Git(operation)) => {
+            return Json(GitResponse {
+                stdout: String::new(),
+                stderr: format!("Simulated failure for git {}", operation.subcommand()),
+                exit_code: 1,
+                passthrough: false,
+                report_exit_status: false,
+            });
+        }
+        Some(FailureKind::GitOutput { stdout, .. }) => {
+            return Json(GitResponse {
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+                exit_code: 0,
+                passthrough: false,
+                report_exit_status: false,
+            });
+        }
+        Some(_) => unreachable!("only Git failures are matched by the Git interceptor"),
+        None => {}
     }
 
     if is_push {
@@ -201,6 +240,23 @@ mod tests {
             subcommand(&args(&["git", "--no-replace-objects", "push", "origin"])),
             Some("push")
         );
+        assert_eq!(
+            subcommand(&args(&[
+                "git",
+                "--no-replace-objects",
+                "-c",
+                "remote.gherrit-publication.url=",
+                "-c",
+                "remote.gherrit-publication.pushurl=",
+                "--config-env=remote.gherrit-publication.url=GHERRIT_PRIVATE_PUSH_DESTINATION",
+                "--config-env=remote.gherrit-publication.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
+                "-c",
+                "http.followRedirects=false",
+                "push",
+                "gherrit-publication",
+            ])),
+            Some("push")
+        );
         assert_eq!(subcommand(&args(&["git", "ls-remote", "origin"])), Some("ls-remote"));
         assert_eq!(subcommand(&args(&["git"])), None);
         assert_eq!(subcommand(&args(&["git", "--version"])), None);
@@ -217,11 +273,40 @@ mod tests {
         for (subcommand, expected) in [
             ("var", Some(GitOperation::Var)),
             ("interpret-trailers", Some(GitOperation::InterpretTrailers)),
-            ("ls-remote", Some(GitOperation::LsRemote)),
+            ("ls-remote", None),
             ("push", None),
             ("status", None),
         ] {
             assert_eq!(GitOperation::from_subcommand(subcommand), expected);
+        }
+
+        for (arguments, expected) in [
+            (
+                &[
+                    "git",
+                    "--no-replace-objects",
+                    "-c",
+                    "http.followRedirects=false",
+                    "config",
+                    "--bool",
+                    "--get-urlmatch",
+                ][..],
+                Some(GitOperation::HttpRedirectPolicy),
+            ),
+            (
+                &["git", "--no-replace-objects", "ls-remote", "--get-url"][..],
+                Some(GitOperation::LsRemoteUrl),
+            ),
+            (
+                &["git", "--no-replace-objects", "ls-remote", "--symref"][..],
+                Some(GitOperation::LsRemoteDefaultBranch),
+            ),
+            (
+                &["git", "--no-replace-objects", "ls-remote", "refs/heads/Gone"][..],
+                Some(GitOperation::LsRemoteManagedBranches),
+            ),
+        ] {
+            assert_eq!(GitOperation::from_args(&args(arguments)), expected);
         }
     }
 
@@ -229,16 +314,19 @@ mod tests {
     fn git_faults_match_in_script_order() {
         let expected = VecDeque::from([
             FailureKind::Git(GitOperation::Var),
-            FailureKind::Git(GitOperation::LsRemote),
+            FailureKind::Git(GitOperation::LsRemoteDefaultBranch),
         ]);
         let mut state = MockState { faults: expected.clone(), ..Default::default() };
 
-        assert_eq!(check_and_apply_failure(&mut state, GitOperation::LsRemote), None);
+        assert_eq!(check_and_apply_failure(&mut state, GitOperation::LsRemoteDefaultBranch), None);
         assert_eq!(state.faults, expected);
-        assert_eq!(check_and_apply_failure(&mut state, GitOperation::Var), Some(GitOperation::Var));
         assert_eq!(
-            check_and_apply_failure(&mut state, GitOperation::LsRemote),
-            Some(GitOperation::LsRemote)
+            check_and_apply_failure(&mut state, GitOperation::Var),
+            Some(FailureKind::Git(GitOperation::Var))
+        );
+        assert_eq!(
+            check_and_apply_failure(&mut state, GitOperation::LsRemoteDefaultBranch),
+            Some(FailureKind::Git(GitOperation::LsRemoteDefaultBranch))
         );
         assert!(state.faults.is_empty());
 
