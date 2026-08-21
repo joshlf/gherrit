@@ -157,17 +157,31 @@ entire evolution of a PR. These version tags can be used to diff any two
 versions of a PR – this is how GHerrit generates the **Patch History Table** in
 the PR description.
 
-#### Optimistic Concurrency Control
+The tags advertised by the configured push destination are the authoritative
+version history. GHerrit neither reads nor creates local version tags, so a
+fresh clone and an older working copy select the same next version. Before any
+write, GHerrit observes the active managed heads and exact active tag
+namespaces, then requires every published history to be contiguous from `v1`
+and its latest tag to agree with the managed head. It validates and plans the
+complete local stack before publishing any prefix of it.
 
-GHerrit enforces optimistic locking to prevent race conditions when multiple
-users update the same stack. When pushing a new version tag (e.g., `v2`),
-GHerrit uses the atomic push option:
-`--force-with-lease=refs/tags/gherrit/<id>/v<ver>:`.
+#### Leased Git Updates
+
+GHerrit's publication protocol assumes one publisher at a time. For every
+change it does update, GHerrit nevertheless rejects drift between observation
+and the Git write: the managed branch is leased against the exact object
+observed at the push destination, and a new version tag (e.g., `v2`) is leased
+against absence:
+`--force-with-lease=refs/tags/gherrit/<id>/v<ver>:`. The branch and tag updates
+for each bounded publication batch are sent in one atomic push. Up-to-date
+managed refs are not included in a push, and GitHub mutations are not
+serialized with Git writes, so these leases are not a general multi-publisher
+lock.
 
 The trailing colon (`:`) tells Git to ensure the ref does **not** already exist
 on the remote. If another user has already pushed `v2` in the interim, the
-assertion fails, the push is rejected, and the user is forced to fetch and
-rebase, preserving the integrity of the patch history.
+assertion fails and the complete atomic batch is rejected. The publisher must
+observe the destination again before retrying.
 
 #### `pre-push` Hook
 
