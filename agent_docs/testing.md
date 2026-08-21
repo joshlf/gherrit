@@ -149,7 +149,8 @@ The core model should distinguish at least:
 
 - local commits, with object ID, GHerrit ID, title, body, and stack position;
 - stack visibility and base branch;
-- observed managed branches and version tags;
+- destination-scoped observations which couple each active change to its
+  managed head, owned base, and complete immutable version history;
 - pull requests keyed by stable GHerrit ID, including lifecycle state;
 - desired pull request specifications and minimal update patches;
 - ref updates with explicit expected and desired object IDs; and
@@ -168,9 +169,13 @@ call into `gix`, `Command`, Octocrab, or an HTTP client.
 The Git boundary should support:
 
 - observing the local stack and branch configuration;
-- observing relevant managed branches and tags;
-- publishing one atomic batch with explicit leases; and
-- recording locally any state required after confirmed publication.
+- observing every relevant managed branch and exact active tag namespace at
+  the bound push destination; and
+- publishing bounded atomic batches with explicit branch and tag leases.
+
+Remote immutable tags are version authority. The boundary must not consult or
+persist local version tags: tests must produce the same next version from a
+fresh clone, a clone with stale local tags, and a split fetch/push remote.
 
 The GitHub boundary should support:
 

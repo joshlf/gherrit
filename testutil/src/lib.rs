@@ -456,7 +456,11 @@ impl Drop for MockServerInfo {
 pub enum GitOperation {
     Var,
     InterpretTrailers,
-    LsRemote,
+    HttpRedirectPolicy,
+    LsRemoteUrl,
+    LsRemoteDefaultBranch,
+    LsRemoteManagedBranches,
+    LsRemoteActiveVersions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,13 +480,13 @@ pub enum FailureKind {
     GraphQl,
     QueryTransport,
     QueryHttp(RetryableHttpStatus),
-    RepositoryIdHttp(RetryableHttpStatus),
     CreatePr,
     CreatePrHttp(RetryableHttpStatus),
     SecondCreatePrHttp(RetryableHttpStatus),
     CreatePrRedirect(RedirectStatus),
     UpdatePr,
     Git(GitOperation),
+    GitOutput { operation: GitOperation, stdout: &'static str },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -591,6 +595,23 @@ impl MockGithub<'_> {
         self.context.inspect_mock_state(|state| state.graphql_redirect_trap_requests)
     }
 
+    pub fn git_redirect_source_requests(&self) -> usize {
+        self.context.inspect_mock_state(|state| state.git_redirect_source_requests)
+    }
+
+    pub fn git_redirect_trap_requests(&self) -> usize {
+        self.context.inspect_mock_state(|state| state.git_redirect_trap_requests)
+    }
+
+    /// Overrides GitHub's view of the repository default branch without
+    /// changing the bare Git repository. This models cross-system disagreement
+    /// which production code must reject before writing either system.
+    pub fn set_default_branch(&self, name: &str, object_id: &str) {
+        self.context.mutate_mock_state(|state| {
+            state.github_default_branch = Some((name.to_string(), object_id.to_string()));
+        });
+    }
+
     pub fn seed_pull_request(&self, seed: PullRequestSeed) {
         self.context.mutate_mock_state(|state| {
             let pr = mock_server::PrEntry::mock(mock_server::MockPrArgs {
@@ -639,17 +660,22 @@ impl Drop for TestContext {
         // Stop the server before fixture directories and state are released.
         drop(self.mock_server.take());
 
-        let (state_poisoned, pending_faults) = self
+        let (state_poisoned, pending_faults, pending_remote_updates) = self
             .mock_server_state
             .as_ref()
             .map(|state| match state.read() {
-                Ok(state) => (false, state.faults.clone()),
-                Err(poisoned) => (true, poisoned.into_inner().faults.clone()),
+                Ok(state) => {
+                    (false, state.faults.clone(), state.git.pending_remote_ref_updates().clone())
+                }
+                Err(poisoned) => {
+                    let state = poisoned.into_inner();
+                    (true, state.faults.clone(), state.git.pending_remote_ref_updates().clone())
+                }
             })
             .unwrap_or_default();
         if state_poisoned {
             let message = format!(
-                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}"
+                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}; unconsumed remote updates: {pending_remote_updates:?}"
             );
             if thread::panicking() {
                 eprintln!("{message}");
@@ -663,6 +689,15 @@ impl Drop for TestContext {
                 eprintln!("Test fixture also has unconsumed faults: {pending_faults:?}");
             } else {
                 panic!("Test fixture has unconsumed faults: {pending_faults:?}");
+            }
+        }
+        if !pending_remote_updates.is_empty() {
+            if thread::panicking() {
+                eprintln!(
+                    "Test fixture also has unconsumed remote updates: {pending_remote_updates:?}"
+                );
+            } else {
+                panic!("Test fixture has unconsumed remote updates: {pending_remote_updates:?}");
             }
         }
     }
@@ -699,9 +734,14 @@ impl TestContext {
 
     #[must_use = "command builders do nothing until executed"]
     pub fn gherrit_cmd(&self) -> TestCommand {
+        self.gherrit_cmd_at(&self.repo_path)
+    }
+
+    #[must_use = "command builders do nothing until executed"]
+    pub fn gherrit_cmd_at(&self, directory: &Path) -> TestCommand {
         // Use injected binary path
         let mut cmd = TestCommand::new(&self.gherrit_bin_path);
-        cmd.current_dir(&self.repo_path);
+        cmd.current_dir(directory);
 
         self.configure_test_env(&mut cmd);
 
@@ -723,8 +763,13 @@ impl TestContext {
 
     #[must_use = "command builders do nothing until executed"]
     pub fn git_cmd(&self) -> TestCommand {
+        self.git_cmd_at(&self.repo_path)
+    }
+
+    #[must_use = "command builders do nothing until executed"]
+    pub fn git_cmd_at(&self, directory: &Path) -> TestCommand {
         let mut cmd = TestCommand::new("git");
-        cmd.current_dir(&self.repo_path);
+        cmd.current_dir(directory);
         self.configure_test_env(&mut cmd);
         cmd
     }
@@ -863,7 +908,7 @@ impl TestContext {
 
     pub fn inject_failure(&self, kind: FailureKind) {
         match kind {
-            FailureKind::Git(_) => assert!(
+            FailureKind::Git(_) | FailureKind::GitOutput { .. } => assert!(
                 self.has_git_interceptor,
                 "missing test capability: .with_git_interceptor()"
             ),
@@ -874,6 +919,23 @@ impl TestContext {
 
     pub fn expect_git_failure(&self, operation: GitOperation) {
         self.inject_failure(FailureKind::Git(operation));
+    }
+
+    pub fn expect_git_output(&self, operation: GitOperation, stdout: &'static str) {
+        self.inject_failure(FailureKind::GitOutput { operation, stdout });
+    }
+
+    /// Changes one remote ref after observation and immediately before push.
+    pub fn update_remote_ref_before_push(
+        &self,
+        ref_name: impl Into<String>,
+        target: impl Into<String>,
+    ) {
+        assert!(self.has_remote, "missing test capability: .with_remote()");
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        self.mock_state().write().unwrap().git.schedule_remote_ref_update(
+            git_interceptor::RemoteRefUpdate { ref_name: ref_name.into(), target: target.into() },
+        );
     }
 
     fn enqueue_failure(&self, kind: FailureKind) {
@@ -924,6 +986,11 @@ impl TestContext {
                 })
                 .collect()
         })
+    }
+
+    pub fn recorded_git_invocations(&self, operation: GitOperation) -> Vec<Vec<String>> {
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        self.inspect_mock_state(|state| state.git.invocations(operation))
     }
 
     pub fn formatted_github_state(&self) -> String {
