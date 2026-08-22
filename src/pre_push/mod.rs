@@ -18,6 +18,10 @@ mod local;
 mod publication;
 mod reconcile;
 mod remote;
+// This production boundary is wired into destination commands by the owned-base
+// activation change. Keep it independently testable while that cutover is built.
+#[allow(dead_code)]
+mod subprocess;
 mod version;
 
 use body::PrBody;
