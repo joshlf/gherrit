@@ -294,6 +294,22 @@ pub(super) struct ManagedOpenPullRequest {
     has_landing_automation: bool,
 }
 
+pub(super) struct ManagedOpenParts {
+    id: GherritPrId,
+    identity: PullRequestIdentity,
+    observed_base: ObservedBase,
+    title: Box<str>,
+    body: Box<str>,
+}
+
+impl ManagedOpenParts {
+    pub(super) fn into_parts(
+        self,
+    ) -> (GherritPrId, PullRequestIdentity, ObservedBase, Box<str>, Box<str>) {
+        (self.id, self.identity, self.observed_base, self.title, self.body)
+    }
+}
+
 impl ManagedOpenPullRequest {
     pub(super) fn id(&self) -> &GherritPrId {
         &self.id
@@ -321,6 +337,16 @@ impl ManagedOpenPullRequest {
 
     pub(super) fn has_landing_automation(&self) -> bool {
         self.has_landing_automation
+    }
+
+    pub(super) fn into_validated_parts(self) -> ManagedOpenParts {
+        ManagedOpenParts {
+            id: self.id,
+            identity: self.identity,
+            observed_base: self.base,
+            title: self.title,
+            body: self.body,
+        }
     }
 }
 
@@ -359,6 +385,16 @@ impl CorrelatedPullRequests {
 
     pub(super) fn initial_identities(&self) -> &InitialPullRequestIdentities {
         &self.initial_identities
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        Box<[LocalPullRequestObservation]>,
+        Box<[ManagedOpenPullRequest]>,
+        InitialPullRequestIdentities,
+    ) {
+        (self.local, self.nonlocal, self.initial_identities)
     }
 }
 
@@ -663,6 +699,28 @@ impl TerminalHistories {
 
     pub(super) fn is_empty(&self) -> bool {
         self.by_id.is_empty()
+    }
+
+    /// Consumes complete empty terminal history against one exact local order.
+    ///
+    /// The observation is keyed by ID, so response arrival order is
+    /// irrelevant. The caller supplies the local-stack order only after the
+    /// observed and expected ID sets agree exactly.
+    pub(super) fn into_exact_empty_ids(
+        self,
+        expected_in_stack_order: &[GherritPrId],
+    ) -> Result<Box<[GherritPrId]>> {
+        let mut expected = HashSet::with_capacity(expected_in_stack_order.len());
+        for id in expected_in_stack_order {
+            if !expected.insert(id.clone()) {
+                bail!("terminal-history join repeats expected change '{}'", id.as_str());
+            }
+        }
+        let observed = self.into_legacy_empty_ids()?;
+        if observed != expected {
+            bail!("terminal-history join does not match the exact missing-OPEN change set");
+        }
+        Ok(expected_in_stack_order.to_vec().into_boxed_slice())
     }
 
     /// Temporary adapter for the active publisher removed by activation.

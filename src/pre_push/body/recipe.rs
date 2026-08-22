@@ -12,6 +12,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 use super::MAX_BODY_SIZE_BYTES;
 use crate::pre_push::{
+    destination::{PushDestination, RepositoryCoordinates},
     history::{Revision, ValidatedChangeHistory},
     local::{CommitBody, GherritPrId, LocalChange, LocalStack, PullRequestTitle},
     pull_request::PullRequestNumber,
@@ -19,46 +20,52 @@ use crate::pre_push::{
 };
 
 const MAX_PENDING_PULL_REQUEST_NUMBER: u64 = i32::MAX as u64;
-const METADATA_PREFIX: &str = "<!-- gherrit-meta:";
 
-/// Link context which cannot add control-delimited lines or reserved metadata.
+/// The selected repository and optional raw public branch used by body links.
 ///
-/// Repository and branch provenance remains a planner obligation. This narrow
-/// pre-activation value does not claim to be a general Markdown URL escaper.
+/// Repository and branch provenance remains a planner obligation. The branch
+/// stays raw here because the label and URL projections belong at the output
+/// boundary and must always derive from the same value.
 #[derive(Debug, Eq, PartialEq)]
 pub(in crate::pre_push) struct BodyLinkContext {
-    repository_url: String,
+    repository: RepositoryCoordinates,
     public_branch: Option<String>,
 }
 
 impl BodyLinkContext {
-    pub(in crate::pre_push) fn new(
-        repository_url: String,
+    /// Derives repository links from the exact selected push destination.
+    pub(in crate::pre_push) fn from_destination(
+        destination: &PushDestination,
         public_branch: Option<String>,
     ) -> Result<Self> {
-        validate_link_fragment("repository URL", &repository_url)?;
+        let repository = destination.repository_coordinates();
+        Self::new(repository, public_branch)
+    }
+
+    fn new(repository: RepositoryCoordinates, public_branch: Option<String>) -> Result<Self> {
         if let Some(branch) = &public_branch {
-            validate_link_fragment("public branch", branch)?;
+            validate_public_branch(branch)?;
         }
-        Ok(Self { repository_url, public_branch })
+        Ok(Self { repository, public_branch })
+    }
+
+    pub(in crate::pre_push) fn agrees_with(&self, destination: &PushDestination) -> bool {
+        self.repository == destination.repository_coordinates()
     }
 }
 
-fn validate_link_fragment(field: &str, value: &str) -> Result<()> {
+fn validate_public_branch(value: &str) -> Result<()> {
     if value.is_empty() {
-        bail!("A body recipe requires a nonempty {field}");
+        bail!("A body recipe requires a nonempty public branch");
     }
-    // ASCII control bytes and DEL could create body lines outside the link.
-    // Git excludes them from ref names. Git accepts UTF-8 C1 control scalars,
-    // however, and the branch renderer treats those as safe non-ASCII data: it
-    // writes them literally in the label and percent-encodes their URL bytes.
-    // A Unicode-wide `char::is_control` check would reject valid Git branches
-    // without protecting either output grammar.
+    // Git excludes ASCII control bytes and DEL from ref names, and those bytes
+    // could create body lines outside the branch link. It accepts UTF-8 C1
+    // control scalars, however. Those are safe data here: the Markdown label
+    // writes them literally and the URL projection percent-encodes their UTF-8
+    // bytes. A Unicode-wide `char::is_control` check would therefore reject
+    // valid Git branches without protecting either output grammar.
     if value.bytes().any(|byte| byte.is_ascii_control()) {
-        bail!("A body recipe {field} must not contain ASCII control bytes");
-    }
-    if value.contains(METADATA_PREFIX) {
-        bail!("A body recipe {field} contains the reserved GHerrit metadata marker");
+        bail!("A body recipe public branch must not contain ASCII control bytes");
     }
     Ok(())
 }
@@ -98,6 +105,12 @@ fn write_public_branch_link(output: &mut impl fmt::Write, branch: &str) -> fmt::
 pub(in crate::pre_push) struct GeneratedBody(Box<str>);
 
 impl GeneratedBody {
+    #[cfg(test)]
+    pub(in crate::pre_push) fn for_test(value: &str) -> Self {
+        assert!(value.len() <= MAX_BODY_SIZE_BYTES, "test body must satisfy the product limit");
+        Self(value.into())
+    }
+
     pub(in crate::pre_push) fn as_str(&self) -> &str {
         &self.0
     }
@@ -194,7 +207,8 @@ impl StackBodyRecipes {
         stack: LocalStack,
         inputs: Vec<BodyRecipeInput>,
     ) -> Result<Self> {
-        let BodyLinkContext { repository_url, public_branch } = context;
+        let BodyLinkContext { repository, public_branch } = context;
+        let repository_url = repository.relative_url();
         let changes = stack.into_changes();
         if changes.len() != inputs.len() {
             bail!(
@@ -941,13 +955,20 @@ mod tests {
         stack: LocalStack,
         histories: Vec<ValidatedChangeHistory>,
     ) -> Result<StackBodyRecipes> {
+        debug_assert_eq!(repository_url, "/octo/widgets");
+        let destination =
+            PushDestination::for_test("origin", "https://github.com/octo/widgets.git", Vec::new())?;
         let context =
-            BodyLinkContext::new(repository_url.to_owned(), public_branch.map(str::to_owned))?;
+            BodyLinkContext::from_destination(&destination, public_branch.map(str::to_owned))?;
         StackBodyRecipes::new(context, stack, histories.into_iter().map(missing_input).collect())
     }
 
     fn link_context(repository_url: &str, public_branch: Option<&str>) -> BodyLinkContext {
-        BodyLinkContext::new(repository_url.to_owned(), public_branch.map(str::to_owned)).unwrap()
+        debug_assert_eq!(repository_url, "/octo/widgets");
+        let destination =
+            PushDestination::for_test("origin", "https://github.com/octo/widgets.git", Vec::new())
+                .unwrap();
+        BodyLinkContext::from_destination(&destination, public_branch.map(str::to_owned)).unwrap()
     }
 
     fn rendered_report(bodies: &[RenderedBody]) -> String {
@@ -1361,13 +1382,6 @@ mod tests {
     }
 
     #[test]
-    fn construction_rejects_an_empty_repository_url() {
-        let (stack, histories) = stack_fixture(&[("Gurl", "URL", "Body")]);
-        let error = missing_recipes("", None, stack, histories).unwrap_err();
-        assert!(error.to_string().contains("nonempty repository URL"));
-    }
-
-    #[test]
     fn public_branch_links_escape_markdown_and_encode_url_paths() {
         let mut rendered = String::new();
         for branch in [
@@ -1423,6 +1437,11 @@ mod tests {
 
     #[test]
     fn public_branch_validation_matches_git_control_domain() {
+        let destination =
+            PushDestination::for_test("origin", "https://github.com/octo/widgets.git", Vec::new())
+                .unwrap();
+        let repository = destination.repository_coordinates();
+
         for byte in (0..=0x1f).chain([0x7f]) {
             let branch = format!("feature/{}tail", char::from(byte));
             let full_name = format!("refs/heads/{branch}");
@@ -1431,10 +1450,11 @@ mod tests {
                 "ASCII control byte {byte:#04x} must be outside Git's branch domain"
             );
             assert!(
-                BodyLinkContext::new("/octo/widgets".to_owned(), Some(branch)).is_err(),
+                BodyLinkContext::new(repository.clone(), Some(branch)).is_err(),
                 "ASCII control byte {byte:#04x} must not reach a body line"
             );
         }
+        assert!(BodyLinkContext::new(repository.clone(), Some(String::new())).is_err());
 
         for scalar in 0x80..=0x9f {
             let control = char::from_u32(scalar).unwrap();
@@ -1442,7 +1462,7 @@ mod tests {
             let full_name = format!("refs/heads/{branch}");
             gix::refs::FullName::try_from(full_name.as_str())
                 .expect("a UTF-8 C1 control scalar is valid Git branch data");
-            BodyLinkContext::new("/octo/widgets".to_owned(), Some(branch.clone()))
+            BodyLinkContext::new(repository.clone(), Some(branch.clone()))
                 .expect("every valid UTF-8 Git branch must remain linkable");
 
             let mut rendered = String::new();
@@ -1455,20 +1475,6 @@ mod tests {
                 "UTF-8 C1 control scalar U+{scalar:04X}"
             );
         }
-    }
-
-    #[test]
-    fn link_context_rejects_structure_and_metadata_injection() {
-        for repository_url in ["/octo/line\nbreak", "/octo/widgets<!-- gherrit-meta: forged -->"] {
-            assert!(BodyLinkContext::new(repository_url.to_owned(), None).is_err());
-        }
-        for public_branch in ["feature/line\nbreak", "feature/x<!-- gherrit-meta: forged -->"] {
-            assert!(
-                BodyLinkContext::new("/octo/widgets".to_owned(), Some(public_branch.to_owned()),)
-                    .is_err()
-            );
-        }
-        assert!(BodyLinkContext::new("/octo/widgets".to_owned(), Some(String::new())).is_err());
     }
 
     #[test]

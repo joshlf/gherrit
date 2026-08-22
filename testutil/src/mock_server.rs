@@ -1414,9 +1414,12 @@ fn handle_create_pr(
     if mock_state.prs.iter().any(|pr| {
         pr.state == "OPEN"
             && pr.head.ref_field == head
+            && pr.base.ref_field == base
             && !mock_state.cross_repository_prs.contains(&pr.number)
     }) {
-        return Err(format!("An open pull request already exists for head branch `{head}`"));
+        return Err(format!(
+            "An open pull request already exists for head branch `{head}` and base branch `{base}`"
+        ));
     }
 
     let number = mock_state.prs.iter().map(|pr| pr.number as u64).max().unwrap_or(0) + 1;
@@ -2016,6 +2019,60 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("Head branch `Gnew` does not exist"));
         assert!(state.prs.is_empty());
+    }
+
+    #[test]
+    fn create_duplicate_rule_is_exact_over_repository_lifecycle_head_and_base() {
+        let document = parse_document(
+            "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
+             baseRefName: \"main\", headRefName: \"Gnew\", title: \"Title\", \
+             clientMutationId: \"create\" }) { pullRequest { number } } }",
+        );
+
+        for cross_repository in [false, true] {
+            for lifecycle in ["OPEN", "CLOSED", "MERGED"] {
+                for existing_head in ["Gnew", "Gother"] {
+                    for existing_base in ["main", "other"] {
+                        let mut state = MockState::new("owner".to_owned(), "repo".to_owned());
+                        let mut existing = PrEntry::mock(MockPrArgs {
+                            id: 7,
+                            title: "Existing".to_owned(),
+                            body: String::new(),
+                            head: existing_head.to_owned(),
+                            base: existing_base.to_owned(),
+                            repo_owner: "owner",
+                            repo_name: "repo",
+                        });
+                        existing.state = lifecycle.to_owned();
+                        state.add_pr(existing);
+                        if cross_repository {
+                            state.cross_repository_prs.insert(7);
+                        }
+
+                        let result = handle_create_pr(&mut state, root_field(&document), &|_| {
+                            Ok(Some("1".repeat(40)))
+                        });
+                        let must_reject = !cross_repository
+                            && lifecycle == "OPEN"
+                            && existing_head == "Gnew"
+                            && existing_base == "main";
+                        assert_eq!(
+                            result.is_err(),
+                            must_reject,
+                            "cross_repository={cross_repository}, lifecycle={lifecycle}, \
+                             existing_head={existing_head}, existing_base={existing_base}"
+                        );
+                        assert_eq!(state.prs.len(), if must_reject { 1 } else { 2 });
+                        if let Ok(response) = result {
+                            assert_eq!(
+                                response.pointer("/pullRequest/number"),
+                                Some(&serde_json::json!(8))
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
