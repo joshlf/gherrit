@@ -34,7 +34,7 @@ const VERSION_PREFIX: &[u8] = b"refs/tags/gherrit/";
 #[derive(Debug)]
 pub(super) struct RemoteHeads {
     default_branch: DefaultBranch,
-    managed_heads: HashMap<GherritPrId, ObjectId>,
+    candidate_heads: HashMap<GherritPrId, ObjectId>,
     owned_bases: HashMap<GherritPrId, ObjectId>,
 }
 
@@ -43,8 +43,12 @@ impl RemoteHeads {
         &self.default_branch
     }
 
-    pub(super) fn managed_head(&self, id: &GherritPrId) -> Option<ObjectId> {
-        self.managed_heads.get(id).copied()
+    /// Returns a syntactically eligible top-level head.
+    ///
+    /// A matching name is only candidate evidence. Pull-request metadata or
+    /// the corresponding owned-base ref must establish managed identity.
+    pub(super) fn candidate_head(&self, id: &GherritPrId) -> Option<ObjectId> {
+        self.candidate_heads.get(id).copied()
     }
 
     pub(super) fn owned_base(&self, id: &GherritPrId) -> Option<ObjectId> {
@@ -81,7 +85,7 @@ impl<'stack> ObservedStack<'stack> {
                 })?;
                 Ok(ObservedChange {
                     change,
-                    head: heads.managed_head(change.id()),
+                    head: heads.candidate_head(change.id()),
                     owned_base: heads.owned_base(change.id()),
                     versions: history,
                 })
@@ -413,7 +417,7 @@ fn parse_remote_heads(output: &[u8]) -> Result<RemoteHeads> {
     let branch = str::from_utf8(branch).wrap_err("default branch name is not UTF-8")?.to_owned();
     let default_branch = DefaultBranch::new(branch, *direct_head)?;
 
-    let mut managed_heads = HashMap::new();
+    let mut candidate_heads = HashMap::new();
     let mut owned_bases = HashMap::new();
     for (name, object_id) in direct {
         if name.ends_with(b"^{}") {
@@ -424,10 +428,17 @@ fn parse_remote_heads(output: &[u8]) -> Result<RemoteHeads> {
         } else if parse_version_tag_name(&name)?.is_some() {
             bail!("head advertisement unexpectedly included immutable version history");
         } else if let Some(id) = parse_top_level_change_head(&name) {
-            managed_heads.insert(id, object_id);
+            candidate_heads.insert(id, object_id);
         }
     }
-    Ok(RemoteHeads { default_branch, managed_heads, owned_bases })
+    Ok(RemoteHeads { default_branch, candidate_heads, owned_bases })
+}
+
+#[cfg(test)]
+pub(super) fn parse_remote_heads_for_test(output: &[u8]) -> Result<RemoteHeads> {
+    // Tests in neighboring behavior modules deliberately enter through the
+    // production byte parser instead of manufacturing a validated head set.
+    parse_remote_heads(output)
 }
 
 fn validate_advertised_ref_name(name: &[u8]) -> Result<()> {
@@ -676,9 +687,9 @@ mod tests {
 
         let heads = parse_remote_heads(&output).unwrap();
         assert_eq!(heads.default_branch().name(), "main");
-        assert_eq!(heads.managed_head(&id("Gone")).unwrap().to_string(), ONE);
+        assert_eq!(heads.candidate_head(&id("Gone")).unwrap().to_string(), ONE);
         assert_eq!(heads.owned_base(&id("Gone")).unwrap().to_string(), TWO);
-        assert_eq!(heads.managed_head(&id("Gmissing")), None);
+        assert_eq!(heads.candidate_head(&id("Gmissing")), None);
         assert_eq!(heads.owned_base(&id("Gmissing")), None);
     }
 
@@ -692,9 +703,9 @@ mod tests {
         );
         let heads = parse_remote_heads(output.as_bytes()).unwrap();
 
-        assert!(heads.managed_heads.is_empty());
+        assert!(heads.candidate_heads.is_empty());
         assert!(heads.owned_bases.is_empty());
-        assert_eq!(heads.managed_head(&id("Gone")), None);
+        assert_eq!(heads.candidate_head(&id("Gone")), None);
         assert_eq!(heads.owned_base(&id("Gone")), None);
     }
 

@@ -16,6 +16,7 @@ mod destination;
 mod github;
 mod local;
 mod publication;
+mod pull_request;
 mod reconcile;
 mod remote;
 // This production boundary is wired into destination commands by the owned-base
