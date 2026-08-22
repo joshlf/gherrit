@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, VecDeque},
     env,
     ffi::OsString,
     fmt, fs, panic,
@@ -476,15 +476,17 @@ pub enum RedirectStatus {
     Permanent,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailureKind {
     GraphQl,
     QueryTransport,
     QueryHttp(RetryableHttpStatus),
+    QueryBadRequest,
     CreatePr,
     CreatePrHttp(RetryableHttpStatus),
     SecondCreatePrHttp(RetryableHttpStatus),
     CreatePrRedirect(RedirectStatus),
+    ApplyMutationIdsThenDisconnect(Box<[String]>),
     UpdatePr,
     Git(GitOperation),
     GitOutput { operation: GitOperation, stdout: &'static str },
@@ -497,6 +499,41 @@ pub enum GraphQlOperation {
     Query,
     CreatePr,
     UpdatePr,
+}
+
+/// Canonical wire meaning for one schema-validated GraphQL request.
+///
+/// Selection lists are sorted because GraphQL field order has no semantic
+/// meaning. Connections and mutation operations retain their wire order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphQlExchange {
+    Repository {
+        owner: String,
+        repository: String,
+        selected_fields: Vec<String>,
+        connections: Vec<PullRequestConnectionExchange>,
+    },
+    Mutation {
+        operations: Vec<MutationExchange>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestConnectionExchange {
+    pub alias: Option<String>,
+    pub head: Option<String>,
+    pub first: usize,
+    pub after: Option<String>,
+    pub states: Vec<String>,
+    pub selected_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationExchange {
+    pub operation: GraphQlOperation,
+    pub alias: Option<String>,
+    pub input: BTreeMap<String, String>,
+    pub selected_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -600,6 +637,35 @@ impl MockGithub<'_> {
         self.context.inspect_mock_state(|state| state.graphql_requests.clone())
     }
 
+    /// Installs a strict, ordered semantic GraphQL transcript.
+    ///
+    /// Schema/AST validation still runs first. Teardown rejects mismatches,
+    /// unexpected requests, and expected exchanges left unconsumed.
+    pub fn expect_graphql_transcript(&self, exchanges: impl IntoIterator<Item = GraphQlExchange>) {
+        self.context.mutate_mock_state(|state| {
+            assert!(
+                state.semantic_graphql_transcript.is_none(),
+                "a semantic GraphQL transcript is already installed"
+            );
+            state.semantic_graphql_transcript = Some(exchanges.into_iter().collect());
+        });
+    }
+
+    pub fn assert_graphql_transcript_consumed(&self) {
+        self.context.inspect_mock_state(|state| {
+            assert!(
+                state.semantic_graphql_error.is_none(),
+                "semantic GraphQL transcript failed: {}",
+                state.semantic_graphql_error.as_deref().unwrap_or_default()
+            );
+            assert!(
+                state.semantic_graphql_transcript.as_ref().is_some_and(VecDeque::is_empty),
+                "semantic GraphQL transcript has unconsumed exchanges: {:?}",
+                state.semantic_graphql_transcript
+            );
+        });
+    }
+
     pub fn redirect_trap_requests(&self) -> usize {
         self.context.inspect_mock_state(|state| state.graphql_redirect_trap_requests)
     }
@@ -650,6 +716,19 @@ impl MockGithub<'_> {
         });
     }
 
+    pub fn mark_pull_request_cross_repository(&self, number: usize) {
+        self.context.mutate_mock_state(|state| {
+            assert!(
+                state.prs.iter().any(|pull_request| pull_request.number == number),
+                "pull request #{number} does not exist"
+            );
+            assert!(
+                state.cross_repository_prs.insert(number),
+                "pull request #{number} is already marked cross-repository"
+            );
+        });
+    }
+
     /// Replaces the raw identities returned for one pull request.
     ///
     /// Protocol tests use this to construct contradictory GitHub evidence
@@ -672,7 +751,13 @@ impl Drop for TestContext {
         // Stop the server before fixture directories and state are released.
         drop(self.mock_server.take());
 
-        let (state_poisoned, pending_faults, pending_remote_transactions) = self
+        let (
+            state_poisoned,
+            pending_faults,
+            pending_remote_transactions,
+            pending_graphql_transcript,
+            graphql_transcript_error,
+        ) = self
             .mock_server_state
             .as_ref()
             .map(|state| match state.read() {
@@ -680,6 +765,8 @@ impl Drop for TestContext {
                     false,
                     state.faults.clone(),
                     state.git.pending_remote_ref_transactions().clone(),
+                    state.semantic_graphql_transcript.clone(),
+                    state.semantic_graphql_error.clone(),
                 ),
                 Err(poisoned) => {
                     let state = poisoned.into_inner();
@@ -687,13 +774,15 @@ impl Drop for TestContext {
                         true,
                         state.faults.clone(),
                         state.git.pending_remote_ref_transactions().clone(),
+                        state.semantic_graphql_transcript.clone(),
+                        state.semantic_graphql_error.clone(),
                     )
                 }
             })
             .unwrap_or_default();
         if state_poisoned {
             let message = format!(
-                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}; unconsumed remote ref transactions: {pending_remote_transactions:?}"
+                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}; unconsumed remote ref transactions: {pending_remote_transactions:?}; unconsumed GraphQL transcript: {pending_graphql_transcript:?}; GraphQL transcript error: {graphql_transcript_error:?}"
             );
             if thread::panicking() {
                 eprintln!("{message}");
@@ -717,6 +806,24 @@ impl Drop for TestContext {
             } else {
                 panic!(
                     "Test fixture has unconsumed remote ref transactions: {pending_remote_transactions:?}"
+                );
+            }
+        }
+        if let Some(error) = graphql_transcript_error {
+            if thread::panicking() {
+                eprintln!("Test fixture also has a GraphQL transcript error: {error}");
+            } else {
+                panic!("Test fixture has a GraphQL transcript error: {error}");
+            }
+        }
+        if pending_graphql_transcript.as_ref().is_some_and(|transcript| !transcript.is_empty()) {
+            if thread::panicking() {
+                eprintln!(
+                    "Test fixture also has unconsumed GraphQL exchanges: {pending_graphql_transcript:?}"
+                );
+            } else {
+                panic!(
+                    "Test fixture has unconsumed GraphQL exchanges: {pending_graphql_transcript:?}"
                 );
             }
         }
@@ -932,7 +1039,7 @@ impl TestContext {
     }
 
     pub fn inject_failure(&self, kind: FailureKind) {
-        match kind {
+        match &kind {
             FailureKind::Git(_)
             | FailureKind::GitOutput { .. }
             | FailureKind::GitPushOutput { .. }
@@ -1018,6 +1125,12 @@ impl TestContext {
         assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
         assert_ne!(limit, 0, "GraphQL query operation limit must be nonzero");
         self.mock_state().write().unwrap().max_graphql_query_operations_per_request = Some(limit);
+    }
+
+    pub fn limit_graphql_connection_page_size(&self, limit: usize) {
+        assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
+        assert_ne!(limit, 0, "GraphQL connection page limit must be nonzero");
+        self.mock_state().write().unwrap().max_graphql_connection_page_size = Some(limit);
     }
 
     pub fn assert_failure_consumed(&self) {

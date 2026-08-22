@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     future::IntoFuture,
     path::PathBuf,
     sync::{mpsc::Sender, Arc, LazyLock, RwLock},
@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::{
-    git_interceptor, FailureKind, GraphQlOperation, RedirectStatus, RetryableHttpStatus,
-    TestEnvironment,
+    git_interceptor, FailureKind, GraphQlExchange, GraphQlOperation, MutationExchange,
+    PullRequestConnectionExchange, RedirectStatus, RetryableHttpStatus, TestEnvironment,
 };
 
 const MAX_PULL_REQUEST_CANDIDATES: usize = 100;
@@ -38,10 +38,13 @@ pub struct MockState {
     pub(super) cross_repository_prs: HashSet<usize>,
     pub(super) git: git_interceptor::State,
     pub graphql_requests: Vec<Vec<GraphQlOperation>>,
+    pub semantic_graphql_transcript: Option<VecDeque<GraphQlExchange>>,
+    pub semantic_graphql_error: Option<String>,
     pub graphql_redirect_trap_requests: usize,
     pub git_redirect_source_requests: usize,
     pub git_redirect_trap_requests: usize,
     pub max_graphql_query_operations_per_request: Option<usize>,
+    pub max_graphql_connection_page_size: Option<usize>,
     pub repo_owner: String,
     pub repo_name: String,
     pub github_default_branch: Option<(String, String)>,
@@ -226,11 +229,11 @@ fn check_and_apply_graphql_failure(
     let fail_action = mock_state.faults.front()?;
     let matches = match fail_action {
         GraphQl => true,
-        QueryTransport | QueryHttp(_) => {
+        QueryTransport | QueryHttp(_) | QueryBadRequest => {
             !operations.is_empty()
                 && operations.iter().all(|operation| *operation == GraphQlOperation::Query)
         }
-        CreatePr | CreatePrHttp(_) | CreatePrRedirect(_) => {
+        CreatePr | CreatePrHttp(_) | CreatePrRedirect(_) | ApplyMutationIdsThenDisconnect(_) => {
             operations.contains(&GraphQlOperation::CreatePr)
         }
         SecondCreatePrHttp(_) => {
@@ -270,6 +273,157 @@ fn graphql_operations(document: &ExecutableDocument) -> Vec<GraphQlOperation> {
             }
         })
         .collect()
+}
+
+fn selected_semantic_fields(
+    selection_set: &executable::SelectionSet,
+    path: &str,
+) -> Result<Vec<String>, String> {
+    fn collect(
+        selection_set: &executable::SelectionSet,
+        path: &str,
+        prefix: Option<&str>,
+        fields: &mut Vec<String>,
+    ) -> Result<(), String> {
+        for field in selected_fields(selection_set, path)? {
+            let field_name = match &field.alias {
+                Some(alias) => format!("{}:{}", alias.as_str(), field.name.as_str()),
+                None => field.name.as_str().to_string(),
+            };
+            let field_name =
+                prefix.map_or(field_name.clone(), |prefix| format!("{prefix}.{field_name}"));
+            if field.selection_set.selections.is_empty() {
+                fields.push(field_name);
+            } else {
+                collect(&field.selection_set, path, Some(&field_name), fields)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut fields = Vec::new();
+    collect(selection_set, path, None, &mut fields)?;
+    fields.sort_unstable();
+    Ok(fields)
+}
+
+fn canonical_graphql_exchange(
+    document: &ExecutableDocument,
+    variables: &GraphQlVariables,
+) -> Result<GraphQlExchange, String> {
+    let operation = document.operations.iter().next().expect("the document was validated");
+    let fields = selected_fields(&operation.selection_set, "operation")?;
+    if let Some(repository) = fields.iter().find(|field| field.name == "repository") {
+        let owner = resolve_string_argument(repository, "owner", "repository", variables)?;
+        let repository_name = resolve_string_argument(repository, "name", "repository", variables)?;
+        let mut selected_repository_fields = Vec::new();
+        let mut connections = Vec::new();
+        for field in selected_fields(&repository.selection_set, "repository")? {
+            if field.name != "pullRequests" {
+                let field_name = field.name.as_str();
+                if field.selection_set.selections.is_empty() {
+                    selected_repository_fields.push(field_name.to_string());
+                } else {
+                    selected_repository_fields.extend(
+                        selected_semantic_fields(&field.selection_set, field_name)?
+                            .into_iter()
+                            .map(|nested| format!("{field_name}.{nested}")),
+                    );
+                }
+                continue;
+            }
+
+            let path = "repository.pullRequests";
+            let first = argument(field, "first")
+                .and_then(|value| match value {
+                    ast::Value::Int(value) => value.as_str().parse::<usize>().ok(),
+                    _ => None,
+                })
+                .ok_or_else(|| format!("Missing integer GraphQL argument `{path}(first: ...)`"))?;
+            let head = argument(field, "headRefName")
+                .map(|_| resolve_string_argument(field, "headRefName", path, variables))
+                .transpose()?;
+            let after = argument(field, "after")
+                .map(|_| resolve_string_argument(field, "after", path, variables))
+                .transpose()?;
+            let mut states = argument(field, "states")
+                .and_then(|value| match value {
+                    ast::Value::List(values) => Some(
+                        values
+                            .iter()
+                            .filter_map(|value| match &**value {
+                                ast::Value::Enum(value) => Some(value.as_str().to_string()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                })
+                .ok_or_else(|| format!("Missing GraphQL argument `{path}(states: ...)`"))?;
+            states.sort_unstable();
+            connections.push(PullRequestConnectionExchange {
+                alias: field.alias.as_ref().map(|alias| alias.as_str().to_string()),
+                head,
+                first,
+                after,
+                states,
+                selected_fields: selected_semantic_fields(&field.selection_set, path)?,
+            });
+        }
+        selected_repository_fields.sort_unstable();
+        return Ok(GraphQlExchange::Repository {
+            owner,
+            repository: repository_name,
+            selected_fields: selected_repository_fields,
+            connections,
+        });
+    }
+
+    let operations = fields
+        .into_iter()
+        .map(|field| {
+            let operation = match field.name.as_str() {
+                "createPullRequest" => GraphQlOperation::CreatePr,
+                "updatePullRequest" => GraphQlOperation::UpdatePr,
+                name => return Err(format!("Unsupported semantic mutation operation `{name}`")),
+            };
+            let input = input_object(field, field.name.as_str())?
+                .iter()
+                .map(|(name, value)| match &**value {
+                    ast::Value::String(value) => Ok((name.as_str().to_string(), value.clone())),
+                    _ => Err(format!("Non-string semantic mutation input `{}.{name}`", field.name)),
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            Ok(MutationExchange {
+                operation,
+                alias: field.alias.as_ref().map(|alias| alias.as_str().to_string()),
+                input,
+                selected_fields: selected_semantic_fields(
+                    &field.selection_set,
+                    field.name.as_str(),
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(GraphQlExchange::Mutation { operations })
+}
+
+fn consume_semantic_exchange(
+    mock_state: &mut MockState,
+    exchange: &GraphQlExchange,
+) -> Result<(), String> {
+    let Some(transcript) = &mut mock_state.semantic_graphql_transcript else {
+        return Ok(());
+    };
+    match transcript.pop_front() {
+        Some(expected) if expected == *exchange => Ok(()),
+        Some(expected) => Err(format!(
+            "GraphQL semantic transcript mismatch:\nexpected: {expected:#?}\nactual: {exchange:#?}"
+        )),
+        None => Err(format!(
+            "Unexpected GraphQL request after semantic transcript was exhausted:\n{exchange:#?}"
+        )),
+    }
 }
 
 type GraphQlVariables = Option<serde_json::Map<String, serde_json::Value>>;
@@ -737,7 +891,7 @@ fn validate_update_field(field: &executable::Field) -> Result<(), String> {
             "pullRequest" => validate_scalar_fields(
                 &field.selection_set,
                 "updatePullRequest.pullRequest",
-                &["id"],
+                &["number", "id"],
             )?,
             _ => {
                 return Err(format!(
@@ -810,9 +964,17 @@ async fn graphql(
     if let Err(message) = validate_supported_document(&document, &variables) {
         return graphql_http_error(&message);
     }
+    let exchange = match canonical_graphql_exchange(&document, &variables) {
+        Ok(exchange) => exchange,
+        Err(message) => return graphql_http_error(&message),
+    };
 
     let operations = graphql_operations(&document);
     let mut mock_state = app_state.state.write().unwrap();
+    if let Err(message) = consume_semantic_exchange(&mut mock_state, &exchange) {
+        mock_state.semantic_graphql_error = Some(message.clone());
+        return graphql_http_error(&message);
+    }
     mock_state.graphql_requests.push(operations.clone());
     let create_request_number = mock_state
         .graphql_requests
@@ -834,9 +996,34 @@ async fn graphql(
             }),
         );
     }
+    let exceeds_page_limit = match &exchange {
+        GraphQlExchange::Repository { connections, .. } => mock_state
+            .max_graphql_connection_page_size
+            .is_some_and(|limit| connections.iter().any(|connection| connection.first > limit)),
+        GraphQlExchange::Mutation { .. } => false,
+    };
+    if exceeds_page_limit {
+        return graphql_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "errors": [{
+                    "type": "RESOURCE_LIMITS_EXCEEDED",
+                    "message": "Request exceeds the mock GraphQL connection page limit",
+                }]
+            }),
+        );
+    }
     if let Some(failure) =
         check_and_apply_graphql_failure(&mut mock_state, &operations, create_request_number)
     {
+        if let FailureKind::ApplyMutationIdsThenDisconnect(client_mutation_ids) = failure {
+            return apply_mutation_ids_then_disconnect(
+                &mut mock_state,
+                &document,
+                &app_state,
+                &client_mutation_ids,
+            );
+        }
         return graphql_failure_response(failure);
     }
 
@@ -888,6 +1075,64 @@ async fn graphql(
     graphql_response(StatusCode::OK, serde_json::Value::Object(response_json))
 }
 
+fn apply_mutation_ids_then_disconnect(
+    mock_state: &mut MockState,
+    document: &ExecutableDocument,
+    app_state: &AppState,
+    client_mutation_ids: &[String],
+) -> Response {
+    let expected = client_mutation_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    if expected.len() != client_mutation_ids.len() {
+        return graphql_http_error(
+            "ApplyMutationIdsThenDisconnect contains a repeated client mutation ID",
+        );
+    }
+
+    let mut applied = HashSet::new();
+    for operation in document.operations.iter() {
+        for selection in &operation.selection_set.selections {
+            let executable::Selection::Field(field) = selection else { continue };
+            let path = field.name.as_str();
+            let Ok(input) = input_object(field, path) else { continue };
+            let Some(client_mutation_id) = get_string_field(input, "clientMutationId") else {
+                continue;
+            };
+            if !expected.contains(client_mutation_id.as_str()) {
+                continue;
+            }
+            if !applied.insert(client_mutation_id.clone()) {
+                return graphql_http_error(
+                    "ApplyMutationIdsThenDisconnect matched a client mutation ID more than once",
+                );
+            }
+            let result = match path {
+                "createPullRequest" => handle_create_pr(mock_state, field, &|branch| {
+                    remote_branch_oid(app_state, branch)
+                }),
+                "updatePullRequest" => handle_update_pr(mock_state, field, &|branch| {
+                    remote_branch_oid(app_state, branch)
+                }),
+                _ => continue,
+            };
+            if let Err(message) = result {
+                return graphql_http_error(&format!(
+                    "ApplyMutationIdsThenDisconnect could not apply `{client_mutation_id}`: {message}"
+                ));
+            }
+        }
+    }
+    if applied.len() != expected.len() {
+        let mut missing =
+            expected.iter().copied().filter(|id| !applied.contains(*id)).collect::<Vec<_>>();
+        missing.sort_unstable();
+        return graphql_http_error(&format!(
+            "ApplyMutationIdsThenDisconnect did not find client mutation ID(s): {}",
+            missing.join(", ")
+        ));
+    }
+    graphql_disconnect_response()
+}
+
 async fn graphql_redirect_trap(State(app_state): State<AppState>) -> Response {
     app_state.state.write().unwrap().graphql_redirect_trap_requests += 1;
     graphql_response(
@@ -925,19 +1170,20 @@ fn graphql_failure_response(failure: FailureKind) -> Response {
     use FailureKind::*;
 
     if matches!(failure, QueryTransport) {
-        let body = Body::from_stream(futures_util::stream::once(async {
-            Err::<Bytes, _>(std::io::Error::other("Injected GraphQL response transport failure"))
-        }));
-        return Response::new(body);
+        return graphql_disconnect_response();
     }
 
     let status = match failure {
         QueryHttp(status) | CreatePrHttp(status) | SecondCreatePrHttp(status) => {
             retryable_status(status)
         }
+        QueryBadRequest => StatusCode::BAD_REQUEST,
         CreatePrRedirect(status) => redirect_status(status),
         GraphQl | CreatePr | UpdatePr => StatusCode::OK,
         QueryTransport => unreachable!("handled above"),
+        ApplyMutationIdsThenDisconnect(_) => {
+            unreachable!("partial mutation application is handled before response generation")
+        }
         Git(_) | GitOutput { .. } | GitPushOutput { .. } | GitPushOutputCrLf => {
             unreachable!("Git failures are not handled by the GraphQL endpoint")
         }
@@ -956,6 +1202,13 @@ fn graphql_failure_response(failure: FailureKind) -> Response {
         })),
     )
         .into_response()
+}
+
+fn graphql_disconnect_response() -> Response {
+    let body = Body::from_stream(futures_util::stream::once(async {
+        Err::<Bytes, _>(std::io::Error::other("Injected GraphQL response transport failure"))
+    }));
+    Response::new(body)
 }
 
 fn graphql_response(status: StatusCode, value: serde_json::Value) -> Response {
@@ -1117,6 +1370,9 @@ fn handle_update_pr(
                 for field in selected_fields(&field.selection_set, "updatePullRequest.pullRequest")?
                 {
                     match field.name.as_str() {
+                        "number" => {
+                            pull_request.insert(response_key(field), serde_json::json!(pr.number));
+                        }
                         "id" => {
                             pull_request.insert(response_key(field), serde_json::json!(node_id));
                         }
@@ -1453,6 +1709,50 @@ mod tests {
         operations: &[GraphQlOperation],
     ) -> Option<FailureKind> {
         check_and_apply_graphql_failure(state, operations, 0)
+    }
+
+    fn semantic_repository(owner: &str) -> GraphQlExchange {
+        GraphQlExchange::Repository {
+            owner: owner.to_owned(),
+            repository: "repo".to_owned(),
+            selected_fields: vec!["id".to_owned()],
+            connections: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn semantic_transcript_rejects_wrong_order_and_unexpected_requests() {
+        let expected = semantic_repository("first");
+        let later = semantic_repository("later");
+        let mut wrong_order = MockState {
+            semantic_graphql_transcript: Some(VecDeque::from([expected.clone(), later.clone()])),
+            ..Default::default()
+        };
+        assert!(consume_semantic_exchange(&mut wrong_order, &later)
+            .unwrap_err()
+            .contains("mismatch"));
+
+        let mut exhausted =
+            MockState { semantic_graphql_transcript: Some(VecDeque::new()), ..Default::default() };
+        assert!(consume_semantic_exchange(&mut exhausted, &expected)
+            .unwrap_err()
+            .contains("Unexpected"));
+    }
+
+    #[test]
+    fn semantic_transcript_retains_unconsumed_exchanges() {
+        let mut state = MockState {
+            semantic_graphql_transcript: Some(VecDeque::from([
+                semantic_repository("first"),
+                semantic_repository("later"),
+            ])),
+            ..Default::default()
+        };
+        consume_semantic_exchange(&mut state, &semantic_repository("first")).unwrap();
+        assert_eq!(
+            state.semantic_graphql_transcript,
+            Some(VecDeque::from([semantic_repository("later")]))
+        );
     }
 
     #[test]

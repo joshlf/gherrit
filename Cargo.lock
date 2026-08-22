@@ -1079,6 +1079,7 @@ dependencies = [
  "eyre",
  "fastrand",
  "gix",
+ "http-body-util",
  "insta",
  "libc",
  "log",
