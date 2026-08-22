@@ -1,4 +1,49 @@
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
+
+const ACTIVE_VERSION_QUERY_BUDGET_BYTES: usize = 16 * 1024;
+const MANY_ACTIVE_ID_COUNT: usize = 60;
+const MANY_ACTIVE_ID_LEN: usize = 120;
+
+fn commit_many_active_changes(ctx: &testutil::TestContext) -> Vec<String> {
+    let ids = (0..MANY_ACTIVE_ID_COUNT)
+        .map(|index| {
+            let prefix = format!("G{index:03}");
+            format!("{prefix}{}", "a".repeat(MANY_ACTIVE_ID_LEN - prefix.len()))
+        })
+        .collect::<Vec<_>>();
+
+    let pattern_bytes = ids
+        .iter()
+        .flat_map(|id| {
+            let root = format!("refs/tags/gherrit/{id}");
+            [root.len() + 1, root.len() + 3]
+        })
+        .sum::<usize>();
+    assert!(pattern_bytes > ACTIVE_VERSION_QUERY_BUDGET_BYTES);
+
+    ids.iter().enumerate().for_each(|(index, id)| {
+        ctx.commit_with_explicit_gherrit_id(&format!("Change {index}"), id);
+    });
+    ids
+}
+
+fn active_version_patterns(ids: &[String]) -> Vec<String> {
+    ids.iter()
+        .flat_map(|id| {
+            let root = format!("refs/tags/gherrit/{id}");
+            [root.clone(), format!("{root}/*")]
+        })
+        .collect()
+}
+
+fn observed_active_version_patterns(queries: &[Vec<String>]) -> Vec<String> {
+    queries
+        .iter()
+        .flatten()
+        .filter(|argument| argument.starts_with("refs/tags/gherrit/"))
+        .cloned()
+        .collect()
+}
 
 fn installed_git_version(ctx: &testutil::TestContext) -> (u64, u64) {
     let output = ctx.git_cmd().arg("--version").assert().success().get_output().stdout.clone();
@@ -77,6 +122,40 @@ fn test_full_stack_lifecycle_mocked() {
     assert_eq!(
         ctx.remote_ref_oid(&format!("refs/heads/{commit_b_id}")).as_deref(),
         Some(commit_b_oid.as_str())
+    );
+
+    let heads = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads);
+    let versions = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions);
+    assert_eq!(heads.len(), 1, "one attempt has one global head observation");
+    assert_eq!(versions.len(), 1, "an ordinary stack has one exact history observation");
+    assert!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteOther).is_empty());
+    assert_eq!(
+        heads[0],
+        [
+            "git",
+            "--no-replace-objects",
+            "--config-env=remote.gherrit-publication.url=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            "--config-env=remote.gherrit-publication.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            "-c",
+            "http.followRedirects=false",
+            "ls-remote",
+            "--quiet",
+            "--symref",
+            "--",
+            "gherrit-publication",
+            "HEAD",
+            "refs/heads/*",
+            "refs/tags/gherrit",
+        ]
+        .map(ToOwned::to_owned)
+    );
+    assert!(
+        versions[0].iter().any(|argument| argument == &format!("refs/tags/gherrit/{commit_a_id}"))
+    );
+    assert!(
+        versions[0]
+            .iter()
+            .any(|argument| argument == &format!("refs/tags/gherrit/{commit_b_id}/*"))
     );
 }
 
@@ -645,6 +724,57 @@ fn concurrent_tag_creation_fails_the_atomic_branch_and_tag_leases() {
 }
 
 #[test]
+fn publication_between_head_and_history_observations_is_rejected_before_writes() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("observation-race");
+    ctx.commit_with_gherrit_id("Commit V1");
+    ctx.hook_cmd("pre-push").assert().success();
+
+    let gherrit_id = ctx.gherrit_id("HEAD").unwrap();
+    let managed_ref = format!("refs/heads/{gherrit_id}");
+    let v1_ref = format!("refs/tags/gherrit/{gherrit_id}/v1");
+    let v2_ref = format!("refs/tags/gherrit/{gherrit_id}/v2");
+    let v1_oid = ctx.head_oid();
+    let concurrent_oid = ctx.remote_ref_oid("refs/heads/main").unwrap();
+    ctx.amend();
+
+    // The two reads are intentionally not described as one snapshot. Model a
+    // concurrent publisher committing a coherent head/tag tuple after the
+    // global head query but before the exact version query. Coupling the two
+    // results must reject the torn observation before either system is
+    // mutated by this attempt.
+    ctx.update_remote_refs_before_active_version_observation([
+        (managed_ref.as_str(), concurrent_oid.as_str()),
+        (v2_ref.as_str(), concurrent_oid.as_str()),
+    ]);
+    let github_requests_before = ctx.github().requests().len();
+    let pushes_before = ctx.recorded_pushes().len();
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("head does not match its latest version tag"));
+
+    assert_eq!(ctx.github().requests().len(), github_requests_before);
+    assert_eq!(ctx.recorded_pushes().len(), pushes_before);
+    assert_eq!(ctx.remote_ref_oid(&managed_ref).as_deref(), Some(concurrent_oid.as_str()));
+    assert_eq!(ctx.remote_ref_oid(&v1_ref).as_deref(), Some(v1_oid.as_str()));
+    assert_eq!(ctx.remote_ref_oid(&v2_ref).as_deref(), Some(concurrent_oid.as_str()));
+    assert_ne!(ctx.head_oid(), concurrent_oid);
+    assert_eq!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads).len(), 2);
+    assert_eq!(
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions).len(),
+        2
+    );
+    assert!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteOther).is_empty());
+}
+
+#[test]
 fn malformed_inactive_version_history_is_not_observed() {
     let ctx = testutil::test_context!()
         .with_remote()
@@ -671,6 +801,173 @@ fn malformed_inactive_version_history_is_not_observed() {
         ctx.remote_ref_oid("refs/heads/main").as_deref()
     );
     assert!(ctx.remote_ref_oid("refs/tags/gherrit/Gactive/v1").is_some());
+}
+
+#[test]
+fn active_version_observation_batches_cover_every_local_id() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("batched-active-history");
+    let ids = commit_many_active_changes(&ctx);
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    let queries = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions);
+    assert!(queries.len() > 1, "fixture must require more than one active-history query");
+    assert_eq!(observed_active_version_patterns(&queries), active_version_patterns(&ids));
+    assert!(queries.iter().all(|query| {
+        query
+            .iter()
+            .filter(|argument| argument.starts_with("refs/tags/gherrit/"))
+            .map(|argument| argument.len() + 1)
+            .sum::<usize>()
+            <= ACTIVE_VERSION_QUERY_BUDGET_BYTES
+    }));
+    assert_eq!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads).len(), 1);
+    assert!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteOther).is_empty());
+    assert!(!ctx.recorded_pushes().is_empty());
+    assert!(ctx.recorded_pushes().iter().all(testutil::PushRecord::succeeded));
+
+    let expected_refs = ids
+        .iter()
+        .flat_map(|id| [format!("refs/heads/{id}"), format!("refs/tags/gherrit/{id}/v1")])
+        .collect::<BTreeSet<_>>();
+    let actual_refs = ctx
+        .remote_refs("refs")
+        .into_iter()
+        .filter(|ref_name| ref_name != "refs/heads/main")
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual_refs, expected_refs);
+    assert_eq!(
+        ctx.github()
+            .pull_requests()
+            .into_iter()
+            .map(|pull_request| pull_request.head)
+            .collect::<BTreeSet<_>>(),
+        ids.into_iter().collect()
+    );
+}
+
+#[test]
+fn later_active_version_observation_failure_blocks_every_write() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("failed-later-active-history");
+    let ids = commit_many_active_changes(&ctx);
+    let refs_before = ctx.remote_refs("refs");
+    ctx.expect_git_output(testutil::GitOperation::LsRemoteActiveVersions, "");
+    ctx.expect_git_failure(testutil::GitOperation::LsRemoteActiveVersions);
+
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicates::str::contains(
+        "`git ls-remote` failed while observing active version history",
+    ));
+
+    ctx.assert_failure_consumed();
+    let queries = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions);
+    assert_eq!(queries.len(), 2, "the first batch succeeded before the second failed");
+    assert_eq!(observed_active_version_patterns(&queries), active_version_patterns(&ids));
+    assert_eq!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads).len(), 1);
+    assert!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteOther).is_empty());
+    assert!(ctx.github().requests().is_empty());
+    assert!(ctx.recorded_pushes().is_empty());
+    assert_eq!(ctx.remote_refs("refs"), refs_before);
+}
+
+#[test]
+fn global_head_arguments_do_not_grow_with_the_local_stack() {
+    let observe = |count: usize| {
+        let ctx = testutil::test_context!()
+            .with_remote()
+            .with_initial_commit()
+            .with_mock_github()
+            .with_git_interceptor()
+            .build();
+        ctx.checkout_managed_private(&format!("constant-head-query-{count}"));
+        for index in 0..count {
+            ctx.commit_with_explicit_gherrit_id(&format!("Change {index}"), &format!("G{index}"));
+        }
+        ctx.hook_cmd("pre-push").assert().success();
+        let queries = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads);
+        assert_eq!(queries.len(), 1);
+        queries.into_iter().next().unwrap()
+    };
+
+    assert_eq!(observe(1), observe(40));
+}
+
+#[test]
+fn empty_local_stack_only_observes_global_heads() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("empty-stack");
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    assert_eq!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads).len(), 1);
+    assert!(
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions).is_empty()
+    );
+    assert!(ctx.recorded_pushes().is_empty());
+}
+
+#[test]
+fn global_nonlocal_heads_do_not_expand_the_active_stack() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.remote_git_cmd()
+        .args(["update-ref", "refs/heads/Ginactive", "refs/heads/main"])
+        .assert()
+        .success();
+    ctx.checkout_managed_private("ignore-nonlocal-head");
+    ctx.commit_with_explicit_gherrit_id("Active", "Gactive");
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    assert!(ctx.remote_ref_oid("refs/tags/gherrit/Gactive/v1").is_some());
+    assert!(ctx.remote_ref_oid("refs/tags/gherrit/Ginactive/v1").is_none());
+    assert_eq!(ctx.github().pull_requests().len(), 1);
+    assert_eq!(ctx.github().pull_requests()[0].head, "Gactive");
+}
+
+#[test]
+fn oversized_late_id_fails_after_global_heads_but_before_active_history() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("oversized-active-history");
+    ctx.commit_with_explicit_gherrit_id("Small", "Gsmall");
+    let oversized = format!("G{}", "a".repeat(9_000));
+    ctx.commit_with_explicit_gherrit_id("Oversized", &oversized);
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("too long for a remote observation query"));
+
+    assert_eq!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads).len(), 1);
+    assert!(
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions).is_empty()
+    );
+    assert!(ctx.recorded_pushes().is_empty());
+    assert!(ctx.github().requests().is_empty());
 }
 
 #[test]
