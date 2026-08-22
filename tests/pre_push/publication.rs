@@ -45,6 +45,36 @@ fn test_full_stack_lifecycle_mocked() {
 }
 
 #[test]
+fn test_first_parent_stack_excludes_commits_reachable_only_through_a_merge() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("first-parent-merge");
+    ctx.commit_with_gherrit_id("Stack change");
+    let stack_id = ctx.gherrit_id("HEAD").unwrap();
+
+    ctx.run_git(&["checkout", "-b", "side", "main"]);
+    ctx.commit_with_gherrit_id("Side change");
+    let side_id = ctx.gherrit_id("HEAD").unwrap();
+    ctx.run_git(&["checkout", "first-parent-merge"]);
+    ctx.run_git(&["merge", "--no-ff", "side", "-m", "Merge side\n\ngherrit-pr-id: Gmerge"]);
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    assert!(ctx.remote_ref_oid(&format!("refs/heads/{stack_id}")).is_some());
+    assert!(ctx.remote_ref_oid("refs/heads/Gmerge").is_some());
+    assert!(ctx.remote_ref_oid(&format!("refs/heads/{side_id}")).is_none());
+    let pull_requests = ctx.github().pull_requests();
+    assert_eq!(
+        pull_requests.iter().map(|pr| (pr.head.as_str(), pr.base.as_str())).collect::<Vec<_>>(),
+        [(stack_id.as_str(), "main"), ("Gmerge", stack_id.as_str())]
+    );
+}
+
+#[test]
 fn test_stack_id_comes_only_from_the_trailer_block() {
     let ctx = testutil::test_context!()
         .with_remote()
