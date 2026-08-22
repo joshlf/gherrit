@@ -180,6 +180,7 @@ impl LocalChange {
 /// An ordered, validated first-parent path from the default branch to `HEAD`.
 #[derive(Debug)]
 pub(super) struct LocalStack {
+    default_branch: DefaultBranch,
     changes: Vec<LocalChange>,
 }
 
@@ -203,6 +204,16 @@ impl LocalStack {
         default_tip: ObjectId,
         changes: impl IntoIterator<Item = (GherritPrId, ObjectId, String, String)>,
     ) -> Result<Self> {
+        let default_branch = DefaultBranch::new("main".to_owned(), default_tip)?;
+        Self::for_test_with_default(default_branch, changes)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test_with_default(
+        default_branch: DefaultBranch,
+        changes: impl IntoIterator<Item = (GherritPrId, ObjectId, String, String)>,
+    ) -> Result<Self> {
+        let default_tip = default_branch.tip();
         let mut first_parent = default_tip;
         let changes = changes
             .into_iter()
@@ -219,7 +230,7 @@ impl LocalStack {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Self::new(default_tip, "main", changes)
+        Self::new(default_branch, changes)
     }
 
     /// Reads and validates the local managed stack without performing network
@@ -232,7 +243,17 @@ impl LocalStack {
         repo.ensure_publishable_history()?;
 
         let head = repo.rev_parse_single("HEAD")?;
-        let default_ref = repo.rev_parse_single(default_branch.full_ref_name().as_str())?;
+        let default_ref =
+            repo.rev_parse_single(default_branch.full_ref_name().as_str()).wrap_err_with(|| {
+                format!("Local default branch '{}' is unavailable", default_branch.name())
+            })?;
+        let local_default_tip = default_ref.detach();
+        if local_default_tip != default_branch.tip() {
+            bail!(
+                "Local default branch '{}' does not match the push repository",
+                default_branch.name()
+            );
+        }
         let commits = repo.first_parent_commits_between(default_ref, head).map_err(|err| match err {
             util::FirstParentCommitsBetweenError::NotOnFirstParentPath => {
                 let branch_name = repo.current_branch().name().unwrap_or("current branch");
@@ -269,17 +290,21 @@ impl LocalStack {
             .map(|((commit, title), trailers)| LocalChange::from_commit(commit, title, &trailers))
             .collect::<Result<Vec<_>>>()?;
 
-        let stack = Self::new(default_ref.detach(), default_branch.name(), changes)?;
+        let stack = Self::new(default_branch.clone(), changes)?;
         ensure_change_ids_unique_in_head_ancestry(&stack, head.detach())?;
         Ok(stack)
     }
 
-    fn new(default_tip: ObjectId, default_branch: &str, changes: Vec<LocalChange>) -> Result<Self> {
+    fn new(default_branch: DefaultBranch, changes: Vec<LocalChange>) -> Result<Self> {
+        let default_tip = default_branch.tip();
+        let default_branch_name = default_branch.name();
         let ids = changes.iter().map(|change| change.id.as_str());
         ensure_unique_change_ids(ids)?;
-        if let Some(change) = changes.iter().find(|change| change.id.as_str() == default_branch) {
+        if let Some(change) =
+            changes.iter().find(|change| change.id.as_str() == default_branch_name)
+        {
             bail!(
-                "Commit {} has gherrit-pr-id '{default_branch}', which conflicts with the repository default branch",
+                "Commit {} has gherrit-pr-id '{default_branch_name}', which conflicts with the repository default branch",
                 change.head
             );
         }
@@ -295,7 +320,11 @@ impl LocalStack {
             expected_parent = change.head;
         }
 
-        Ok(Self { changes })
+        Ok(Self { default_branch, changes })
+    }
+
+    pub(super) fn default_branch(&self) -> &DefaultBranch {
+        &self.default_branch
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -476,7 +505,11 @@ mod tests {
     use super::*;
 
     fn object_id(byte: u8) -> ObjectId {
-        ObjectId::from_bytes_or_panic(&[byte; 20])
+        let mut bytes = [byte; 20];
+        if byte == 0 {
+            bytes[19] = 1;
+        }
+        ObjectId::from_bytes_or_panic(&bytes)
     }
 
     fn change(id: &str, head: u8, first_parent: u8) -> LocalChange {
@@ -487,6 +520,10 @@ mod tests {
             title: PullRequestTitle::new("Test change".to_owned()).unwrap(),
             body: CommitBody::new(String::new()).unwrap(),
         }
+    }
+
+    fn default_branch(tip: u8) -> DefaultBranch {
+        DefaultBranch::new("main".to_owned(), object_id(tip)).unwrap()
     }
 
     #[test]
@@ -530,12 +567,9 @@ mod tests {
 
     #[test]
     fn stacks_require_unique_change_ids() {
-        let error = LocalStack::new(
-            object_id(0),
-            "main",
-            vec![change("Gsame", 1, 0), change("Gsame", 2, 1)],
-        )
-        .unwrap_err();
+        let error =
+            LocalStack::new(default_branch(0), vec![change("Gsame", 1, 0), change("Gsame", 2, 1)])
+                .unwrap_err();
 
         assert_eq!(error.to_string(), "Stack contains multiple commits with gherrit-pr-id 'Gsame'");
     }
@@ -543,8 +577,7 @@ mod tests {
     #[test]
     fn stacks_require_one_contiguous_first_parent_path() {
         let stack = LocalStack::new(
-            object_id(0),
-            "main",
+            default_branch(0),
             vec![change("Gone", 1, 0), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
         )
         .unwrap();
@@ -555,7 +588,7 @@ mod tests {
         );
 
         let error =
-            LocalStack::new(object_id(0), "main", vec![change("Gone", 1, 0), change("Gtwo", 2, 0)])
+            LocalStack::new(default_branch(0), vec![change("Gone", 1, 0), change("Gtwo", 2, 0)])
                 .unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -567,10 +600,40 @@ mod tests {
     }
 
     #[test]
+    fn collection_rejects_a_default_tip_from_another_push_repository() {
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let local_tip = repository.rev_parse_single("refs/heads/main").unwrap().detach();
+        let other_tip = object_id(9);
+        assert_ne!(local_tip, other_tip);
+        let supplied_default = DefaultBranch::new("main".to_owned(), other_tip).unwrap();
+
+        let error = LocalStack::collect(&repository, &supplied_default, "origin").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Local default branch 'main' does not match the push repository"
+        );
+    }
+
+    #[test]
+    fn collection_preserves_context_for_a_missing_local_default_branch() {
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        context.run_git(&["checkout", "-b", "feature"]);
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let default_tip = repository.rev_parse_single("refs/heads/main").unwrap().detach();
+        context.run_git(&["branch", "--delete", "--force", "main"]);
+        let supplied_default = DefaultBranch::new("main".to_owned(), default_tip).unwrap();
+
+        let error = LocalStack::collect(&repository, &supplied_default, "origin").unwrap_err();
+
+        assert_eq!(error.to_string(), "Local default branch 'main' is unavailable");
+    }
+
+    #[test]
     fn stack_order_derives_root_parent_and_child_positions() {
         let stack = LocalStack::new(
-            object_id(0),
-            "main",
+            default_branch(0),
             vec![change("Gone", 1, 0), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
         )
         .unwrap();
@@ -586,7 +649,7 @@ mod tests {
 
     #[test]
     fn stack_ids_cannot_name_the_default_branch() {
-        let error = LocalStack::new(object_id(0), "main", vec![change("main", 1, 0)]).unwrap_err();
+        let error = LocalStack::new(default_branch(0), vec![change("main", 1, 0)]).unwrap_err();
 
         assert_eq!(
             error.to_string(),

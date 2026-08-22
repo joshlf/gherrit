@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 /// A stack item annotated with the relationships needed to project it as a PR.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct StackEntry<T> {
@@ -76,8 +78,12 @@ pub(super) fn plan_update(current: CurrentPr<'_>, desired: DesiredPr<'_>) -> Opt
     })
 }
 
-fn normalize_body(body: &str) -> String {
-    body.replace("\r\n", "\n").trim().to_string()
+/// Defines GHerrit's sole pull-request body comparison equivalence.
+///
+/// CRLF and LF spellings of a line ending compare equal. Every other byte is
+/// part of the generated projection and must match.
+fn normalize_body(body: &str) -> Cow<'_, str> {
+    if body.contains("\r\n") { Cow::Owned(body.replace("\r\n", "\n")) } else { Cow::Borrowed(body) }
 }
 
 #[cfg(test)]
@@ -214,13 +220,28 @@ mod tests {
     }
 
     #[test]
-    fn treats_line_endings_and_outer_whitespace_as_equivalent() {
+    fn normalizes_only_crlf_pairs_when_planning_body_updates() {
         assert_eq!(
             plan_update(
-                current("Title", " \r\nBody\r\n ", "main"),
-                desired("Title", "Body\n", "main"),
+                current("Title", "Line one\r\nLine two", "main"),
+                desired("Title", "Line one\nLine two", "main"),
             ),
             None
+        );
+        assert_eq!(
+            plan_update(
+                current("Title", "Line one\nLine two", "main"),
+                desired("Title", "Line one\r\nLine two", "main"),
+            ),
+            None
+        );
+        assert_eq!(
+            plan_update(current("Title", " Body ", "main"), desired("Title", "Body", "main")),
+            update(None, Some("Body"), None)
+        );
+        assert_eq!(
+            plan_update(current("Title", "Body\n", "main"), desired("Title", "Body", "main")),
+            update(None, Some("Body"), None)
         );
     }
 

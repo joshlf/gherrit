@@ -47,6 +47,31 @@ pub(super) struct PushDestination {
     test_environment: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
 }
 
+/// GitHub repository coordinates derived from one validated push destination.
+///
+/// This value deliberately contains no destination literal. It is the narrow
+/// equality proof used to prevent Git and GitHub evidence for different
+/// repositories from being combined during pure planning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RepositoryCoordinates {
+    owner: String,
+    repository: String,
+}
+
+impl RepositoryCoordinates {
+    pub(super) fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    pub(super) fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    pub(super) fn relative_url(&self) -> String {
+        format!("/{}/{}", self.owner, self.repository)
+    }
+}
+
 impl PushDestination {
     #[cfg(test)]
     pub(super) fn for_test(
@@ -355,12 +380,11 @@ impl PushDestination {
         self.resolved.configured_remote.as_str()
     }
 
-    pub(super) fn owner(&self) -> &str {
-        &self.resolved.owner
-    }
-
-    pub(super) fn repository(&self) -> &str {
-        &self.resolved.repository
+    pub(super) fn repository_coordinates(&self) -> RepositoryCoordinates {
+        RepositoryCoordinates {
+            owner: self.resolved.owner.clone(),
+            repository: self.resolved.repository.clone(),
+        }
     }
 
     pub(super) fn pr_url(&self, pr_number: u64) -> String {
@@ -627,21 +651,12 @@ impl DefaultBranch {
         &self.name
     }
 
-    pub(super) fn full_ref_name(&self) -> String {
-        format!("refs/heads/{}", self.name)
+    pub(super) fn tip(&self) -> ObjectId {
+        self.tip
     }
 
-    /// Requires the local branch used for read-only stack derivation to be an
-    /// exact copy of the branch observed at the push destination.
-    pub(super) fn ensure_local(&self, repo: &util::Repo) -> Result<()> {
-        let local_tip = repo
-            .rev_parse_single(self.full_ref_name().as_str())
-            .wrap_err_with(|| format!("Local default branch '{}' is unavailable", self.name))?
-            .detach();
-        if local_tip != self.tip {
-            bail!("Local default branch '{}' does not match the push repository", self.name);
-        }
-        Ok(())
+    pub(super) fn full_ref_name(&self) -> String {
+        format!("refs/heads/{}", self.name)
     }
 
     /// Establishes the default branch used by all write planning and intent.
