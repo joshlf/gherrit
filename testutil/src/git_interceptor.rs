@@ -106,11 +106,15 @@ fn check_and_apply_failure(
 
 /// Returns the subcommand from the command shape emitted by GHerrit.
 ///
-/// The harness intentionally does not emulate Git's global-option grammar.
-/// Production calls put the subcommand immediately after the executable and
-/// the interceptor treats every subsequent argument as opaque.
+/// The harness recognizes the one global option required by production, but
+/// intentionally does not emulate Git's general global-option grammar. Direct
+/// fixture commands still use the ordinary `git <subcommand>` shape.
 fn subcommand(args: &[String]) -> Option<&str> {
-    args.get(1).filter(|argument| !argument.starts_with('-')).map(String::as_str)
+    match args.get(1).map(String::as_str) {
+        Some("--no-replace-objects") => args.get(2).map(String::as_str),
+        Some(argument) if !argument.starts_with('-') => Some(argument),
+        Some(_) | None => None,
+    }
 }
 
 async fn handle_git(
@@ -191,8 +195,12 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_only_the_product_command_shape() {
+    fn recognizes_product_and_direct_fixture_command_shapes() {
         assert_eq!(subcommand(&args(&["git", "push", "origin"])), Some("push"));
+        assert_eq!(
+            subcommand(&args(&["git", "--no-replace-objects", "push", "origin"])),
+            Some("push")
+        );
         assert_eq!(subcommand(&args(&["git", "ls-remote", "origin"])), Some("ls-remote"));
         assert_eq!(subcommand(&args(&["git"])), None);
         assert_eq!(subcommand(&args(&["git", "--version"])), None);
