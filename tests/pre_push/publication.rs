@@ -187,6 +187,16 @@ fn test_first_parent_stack_excludes_commits_reachable_only_through_a_merge() {
         pull_requests.iter().map(|pr| (pr.head.as_str(), pr.base.as_str())).collect::<Vec<_>>(),
         [(stack_id.as_str(), "main"), ("Gmerge", stack_id.as_str())]
     );
+    for pull_request in pull_requests {
+        assert_eq!(
+            ctx.remote_ref_oid(&format!("refs/heads/{}", pull_request.head)).as_deref(),
+            Some(pull_request.head_oid.as_str())
+        );
+        assert_eq!(
+            ctx.remote_ref_oid(&format!("refs/heads/{}", pull_request.base)).as_deref(),
+            Some(pull_request.base_oid.as_str())
+        );
+    }
 }
 
 #[test]

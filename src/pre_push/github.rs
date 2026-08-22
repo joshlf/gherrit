@@ -1,26 +1,49 @@
-use std::{collections::HashSet, ops::Range};
+use std::{
+    collections::{BTreeMap, HashSet},
+    ops::Range,
+};
 
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{
-    batching::{MAX_MUTATION_ALIASES, MAX_MUTATION_REQUEST_BYTES},
-    destination::DefaultBranch,
-    reconcile::PullRequestState,
-};
+use super::destination::DefaultBranch;
 
-const MAX_PULL_REQUEST_CANDIDATES: usize = 100;
+pub(super) const MAX_MUTATION_ALIASES: usize = 64;
+// A 131,072-byte pull-request body made entirely from U+0001 expands to
+// 917,504 bytes after GraphQL-string escaping and then outer-JSON escaping.
+// One MiB accommodates that worst case plus the mutation's other supported
+// fields while retaining a deterministic preflight request limit.
+const MAX_MUTATION_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// A selected nullable GraphQL field. Unlike `Option<T>`, this rejects a
+/// missing response key while accepting an explicit JSON null.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Nullable<T> {
+    Value(T),
+    Null(()),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PullRequest {
+/// Complete pull-request facts returned by the repository-wide open scan.
+///
+/// The compatibility selector currently consumes only identity, lifecycle,
+/// and head-repository facts. Keeping the exact refs, object IDs, and policy
+/// state here makes the observation itself complete, so later validation does
+/// not need another network read.
+pub(super) struct OpenPullRequest {
     pub(super) number: u64,
     pub(super) node_id: String,
-    pub(super) title: Option<String>,
-    pub(super) body: Option<String>,
+    pub(super) title: String,
+    pub(super) body: String,
     pub(super) base_branch: String,
     pub(super) head_branch: String,
-    pub(super) state: PullRequestState,
+    pub(super) base_oid: gix::ObjectId,
+    pub(super) head_oid: gix::ObjectId,
+    pub(super) is_cross_repository: bool,
+    pub(super) has_auto_merge_request: bool,
+    pub(super) is_in_merge_queue: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,18 +53,11 @@ pub(super) struct CreatedPullRequest {
     pub(super) node_id: String,
 }
 
-/// One read-only GraphQL field which may be retried in a smaller query.
-pub(super) trait QueryOperation {
-    type Output;
-
-    fn document(&self) -> String;
-    fn decode(&self, response: Value) -> Result<Self::Output>;
-}
-
 /// One GraphQL mutation field whose response is an acknowledgement receipt.
 ///
-/// Mutation operations deliberately do not implement `QueryOperation`. This
-/// keeps adaptive query retries unavailable to writes at the type level.
+/// Mutation operations deliberately use an API distinct from the read-only
+/// request types. This keeps adaptive query retries unavailable to writes at
+/// the type level.
 pub(super) trait MutationOperation {
     type Output;
 
@@ -61,41 +77,6 @@ pub(super) struct PreparedMutationBatch {
     pub(super) operation_range: Range<usize>,
     pub(super) request: Value,
     pub(super) serialized_bytes: usize,
-}
-
-/// Builds the exact GraphQL document sent for one adaptive query batch.
-pub(super) fn query_batch_document<O: QueryOperation>(operations: &[O]) -> String {
-    let body = operations
-        .iter()
-        .enumerate()
-        .map(|(index, operation)| format!("op{index}: {}", operation.document()))
-        .collect::<String>();
-    format!("query {{ {body} }}")
-}
-
-/// Decodes every aliased operation in a successful adaptive query response.
-pub(super) fn decode_query_batch_response<O: QueryOperation>(
-    operations: &[O],
-    response: Value,
-) -> Result<Vec<O::Output>> {
-    let data = response
-        .get("data")
-        .ok_or_else(|| eyre!("Missing JSON field in GraphQL response: `data`"))?
-        .as_object()
-        .ok_or_else(|| eyre!("GraphQL response field `data` is not an object"))?;
-
-    operations
-        .iter()
-        .enumerate()
-        .map(|(index, operation)| {
-            let alias = format!("op{index}");
-            let response = data
-                .get(&alias)
-                .cloned()
-                .ok_or_else(|| eyre!("GraphQL response is missing operation `{alias}`"))?;
-            operation.decode(response)
-        })
-        .collect()
 }
 
 fn mutation_batch_document<O: MutationOperation>(operations: &[O]) -> String {
@@ -217,178 +198,465 @@ pub(super) struct Repository {
     pub(super) default_branch: DefaultBranch,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub(super) struct PullRequestLookup {
-    pub(super) pull_request: Option<PullRequest>,
-    pub(super) repository: Option<Repository>,
-}
-
-/// Looks up the PR whose head branch is a GHerrit ID.
+/// The first page of the repository-wide open-pull-request connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FindPullRequest {
+pub(super) struct FirstOpenPullRequests {
     owner: String,
     repository: String,
-    head_branch: String,
-    include_repository: bool,
+    first: usize,
 }
 
-impl FindPullRequest {
-    pub(super) fn new(owner: String, repository: String, head_branch: String) -> Self {
-        Self { owner, repository, head_branch, include_repository: false }
-    }
-
-    /// Includes repository-wide facts in this lookup so the first adaptive
-    /// pull-request batch also observes the repository identity and default
-    /// branch without another network request.
-    pub(super) fn with_repository(owner: String, repository: String, head_branch: String) -> Self {
-        Self { owner, repository, head_branch, include_repository: true }
-    }
-
-    #[cfg(test)]
-    fn decode(&self, response: Value) -> Result<Option<PullRequest>> {
-        <Self as QueryOperation>::decode(self, response).map(|lookup| lookup.pull_request)
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NextOpenPullRequests {
+    owner: String,
+    repository: String,
+    after: String,
+    first: usize,
 }
 
-impl QueryOperation for FindPullRequest {
-    type Output = PullRequestLookup;
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct FirstOpenPullRequestsPage {
+    pub(super) repository: Repository,
+    pub(super) pull_requests: Vec<OpenPullRequest>,
+    pub(super) next_cursor: Option<String>,
+}
 
-    fn document(&self) -> String {
-        let connection = |alias: &str, states: &str| {
-            format!(
-                "{alias}: pullRequests(headRefName: {}, first: {MAX_PULL_REQUEST_CANDIDATES}, states: {states}) {{ nodes {{ number, id, title, body, baseRefName, state, isCrossRepository }} pageInfo {{ hasNextPage }} }}",
-                json!(self.head_branch),
-            )
-        };
-        let repository = if self.include_repository {
-            "id, defaultBranchRef { name, target { oid } } "
-        } else {
-            ""
-        };
-        format!(
-            "repository(owner: {}, name: {}) {{ {repository}{} {} }}",
-            json!(self.owner),
-            json!(self.repository),
-            connection("open", "[OPEN]"),
-            connection("historical", "[CLOSED, MERGED]"),
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct NextOpenPullRequestsPage {
+    pub(super) pull_requests: Vec<OpenPullRequest>,
+    pub(super) next_cursor: Option<String>,
+}
+
+impl FirstOpenPullRequests {
+    pub(super) fn new(owner: String, repository: String, first: usize) -> Self {
+        assert!(first > 0, "an open pull request page size must be positive");
+        Self { owner, repository, first }
+    }
+
+    pub(super) fn document(&self) -> String {
+        open_pull_requests_document(
+            &self.owner,
+            &self.repository,
+            self.first,
+            OpenPullRequestPage::First,
         )
     }
 
-    fn decode(&self, response: Value) -> Result<Self::Output> {
+    pub(super) fn decode(&self, response: Value) -> Result<FirstOpenPullRequestsPage> {
+        let DecodedOpenPullRequestsPage {
+            repository_node_id,
+            default_branch_ref,
+            pull_requests,
+            next_cursor,
+        } = decode_open_pull_requests_page(response)?;
+        let node_id = match repository_node_id {
+            Some(node_id) if !node_id.is_empty() => node_id,
+            Some(_) => bail!("GitHub reported an empty repository node ID"),
+            None => bail!("GitHub omitted the repository node ID"),
+        };
+        let default_branch = match default_branch_ref {
+            Some(default_branch) => default_branch,
+            None => bail!("GitHub omitted the repository default branch"),
+        };
+        let target = match default_branch.target {
+            Nullable::Value(target) => target,
+            Nullable::Null(()) => bail!("GitHub omitted the default branch target"),
+        };
+        let oid = match target.oid {
+            Nullable::Value(oid) => oid,
+            Nullable::Null(()) => bail!("GitHub omitted the default branch object ID"),
+        };
+        let tip = gix::ObjectId::from_hex(oid.as_bytes())
+            .wrap_err("GitHub reported an invalid default branch object ID")?;
+        let repository = Repository {
+            node_id,
+            default_branch: DefaultBranch::new(default_branch.name, tip)
+                .wrap_err("GitHub reported an invalid default branch")?,
+        };
+
+        Ok(FirstOpenPullRequestsPage { repository, pull_requests, next_cursor })
+    }
+}
+
+impl NextOpenPullRequests {
+    pub(super) fn new(owner: String, repository: String, after: String, first: usize) -> Self {
+        assert!(!after.is_empty(), "an open pull request cursor must be nonempty");
+        assert!(first > 0, "an open pull request page size must be positive");
+        Self { owner, repository, after, first }
+    }
+
+    pub(super) fn document(&self) -> String {
+        open_pull_requests_document(
+            &self.owner,
+            &self.repository,
+            self.first,
+            OpenPullRequestPage::Next { after: &self.after },
+        )
+    }
+
+    pub(super) fn decode(&self, response: Value) -> Result<NextOpenPullRequestsPage> {
+        if response.pointer("/data/repository").and_then(Value::as_object).is_some_and(
+            |repository| {
+                repository.contains_key("id") || repository.contains_key("defaultBranchRef")
+            },
+        ) {
+            bail!("GitHub returned unrequested repository facts on a later open PR page");
+        }
+        let DecodedOpenPullRequestsPage {
+            repository_node_id: _,
+            default_branch_ref: _,
+            pull_requests,
+            next_cursor,
+        } = decode_open_pull_requests_page(response)?;
+        Ok(NextOpenPullRequestsPage { pull_requests, next_cursor })
+    }
+}
+
+enum OpenPullRequestPage<'a> {
+    First,
+    Next { after: &'a str },
+}
+
+fn open_pull_requests_document(
+    owner: &str,
+    repository: &str,
+    first: usize,
+    page: OpenPullRequestPage<'_>,
+) -> String {
+    let (repository_facts, after) = match page {
+        OpenPullRequestPage::First => {
+            ("id, defaultBranchRef { name, target { oid } } ", String::new())
+        }
+        OpenPullRequestPage::Next { after } => ("", format!(", after: {}", json!(after))),
+    };
+    format!(
+        "query {{ repository(owner: {}, name: {}) {{ {repository_facts}pullRequests(first: {first}{after}, states: [OPEN]) {{ nodes {{ number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, autoMergeRequest {{ enabledAt }}, isInMergeQueue }} pageInfo {{ hasNextPage, endCursor }} }} }} }}",
+        json!(owner),
+        json!(repository),
+    )
+}
+
+struct DecodedOpenPullRequestsPage {
+    repository_node_id: Option<String>,
+    default_branch_ref: Option<DefaultBranchRef>,
+    pull_requests: Vec<OpenPullRequest>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DefaultBranchRef {
+    name: String,
+    target: Nullable<GitObject>,
+}
+
+#[derive(Deserialize)]
+struct GitObject {
+    oid: Nullable<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum OpenPullRequestState {
+    Open,
+}
+
+fn decode_open_pull_requests_page(response: Value) -> Result<DecodedOpenPullRequestsPage> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Response {
+        id: Option<String>,
+        default_branch_ref: Option<DefaultBranchRef>,
+        pull_requests: PullRequests,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PullRequests {
+        nodes: Vec<Node>,
+        page_info: PageInfo,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PageInfo {
+        has_next_page: bool,
+        end_cursor: Nullable<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct AutoMergeRequest {
+        enabled_at: Nullable<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Node {
+        number: i64,
+        id: String,
+        title: String,
+        body: String,
+        base_ref_name: String,
+        base_ref_oid: String,
+        head_ref_name: String,
+        head_ref_oid: String,
+        state: OpenPullRequestState,
+        is_cross_repository: bool,
+        auto_merge_request: Nullable<AutoMergeRequest>,
+        is_in_merge_queue: bool,
+    }
+
+    let response = response
+        .get("data")
+        .and_then(|data| data.get("repository"))
+        .cloned()
+        .ok_or_else(|| eyre!("GitHub open pull request response is missing repository data"))?;
+    let response: Response = serde_json::from_value(response)
+        .wrap_err("Failed to decode pull request query response")?;
+    let pull_requests = response
+        .pull_requests
+        .nodes
+        .into_iter()
+        .map(|node| {
+            let number = u64::try_from(node.number)
+                .ok()
+                .filter(|number| *number > 0 && *number <= i32::MAX as u64)
+                .ok_or_else(|| {
+                    eyre!("GitHub reported an invalid pull request number {}", node.number)
+                })?;
+            for (field, value) in [
+                ("pull request node ID", &node.id),
+                ("pull request base ref name", &node.base_ref_name),
+                ("pull request head ref name", &node.head_ref_name),
+            ] {
+                if value.is_empty() {
+                    bail!("GitHub reported an empty {field}");
+                }
+            }
+            let parse_oid = |field: &str, oid: &str| {
+                let object_id = gix::ObjectId::from_hex(oid.as_bytes())
+                    .wrap_err_with(|| format!("GitHub reported an invalid {field}"))?;
+                if object_id.is_null() {
+                    bail!("GitHub reported a null {field}");
+                }
+                Ok(object_id)
+            };
+            let base_oid = parse_oid("pull request base ref object ID", &node.base_ref_oid)?;
+            let head_oid = parse_oid("pull request head ref object ID", &node.head_ref_oid)?;
+            let OpenPullRequestState::Open = node.state;
+            let has_auto_merge_request = match node.auto_merge_request {
+                Nullable::Value(request) => {
+                    let _ = request.enabled_at;
+                    true
+                }
+                Nullable::Null(()) => false,
+            };
+            Ok(OpenPullRequest {
+                number,
+                node_id: node.id,
+                title: node.title,
+                body: node.body,
+                base_branch: node.base_ref_name,
+                head_branch: node.head_ref_name,
+                base_oid,
+                head_oid,
+                is_cross_repository: node.is_cross_repository,
+                has_auto_merge_request,
+                is_in_merge_queue: node.is_in_merge_queue,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let next_cursor = match response.pull_requests.page_info {
+        PageInfo { has_next_page: true, end_cursor: Nullable::Value(cursor) }
+            if !cursor.is_empty() =>
+        {
+            Some(cursor)
+        }
+        PageInfo { has_next_page: true, .. } => {
+            bail!("GitHub reported another open pull request page without an end cursor");
+        }
+        PageInfo { has_next_page: false, .. } => None,
+    };
+
+    Ok(DecodedOpenPullRequestsPage {
+        repository_node_id: response.id,
+        default_branch_ref: response.default_branch_ref,
+        pull_requests,
+        next_cursor,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TerminalPullRequestQuery {
+    head_branch: String,
+    after: Option<String>,
+    first: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TerminalPullRequestPage {
+    pub(super) pull_requests: Vec<TerminalPullRequest>,
+    pub(super) next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TerminalPullRequest {
+    pub(super) number: u64,
+    pub(super) node_id: String,
+    pub(super) state: TerminalPullRequestState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(super) enum TerminalPullRequestState {
+    Closed,
+    Merged,
+}
+
+/// A repository-root terminal-history query with independently paged aliases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TerminalPullRequests {
+    owner: String,
+    repository: String,
+    queries: Vec<TerminalPullRequestQuery>,
+}
+
+impl TerminalPullRequests {
+    pub(super) const MAX_ALIASES: usize = 64;
+
+    pub(super) fn new(
+        owner: String,
+        repository: String,
+        queries: Vec<TerminalPullRequestQuery>,
+    ) -> Result<Self> {
+        if queries.is_empty() || queries.len() > Self::MAX_ALIASES {
+            bail!("A terminal pull request query requires between one and 64 aliases");
+        }
+        Ok(Self { owner, repository, queries })
+    }
+
+    pub(super) fn document(&self) -> String {
+        let fields = self.queries.iter().enumerate().map(|(index, query)| {
+            let after = query.after.as_ref()
+                .map(|cursor| format!(", after: {}", json!(cursor)))
+                .unwrap_or_default();
+            format!(
+                "op{index}: pullRequests(headRefName: {}, first: {}{after}, states: [CLOSED, MERGED]) {{ nodes {{ number, id, headRefName, state, isCrossRepository }} pageInfo {{ hasNextPage, endCursor }} }}",
+                json!(query.head_branch),
+                query.first,
+            )
+        }).collect::<String>();
+        format!(
+            "query {{ repository(owner: {}, name: {}) {{ {fields} }} }}",
+            json!(self.owner),
+            json!(self.repository),
+        )
+    }
+
+    pub(super) fn decode(&self, response: Value) -> Result<Vec<TerminalPullRequestPage>> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
-        struct Response {
-            id: Option<String>,
-            default_branch_ref: Option<DefaultBranchRef>,
-            open: PullRequests,
-            historical: PullRequests,
-        }
-
-        #[derive(Deserialize)]
-        struct DefaultBranchRef {
-            name: String,
-            target: Option<GitObject>,
-        }
-
-        #[derive(Deserialize)]
-        struct GitObject {
-            oid: Option<String>,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct PullRequests {
+        struct Connection {
             nodes: Vec<Node>,
             page_info: PageInfo,
         }
-
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct PageInfo {
             has_next_page: bool,
+            end_cursor: Nullable<String>,
         }
-
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Node {
-            number: u64,
+            number: i64,
             id: String,
-            title: Option<String>,
-            body: Option<String>,
-            base_ref_name: String,
-            state: PullRequestState,
+            head_ref_name: String,
+            state: TerminalPullRequestState,
             is_cross_repository: bool,
         }
 
-        let response: Response = serde_json::from_value(response)
-            .wrap_err("Failed to decode pull request query response")?;
-        let select = |kind: &str, pull_requests: PullRequests| -> Result<Option<Node>> {
-            let mut candidates = pull_requests
-                .nodes
-                .into_iter()
-                .filter(|node| !node.is_cross_repository)
-                .collect::<Vec<_>>();
-            if candidates.len() > 1 {
-                let candidates = candidates
-                    .iter()
-                    .map(|node| format!("#{}", node.number))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                bail!(
-                    "Found multiple {kind} pull requests for GHerrit ID '{}': {candidates}. GHerrit cannot safely choose one.",
-                    self.head_branch
-                );
-            }
-            if pull_requests.page_info.has_next_page {
-                bail!(
-                    "Found more than {MAX_PULL_REQUEST_CANDIDATES} {kind} pull request candidates for GHerrit ID '{}'. GHerrit cannot safely inspect them all.",
-                    self.head_branch
-                );
-            }
-            Ok(candidates.pop())
-        };
+        let connections: BTreeMap<String, Connection> = serde_json::from_value(response)
+            .wrap_err("Failed to decode terminal pull request query response")?;
+        let expected =
+            (0..self.queries.len()).map(|index| format!("op{index}")).collect::<HashSet<_>>();
+        if connections.len() != expected.len() {
+            bail!("GitHub terminal pull request response has an unexpected alias set");
+        }
+        if let Some(alias) = connections.keys().find(|alias| !expected.contains(*alias)) {
+            bail!("GitHub terminal pull request response contains unexpected operation `{alias}`");
+        }
 
-        // A sole open PR is authoritative even when the same managed branch
-        // has closed or merged history. Only consult history when no open PR
-        // from this repository exists.
-        let node = match select("open", response.open)? {
-            Some(open) => Some(open),
-            None => select("historical", response.historical)?,
-        };
-        let pull_request = node.map(|node| PullRequest {
-            number: node.number,
-            node_id: node.id,
-            title: node.title,
-            body: node.body,
-            base_branch: node.base_ref_name,
-            head_branch: self.head_branch.clone(),
-            state: node.state,
-        });
-        let repository = if self.include_repository {
-            let node_id =
-                response.id.ok_or_else(|| eyre!("GitHub omitted the repository node ID"))?;
-            if node_id.is_empty() {
-                bail!("GitHub reported an empty repository node ID");
-            }
-            let default_branch = response
-                .default_branch_ref
-                .ok_or_else(|| eyre!("GitHub omitted the repository default branch"))?;
-            let target = default_branch
-                .target
-                .ok_or_else(|| eyre!("GitHub omitted the default branch target"))?;
-            let oid =
-                target.oid.ok_or_else(|| eyre!("GitHub omitted the default branch object ID"))?;
-            let tip = gix::ObjectId::from_hex(oid.as_bytes())
-                .wrap_err("GitHub reported an invalid default branch object ID")?;
-            Some(Repository {
-                node_id,
-                default_branch: DefaultBranch::new(default_branch.name, tip)
-                    .wrap_err("GitHub reported an invalid default branch")?,
+        self.queries
+            .iter()
+            .enumerate()
+            .map(|(index, query)| {
+                let alias = format!("op{index}");
+                let connection = connections.get(&alias).ok_or_else(|| {
+                    eyre!("GitHub terminal pull request response is missing operation `{alias}`")
+                })?;
+                let pull_requests = connection
+                    .nodes
+                    .iter()
+                    .map(|node| {
+                        let number = u64::try_from(node.number)
+                            .ok()
+                            .filter(|number| *number > 0 && *number <= i32::MAX as u64)
+                            .ok_or_else(|| {
+                                eyre!(
+                                    "GitHub reported an invalid terminal pull request number {}",
+                                    node.number
+                                )
+                            })?;
+                        if node.id.is_empty() {
+                            bail!("GitHub reported an empty terminal pull request node ID");
+                        }
+                        if node.head_ref_name != query.head_branch {
+                            bail!(
+                                "GitHub terminal pull request for '{}' returned head branch '{}'",
+                                query.head_branch,
+                                node.head_ref_name
+                            );
+                        }
+                        Ok((!node.is_cross_repository).then(|| TerminalPullRequest {
+                            number,
+                            node_id: node.id.clone(),
+                            state: node.state,
+                        }))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                let next_cursor = match &connection.page_info {
+                    PageInfo { has_next_page: true, end_cursor: Nullable::Value(cursor) }
+                        if !cursor.is_empty() =>
+                    {
+                        Some(cursor.clone())
+                    }
+                    PageInfo { has_next_page: true, .. } => bail!(
+                        "GitHub reported another terminal pull request page without an end cursor"
+                    ),
+                    PageInfo { has_next_page: false, .. } => None,
+                };
+                Ok(TerminalPullRequestPage { pull_requests, next_cursor })
             })
-        } else {
-            None
-        };
-        Ok(PullRequestLookup { pull_request, repository })
+            .collect()
+    }
+}
+
+impl TerminalPullRequestQuery {
+    pub(super) fn new(head_branch: String, after: Option<String>, first: usize) -> Result<Self> {
+        if head_branch.is_empty() {
+            bail!("A terminal pull request query requires a nonempty head branch");
+        }
+        if first == 0 {
+            bail!("A terminal pull request query requires a positive page size");
+        }
+        if after.as_deref() == Some("") {
+            bail!("A terminal pull request query requires a nonempty pagination cursor");
+        }
+        Ok(Self { head_branch, after, first })
     }
 }
 
@@ -608,64 +876,335 @@ impl MutationOperation for UpdatePullRequest {
 }
 
 #[cfg(test)]
-mod tests {
+mod observation_tests {
     use super::*;
-    use crate::pre_push::body::MAX_BODY_SIZE_BYTES;
 
-    fn pull_request_node(number: u64, state: &str, is_cross_repository: bool) -> Value {
+    fn open_node(number: i64, head: &str) -> Value {
         json!({
             "number": number,
             "id": format!("PR_{number}"),
             "title": "Title",
-            "body": null,
+            "body": "Body",
             "baseRefName": "main",
+            "baseRefOid": "1".repeat(40),
+            "headRefName": head,
+            "headRefOid": "2".repeat(40),
+            "state": "OPEN",
+            "isCrossRepository": false,
+            "autoMergeRequest": null,
+            "isInMergeQueue": false,
+        })
+    }
+
+    fn open_response(nodes: Vec<Value>, has_next_page: bool, end_cursor: Value) -> Value {
+        json!({
+            "data": {
+                "repository": {
+                    "id": "R_1",
+                    "defaultBranchRef": {
+                        "name": "main",
+                        "target": { "oid": "3".repeat(40) },
+                    },
+                    "pullRequests": {
+                        "nodes": nodes,
+                        "pageInfo": {
+                            "hasNextPage": has_next_page,
+                            "endCursor": end_cursor,
+                        },
+                    },
+                },
+            },
+        })
+    }
+
+    fn terminal_node(number: i64, head: &str, state: &str, is_cross_repository: bool) -> Value {
+        json!({
+            "number": number,
+            "id": format!("PR_{number}"),
+            "headRefName": head,
             "state": state,
             "isCrossRepository": is_cross_repository,
         })
     }
 
-    fn connection(nodes: Vec<Value>, has_next_page: bool) -> Value {
+    fn terminal_query() -> TerminalPullRequests {
+        TerminalPullRequests::new(
+            "owner".to_string(),
+            "repo".to_string(),
+            vec![TerminalPullRequestQuery::new("G42".to_string(), None, 100).unwrap()],
+        )
+        .unwrap()
+    }
+
+    fn terminal_response(nodes: Vec<Value>, has_next_page: bool, end_cursor: Value) -> Value {
         json!({
-            "nodes": nodes,
-            "pageInfo": { "hasNextPage": has_next_page },
+            "op0": {
+                "nodes": nodes,
+                "pageInfo": { "hasNextPage": has_next_page, "endCursor": end_cursor },
+            },
         })
     }
 
-    fn lookup_response(open: Value, historical: Value) -> Value {
-        json!({ "open": open, "historical": historical })
-    }
-
-    fn empty_connection() -> Value {
-        connection(Vec::new(), false)
-    }
-
     #[test]
-    fn query_document_escapes_every_repository_identity_component() {
-        let query = FindPullRequest::new(
-            "o\"wner".to_string(),
-            "repo\nname".to_string(),
-            "head\\branch".to_string(),
-        );
-
-        assert_eq!(
-            query.document(),
-            r#"repository(owner: "o\"wner", name: "repo\nname") { open: pullRequests(headRefName: "head\\branch", first: 100, states: [OPEN]) { nodes { number, id, title, body, baseRefName, state, isCrossRepository } pageInfo { hasNextPage } } historical: pullRequests(headRefName: "head\\branch", first: 100, states: [CLOSED, MERGED]) { nodes { number, id, title, body, baseRefName, state, isCrossRepository } pageInfo { hasNextPage } } }"#
-        );
-    }
-
-    #[test]
-    fn the_first_lookup_observes_repository_facts_in_the_same_document() {
-        let query = FindPullRequest::with_repository(
+    fn open_scan_documents_use_one_connection_and_an_exact_cursor() {
+        let first = FirstOpenPullRequests::new("owner".to_string(), "repo".to_string(), 100);
+        let next = NextOpenPullRequests::new(
             "owner".to_string(),
             "repo".to_string(),
-            "G123".to_string(),
+            "opaque cursor".to_string(),
+            100,
         );
+        assert!(first.document().contains("id, defaultBranchRef"));
+        assert!(!next.document().contains("defaultBranchRef"));
+        assert!(next.document().contains("after: \"opaque cursor\""));
+        assert!(!next.document().contains("headRefName:"));
+    }
 
+    #[test]
+    fn open_scan_decoder_requires_a_cursor_only_when_more_pages_exist() {
+        let query = FirstOpenPullRequests::new("owner".to_string(), "repo".to_string(), 100);
         assert_eq!(
-            query.document(),
-            r#"repository(owner: "owner", name: "repo") { id, defaultBranchRef { name, target { oid } } open: pullRequests(headRefName: "G123", first: 100, states: [OPEN]) { nodes { number, id, title, body, baseRefName, state, isCrossRepository } pageInfo { hasNextPage } } historical: pullRequests(headRefName: "G123", first: 100, states: [CLOSED, MERGED]) { nodes { number, id, title, body, baseRefName, state, isCrossRepository } pageInfo { hasNextPage } } }"#
+            query
+                .decode(open_response(vec![open_node(42, "G42")], true, json!("cursor-1")))
+                .unwrap()
+                .next_cursor
+                .as_deref(),
+            Some("cursor-1")
+        );
+        assert!(
+            query.decode(open_response(vec![open_node(42, "G42")], true, Value::Null)).is_err()
+        );
+        assert_eq!(
+            query
+                .decode(open_response(vec![open_node(42, "G42")], false, json!("ignored")))
+                .unwrap()
+                .next_cursor,
+            None
         );
     }
+
+    #[test]
+    fn open_scan_decoder_requires_complete_first_page_repository_facts() {
+        let query = FirstOpenPullRequests::new("owner".to_string(), "repo".to_string(), 100);
+        let base = open_response(vec![], false, Value::Null);
+        let mut cases = vec![json!({}), json!({ "data": { "repository": null } })];
+
+        for field in ["id", "defaultBranchRef"] {
+            let mut response = base.clone();
+            response["data"]["repository"].as_object_mut().unwrap().remove(field);
+            cases.push(response);
+        }
+        for (pointer, replacement) in [
+            ("/data/repository/id", json!("")),
+            ("/data/repository/defaultBranchRef/target", Value::Null),
+            ("/data/repository/defaultBranchRef/target/oid", Value::Null),
+            ("/data/repository/defaultBranchRef/target/oid", json!("invalid")),
+        ] {
+            let mut response = base.clone();
+            *response.pointer_mut(pointer).unwrap() = replacement;
+            cases.push(response);
+        }
+
+        for response in cases {
+            assert!(query.decode(response).is_err());
+        }
+    }
+
+    #[test]
+    fn later_open_pages_neither_require_nor_accept_repository_facts() {
+        let query = NextOpenPullRequests::new(
+            "owner".to_string(),
+            "repo".to_string(),
+            "cursor-1".to_string(),
+            100,
+        );
+        let response = open_response(vec![], false, Value::Null);
+        assert!(query.decode(response.clone()).is_err());
+        let mut null_facts = response.clone();
+        null_facts["data"]["repository"]["id"] = Value::Null;
+        null_facts["data"]["repository"]["defaultBranchRef"] = Value::Null;
+        assert!(query.decode(null_facts).is_err());
+
+        let mut response = response;
+        let repository = response["data"]["repository"].as_object_mut().unwrap();
+        repository.remove("id");
+        repository.remove("defaultBranchRef");
+        assert_eq!(query.decode(response).unwrap().next_cursor, None);
+    }
+
+    #[test]
+    fn open_scan_decoder_requires_every_selected_node_field() {
+        let query = FirstOpenPullRequests::new("owner".to_string(), "repo".to_string(), 100);
+
+        for field in [
+            "id",
+            "title",
+            "body",
+            "baseRefName",
+            "baseRefOid",
+            "headRefName",
+            "headRefOid",
+            "state",
+            "isCrossRepository",
+            "autoMergeRequest",
+            "isInMergeQueue",
+        ] {
+            let mut node = open_node(42, "G42");
+            node.as_object_mut().unwrap().remove(field);
+            let error = query
+                .decode(open_response(vec![node], false, Value::Null))
+                .expect_err("a selected field may not be absent");
+            assert!(
+                format!("{error:?}").contains("missing field"),
+                "field={field}, error={error:?}"
+            );
+        }
+
+        for field in ["title", "body"] {
+            let mut node = open_node(42, "G42");
+            node[field] = Value::Null;
+            assert!(
+                query.decode(open_response(vec![node], false, Value::Null)).is_err(),
+                "field={field}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_scan_decoder_preserves_projection_and_policy_state() {
+        let query = FirstOpenPullRequests::new("owner".to_string(), "repo".to_string(), 100);
+        let mut node = open_node(i64::from(i32::MAX), "G42");
+        node["autoMergeRequest"] = json!({ "enabledAt": "2026-01-01T00:00:00Z" });
+        node["isInMergeQueue"] = json!(true);
+
+        let pull_requests =
+            query.decode(open_response(vec![node], false, Value::Null)).unwrap().pull_requests;
+        assert_eq!(
+            pull_requests,
+            [OpenPullRequest {
+                number: i32::MAX as u64,
+                node_id: format!("PR_{}", i32::MAX),
+                title: "Title".to_string(),
+                body: "Body".to_string(),
+                base_branch: "main".to_string(),
+                head_branch: "G42".to_string(),
+                base_oid: gix::ObjectId::from_hex("1".repeat(40).as_bytes()).unwrap(),
+                head_oid: gix::ObjectId::from_hex("2".repeat(40).as_bytes()).unwrap(),
+                is_cross_repository: false,
+                has_auto_merge_request: true,
+                is_in_merge_queue: true,
+            }]
+        );
+
+        let mut nullable_enabled_at = open_node(42, "G42");
+        nullable_enabled_at["autoMergeRequest"] = json!({ "enabledAt": null });
+        assert!(
+            query
+                .decode(open_response(vec![nullable_enabled_at], false, Value::Null))
+                .unwrap()
+                .pull_requests[0]
+                .has_auto_merge_request
+        );
+
+        for invalid_request in [json!({}), json!({ "enabledAt": {} })] {
+            let mut node = open_node(42, "G42");
+            node["autoMergeRequest"] = invalid_request;
+            assert!(query.decode(open_response(vec![node], false, Value::Null)).is_err());
+        }
+    }
+
+    #[test]
+    fn terminal_batches_are_bounded_and_keep_each_cursor_independent() {
+        let queries = (0..64)
+            .map(|index| {
+                TerminalPullRequestQuery::new(
+                    format!("G{index}"),
+                    (index == 1).then(|| "cursor-1".to_string()),
+                    100,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let query =
+            TerminalPullRequests::new("owner".to_string(), "repo".to_string(), queries).unwrap();
+        assert_eq!(query.document().matches("pullRequests(").count(), 64);
+        assert!(TerminalPullRequests::new("o".to_string(), "r".to_string(), vec![]).is_err());
+    }
+
+    #[test]
+    fn terminal_query_rejects_unusable_connection_arguments() {
+        for (head_branch, after, first) in
+            [("", None, 100), ("G42", None, 0), ("G42", Some(""), 100)]
+        {
+            assert!(
+                TerminalPullRequestQuery::new(
+                    head_branch.to_string(),
+                    after.map(str::to_string),
+                    first,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_decoder_preserves_every_same_repository_candidate() {
+        let query = terminal_query();
+        let pages = query
+            .decode(terminal_response(
+                vec![
+                    terminal_node(7, "G42", "CLOSED", false),
+                    terminal_node(8, "G42", "MERGED", true),
+                    terminal_node(9, "G42", "MERGED", false),
+                ],
+                true,
+                json!("terminal-cursor"),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            pages,
+            [TerminalPullRequestPage {
+                pull_requests: vec![
+                    TerminalPullRequest {
+                        number: 7,
+                        node_id: "PR_7".to_string(),
+                        state: TerminalPullRequestState::Closed,
+                    },
+                    TerminalPullRequest {
+                        number: 9,
+                        node_id: "PR_9".to_string(),
+                        state: TerminalPullRequestState::Merged,
+                    },
+                ],
+                next_cursor: Some("terminal-cursor".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn terminal_decoder_rejects_incomplete_or_contradictory_evidence() {
+        let query = terminal_query();
+        for node in [
+            terminal_node(0, "G42", "CLOSED", false),
+            terminal_node(i64::from(i32::MAX) + 1, "G42", "CLOSED", false),
+            terminal_node(42, "other", "CLOSED", false),
+            terminal_node(42, "G42", "OPEN", false),
+        ] {
+            assert!(query.decode(terminal_response(vec![node], false, Value::Null)).is_err());
+        }
+
+        let mut missing_id = terminal_node(42, "G42", "CLOSED", false);
+        missing_id.as_object_mut().unwrap().remove("id");
+        assert!(query.decode(terminal_response(vec![missing_id], false, Value::Null)).is_err());
+        assert!(query.decode(terminal_response(vec![], true, Value::Null)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pre_push::body::MAX_BODY_SIZE_BYTES;
 
     #[test]
     fn create_document_escapes_every_input() {
@@ -712,316 +1251,6 @@ mod tests {
             mutation_batch_document(&operations),
             r#"mutation { op0: updatePullRequest(input: { pullRequestId: "PR_1", title: "one", clientMutationId: "gherrit:update:PR_1" }) { clientMutationId, pullRequest { id } }op1: updatePullRequest(input: { pullRequestId: "PR_2", title: "two", clientMutationId: "gherrit:update:PR_2" }) { clientMutationId, pullRequest { id } } }"#
         );
-    }
-
-    #[test]
-    fn decodes_repository_identity_and_default_branch_with_the_first_lookup() {
-        let query = FindPullRequest::with_repository(
-            "owner".to_string(),
-            "repo".to_string(),
-            "G123".to_string(),
-        );
-        let oid = "1111111111111111111111111111111111111111";
-        let response = |oid: &str| {
-            json!({
-                "id": "R_1",
-                "defaultBranchRef": {
-                    "name": "master",
-                    "target": { "oid": oid },
-                },
-                "open": empty_connection(),
-                "historical": empty_connection(),
-            })
-        };
-
-        assert_eq!(
-            <FindPullRequest as QueryOperation>::decode(&query, response(oid)).unwrap(),
-            PullRequestLookup {
-                pull_request: None,
-                repository: Some(Repository {
-                    node_id: "R_1".to_string(),
-                    default_branch: DefaultBranch::new(
-                        "master".to_string(),
-                        gix::ObjectId::from_hex(oid.as_bytes()).unwrap(),
-                    )
-                    .unwrap(),
-                }),
-            },
-        );
-        assert!(
-            <FindPullRequest as QueryOperation>::decode(&query, response("not-an-object-id"))
-                .is_err()
-        );
-        assert!(
-            <FindPullRequest as QueryOperation>::decode(
-                &query,
-                response("0000000000000000000000000000000000000000"),
-            )
-            .is_err()
-        );
-        for incomplete in [
-            json!({
-                "defaultBranchRef": {
-                    "name": "master",
-                    "target": { "oid": oid },
-                },
-                "open": empty_connection(),
-                "historical": empty_connection(),
-            }),
-            json!({
-                "id": "R_1",
-                "open": empty_connection(),
-                "historical": empty_connection(),
-            }),
-            json!({
-                "id": "",
-                "defaultBranchRef": {
-                    "name": "master",
-                    "target": { "oid": oid },
-                },
-                "open": empty_connection(),
-                "historical": empty_connection(),
-            }),
-            json!({
-                "id": "R_1",
-                "defaultBranchRef": {
-                    "name": "master",
-                    "target": null,
-                },
-                "open": empty_connection(),
-                "historical": empty_connection(),
-            }),
-            json!({
-                "id": "R_1",
-                "defaultBranchRef": {
-                    "name": "master",
-                    "target": { "oid": null },
-                },
-                "open": empty_connection(),
-                "historical": empty_connection(),
-            }),
-        ] {
-            assert!(
-                <FindPullRequest as QueryOperation>::decode(&query, incomplete).is_err(),
-                "the first lookup must include complete repository facts",
-            );
-        }
-    }
-
-    #[test]
-    fn decodes_pull_request_queries_to_owned_state() {
-        let query =
-            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
-
-        assert_eq!(
-            query
-                .decode(lookup_response(
-                    connection(vec![pull_request_node(42, "OPEN", false)], false),
-                    empty_connection(),
-                ))
-                .unwrap(),
-            Some(PullRequest {
-                number: 42,
-                node_id: "PR_42".to_string(),
-                title: Some("Title".to_string()),
-                body: None,
-                base_branch: "main".to_string(),
-                head_branch: "G123".to_string(),
-                state: PullRequestState::Open,
-            })
-        );
-        assert_eq!(
-            query.decode(lookup_response(empty_connection(), empty_connection())).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn pull_request_lifecycle_decoding_is_exhaustive_and_fail_closed() {
-        let query =
-            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
-        let response = |state| {
-            let node = pull_request_node(42, state, false);
-            match state {
-                "OPEN" => lookup_response(connection(vec![node], false), empty_connection()),
-                _ => lookup_response(empty_connection(), connection(vec![node], false)),
-            }
-        };
-
-        [
-            ("OPEN", PullRequestState::Open),
-            ("CLOSED", PullRequestState::Closed),
-            ("MERGED", PullRequestState::Merged),
-        ]
-        .into_iter()
-        .for_each(|(wire_state, expected)| {
-            let pull_request = query.decode(response(wire_state)).unwrap().unwrap();
-            assert_eq!(pull_request.state, expected, "wire_state={wire_state}");
-        });
-
-        let error = query.decode(response("UNKNOWN")).unwrap_err();
-        assert_eq!(error.to_string(), "Failed to decode pull request query response");
-        assert!(format!("{error:?}").contains("unknown variant `UNKNOWN`"));
-    }
-
-    #[test]
-    fn a_unique_open_pull_request_wins_over_history() {
-        let query =
-            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
-
-        let selected = query
-            .decode(lookup_response(
-                connection(vec![pull_request_node(42, "OPEN", false)], false),
-                connection(
-                    vec![
-                        pull_request_node(7, "CLOSED", false),
-                        pull_request_node(8, "MERGED", false),
-                    ],
-                    true,
-                ),
-            ))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(selected.number, 42);
-        assert_eq!(selected.state, PullRequestState::Open);
-    }
-
-    #[test]
-    fn fork_pull_requests_do_not_participate_in_selection() {
-        let query =
-            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
-
-        let selected = query
-            .decode(lookup_response(
-                connection(
-                    vec![pull_request_node(7, "OPEN", true), pull_request_node(42, "OPEN", false)],
-                    false,
-                ),
-                empty_connection(),
-            ))
-            .unwrap()
-            .unwrap();
-        assert_eq!(selected.number, 42);
-
-        assert_eq!(
-            query
-                .decode(lookup_response(
-                    connection(vec![pull_request_node(7, "OPEN", true)], false),
-                    connection(vec![pull_request_node(8, "CLOSED", true)], false),
-                ))
-                .unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn a_unique_historical_pull_request_preserves_lifecycle_handling() {
-        let query =
-            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
-
-        let selected = query
-            .decode(lookup_response(
-                connection(vec![pull_request_node(7, "OPEN", true)], false),
-                connection(vec![pull_request_node(42, "MERGED", false)], false),
-            ))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(selected.number, 42);
-        assert_eq!(selected.state, PullRequestState::Merged);
-    }
-
-    #[test]
-    fn duplicate_same_repository_candidates_are_ambiguous_by_lifecycle() {
-        let query =
-            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
-
-        let open_error = query
-            .decode(lookup_response(
-                connection(
-                    vec![
-                        pull_request_node(42, "OPEN", false),
-                        pull_request_node(99, "OPEN", false),
-                    ],
-                    false,
-                ),
-                empty_connection(),
-            ))
-            .unwrap_err();
-
-        assert_eq!(
-            open_error.to_string(),
-            "Found multiple open pull requests for GHerrit ID 'G123': #42, #99. GHerrit cannot safely choose one."
-        );
-
-        let historical_error = query
-            .decode(lookup_response(
-                empty_connection(),
-                connection(
-                    vec![
-                        pull_request_node(42, "CLOSED", false),
-                        pull_request_node(99, "MERGED", false),
-                    ],
-                    false,
-                ),
-            ))
-            .unwrap_err();
-        assert_eq!(
-            historical_error.to_string(),
-            "Found multiple historical pull requests for GHerrit ID 'G123': #42, #99. GHerrit cannot safely choose one."
-        );
-    }
-
-    #[test]
-    fn incomplete_candidate_pages_fail_closed() {
-        let query =
-            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
-
-        let open_error = query
-            .decode(lookup_response(
-                connection(vec![pull_request_node(7, "OPEN", true)], true),
-                empty_connection(),
-            ))
-            .unwrap_err();
-        assert_eq!(
-            open_error.to_string(),
-            "Found more than 100 open pull request candidates for GHerrit ID 'G123'. GHerrit cannot safely inspect them all."
-        );
-
-        let historical_error = query
-            .decode(lookup_response(
-                empty_connection(),
-                connection(vec![pull_request_node(7, "CLOSED", true)], true),
-            ))
-            .unwrap_err();
-        assert_eq!(
-            historical_error.to_string(),
-            "Found more than 100 historical pull request candidates for GHerrit ID 'G123'. GHerrit cannot safely inspect them all."
-        );
-    }
-
-    #[test]
-    fn incomplete_pull_request_nodes_are_errors() {
-        let query =
-            FindPullRequest::new("owner".to_string(), "repo".to_string(), "G123".to_string());
-        let error = query
-            .decode(lookup_response(
-                connection(
-                    vec![json!({
-                        "number": 42,
-                        "id": "PR_42",
-                        "state": "OPEN",
-                        "isCrossRepository": false,
-                    })],
-                    false,
-                ),
-                empty_connection(),
-            ))
-            .unwrap_err();
-
-        assert_eq!(error.to_string(), "Failed to decode pull request query response");
-        assert!(format!("{error:?}").contains("missing field `baseRefName`"));
     }
 
     #[derive(Debug)]
