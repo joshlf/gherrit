@@ -1,5 +1,0 @@
----
-source: src/pre_push/body.rs
-expression: "metadata_comment(\"G\\\"雪\", Some(\"parent\\\\branch\"), Some(\"child\\nline\"),)"
----
-<!-- gherrit-meta: {"id":"G\"雪","parent":"parent\\branch","child":"child\nline"} -->
