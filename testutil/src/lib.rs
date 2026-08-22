@@ -458,8 +458,10 @@ pub enum GitOperation {
     InterpretTrailers,
     HttpRedirectPolicy,
     LsRemoteUrl,
-    LsRemoteDefaultBranch,
-    LsRemoteManagedBranches,
+    LsRemoteHeads,
+    LsRemoteActiveVersions,
+    LsRemoteOther,
+    Push,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +487,7 @@ pub enum FailureKind {
     CreatePrRedirect(RedirectStatus),
     UpdatePr,
     Git(GitOperation),
+    GitOnInvocation { operation: GitOperation, occurrence: usize },
     GitOutput { operation: GitOperation, stdout: &'static str },
 }
 
@@ -493,6 +496,16 @@ pub enum GraphQlOperation {
     Query,
     CreatePr,
     UpdatePr,
+}
+
+/// One production interaction at either side of the Git/GitHub boundary.
+///
+/// Keeping both protocols in one ordered log lets process tests prove ordering
+/// properties which two independent per-protocol logs cannot express.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundaryEvent {
+    Git(GitOperation),
+    GraphQl(Vec<GraphQlOperation>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -643,17 +656,22 @@ impl Drop for TestContext {
         // Stop the server before fixture directories and state are released.
         drop(self.mock_server.take());
 
-        let (state_poisoned, pending_faults) = self
+        let (state_poisoned, pending_faults, pending_remote_updates) = self
             .mock_server_state
             .as_ref()
             .map(|state| match state.read() {
-                Ok(state) => (false, state.faults.clone()),
-                Err(poisoned) => (true, poisoned.into_inner().faults.clone()),
+                Ok(state) => {
+                    (false, state.faults.clone(), state.git.pending_remote_ref_updates().clone())
+                }
+                Err(poisoned) => {
+                    let state = poisoned.into_inner();
+                    (true, state.faults.clone(), state.git.pending_remote_ref_updates().clone())
+                }
             })
             .unwrap_or_default();
         if state_poisoned {
             let message = format!(
-                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}"
+                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}; unconsumed remote updates: {pending_remote_updates:?}"
             );
             if thread::panicking() {
                 eprintln!("{message}");
@@ -667,6 +685,15 @@ impl Drop for TestContext {
                 eprintln!("Test fixture also has unconsumed faults: {pending_faults:?}");
             } else {
                 panic!("Test fixture has unconsumed faults: {pending_faults:?}");
+            }
+        }
+        if !pending_remote_updates.is_empty() {
+            if thread::panicking() {
+                eprintln!(
+                    "Test fixture also has unconsumed remote updates: {pending_remote_updates:?}"
+                );
+            } else {
+                panic!("Test fixture has unconsumed remote updates: {pending_remote_updates:?}");
             }
         }
     }
@@ -877,10 +904,19 @@ impl TestContext {
 
     pub fn inject_failure(&self, kind: FailureKind) {
         match kind {
-            FailureKind::Git(_) | FailureKind::GitOutput { .. } => assert!(
-                self.has_git_interceptor,
-                "missing test capability: .with_git_interceptor()"
-            ),
+            FailureKind::Git(_) | FailureKind::GitOutput { .. } => {
+                assert!(
+                    self.has_git_interceptor,
+                    "missing test capability: .with_git_interceptor()"
+                )
+            }
+            FailureKind::GitOnInvocation { occurrence, .. } => {
+                assert!(
+                    self.has_git_interceptor,
+                    "missing test capability: .with_git_interceptor()"
+                );
+                assert_ne!(occurrence, 0, "Git invocation occurrences are one-based");
+            }
             _ => assert!(self.has_mock_github, "missing test capability: .with_mock_github()"),
         }
         self.enqueue_failure(kind);
@@ -890,8 +926,27 @@ impl TestContext {
         self.inject_failure(FailureKind::Git(operation));
     }
 
+    pub fn expect_git_failure_on_invocation(&self, operation: GitOperation, occurrence: usize) {
+        self.inject_failure(FailureKind::GitOnInvocation { operation, occurrence });
+    }
+
     pub fn expect_git_output(&self, operation: GitOperation, stdout: &'static str) {
         self.inject_failure(FailureKind::GitOutput { operation, stdout });
+    }
+
+    /// Schedules a deterministic concurrent remote write after GHerrit has
+    /// observed refs but immediately before its next production push reaches
+    /// the real Git executable.
+    pub fn update_remote_ref_before_next_passthrough_push(
+        &self,
+        ref_name: impl Into<String>,
+        target: impl Into<String>,
+    ) {
+        assert!(self.has_remote, "missing test capability: .with_remote()");
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        self.mock_state().write().unwrap().git.schedule_remote_ref_update(
+            git_interceptor::RemoteRefUpdate { ref_name: ref_name.into(), target: target.into() },
+        );
     }
 
     fn enqueue_failure(&self, kind: FailureKind) {
@@ -942,6 +997,21 @@ impl TestContext {
                 })
                 .collect()
         })
+    }
+
+    /// Returns production Git invocations recorded at one typed boundary.
+    ///
+    /// Fixture setup commands are excluded even though the interceptor passes
+    /// them through to the system Git executable.
+    pub fn recorded_git_invocations(&self, operation: GitOperation) -> Vec<Vec<String>> {
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        self.inspect_mock_state(|state| state.git.invocations(operation))
+    }
+
+    pub fn boundary_events(&self) -> Vec<BoundaryEvent> {
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
+        self.inspect_mock_state(|state| state.boundary_events.clone())
     }
 
     pub fn formatted_github_state(&self) -> String {
@@ -1431,6 +1501,28 @@ mod tests {
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .expect("fixture panic must have a string message");
         assert!(message.contains("Git(Var)"), "unexpected teardown panic: {message}");
+    }
+
+    #[test]
+    fn interceptor_rejects_an_unconsumed_scheduled_remote_update() {
+        let driver_dir = TempDir::new().unwrap();
+        let driver = driver_dir.path().join("gherrit-test-driver");
+        fs::write(&driver, "test driver placeholder").unwrap();
+
+        let panic = panic::catch_unwind(|| {
+            let ctx = TestContextBuilder::new(&driver).with_remote().with_git_interceptor().build();
+            ctx.update_remote_ref_before_next_passthrough_push(
+                "refs/heads/Gone",
+                "refs/heads/main",
+            );
+        })
+        .expect_err("dropping the fixture must reject an unconsumed remote update");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("fixture panic must have a string message");
+        assert!(message.contains("refs/heads/Gone"), "unexpected teardown panic: {message}");
     }
 
     #[test]

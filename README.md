@@ -192,17 +192,32 @@ entire evolution of a PR. These version tags can be used to diff any two
 versions of a PR – this is how GHerrit generates the **Patch History Table** in
 the PR description.
 
-#### Optimistic Concurrency Control
+#### Git Ref Drift Detection
 
-GHerrit enforces optimistic locking to prevent race conditions when multiple
-users update the same stack. When pushing a new version tag (e.g., `v2`),
-GHerrit uses the atomic push option:
-`--force-with-lease=refs/tags/gherrit/<id>/v<ver>:`.
+GHerrit's publication protocol assumes one publisher at a time. It does not
+provide serializable multi-publisher publication, and GitHub mutations cannot
+be conditioned on an expected Git ref state.
 
-The trailing colon (`:`) tells Git to ensure the ref does **not** already exist
-on the remote. If another user has already pushed `v2` in the interim, the
-assertion fails, the push is rejected, and the user is forced to fetch and
-rebase, preserving the integrity of the patch history.
+Within that boundary, GHerrit detects Git ref drift between observation and
+its own Git writes. One remote observation establishes the default branch and
+all managed heads. After deriving the local stack, a second batched observation
+reads immutable version history only for its active changes. Work therefore
+scales with repository heads plus active histories, not every version ever
+published in the repository.
+
+Before changing a managed head, GHerrit derives the next version from remote
+history, leases the exact observed head, and requires the new version tag to be
+absent. If either ref changes after observation, Git rejects the
+complete atomic push. A change already at its desired head is a true no-op and
+sends no lease. These checks protect refs which GHerrit actually updates; they
+do not fence the later pull request metadata projection. Local version tags do
+not participate in these decisions.
+
+Before observing GitHub or writing refs, GHerrit renders every variable push
+argument and partitions the complete branch-and-tag pair for each change into
+conservatively byte-budgeted batches. A pair is never split between pushes. An
+individually oversized change anywhere in the stack rejects the whole plan;
+an unchanged stack produces no push.
 
 #### `pre-push` Hook
 
