@@ -371,7 +371,7 @@ impl CorrelatedPullRequests {
 /// but its body and branch names never participate in managed correlation.
 pub(super) fn correlate<'a>(
     local_ids: impl IntoIterator<Item = &'a GherritPrId>,
-    heads: &RemoteHeads,
+    heads: &RemoteHeads<'_>,
     open_pull_requests: Vec<OpenPullRequest>,
 ) -> Result<CorrelatedPullRequests> {
     let local_ids = local_ids.into_iter().cloned().collect::<Vec<_>>();
@@ -673,7 +673,7 @@ mod tests {
         GherritPrId::from_ref_component(value.as_bytes()).unwrap()
     }
 
-    fn raw_heads(candidate_heads: &[&str], owned_bases: &[&str]) -> RemoteHeads {
+    fn raw_heads(candidate_heads: &[&str], owned_bases: &[&str]) -> RemoteHeads<'static> {
         let default = object_id(1);
         let mut advertisement =
             format!("ref: refs/heads/main\tHEAD\n{default}\tHEAD\n{default}\trefs/heads/main\n");
