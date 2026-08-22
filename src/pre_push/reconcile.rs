@@ -1,42 +1,3 @@
-/// Terminal pull-request evidence which permanently retires a change ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RetiredPullRequest {
-    Closed { number: u64 },
-    Merged { number: u64 },
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct RetiredPullRequests {
-    pull_requests: Vec<RetiredPullRequest>,
-}
-
-impl std::fmt::Display for RetiredPullRequests {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.pull_requests.iter().try_for_each(|pull_request| {
-            let (state, number) = match *pull_request {
-                RetiredPullRequest::Closed { number } => ("closed", number),
-                RetiredPullRequest::Merged { number } => ("merged", number),
-            };
-            writeln!(
-                formatter,
-                "Cannot push to {state} PR #{number}. Please open a new PR or reopen the existing one."
-            )
-        })?;
-        write!(formatter, "You may want to rebase on the latest changes before pushing.")
-    }
-}
-
-impl std::error::Error for RetiredPullRequests {}
-
-/// Rejects any change ID which has already had a closed or merged PR.
-pub(super) fn ensure_pull_request_ids_available(
-    pull_requests: impl IntoIterator<Item = RetiredPullRequest>,
-) -> Result<(), RetiredPullRequests> {
-    let pull_requests = pull_requests.into_iter().collect::<Vec<_>>();
-
-    if pull_requests.is_empty() { Ok(()) } else { Err(RetiredPullRequests { pull_requests }) }
-}
-
 /// A stack item annotated with the relationships needed to project it as a PR.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct StackEntry<T> {
@@ -122,59 +83,6 @@ fn normalize_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const RETIRED_PULL_REQUESTS: [RetiredPullRequest; 2] =
-        [RetiredPullRequest::Closed { number: 42 }, RetiredPullRequest::Merged { number: 42 }];
-
-    #[test]
-    fn pull_request_lifecycle_policy_covers_every_terminal_state() {
-        let cases = [
-            (
-                RetiredPullRequest::Closed { number: 42 },
-                "Cannot push to closed PR #42. Please open a new PR or reopen the existing one.\n\
-                 You may want to rebase on the latest changes before pushing.",
-            ),
-            (
-                RetiredPullRequest::Merged { number: 42 },
-                "Cannot push to merged PR #42. Please open a new PR or reopen the existing one.\n\
-                 You may want to rebase on the latest changes before pushing.",
-            ),
-        ];
-
-        for (pull_request, expected_error) in cases {
-            let error = ensure_pull_request_ids_available([pull_request]).unwrap_err();
-            assert_eq!(error.to_string(), expected_error, "pull_request={pull_request:?}");
-        }
-    }
-
-    #[test]
-    fn only_an_empty_terminal_observation_keeps_ids_available() {
-        assert_eq!(ensure_pull_request_ids_available(std::iter::empty()), Ok(()));
-
-        for first in RETIRED_PULL_REQUESTS {
-            for second in RETIRED_PULL_REQUESTS {
-                let observed = [first, second];
-                let actual = ensure_pull_request_ids_available(observed).unwrap_err().pull_requests;
-                assert_eq!(actual, observed, "pull_requests=({first:?}, {second:?})");
-            }
-        }
-    }
-
-    #[test]
-    fn pull_request_lifecycle_diagnostic_reports_every_violation_in_order() {
-        let error = ensure_pull_request_ids_available([
-            RetiredPullRequest::Merged { number: 11 },
-            RetiredPullRequest::Closed { number: 33 },
-        ])
-        .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "Cannot push to merged PR #11. Please open a new PR or reopen the existing one.\n\
-             Cannot push to closed PR #33. Please open a new PR or reopen the existing one.\n\
-             You may want to rebase on the latest changes before pushing."
-        );
-    }
 
     fn link_ids(base_branch: &str, ids: &[&str]) -> Vec<StackEntry<String>> {
         link_stack(base_branch, ids.iter().copied().map(str::to_owned), Clone::clone)

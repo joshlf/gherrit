@@ -11,7 +11,7 @@ use std::{borrow::Cow, env, process::Command, str};
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::ObjectId;
 
-use super::subprocess;
+use super::{bounded_diagnostic_detail, subprocess};
 use crate::util;
 
 const DESTINATION_ENV: &str = "GHERRIT_PRIVATE_PUSH_DESTINATION";
@@ -652,14 +652,17 @@ impl DefaultBranch {
     /// agree before any write.
     pub(super) fn agree(git: Self, github: Self) -> Result<Self> {
         if git.name != github.name {
+            let git_name = bounded_diagnostic_detail(&git.name);
+            let github_name = bounded_diagnostic_detail(&github.name);
             bail!(
                 "Git and GitHub disagree about the repository default branch name ('{}' versus '{}')",
-                git.name,
-                github.name
+                git_name,
+                github_name
             );
         }
         if git.tip != github.tip {
-            bail!("Git and GitHub disagree about the tip of default branch '{}'", git.name);
+            let name = bounded_diagnostic_detail(&git.name);
+            bail!("Git and GitHub disagree about the tip of default branch '{}'", name);
         }
 
         Ok(git)
@@ -851,6 +854,19 @@ mod tests {
         for name in ["main", "gherrit-base", "gherrit-basesuffix", "prefix/gherrit-bases/Gone"] {
             assert!(DefaultBranch::new(name.to_owned(), tip).is_ok(), "name={name}");
         }
+    }
+
+    #[test]
+    fn default_branch_disagreement_bounds_external_names() {
+        let tip = ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+        let git = DefaultBranch::new("main".to_owned(), tip).unwrap();
+        let github = DefaultBranch::new(format!("evil\u{202e}{}", "x".repeat(1_000)), tip).unwrap();
+
+        let error = DefaultBranch::agree(git, github).unwrap_err().to_string();
+
+        assert!(error.is_ascii(), "error={error:?}");
+        assert!(error.ends_with("...')"), "error={error:?}");
+        assert!(error.len() < 400, "error length={}", error.len());
     }
 
     #[test]
