@@ -35,38 +35,6 @@ synchronizes them to GitHub as a chain of dependent Pull Requests.
     gherrit install
     ```
 
-3.  **Setup GitHub Action (Optional but Recommended):**
-    To enable automatic cascading merges (where merging a parent PR
-    automatically rebases its child), add the following workflow to your
-    repository at `.github/workflows/gherrit-rebase-stack.yml`:
-
-    ```yaml
-    name: Rebase Stack
-    on:
-      pull_request:
-        types: [closed]
-
-    permissions:
-      contents: write
-      pull-requests: write
-
-    jobs:
-      rebase-stack:
-        if: github.event.pull_request.merged == true
-        runs-on: ubuntu-latest
-        steps:
-          - uses: actions/checkout@v4
-            with:
-              fetch-depth: 0
-              token: ${{ secrets.GITHUB_TOKEN }}
-
-          - name: Run Gherrit Cascade
-            uses: joshlf/gherrit@main
-            with:
-              token: ${{ secrets.GITHUB_TOKEN }}
-              pr_body: ${{ github.event.pull_request.body }}
-    ```
-
 ## Usage
 
 Once installed, simply work as if you were using Gerrit.
@@ -114,7 +82,7 @@ git push
 To modify a commit in the middle of the stack, use interactive rebase:
 
 ```bash
-git rebase -i main
+git rebase --rebase-merges -i main
 # (Edit, squash, or reword commits)
 ```
 
@@ -125,7 +93,48 @@ git push
 ```
 
 GHerrit will detect the changes based on the persistent `gherrit-pr-id` in the
-commit trailers and update the corresponding PRs in place.
+commit trailers and update the corresponding PRs in place. The
+`--rebase-merges` option preserves merge topology in stacks which contain
+merge commits.
+
+### 4\. Landing a Stack
+
+Only merge the root PR whose base is the repository's default branch. GHerrit
+does not automatically rebase the remaining stack after the root lands.
+
+Run the following commands with the managed stack branch checked out. Replace
+`<gherrit-remote>` with the remote configured for GHerrit. That remote's fetch
+URL and push destination must identify the same repository.
+
+Replace `<default-branch>` with the repository's default branch and
+`<merged-root-commit>` with the local commit for the PR which just landed:
+
+```bash
+git fetch <gherrit-remote> \
+    refs/heads/<default-branch>:refs/heads/<default-branch>
+git rebase --rebase-merges \
+    --onto refs/heads/<default-branch> <merged-root-commit>
+git push
+```
+
+The explicit fetch destination advances the local default branch. The refspec
+has no leading `+`, so Git accepts only a fast-forward and refuses to overwrite
+a divergent local branch. If that command fails, reconcile the local default
+branch deliberately rather than forcing the fetch. GHerrit uses the local
+default branch, not a remote-tracking branch, as the start of the stack.
+
+The rebase omits the landed root while recreating the remaining merge
+topology. Inspect the result and resolve any conflicts before pushing.
+
+For example, if GHerrit uses `origin` and the default branch is `main`:
+
+```bash
+git fetch origin refs/heads/main:refs/heads/main
+git rebase --rebase-merges --onto refs/heads/main <merged-root-commit>
+git push
+```
+
+GHerrit updates the remaining PRs from the rebased commits.
 
 ## Configuration
 
@@ -232,32 +241,6 @@ GHerrit emulates this by rewriting each PR's message with links to other PRs in
 the same stack:
 
 <img width="915" height="317" alt="Screenshot 2025-12-02 at 6 46 15 PM" src="https://github.com/user-attachments/assets/6ee80641-af67-4b37-9f57-797207637bbe" />
-
-#### Cascading Merge Automation
-
-When managing a stack of PRs on GitHub, merging a parent PR (e.g., `feature-A`)
-into `main` causes a problem for its child PR (`feature-B`). Since `feature-B`
-was based on the *branch* `feature-A`, and `feature-A` has now been squashed
-and merged into `main`, GitHub sees the commits in `feature-B` as "new"
-relative to `main`, even if they are identical to the ones just merged. This
-often results in "phantom diffs" or merge conflicts.
-
-To solve this, GHerrit implements a **Cascading Merge** system:
-
-1.  **Metadata Injection**: When pushing, GHerrit injects hidden metadata into
-    the PR description (inside an HTML comment) containing the IDs of the
-    parent and child PRs.
-2.  **Automated Rebase**: A GitHub Action (`gherrit-rebase-stack.yml`) triggers
-    whenever a PR is merged. It:
-    *   Reads the metadata to find the *child* PR's ID.
-    *   Finds the child PR by its synthesized branch name (e.g., `G...`)
-    *   Retargets the child PR to base off `main`.
-    *   Rebases the child PR onto the new `main`.
-    *   Force-pushes the updated child PR.
-
-This ensures that as soon as you merge the bottom of the stack, the next PR
-automatically updates and becomes ready for review/merge, keeping the entire
-chain healthy without manual intervention.
 
 ### Hybrid Workflow Support
 

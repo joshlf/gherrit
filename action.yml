@@ -1,19 +1,21 @@
-name: GHerrit – Rebase Stack
-description: 'Automatically rebase the next PR in a GHerrit stack.'
+name: GHerrit – Automatic Stack Rebase Disabled
+description: >-
+  Compatibility entry point for installations which still invoke GHerrit's
+  former automatic stack-rebase Action.
 inputs:
   token:
-    description: '`GITHUB_TOKEN` to allow rebase and push'
+    description: Historical compatibility input; no longer used.
     required: true
   pr_body:
-    description: 'The body/description of the PR that was just merged. Used to extract the child PR ID from the GHerrit metadata.'
+    description: Historical compatibility input; no longer used.
     required: true
 
 runs:
-  using: "composite"
+  using: composite
   steps:
-    - shell: bash
-      env:
-        ACTION_PATH: ${{ github.action_path }}
-        GH_TOKEN: ${{ inputs.token }}
-        MERGED_PR_BODY: ${{ inputs.pr_body }}
-      run: bash "$ACTION_PATH/ci/rebase_stack_child.sh"
+    - name: Automatic stack rebasing is disabled
+      shell: bash
+      run: |
+        set -eo pipefail
+        echo "::notice title=GHerrit automatic rebase disabled::Rebase the" \
+          "remaining stack locally and push it through GHerrit."
