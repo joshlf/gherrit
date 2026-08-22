@@ -524,6 +524,7 @@ fn test_pre_push_pr_list_retries_a_transient_http_failure() {
         [
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
+            vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::CreatePr],
             vec![testutil::GraphQlOperation::UpdatePr],
         ]
@@ -563,6 +564,7 @@ fn test_pre_push_pr_list_retries_a_response_transport_failure() {
     assert_eq!(
         ctx.github().requests(),
         [
+            vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::CreatePr],
@@ -606,7 +608,11 @@ fn test_pre_push_pr_create_failure() {
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),
-        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::CreatePr],],
+        [
+            vec![testutil::GraphQlOperation::Query],
+            vec![testutil::GraphQlOperation::Query],
+            vec![testutil::GraphQlOperation::CreatePr],
+        ],
         "an indeterminate create response must stop without replay or continuation"
     );
     assert!(ctx.github().pull_requests().is_empty());
@@ -636,7 +642,11 @@ fn test_pre_push_pr_create_service_unavailable_is_not_replayed() {
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),
-        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::CreatePr],],
+        [
+            vec![testutil::GraphQlOperation::Query],
+            vec![testutil::GraphQlOperation::Query],
+            vec![testutil::GraphQlOperation::CreatePr],
+        ],
         "a retryable HTTP response must not replay a mutation request"
     );
     assert!(ctx.github().pull_requests().is_empty());
@@ -745,34 +755,60 @@ fn duplicate_observed_pull_request_identities_stop_before_git_publication() {
                 .build();
             ctx.checkout_managed_private("duplicate-observed-pr-identity");
             let first = ctx.commit_with_gherrit_id("Existing one");
+            let first_oid = ctx.head_oid();
             let second = ctx.commit_with_gherrit_id("Existing two");
+            let second_oid = ctx.head_oid();
+            let main_oid = ctx.remote_ref_oid("refs/heads/main").unwrap();
             if has_missing_pull_request {
                 ctx.commit_with_gherrit_id("Missing pull request");
             }
+
+            for (id, oid) in [(&first, &first_oid), (&second, &second_oid)] {
+                ctx.remote_git_cmd()
+                    .args(["fetch", "--quiet"])
+                    .arg(&ctx.repo_path)
+                    .args([
+                        format!("{oid}:refs/heads/{id}"),
+                        format!("{oid}:refs/tags/gherrit/{id}/v1"),
+                    ])
+                    .assert()
+                    .success();
+            }
+            // Fetching objects directly into the bare fixture can detach its
+            // HEAD. Restore the symbolic default branch which production
+            // observation requires the server to advertise.
+            ctx.remote_git_cmd()
+                .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+                .assert()
+                .success();
 
             ctx.github().seed_pull_request(testutil::PullRequestSeed {
                 number: 1,
                 title: "Existing one".to_owned(),
                 body: String::new(),
                 head: first.clone(),
+                head_oid: first_oid.clone(),
                 base: "main".to_owned(),
+                base_oid: main_oid,
             });
             ctx.github().seed_pull_request(testutil::PullRequestSeed {
                 number: 2,
                 title: "Existing two".to_owned(),
                 body: String::new(),
                 head: second.clone(),
+                head_oid: second_oid,
                 base: first,
+                base_oid: first_oid,
             });
 
             let diagnostic = match collision {
                 Collision::Number => {
                     ctx.github().set_pull_request_identity(&second, 1, "PR_2");
-                    "duplicate observed pull request number 1"
+                    "duplicate open pull request number 1"
                 }
                 Collision::NodeId => {
                     ctx.github().set_pull_request_identity(&second, 2, "PR_1");
-                    "duplicate observed pull request node ID 'PR_1'"
+                    "duplicate open pull request node ID 'PR_1'"
                 }
             };
             let refs_before = ctx.remote_refs("refs");
@@ -786,10 +822,10 @@ fn duplicate_observed_pull_request_identities_stop_before_git_publication() {
             assert_eq!(ctx.remote_refs("refs"), refs_before);
             assert_eq!(ctx.github().pull_requests(), pull_requests_before);
             assert!(ctx.recorded_pushes().is_empty());
-            let query_count = 2 + usize::from(has_missing_pull_request);
             assert_eq!(
                 ctx.github().requests(),
-                [vec![testutil::GraphQlOperation::Query; query_count]]
+                [vec![testutil::GraphQlOperation::Query]],
+                "the complete open scan must reject duplicate identity evidence before terminal history or writes"
             );
         }
     }
