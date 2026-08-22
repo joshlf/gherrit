@@ -20,7 +20,10 @@ use gix::ObjectId;
 use serde::Deserialize;
 
 use super::{
-    github::{OpenPullRequest, TerminalPullRequestPage, TerminalPullRequestState},
+    bounded_diagnostic_detail,
+    github::{
+        CompleteOpenRows, OpenPullRequest, TerminalPullRequestEvidence, TerminalPullRequestState,
+    },
     local::GherritPrId,
     remote::RemoteHeads,
 };
@@ -135,7 +138,7 @@ fn parse_id_field(field: &str, value: String) -> Result<GherritPrId> {
 pub(super) struct PullRequestNumber(NonZeroU32);
 
 impl PullRequestNumber {
-    fn new(value: u64) -> Result<Self> {
+    pub(super) fn new(value: u64) -> Result<Self> {
         let value = u32::try_from(value)
             .ok()
             .and_then(NonZeroU32::new)
@@ -154,7 +157,7 @@ impl PullRequestNumber {
 pub(super) struct PullRequestNodeId(Box<str>);
 
 impl PullRequestNodeId {
-    fn new(value: String) -> Result<Self> {
+    pub(super) fn new(value: String) -> Result<Self> {
         if value.is_empty() {
             bail!("GitHub reported an empty pull request node ID");
         }
@@ -174,7 +177,7 @@ pub(super) struct PullRequestIdentity {
 }
 
 impl PullRequestIdentity {
-    fn new(number: u64, node_id: String) -> Result<Self> {
+    pub(super) fn new(number: u64, node_id: String) -> Result<Self> {
         Ok(Self {
             number: PullRequestNumber::new(number)?,
             node_id: PullRequestNodeId::new(node_id)?,
@@ -203,7 +206,7 @@ pub(super) struct InitialPullRequestIdentities {
 }
 
 impl InitialPullRequestIdentities {
-    fn from_open(pull_requests: &[OpenPullRequest]) -> Result<Self> {
+    pub(super) fn from_open(pull_requests: &[OpenPullRequest]) -> Result<Self> {
         let mut numbers = HashSet::with_capacity(pull_requests.len());
         let mut node_ids = HashSet::with_capacity(pull_requests.len());
 
@@ -212,15 +215,13 @@ impl InitialPullRequestIdentities {
                 PullRequestIdentity::new(pull_request.number, pull_request.node_id.clone())?;
             if !numbers.insert(identity.number) {
                 bail!(
-                    "GitHub OPEN observation repeats pull request number {}",
+                    "GitHub returned duplicate open pull request number {}",
                     identity.number.get()
                 );
             }
             if !node_ids.insert(identity.node_id) {
-                bail!(
-                    "GitHub OPEN observation repeats pull request node ID '{}'",
-                    pull_request.node_id
-                );
+                let node_id = bounded_diagnostic_detail(&pull_request.node_id);
+                bail!("GitHub returned duplicate open pull request node ID '{}'", node_id);
             }
         }
 
@@ -229,10 +230,6 @@ impl InitialPullRequestIdentities {
 
     pub(super) fn len(&self) -> usize {
         self.numbers.len()
-    }
-
-    pub(super) fn contains(&self, identity: &PullRequestIdentity) -> bool {
-        self.numbers.contains(&identity.number) && self.node_ids.contains(&identity.node_id)
     }
 
     pub(super) fn contains_number(&self, number: PullRequestNumber) -> bool {
@@ -369,11 +366,12 @@ impl CorrelatedPullRequests {
 /// Every number/node pair is validated before forks are discarded. A fork can
 /// therefore neither inject malformed identity evidence nor hide a collision,
 /// but its body and branch names never participate in managed correlation.
-pub(super) fn correlate<'a>(
+pub(super) fn correlate_complete<'a>(
     local_ids: impl IntoIterator<Item = &'a GherritPrId>,
     heads: &RemoteHeads<'_>,
-    open_pull_requests: Vec<OpenPullRequest>,
+    open: CompleteOpenRows,
 ) -> Result<CorrelatedPullRequests> {
+    let (open_pull_requests, initial_identities) = open.into_values();
     let local_ids = local_ids.into_iter().cloned().collect::<Vec<_>>();
     let mut local_positions = HashMap::with_capacity(local_ids.len());
     for (index, id) in local_ids.iter().enumerate() {
@@ -385,7 +383,6 @@ pub(super) fn correlate<'a>(
         }
     }
 
-    let initial_identities = InitialPullRequestIdentities::from_open(&open_pull_requests)?;
     let mut local = (0..local_ids.len()).map(|_| None).collect::<Vec<_>>();
     let mut nonlocal = Vec::new();
     let mut managed_ids = HashSet::new();
@@ -396,8 +393,8 @@ pub(super) fn correlate<'a>(
             continue;
         }
 
-        let metadata = parse_metadata(&pull_request.body).wrap_err_with(|| {
-            format!(
+        let metadata = parse_metadata(&pull_request.body).map_err(|_| {
+            eyre!(
                 "GitHub pull request #{} contains invalid GHerrit metadata",
                 identity.number.get()
             )
@@ -406,11 +403,13 @@ pub(super) fn correlate<'a>(
         let managed_id = match metadata {
             Some(metadata) => {
                 if metadata.id().as_str() != pull_request.head_branch {
+                    let metadata_id = bounded_diagnostic_detail(metadata.id().as_str());
+                    let head = bounded_diagnostic_detail(&pull_request.head_branch);
                     bail!(
                         "GitHub pull request #{} metadata identifies '{}' but its head is '{}'",
                         identity.number.get(),
-                        metadata.id().as_str(),
-                        pull_request.head_branch
+                        metadata_id,
+                        head
                     );
                 }
                 Some(metadata.id)
@@ -422,17 +421,19 @@ pub(super) fn correlate<'a>(
 
         let Some(id) = managed_id else {
             if head_id.as_ref().is_some_and(|id| local_positions.contains_key(id)) {
+                let head = bounded_diagnostic_detail(&pull_request.head_branch);
                 bail!(
                     "GitHub pull request #{} uses local GHerrit head '{}' without managed metadata and owned-base evidence",
                     identity.number.get(),
-                    pull_request.head_branch
+                    head
                 );
             }
             continue;
         };
 
         if !managed_ids.insert(id.clone()) {
-            bail!("GitHub has more than one managed OPEN pull request for '{}'", id.as_str());
+            let id = bounded_diagnostic_detail(id.as_str());
+            bail!("GitHub has more than one managed OPEN pull request for '{id}'");
         }
         let base = classify_base(
             heads.default_branch().name(),
@@ -441,10 +442,11 @@ pub(super) fn correlate<'a>(
             pull_request.base_oid,
         )
         .wrap_err_with(|| {
+            let id = bounded_diagnostic_detail(id.as_str());
             format!(
                 "GitHub pull request #{} for '{}' has an unsupported base",
                 identity.number.get(),
-                id.as_str()
+                id
             )
         })?;
         let managed = ManagedOpenPullRequest {
@@ -490,11 +492,10 @@ fn classify_base(
     } else if observed_name == owned_base_name(id) {
         BaseKind::Owned
     } else {
-        bail!(
-            "expected '{}' or '{}', found '{observed_name}'",
-            default_branch,
-            owned_base_name(id)
-        );
+        let default_branch = bounded_diagnostic_detail(default_branch);
+        let owned_base = bounded_diagnostic_detail(&owned_base_name(id));
+        let observed_name = bounded_diagnostic_detail(observed_name);
+        bail!("expected '{}' or '{}', found '{}'", default_branch, owned_base, observed_name);
     };
     Ok(ObservedBase { kind, oid })
 }
@@ -551,33 +552,33 @@ impl TerminalProgress {
 /// connection is exhausted without a same-repository CLOSED or MERGED result.
 #[derive(Debug)]
 pub(super) struct TerminalExhaustionAccumulator {
+    order: Box<[GherritPrId]>,
     by_id: HashMap<GherritPrId, TerminalProgress>,
+    retired: HashMap<GherritPrId, (PullRequestIdentity, TerminalPullRequestState)>,
 }
 
 impl TerminalExhaustionAccumulator {
     pub(super) fn new(ids: impl IntoIterator<Item = GherritPrId>) -> Result<Self> {
+        let mut order = Vec::new();
         let mut by_id = HashMap::new();
         for id in ids {
             if by_id.insert(id.clone(), TerminalProgress::Initial).is_some() {
                 bail!("terminal observation requested change '{}' more than once", id.as_str());
             }
+            order.push(id);
         }
-        Ok(Self { by_id })
+        Ok(Self { order: order.into_boxed_slice(), by_id, retired: HashMap::new() })
     }
 
-    pub(super) fn record_page(
-        mut self,
-        id: &GherritPrId,
-        after: Option<&str>,
-        page: TerminalPullRequestPage,
-    ) -> Result<Self> {
-        let progress = self.by_id.remove(id).ok_or_else(|| {
+    pub(super) fn record_page(mut self, evidence: TerminalPullRequestEvidence) -> Result<Self> {
+        let (id, after, page) = evidence.into_parts();
+        let progress = self.by_id.remove(&id).ok_or_else(|| {
             eyre!("terminal observation returned an unrequested change '{}'", id.as_str())
         })?;
         if matches!(&progress, TerminalProgress::Exhausted) {
             bail!("terminal observation returned another page after exhausting '{}'", id.as_str());
         }
-        if !progress.expects(after) {
+        if !progress.expects(after.as_deref()) {
             bail!("terminal observation returned an unexpected page cursor for '{}'", id.as_str());
         }
 
@@ -589,20 +590,20 @@ impl TerminalExhaustionAccumulator {
                     .map(|identity| (identity, pull_request.state))
             })
             .collect::<Result<Vec<_>>>()?;
-        if let Some((identity, state)) = retired.first() {
-            let state = match state {
-                TerminalPullRequestState::Closed => "closed",
-                TerminalPullRequestState::Merged => "merged",
-            };
-            bail!(
-                "GHerrit change '{}' was already used by {state} pull request #{}",
-                id.as_str(),
-                identity.number().get()
-            );
+        for (identity, state) in retired {
+            if let Some((previous, _)) = self.retired.get(&id) {
+                bail!(
+                    "Found multiple historical pull requests for GHerrit ID '{}': #{}, #{}. GHerrit cannot safely choose one.",
+                    id.as_str(),
+                    previous.number().get(),
+                    identity.number().get()
+                );
+            }
+            self.retired.insert(id.clone(), (identity, state));
         }
 
-        let progress = progress.advance(id, page.next_cursor)?;
-        assert!(self.by_id.insert(id.clone(), progress).is_none());
+        let progress = progress.advance(&id, page.next_cursor)?;
+        assert!(self.by_id.insert(id, progress).is_none());
         Ok(self)
     }
 
@@ -617,10 +618,30 @@ impl TerminalExhaustionAccumulator {
         if !incomplete.is_empty() {
             bail!("terminal observation did not exhaust change ID(s): {}", incomplete.join(", "));
         }
+        if !self.retired.is_empty() {
+            let mut message = self
+                .order
+                .iter()
+                .filter_map(|id| self.retired.get(id))
+                .map(|(identity, state)| {
+                    let state = match state {
+                        TerminalPullRequestState::Closed => "closed",
+                        TerminalPullRequestState::Merged => "merged",
+                    };
+                    format!(
+                        "Cannot push to {state} PR #{}. Please open a new PR or reopen the existing one.\n",
+                        identity.number().get()
+                    )
+                })
+                .collect::<String>();
+            message.push_str("You may want to rebase on the latest changes before pushing.");
+            bail!(message);
+        }
 
+        let expected = self.by_id.into_keys().collect::<HashSet<_>>();
         let by_id =
-            self.by_id.into_keys().map(|id| (id.clone(), CreateAuthorization { id })).collect();
-        Ok(CreateAuthorizations { by_id })
+            expected.iter().cloned().map(|id| (id.clone(), CreateAuthorization { id })).collect();
+        Ok(CreateAuthorizations { by_id, expected })
     }
 }
 
@@ -628,6 +649,7 @@ impl TerminalExhaustionAccumulator {
 #[derive(Debug)]
 pub(super) struct CreateAuthorizations {
     by_id: HashMap<GherritPrId, CreateAuthorization>,
+    expected: HashSet<GherritPrId>,
 }
 
 impl CreateAuthorizations {
@@ -644,6 +666,23 @@ impl CreateAuthorizations {
     pub(super) fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
+
+    /// Consumes the complete authorization set and returns its original IDs.
+    ///
+    /// A caller may take tokens one at a time to construct create operations,
+    /// but preparation must still prove that no authorization was left behind
+    /// and that no taken token's operation was subsequently omitted.
+    pub(super) fn into_expected_ids(self) -> Result<HashSet<GherritPrId>> {
+        if !self.by_id.is_empty() {
+            let mut leftovers = self.by_id.keys().map(GherritPrId::as_str).collect::<Vec<_>>();
+            leftovers.sort_unstable();
+            bail!(
+                "pull request creation left terminal authorization(s) unconsumed: {}",
+                leftovers.join(", ")
+            );
+        }
+        Ok(self.expected)
+    }
 }
 
 /// One-use authorization to plan creation for exactly one change ID.
@@ -656,6 +695,10 @@ impl CreateAuthorization {
     pub(super) fn id(&self) -> &GherritPrId {
         &self.id
     }
+
+    pub(super) fn into_id(self) -> GherritPrId {
+        self.id
+    }
 }
 
 #[cfg(test)]
@@ -663,7 +706,15 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::*;
-    use crate::pre_push::remote;
+    use crate::pre_push::{github::TerminalPullRequestPage, remote};
+
+    fn correlate<'a>(
+        local_ids: impl IntoIterator<Item = &'a GherritPrId>,
+        remote_heads: &RemoteHeads,
+        pull_requests: Vec<OpenPullRequest>,
+    ) -> Result<CorrelatedPullRequests> {
+        correlate_complete(local_ids, remote_heads, CompleteOpenRows::for_test(pull_requests)?)
+    }
 
     fn object_id(byte: u8) -> ObjectId {
         ObjectId::from_bytes_or_panic(&[byte; 20])
@@ -832,6 +883,25 @@ mod tests {
     }
 
     #[test]
+    fn response_derived_identity_and_base_diagnostics_are_terminal_safe_and_bounded() {
+        let returned = format!("{}\nnot-disclosed", "x".repeat(1_000));
+        let open = [
+            raw_open(1, &returned, "fork1", "main", "", true),
+            raw_open(2, &returned, "fork2", "main", "", true),
+        ];
+        let identity_error =
+            InitialPullRequestIdentities::from_open(&open).unwrap_err().to_string();
+        let base_error =
+            classify_base("main", &id("G"), &returned, object_id(1)).unwrap_err().to_string();
+
+        for error in [identity_error, base_error] {
+            assert!(!error.contains('\n'));
+            assert!(!error.contains("not-disclosed"));
+            assert!(error.len() < 400);
+        }
+    }
+
+    #[test]
     fn every_open_identity_including_forks_is_validated_and_retained() {
         let heads = raw_heads(&[], &[]);
         let open = vec![
@@ -845,8 +915,8 @@ mod tests {
 
         let same_repo = PullRequestIdentity::new(7, "same-repo".to_owned()).unwrap();
         let fork = PullRequestIdentity::new(9, "fork".to_owned()).unwrap();
-        assert!(correlated.initial_identities().contains(&same_repo));
-        assert!(correlated.initial_identities().contains(&fork));
+        assert!(correlated.initial_identities().contains_number(same_repo.number()));
+        assert!(correlated.initial_identities().contains_node_id(same_repo.node_id()));
         assert!(correlated.initial_identities().contains_number(fork.number()));
         assert!(correlated.initial_identities().contains_node_id(fork.node_id()));
     }
@@ -1075,14 +1145,24 @@ mod tests {
         }
     }
 
+    fn evidence(
+        id: &GherritPrId,
+        after: Option<&str>,
+        page: TerminalPullRequestPage,
+    ) -> TerminalPullRequestEvidence {
+        TerminalPullRequestEvidence::for_test(id.clone(), after.map(str::to_owned), page)
+    }
+
     #[test]
     fn complete_terminal_exhaustion_yields_exact_consumable_authorizations() {
         let a = id("A");
         let b = id("B");
         let accumulator = TerminalExhaustionAccumulator::new([a.clone(), b.clone()]).unwrap();
-        let accumulator = accumulator.record_page(&a, None, terminal_page(Some("a-1"))).unwrap();
-        let accumulator = accumulator.record_page(&b, None, terminal_page(None)).unwrap();
-        let accumulator = accumulator.record_page(&a, Some("a-1"), terminal_page(None)).unwrap();
+        let accumulator =
+            accumulator.record_page(evidence(&a, None, terminal_page(Some("a-1")))).unwrap();
+        let accumulator = accumulator.record_page(evidence(&b, None, terminal_page(None))).unwrap();
+        let accumulator =
+            accumulator.record_page(evidence(&a, Some("a-1"), terminal_page(None))).unwrap();
 
         let mut authorizations = accumulator.into_authorizations().unwrap();
         assert_eq!(authorizations.len(), 2);
@@ -1100,7 +1180,7 @@ mod tests {
         assert!(TerminalExhaustionAccumulator::new([a.clone(), a.clone()]).is_err());
 
         let accumulator = TerminalExhaustionAccumulator::new([a.clone()]).unwrap();
-        assert!(accumulator.record_page(&b, None, terminal_page(None)).is_err());
+        assert!(accumulator.record_page(evidence(&b, None, terminal_page(None))).is_err());
 
         let accumulator = TerminalExhaustionAccumulator::new([a]).unwrap();
         assert!(accumulator.into_authorizations().is_err());
@@ -1114,23 +1194,32 @@ mod tests {
         let g = id("G");
 
         let wrong_initial = TerminalExhaustionAccumulator::new([g.clone()]).unwrap();
-        assert!(wrong_initial.record_page(&g, Some("unexpected"), terminal_page(None)).is_err());
+        assert!(
+            wrong_initial
+                .record_page(evidence(&g, Some("unexpected"), terminal_page(None)))
+                .is_err()
+        );
 
         let wrong_later = TerminalExhaustionAccumulator::new([g.clone()]).unwrap();
-        let wrong_later = wrong_later.record_page(&g, None, terminal_page(Some("one"))).unwrap();
-        assert!(wrong_later.record_page(&g, None, terminal_page(None)).is_err());
+        let wrong_later =
+            wrong_later.record_page(evidence(&g, None, terminal_page(Some("one")))).unwrap();
+        assert!(wrong_later.record_page(evidence(&g, None, terminal_page(None))).is_err());
 
         let repeated = TerminalExhaustionAccumulator::new([g.clone()]).unwrap();
-        let repeated = repeated.record_page(&g, None, terminal_page(Some("one"))).unwrap();
-        let repeated = repeated.record_page(&g, Some("one"), terminal_page(Some("two"))).unwrap();
-        assert!(repeated.record_page(&g, Some("two"), terminal_page(Some("one"))).is_err());
+        let repeated =
+            repeated.record_page(evidence(&g, None, terminal_page(Some("one")))).unwrap();
+        let repeated =
+            repeated.record_page(evidence(&g, Some("one"), terminal_page(Some("two")))).unwrap();
+        assert!(
+            repeated.record_page(evidence(&g, Some("two"), terminal_page(Some("one")))).is_err()
+        );
 
         let empty = TerminalExhaustionAccumulator::new([g.clone()]).unwrap();
-        assert!(empty.record_page(&g, None, terminal_page(Some(""))).is_err());
+        assert!(empty.record_page(evidence(&g, None, terminal_page(Some("")))).is_err());
 
         let exhausted = TerminalExhaustionAccumulator::new([g.clone()]).unwrap();
-        let exhausted = exhausted.record_page(&g, None, terminal_page(None)).unwrap();
-        assert!(exhausted.record_page(&g, None, terminal_page(None)).is_err());
+        let exhausted = exhausted.record_page(evidence(&g, None, terminal_page(None))).unwrap();
+        assert!(exhausted.record_page(evidence(&g, None, terminal_page(None))).is_err());
     }
 
     #[test]
@@ -1138,10 +1227,71 @@ mod tests {
         for state in [TerminalPullRequestState::Closed, TerminalPullRequestState::Merged] {
             let g = id("G");
             let accumulator = TerminalExhaustionAccumulator::new([g.clone()]).unwrap();
-            let error =
-                accumulator.record_page(&g, None, retired_page(7, "terminal", state)).unwrap_err();
-            assert!(error.to_string().contains("already used"));
+            let error = accumulator
+                .record_page(evidence(&g, None, retired_page(7, "terminal", state)))
+                .unwrap()
+                .into_authorizations()
+                .unwrap_err();
+            assert!(error.to_string().contains("Cannot push to"));
         }
+    }
+
+    #[test]
+    fn retired_diagnostics_are_complete_and_keep_requested_id_order() {
+        let g1 = id("G1");
+        let g2 = id("G2");
+        let accumulator = TerminalExhaustionAccumulator::new([g1.clone(), g2.clone()]).unwrap();
+        let accumulator = accumulator
+            .record_page(evidence(
+                &g2,
+                None,
+                retired_page(22, "terminal-22", TerminalPullRequestState::Closed),
+            ))
+            .unwrap();
+        let error = accumulator
+            .record_page(evidence(
+                &g1,
+                None,
+                retired_page(11, "terminal-11", TerminalPullRequestState::Merged),
+            ))
+            .unwrap()
+            .into_authorizations()
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Cannot push to merged PR #11. Please open a new PR or reopen the existing one.\n\
+             Cannot push to closed PR #22. Please open a new PR or reopen the existing one.\n\
+             You may want to rebase on the latest changes before pushing."
+        );
+    }
+
+    #[test]
+    fn multiple_terminal_pull_requests_keep_the_legacy_ambiguity_diagnostic() {
+        let g = id("G");
+        let accumulator = TerminalExhaustionAccumulator::new([g.clone()]).unwrap();
+        let page = TerminalPullRequestPage {
+            pull_requests: vec![
+                super::super::github::TerminalPullRequest {
+                    number: 7,
+                    node_id: "terminal-7".to_owned(),
+                    state: TerminalPullRequestState::Closed,
+                },
+                super::super::github::TerminalPullRequest {
+                    number: 9,
+                    node_id: "terminal-9".to_owned(),
+                    state: TerminalPullRequestState::Merged,
+                },
+            ],
+            next_cursor: None,
+        };
+        assert!(
+            accumulator
+                .record_page(evidence(&g, None, page))
+                .unwrap_err()
+                .to_string()
+                .contains("Found multiple historical pull requests")
+        );
     }
 
     #[test]
@@ -1154,7 +1304,7 @@ mod tests {
         for page in cases {
             let g = id("G");
             let accumulator = TerminalExhaustionAccumulator::new([g.clone()]).unwrap();
-            assert!(accumulator.record_page(&g, None, page).is_err());
+            assert!(accumulator.record_page(evidence(&g, None, page)).is_err());
         }
     }
 }
