@@ -5,6 +5,9 @@ expression: ctx.github().requests()
 [
     [
         Query,
+    ],
+    [
+        Query,
         Query,
         Query,
         Query,

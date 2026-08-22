@@ -38,7 +38,47 @@ fn non_open_pr_blocks_all_mutations() {
     );
     assert_eq!(
         &requests_after[requests_before.len()..],
-        &[vec![testutil::GraphQlOperation::Query]],
-        "rejected push must only observe GitHub state"
+        &[vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::Query],],
+        "rejected push must complete the open scan and terminal history"
     );
+}
+
+#[test]
+fn multiple_terminal_prs_for_one_change_fail_before_mutation() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("feature-ambiguous-history");
+    ctx.commit_with_gherrit_id("Work");
+    let id = ctx.gherrit_id("HEAD").unwrap();
+    let head_oid = ctx.head_oid();
+    let base_oid = ctx.remote_ref_oid("refs/heads/main").unwrap();
+
+    for (number, state) in
+        [(7, testutil::PullRequestState::Closed), (9, testutil::PullRequestState::Merged)]
+    {
+        ctx.github().seed_pull_request(testutil::PullRequestSeed {
+            number,
+            title: format!("Historical {number}"),
+            body: String::new(),
+            head: id.clone(),
+            head_oid: head_oid.clone(),
+            base: "main".to_string(),
+            base_oid: base_oid.clone(),
+        });
+        ctx.github().set_pull_request_state(number, state);
+    }
+
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicates::str::contains(
+        "Found multiple historical pull requests for GHerrit ID",
+    ));
+
+    assert_eq!(
+        ctx.github().requests(),
+        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::Query]]
+    );
+    assert!(ctx.recorded_pushes().is_empty());
 }
