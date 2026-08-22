@@ -1,46 +1,21 @@
-use serde::Deserialize;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(super) enum PullRequestState {
-    Open,
-    Closed,
-    Merged,
-}
-
-/// A PR lifecycle observation that forbids mutation.
-///
-/// `Open` is unrepresentable, so consumers do not rely on a field invariant.
+/// Terminal pull-request evidence which permanently retires a change ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NonOpenPullRequest {
+pub(super) enum RetiredPullRequest {
     Closed { number: u64 },
     Merged { number: u64 },
 }
 
-impl NonOpenPullRequest {
-    /// Converts a lifecycle observation into rejection evidence.
-    ///
-    /// Returns `None` exactly when the pull request is open.
-    fn from_state(number: u64, state: PullRequestState) -> Option<Self> {
-        match state {
-            PullRequestState::Open => None,
-            PullRequestState::Closed => Some(Self::Closed { number }),
-            PullRequestState::Merged => Some(Self::Merged { number }),
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct NonOpenPullRequests {
-    pull_requests: Vec<NonOpenPullRequest>,
+pub(super) struct RetiredPullRequests {
+    pull_requests: Vec<RetiredPullRequest>,
 }
 
-impl std::fmt::Display for NonOpenPullRequests {
+impl std::fmt::Display for RetiredPullRequests {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.pull_requests.iter().try_for_each(|pull_request| {
             let (state, number) = match *pull_request {
-                NonOpenPullRequest::Closed { number } => ("closed", number),
-                NonOpenPullRequest::Merged { number } => ("merged", number),
+                RetiredPullRequest::Closed { number } => ("closed", number),
+                RetiredPullRequest::Merged { number } => ("merged", number),
             };
             writeln!(
                 formatter,
@@ -51,18 +26,15 @@ impl std::fmt::Display for NonOpenPullRequests {
     }
 }
 
-impl std::error::Error for NonOpenPullRequests {}
+impl std::error::Error for RetiredPullRequests {}
 
-/// Rejects a stack containing any closed or merged pull request.
-pub(super) fn ensure_pull_requests_open(
-    pull_requests: impl IntoIterator<Item = (u64, PullRequestState)>,
-) -> Result<(), NonOpenPullRequests> {
-    let pull_requests = pull_requests
-        .into_iter()
-        .filter_map(|(number, state)| NonOpenPullRequest::from_state(number, state))
-        .collect::<Vec<_>>();
+/// Rejects any change ID which has already had a closed or merged PR.
+pub(super) fn ensure_pull_request_ids_available(
+    pull_requests: impl IntoIterator<Item = RetiredPullRequest>,
+) -> Result<(), RetiredPullRequests> {
+    let pull_requests = pull_requests.into_iter().collect::<Vec<_>>();
 
-    if pull_requests.is_empty() { Ok(()) } else { Err(NonOpenPullRequests { pull_requests }) }
+    if pull_requests.is_empty() { Ok(()) } else { Err(RetiredPullRequests { pull_requests }) }
 }
 
 /// A stack item annotated with the relationships needed to project it as a PR.
@@ -103,8 +75,8 @@ pub(super) fn link_stack<T>(
 /// Metadata currently stored on a PR.
 pub(super) struct CurrentPr<'a> {
     pub(super) node_id: &'a str,
-    pub(super) title: Option<&'a str>,
-    pub(super) body: Option<&'a str>,
+    pub(super) title: &'a str,
+    pub(super) body: &'a str,
     pub(super) base_branch: &'a str,
 }
 
@@ -129,10 +101,8 @@ pub(super) struct PrUpdate {
 
 /// Returns the minimal update needed to make `current` match `desired`.
 pub(super) fn plan_update(current: CurrentPr<'_>, desired: DesiredPr<'_>) -> Option<PrUpdate> {
-    let title = (current.title != Some(desired.title)).then(|| desired.title.to_string());
-    let body = current
-        .body
-        .is_none_or(|body| normalize_body(body) != normalize_body(desired.body))
+    let title = (current.title != desired.title).then(|| desired.title.to_string());
+    let body = (normalize_body(current.body) != normalize_body(desired.body))
         .then(|| desired.body.to_string());
     let base_branch =
         (current.base_branch != desired.base_branch).then(|| desired.base_branch.to_string());
@@ -153,61 +123,48 @@ fn normalize_body(body: &str) -> String {
 mod tests {
     use super::*;
 
-    const PR_STATES: [PullRequestState; 3] =
-        [PullRequestState::Open, PullRequestState::Closed, PullRequestState::Merged];
+    const RETIRED_PULL_REQUESTS: [RetiredPullRequest; 2] =
+        [RetiredPullRequest::Closed { number: 42 }, RetiredPullRequest::Merged { number: 42 }];
 
     #[test]
-    fn pull_request_lifecycle_policy_covers_every_state() {
+    fn pull_request_lifecycle_policy_covers_every_terminal_state() {
         let cases = [
-            (PullRequestState::Open, None),
             (
-                PullRequestState::Closed,
-                Some(
-                    "Cannot push to closed PR #42. Please open a new PR or reopen the existing one.\n\
-                     You may want to rebase on the latest changes before pushing.",
-                ),
+                RetiredPullRequest::Closed { number: 42 },
+                "Cannot push to closed PR #42. Please open a new PR or reopen the existing one.\n\
+                 You may want to rebase on the latest changes before pushing.",
             ),
             (
-                PullRequestState::Merged,
-                Some(
-                    "Cannot push to merged PR #42. Please open a new PR or reopen the existing one.\n\
-                     You may want to rebase on the latest changes before pushing.",
-                ),
+                RetiredPullRequest::Merged { number: 42 },
+                "Cannot push to merged PR #42. Please open a new PR or reopen the existing one.\n\
+                 You may want to rebase on the latest changes before pushing.",
             ),
         ];
 
-        cases.into_iter().for_each(|(state, expected_error)| {
-            let error =
-                ensure_pull_requests_open([(42, state)]).err().map(|error| error.to_string());
-            assert_eq!(error.as_deref(), expected_error, "state={state:?}");
-        });
+        for (pull_request, expected_error) in cases {
+            let error = ensure_pull_request_ids_available([pull_request]).unwrap_err();
+            assert_eq!(error.to_string(), expected_error, "pull_request={pull_request:?}");
+        }
     }
 
     #[test]
-    fn pull_request_lifecycle_policy_is_exhaustive_for_two_pr_stacks() {
-        PR_STATES.into_iter().for_each(|first_state| {
-            PR_STATES.into_iter().for_each(|second_state| {
-                let observed = [(11, first_state), (22, second_state)];
-                let expected = observed
-                    .into_iter()
-                    .filter_map(|(number, state)| NonOpenPullRequest::from_state(number, state))
-                    .collect::<Vec<_>>();
-                let actual = ensure_pull_requests_open(observed)
-                    .err()
-                    .map(|error| error.pull_requests)
-                    .unwrap_or_default();
+    fn only_an_empty_terminal_observation_keeps_ids_available() {
+        assert_eq!(ensure_pull_request_ids_available(std::iter::empty()), Ok(()));
 
-                assert_eq!(actual, expected, "states=({first_state:?}, {second_state:?})");
-            });
-        });
+        for first in RETIRED_PULL_REQUESTS {
+            for second in RETIRED_PULL_REQUESTS {
+                let observed = [first, second];
+                let actual = ensure_pull_request_ids_available(observed).unwrap_err().pull_requests;
+                assert_eq!(actual, observed, "pull_requests=({first:?}, {second:?})");
+            }
+        }
     }
 
     #[test]
     fn pull_request_lifecycle_diagnostic_reports_every_violation_in_order() {
-        let error = ensure_pull_requests_open([
-            (11, PullRequestState::Merged),
-            (22, PullRequestState::Open),
-            (33, PullRequestState::Closed),
+        let error = ensure_pull_request_ids_available([
+            RetiredPullRequest::Merged { number: 11 },
+            RetiredPullRequest::Closed { number: 33 },
         ])
         .unwrap_err();
 
@@ -319,11 +276,7 @@ mod tests {
         assert_eq!(calls, 3);
     }
 
-    fn current<'a>(
-        title: Option<&'a str>,
-        body: Option<&'a str>,
-        base_branch: &'a str,
-    ) -> CurrentPr<'a> {
+    fn current<'a>(title: &'a str, body: &'a str, base_branch: &'a str) -> CurrentPr<'a> {
         CurrentPr { node_id: "PR_node", title, body, base_branch }
     }
 
@@ -347,10 +300,7 @@ mod tests {
     #[test]
     fn omits_an_update_when_metadata_matches() {
         assert_eq!(
-            plan_update(
-                current(Some("Title"), Some("Body"), "main"),
-                desired("Title", "Body", "main"),
-            ),
+            plan_update(current("Title", "Body", "main"), desired("Title", "Body", "main"),),
             None
         );
     }
@@ -359,7 +309,7 @@ mod tests {
     fn treats_line_endings_and_outer_whitespace_as_equivalent() {
         assert_eq!(
             plan_update(
-                current(Some("Title"), Some(" \r\nBody\r\n "), "main"),
+                current("Title", " \r\nBody\r\n ", "main"),
                 desired("Title", "Body\n", "main"),
             ),
             None
@@ -370,7 +320,7 @@ mod tests {
     fn preserves_meaningful_body_whitespace() {
         assert_eq!(
             plan_update(
-                current(Some("Title"), Some("Line one\n\nLine two"), "main"),
+                current("Title", "Line one\n\nLine two", "main"),
                 desired("Title", "Line one\nLine two", "main"),
             ),
             update(None, Some("Line one\nLine two"), None)
@@ -381,22 +331,22 @@ mod tests {
     fn plans_each_metadata_delta_independently() {
         let cases = [
             (
-                current(Some("Old"), Some("Body"), "main"),
+                current("Old", "Body", "main"),
                 desired("Title", "Body", "main"),
                 update(Some("Title"), None, None),
             ),
             (
-                current(Some("Title"), Some("Old"), "main"),
+                current("Title", "Old", "main"),
                 desired("Title", "Body", "main"),
                 update(None, Some("Body"), None),
             ),
             (
-                current(Some("Title"), Some("Body"), "old-base"),
+                current("Title", "Body", "old-base"),
                 desired("Title", "Body", "main"),
                 update(None, None, Some("main")),
             ),
             (
-                current(Some("Old"), Some("Old"), "old-base"),
+                current("Old", "Old", "old-base"),
                 desired("Title", "Body", "main"),
                 update(Some("Title"), Some("Body"), Some("main")),
             ),
@@ -408,20 +358,9 @@ mod tests {
     }
 
     #[test]
-    fn fills_in_missing_title_and_body() {
-        assert_eq!(
-            plan_update(current(None, None, "main"), desired("Title", "Body", "main"),),
-            update(Some("Title"), Some("Body"), None)
-        );
-    }
-
-    #[test]
     fn omits_an_unchanged_base_from_other_updates() {
-        let update = plan_update(
-            current(Some("Old"), Some("Body"), "main"),
-            desired("Title", "Body", "main"),
-        )
-        .unwrap();
+        let update =
+            plan_update(current("Old", "Body", "main"), desired("Title", "Body", "main")).unwrap();
 
         assert_eq!(update.title.as_deref(), Some("Title"));
         assert_eq!(update.base_branch, None);
