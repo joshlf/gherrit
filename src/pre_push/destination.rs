@@ -11,6 +11,7 @@ use std::{borrow::Cow, env, process::Command, str};
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::ObjectId;
 
+use super::subprocess;
 use crate::util;
 
 const DESTINATION_ENV: &str = "GHERRIT_PRIVATE_PUSH_DESTINATION";
@@ -42,16 +43,34 @@ struct ResolvedDestination {
 pub(super) struct PushDestination {
     resolved: ResolvedDestination,
     internal_remote: String,
+    #[cfg(test)]
+    test_environment: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
 }
 
 impl PushDestination {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        configured_remote: &str,
+        literal: &str,
+        environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    ) -> Result<Self> {
+        let configured_remote = util::RemoteName::from_config(configured_remote.as_bytes())?;
+        let output = format!("{literal}\n");
+        let resolved = ResolvedDestination::from_git_output(configured_remote, output.as_bytes())?;
+        Ok(Self {
+            resolved,
+            internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
+            test_environment: Some(environment),
+        })
+    }
+
     /// Resolves the one exact destination Git would use for pushing.
     ///
     /// The configured remote is supplied by the caller so configuration is
     /// decoded and validated exactly once per publication attempt. `--` is
     /// required because Git permits manually configured remote names beginning
     /// with a hyphen.
-    pub(super) fn resolve(configured_remote: util::RemoteName) -> Result<Self> {
+    pub(super) async fn resolve(configured_remote: util::RemoteName) -> Result<Self> {
         let mut command = util::cmd(
             "git",
             ["remote", "get-url", "--push", "--all", "--", configured_remote.as_str()],
@@ -83,9 +102,14 @@ impl PushDestination {
         let active = resolved.inspect_configuration_with_remote(&probe_remote)?;
         let internal_remote = select_absent_remote(INTERNAL_REMOTE_STEM, &active);
 
-        let destination = Self { resolved, internal_remote };
+        let destination = Self {
+            resolved,
+            internal_remote,
+            #[cfg(test)]
+            test_environment: None,
+        };
         destination.inspect_internal_remote_configuration()?;
-        destination.ensure_rewrite_fixed_point()?;
+        destination.ensure_rewrite_fixed_point().await?;
         destination.ensure_http_redirects_disabled()?;
         Ok(destination)
     }
@@ -165,10 +189,10 @@ impl PushDestination {
     /// inapplicable, while `insteadOf` affects ordinary and push URLs equally.
     /// Proving that the fetch interpretation is unchanged therefore proves the
     /// exact destination used by both operations.
-    fn ensure_rewrite_fixed_point(&self) -> Result<()> {
-        let output = self
-            .ls_remote(["--get-url".to_owned()], std::iter::empty())
-            .output()
+    async fn ensure_rewrite_fixed_point(&self) -> Result<()> {
+        let command = self.ls_remote(["--get-url".to_owned()], std::iter::empty());
+        let output = subprocess::output(command, subprocess::REMOTE_GIT_EXECUTION_TIMEOUT)
+            .await
             .wrap_err_with(|| {
                 format!(
                     "Failed to verify Git URL rewriting for GHerrit remote '{}'",
@@ -242,7 +266,18 @@ impl PushDestination {
     /// private local path. Exactly one URL and push URL are added; no empty
     /// reset values or Git-version-dependent additive behavior participate.
     fn adapter_command(&self, arguments: impl IntoIterator<Item = String>) -> Command {
-        self.resolved.private_remote_command(&self.internal_remote, arguments)
+        let command = self.resolved.private_remote_command(&self.internal_remote, arguments);
+        #[cfg(test)]
+        let mut command = command;
+        #[cfg(test)]
+        if let Some(environment) = &self.test_environment {
+            command.env_clear();
+            command.envs(environment.iter().cloned());
+            command.env(DESTINATION_ENV, &self.resolved.literal);
+            command.env("GIT_NO_REPLACE_OBJECTS", "1");
+            command.env("GIT_NO_LAZY_FETCH", "1");
+        }
+        command
     }
 
     /// Constructs a destination-bearing Git command with redirects disabled.
@@ -270,6 +305,30 @@ impl PushDestination {
         ref_patterns: impl IntoIterator<Item = String>,
     ) -> Command {
         self.remote_command("ls-remote", options, ref_patterns)
+    }
+
+    /// Constructs one exact source-only object-acquisition request.
+    ///
+    /// `source_refs` come only from the validated advertisement capability in
+    /// `remote`. No destination ref is supplied, so Git writes objects without
+    /// creating local refs or selecting configured fetch refspecs.
+    pub(super) fn fetch(
+        &self,
+        source_refs: impl IntoIterator<Item = String>,
+        refetch: bool,
+    ) -> Command {
+        self.remote_command(
+            "fetch",
+            [
+                "--no-write-fetch-head".to_owned(),
+                "--no-tags".to_owned(),
+                "--no-recurse-submodules".to_owned(),
+                "--no-auto-maintenance".to_owned(),
+            ]
+            .into_iter()
+            .chain(refetch.then(|| "--refetch".to_owned())),
+            source_refs,
+        )
     }
 
     pub(super) fn push(
@@ -754,6 +813,7 @@ mod tests {
         PushDestination {
             resolved: resolved(b"https://github.com/owner/repo.git\n"),
             internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
+            test_environment: None,
         }
     }
 
@@ -810,6 +870,49 @@ mod tests {
                 "--",
                 "gherrit-publication",
                 "HEAD",
+            ]
+            .map(OsStr::new)
+        );
+
+        let fetch = destination.fetch(["refs/tags/gherrit/Gone/v1".to_owned()], false);
+        assert_eq!(
+            arguments(&fetch),
+            [
+                "--no-replace-objects",
+                "--config-env=remote.gherrit-publication.url=GHERRIT_PRIVATE_PUSH_DESTINATION",
+                "--config-env=remote.gherrit-publication.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
+                "-c",
+                "http.followRedirects=false",
+                "fetch",
+                "--no-write-fetch-head",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-auto-maintenance",
+                "--",
+                "gherrit-publication",
+                "refs/tags/gherrit/Gone/v1",
+            ]
+            .map(OsStr::new)
+        );
+
+        let refetch = destination.fetch(["refs/tags/gherrit/Gone/v1".to_owned()], true);
+        assert_eq!(
+            arguments(&refetch),
+            [
+                "--no-replace-objects",
+                "--config-env=remote.gherrit-publication.url=GHERRIT_PRIVATE_PUSH_DESTINATION",
+                "--config-env=remote.gherrit-publication.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
+                "-c",
+                "http.followRedirects=false",
+                "fetch",
+                "--no-write-fetch-head",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-auto-maintenance",
+                "--refetch",
+                "--",
+                "gherrit-publication",
+                "refs/tags/gherrit/Gone/v1",
             ]
             .map(OsStr::new)
         );

@@ -16,6 +16,12 @@ use command_group::{CommandGroup, GroupChild};
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// One finite execution deadline for destination-bound Git reads.
+///
+/// Callers pass this explicitly so every remote observation and acquisition
+/// uses the same bounded process-lifecycle policy.
+pub(super) const REMOTE_GIT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Runs one remote Git command without blocking GHerrit's Tokio runtime.
 ///
 /// The deadline covers process execution. A fixed, bounded cleanup interval is
