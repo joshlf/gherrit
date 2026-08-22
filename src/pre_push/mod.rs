@@ -29,7 +29,7 @@ use github::{
     PullRequest as PrState, RepositoryIdQuery, UpdatePullRequest, batch_document,
     decode_batch_response,
 };
-use local::{Commit, collect_commits};
+use local::LocalStack;
 use publication::{PushTarget, plan_push, push_batches};
 use reconcile::{
     CurrentPr, DesiredPr, PrUpdate, PullRequestState, ensure_pull_requests_open, link_stack,
@@ -84,7 +84,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
         true => log::info!("Branch {} is MANAGED. Syncing stack...", branch_name.yellow()),
     }
 
-    let commits = collect_commits(repo).wrap_err("Failed to collect commits")?;
+    let commits = LocalStack::collect(repo).wrap_err("Failed to collect commits")?;
 
     if commits.is_empty() {
         log::info!("No commits to sync.");
@@ -108,7 +108,8 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
 
     let octocrab = builder.build()?;
 
-    let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
+    let gherrit_ids =
+        commits.iter().map(|commit| commit.id().as_str().to_owned()).collect::<Vec<_>>();
     let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
     ensure_pull_requests_open(prs.iter().map(|pr| (pr.number, pr.state)))?;
 
@@ -116,40 +117,41 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     let default_branch = repo.find_default_branch_on_default_remote();
 
     let num_commits = commits.len();
-    sync_prs(repo, &octocrab, branch_name, &default_branch, commits, latest_versions, prs).await?;
+    sync_prs(repo, &octocrab, branch_name, &default_branch, &commits, latest_versions, prs).await?;
 
     log::info!("Successfully synced {num_commits} commits.");
     Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
-fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<String, usize>> {
-    let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
+fn push_to_origin(repo: &util::Repo, commits: &LocalStack) -> Result<HashMap<String, usize>> {
+    let gherrit_ids =
+        commits.iter().map(|commit| commit.id().as_str().to_owned()).collect::<Vec<_>>();
 
     // Fetch remote branch states to ensure we don't act on stale information.
     let remote_branch_states = observe_managed_branches(repo, &gherrit_ids)?;
 
     let mut next_versions = HashMap::new();
 
-    for chunk in push_batches(commits) {
+    for chunk in push_batches(commits.as_slice()) {
         let mut targets = Vec::with_capacity(chunk.len());
 
         for c in chunk {
             // Determine the next version based on local tags (Optimistic
             // Locking).
-            let local_max = get_local_version(repo, &c.gherrit_id).unwrap_or(0);
+            let local_max = get_local_version(repo, c.id().as_str()).unwrap_or(0);
             let next_ver = local_max + 1;
-            next_versions.insert(c.gherrit_id.clone(), next_ver);
+            next_versions.insert(c.id().as_str().to_owned(), next_ver);
 
             // Lease the branch to ensure it hasn't changed since our fetch.
             // If we know the remote SHA, we expect it. If we don't (None), we
             // expect "" (creation).
             let expected_sha =
-                remote_branch_states.get(&c.gherrit_id).map(String::as_str).unwrap_or("");
+                remote_branch_states.get(c.id().as_str()).map(String::as_str).unwrap_or("");
 
             targets.push(PushTarget {
-                object_id: c.id,
-                gherrit_id: &c.gherrit_id,
+                object_id: c.head(),
+                gherrit_id: c.id().as_str(),
                 version: next_ver,
                 expected_remote_sha: expected_sha,
             });
@@ -257,13 +259,13 @@ async fn sync_prs(
     octocrab: &Octocrab,
     branch_name: &str,
     base_branch: &str,
-    commits: Vec<Commit>,
+    commits: &LocalStack,
     latest_versions: HashMap<String, usize>,
     prs: Vec<PrState>,
 ) -> Result<()> {
     let remote = repo.default_remote()?;
 
-    let commits = link_stack(base_branch, commits, |commit| commit.gherrit_id.clone());
+    let commits = link_stack(base_branch, commits.iter(), |commit| commit.id().as_str().to_owned());
 
     enum PrResolution {
         Existing(PrState),
@@ -276,16 +278,20 @@ async fn sync_prs(
         .map(|entry| {
             let c = &entry.item;
 
-            if let Some(pr) = prs.iter().find(|pr| pr.head_branch == c.gherrit_id) {
-                log::debug!("Found existing PR #{} for {}", pr.number.green().bold(), c.gherrit_id);
+            if let Some(pr) = prs.iter().find(|pr| pr.head_branch == c.id().as_str()) {
+                log::debug!(
+                    "Found existing PR #{} for {}",
+                    pr.number.green().bold(),
+                    c.id().as_str()
+                );
                 PrResolution::Existing(pr.clone())
             } else {
-                log::debug!("No GitHub PR exists for {}; queuing creation...", c.gherrit_id);
+                log::debug!("No GitHub PR exists for {}; queuing creation...", c.id().as_str());
                 PrResolution::ToCreate(BatchCreate {
-                    title: c.message_title.clone(),
-                    body: c.message_body.clone(),
+                    title: c.title().to_owned(),
+                    body: c.body().to_owned(),
                     base_branch: entry.base_branch.clone(),
-                    head_branch: c.gherrit_id.clone(),
+                    head_branch: c.id().as_str().to_owned(),
                 })
             }
         })
@@ -363,17 +369,17 @@ async fn sync_prs(
         .iter()
         .filter_map(|(entry, pr_state)| {
             let c = &entry.item;
-            let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
+            let latest_version = latest_versions.get(c.id().as_str()).copied().unwrap_or(1);
 
             let body = PrBody {
-                commit_body: &c.message_body,
+                commit_body: c.body(),
                 repo_url: &repo_url,
                 public_branch: public_branch.as_deref(),
                 stack_pr_numbers: &stack_pr_numbers,
                 current_pr_number: pr_state.number,
                 latest_version,
                 base_branch: &entry.base_branch,
-                gherrit_id: &c.gherrit_id,
+                gherrit_id: c.id().as_str(),
                 parent_id: entry.parent_id.as_deref(),
                 child_id: entry.child_id.as_deref(),
             }
@@ -389,7 +395,7 @@ async fn sync_prs(
                     body: pr_state.body.as_deref(),
                     base_branch: &pr_state.base_branch,
                 },
-                DesiredPr { title: &c.message_title, body: &body, base_branch: &entry.base_branch },
+                DesiredPr { title: c.title(), body: &body, base_branch: &entry.base_branch },
             );
 
             if update.is_some() {
