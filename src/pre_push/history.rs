@@ -2,8 +2,11 @@
 //!
 //! Raw remote refs can be absent, incomplete, or contradictory. This module
 //! turns only an absent representation or one complete published history into
-//! a domain value. A published revision always comes from an actual commit and
-//! therefore cannot pair an arbitrary head with an arbitrary first parent.
+//! a domain value. A local value must then be coupled to one literal proposal;
+//! an existing nonlocal value must be nonempty. Either path consumes the whole
+//! value during validation before planning can inspect any revision. A
+//! revision always comes from an actual commit and therefore cannot pair an
+//! arbitrary head with an arbitrary first parent.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -46,7 +49,7 @@ impl Revision {
     }
 }
 
-/// The current entry of a nonempty published history.
+/// The current entry of a nonempty history.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CurrentVersion {
     number: Version,
@@ -70,7 +73,7 @@ impl CurrentVersion {
 /// protocol and are rejected during normalization. A later version may return
 /// to an older revision, so a sequence such as A, B, A remains distinct.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct PublishedHistory {
+struct PublishedHistory {
     first: Revision,
     later: Box<[Revision]>,
 }
@@ -96,15 +99,15 @@ impl PublishedHistory {
         Ok(Self { first, later })
     }
 
-    pub(super) fn len(&self) -> usize {
+    fn len(&self) -> usize {
         1 + self.later.len()
     }
 
-    pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = Revision> + '_ {
+    fn iter(&self) -> impl ExactSizeIterator<Item = Revision> + '_ {
         (0..self.len()).map(|index| if index == 0 { self.first } else { self.later[index - 1] })
     }
 
-    pub(super) fn versioned(&self) -> impl ExactSizeIterator<Item = (Version, Revision)> + '_ {
+    fn versioned(&self) -> impl ExactSizeIterator<Item = (Version, Revision)> + '_ {
         self.iter().enumerate().map(|(index, revision)| {
             let version = Version::from_history_index(index)
                 .expect("an in-memory history position always fits in u64");
@@ -112,12 +115,168 @@ impl PublishedHistory {
         })
     }
 
-    pub(super) fn current(&self) -> CurrentVersion {
+    fn current(&self) -> CurrentVersion {
         let index = self.len() - 1;
         let revision = self.later.last().copied().unwrap_or(self.first);
         let number = Version::from_history_index(index)
             .expect("an in-memory history position always fits in u64");
         CurrentVersion { number, revision }
+    }
+}
+
+/// One complete structurally normalized remote history observation.
+///
+/// The private optional field distinguishes a genuinely absent history from a
+/// nonempty published history. Its production transitions either add a
+/// mandatory literal proposal or require the entire published history to
+/// exist, so neither path accepts a selected subset.
+#[derive(Debug)]
+pub(super) struct NormalizedPublishedHistory {
+    published: Option<PublishedHistory>,
+}
+
+impl NormalizedPublishedHistory {
+    /// Consumes normalized history and couples it to one real proposed commit.
+    pub(super) fn with_proposal(
+        self,
+        proposed_head: ObjectId,
+        graph: &CommitGraphEvidence,
+    ) -> Result<ChangeHistory> {
+        let proposed = graph.revision(proposed_head)?;
+        Ok(ChangeHistory { published: self.published, proposed })
+    }
+
+    /// Consumes and validates all history for an existing nonlocal change.
+    pub(super) fn validate_existing(
+        self,
+        id: &GherritPrId,
+        graph: &CommitGraphEvidence,
+        default_tip: Option<ObjectId>,
+    ) -> Result<ValidatedPublishedHistory> {
+        let published = self.published.ok_or_else(|| {
+            eyre!("Existing GHerrit change '{}' has no published history", id.as_str())
+        })?;
+        graph.validate_complete_revisions(id, published.iter(), default_tip)?;
+        Ok(ValidatedPublishedHistory { published })
+    }
+}
+
+/// Complete published-only evidence for an existing nonlocal change.
+#[derive(Debug)]
+pub(super) struct ValidatedPublishedHistory {
+    published: PublishedHistory,
+}
+
+impl ValidatedPublishedHistory {
+    pub(super) fn published_len(&self) -> usize {
+        self.published.len()
+    }
+
+    pub(super) fn published_versions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (Version, Revision)> + '_ {
+        self.published.versioned()
+    }
+
+    pub(super) fn published_current(&self) -> CurrentVersion {
+        self.published.current()
+    }
+
+    pub(super) fn contains_published_head(&self, head: ObjectId) -> bool {
+        self.published.iter().any(|revision| revision.head() == head)
+    }
+
+    pub(super) fn contains_published_first_parent(&self, first_parent: ObjectId) -> bool {
+        self.published.iter().any(|revision| revision.first_parent() == first_parent)
+    }
+}
+
+/// Complete, unvalidated history for exactly one change.
+///
+/// There is deliberately no inspection surface. Validation consumes this
+/// value and checks the entire published sequence together with its proposal.
+#[derive(Debug)]
+pub(super) struct ChangeHistory {
+    published: Option<PublishedHistory>,
+    proposed: Revision,
+}
+
+impl ChangeHistory {
+    /// Validates the complete history and optionally its exact root base.
+    pub(super) fn validate(
+        self,
+        id: &GherritPrId,
+        graph: &CommitGraphEvidence,
+        default_tip: Option<ObjectId>,
+    ) -> Result<ValidatedChangeHistory> {
+        graph.validate_complete_revisions(id, self.revisions(), default_tip)?;
+        Ok(ValidatedChangeHistory { published: self.published, proposed: self.proposed })
+    }
+
+    fn revisions(&self) -> impl Iterator<Item = Revision> + '_ {
+        self.published.iter().flat_map(PublishedHistory::iter).chain(std::iter::once(self.proposed))
+    }
+}
+
+/// Complete history evidence which is safe for planning to inspect.
+///
+/// Published-only membership intentionally excludes the proposal. GitHub OIDs
+/// observed before publication may be correlated only with already-published
+/// evidence. A proposal equal to the current literal revision is retained as
+/// intent but does not project an adjacent duplicate version.
+#[derive(Debug)]
+pub(super) struct ValidatedChangeHistory {
+    published: Option<PublishedHistory>,
+    proposed: Revision,
+}
+
+impl ValidatedChangeHistory {
+    pub(super) fn published_len(&self) -> usize {
+        self.published.as_ref().map_or(0, PublishedHistory::len)
+    }
+
+    pub(super) fn published_versions(&self) -> impl Iterator<Item = (Version, Revision)> + '_ {
+        self.published.iter().flat_map(PublishedHistory::versioned)
+    }
+
+    pub(super) fn published_current(&self) -> Option<CurrentVersion> {
+        self.published.as_ref().map(PublishedHistory::current)
+    }
+
+    pub(super) fn proposed(&self) -> Revision {
+        self.proposed
+    }
+
+    pub(super) fn needs_publication(&self) -> bool {
+        self.published_current().is_none_or(|current| current.revision() != self.proposed)
+    }
+
+    pub(super) fn projected_versions(&self) -> impl Iterator<Item = (Version, Revision)> + '_ {
+        let proposed = self.needs_publication().then(|| {
+            let version = Version::from_history_index(self.published_len())
+                .expect("an in-memory history position always fits in u64");
+            (version, self.proposed)
+        });
+        self.published_versions().chain(proposed)
+    }
+
+    pub(super) fn projected_current(&self) -> CurrentVersion {
+        if self.needs_publication() {
+            let number = Version::from_history_index(self.published_len())
+                .expect("an in-memory history position always fits in u64");
+            CurrentVersion { number, revision: self.proposed }
+        } else {
+            self.published_current()
+                .expect("only a published current revision can equal the proposal")
+        }
+    }
+
+    pub(super) fn contains_published_head(&self, head: ObjectId) -> bool {
+        self.published_versions().any(|(_, revision)| revision.head() == head)
+    }
+
+    pub(super) fn contains_published_first_parent(&self, first_parent: ObjectId) -> bool {
+        self.published_versions().any(|(_, revision)| revision.first_parent() == first_parent)
     }
 }
 
@@ -133,9 +292,9 @@ pub(super) fn normalize_published_history(
     owned_base: Option<ObjectId>,
     tags: &BTreeMap<Version, ObjectId>,
     graph: &CommitGraphEvidence,
-) -> Result<Option<PublishedHistory>> {
+) -> Result<NormalizedPublishedHistory> {
     match (head, owned_base, tags.is_empty()) {
-        (None, None, true) => return Ok(None),
+        (None, None, true) => return Ok(NormalizedPublishedHistory { published: None }),
         (Some(_), Some(_), false) => {}
         (None, _, false) => {
             bail!("Remote GHerrit change '{}' has version tags but no managed head", id.as_str());
@@ -180,7 +339,7 @@ pub(super) fn normalize_published_history(
             id.as_str()
         );
     }
-    Ok(Some(history))
+    Ok(NormalizedPublishedHistory { published: Some(history) })
 }
 
 #[derive(Debug)]
@@ -206,8 +365,8 @@ impl GherritPrId {
 /// contain the exact identity key. An ancestry traversal owns one temporary
 /// visited set and releases it before the next traversal; evidence never keeps
 /// one full ancestor set per historical head or parent. One traversal per
-/// distinct parent checks all known heads and retains only the bounded H x P
-/// boolean relation until that change has been validated.
+/// distinct parent checks all known heads and stops on the first unsafe pair.
+/// No head-by-parent relation is retained.
 pub(super) struct CommitGraphEvidence {
     commits: HashMap<ObjectId, CommitFacts>,
     trailer_identities: HashMap<ObjectId, Box<[Vec<u8>]>>,
@@ -301,7 +460,7 @@ impl CommitGraphEvidence {
     }
 
     /// Derives a revision from a real commit and its literal first parent.
-    pub(super) fn revision(&self, head: ObjectId) -> Result<Revision> {
+    fn revision(&self, head: ObjectId) -> Result<Revision> {
         let commit = self
             .commits
             .get(&head)
@@ -309,11 +468,12 @@ impl CommitGraphEvidence {
         Revision::from_commit(head, commit)
     }
 
-    /// Proves exact identity and owned-base safety for one complete history.
-    pub(super) fn validate_change(
+    /// Proves every invariant over one privately supplied complete sequence.
+    fn validate_complete_revisions(
         &self,
         id: &GherritPrId,
         revisions: impl IntoIterator<Item = Revision>,
+        default_tip: Option<ObjectId>,
     ) -> Result<()> {
         let revisions = self.literal_revisions(revisions)?;
         let expected = id.as_str().as_bytes();
@@ -346,35 +506,15 @@ impl CommitGraphEvidence {
                 }
             })
             .collect::<Vec<_>>();
-        let parents =
-            revisions.iter().map(|revision| revision.first_parent()).collect::<HashSet<_>>();
-        let mut reachability = HashMap::new();
-        for parent in parents {
-            let reachable = self.reachable_targets(parent, &heads)?;
-            reachability
-                .extend(heads.iter().map(|head| ((parent, *head), reachable.contains(head))));
+        let heads = validate_change_proof(id.as_str(), &proof, |parent, heads| {
+            self.first_reachable_target(parent, heads)
+        })?;
+        if let Some(default_tip) = default_tip {
+            validate_root_proof(default_tip, &heads, |tip, heads| {
+                self.first_reachable_target(tip, heads)
+            })?;
         }
-        validate_change_proof(id.as_str(), &proof, |from, target| {
-            reachability
-                .get(&(from, target))
-                .copied()
-                .ok_or_else(|| eyre!("Missing precomputed reachability evidence"))
-        })
-    }
-
-    /// Proves every root head unreachable from the exact default-branch tip.
-    pub(super) fn validate_root_safety(
-        &self,
-        default_tip: ObjectId,
-        revisions: impl IntoIterator<Item = Revision>,
-    ) -> Result<()> {
-        let revisions = self.literal_revisions(revisions)?;
-        let heads = revisions.iter().map(|revision| revision.head()).collect::<HashSet<_>>();
-        if heads.is_empty() {
-            bail!("A root change must have at least one revision for validation");
-        }
-        let reachable = self.reachable_targets(default_tip, &heads)?;
-        validate_root_proof(default_tip, &heads, |_, target| Ok(reachable.contains(&target)))
+        Ok(())
     }
 
     fn literal_revisions(
@@ -408,22 +548,17 @@ impl CommitGraphEvidence {
         Ok(count)
     }
 
-    /// Returns whether `target` is in the ancestry of `from`, including self.
-    fn is_reachable(&self, from: ObjectId, target: ObjectId) -> Result<bool> {
-        self.visit_ancestry(from, |oid| oid == target)
-    }
-
-    fn reachable_targets(
+    fn first_reachable_target(
         &self,
         from: ObjectId,
         targets: &HashSet<ObjectId>,
-    ) -> Result<HashSet<ObjectId>> {
-        let mut reachable = HashSet::new();
+    ) -> Result<Option<ObjectId>> {
+        let mut reachable = None;
         self.visit_ancestry(from, |oid| {
             if targets.contains(&oid) {
-                reachable.insert(oid);
+                reachable = Some(oid);
             }
-            reachable.len() == targets.len()
+            reachable.is_some()
         })?;
         Ok(reachable)
     }
@@ -465,8 +600,8 @@ struct ProofRevision<T> {
 fn validate_change_proof<T>(
     id: &str,
     revisions: &[ProofRevision<T>],
-    mut is_reachable: impl FnMut(T, T) -> Result<bool>,
-) -> Result<()>
+    mut first_reachable_head: impl FnMut(T, &HashSet<T>) -> Result<Option<T>>,
+) -> Result<HashSet<T>>
 where
     T: Copy + Eq + std::hash::Hash + fmt::Display,
 {
@@ -482,6 +617,15 @@ where
             bail!("Conflicting identity evidence for head {}", revision.head);
         }
     }
+    let heads = identities.keys().copied().collect::<HashSet<_>>();
+    let parents = revisions.iter().map(|revision| revision.first_parent).collect::<HashSet<_>>();
+    for parent in parents {
+        if let Some(head) = first_reachable_head(parent, &heads)? {
+            bail!(
+                "Managed head {head} is reachable from historical or proposed owned base {parent}"
+            );
+        }
+    }
     for (head, (exact_own_identity, ancestry_identity_count)) in &identities {
         if !exact_own_identity {
             bail!("Head commit {head} must have exactly one gherrit-pr-id trailer equal to '{id}'");
@@ -492,25 +636,13 @@ where
             );
         }
     }
-
-    let heads = identities.keys().copied().collect::<HashSet<_>>();
-    let parents = revisions.iter().map(|revision| revision.first_parent).collect::<HashSet<_>>();
-    for parent in parents {
-        for head in &heads {
-            if is_reachable(parent, *head)? {
-                bail!(
-                    "Managed head {head} is reachable from historical or proposed owned base {parent}"
-                );
-            }
-        }
-    }
-    Ok(())
+    Ok(heads)
 }
 
 fn validate_root_proof<T>(
     default_tip: T,
     heads: &HashSet<T>,
-    mut is_reachable: impl FnMut(T, T) -> Result<bool>,
+    mut first_reachable_head: impl FnMut(T, &HashSet<T>) -> Result<Option<T>>,
 ) -> Result<()>
 where
     T: Copy + Eq + std::hash::Hash + fmt::Display,
@@ -518,10 +650,8 @@ where
     if heads.is_empty() {
         bail!("A root change must have at least one revision for validation");
     }
-    for head in heads {
-        if is_reachable(default_tip, *head)? {
-            bail!("Root managed head {head} is reachable from default tip {default_tip}");
-        }
+    if let Some(head) = first_reachable_head(default_tip, heads)? {
+        bail!("Root managed head {head} is reachable from default tip {default_tip}");
     }
     Ok(())
 }
@@ -679,6 +809,22 @@ mod tests {
         entries.into_iter().map(|(number, oid)| (version(number), oid)).collect()
     }
 
+    fn change_history(
+        id: &GherritPrId,
+        graph: &CommitGraphEvidence,
+        published: &[(u64, ObjectId)],
+        proposed: ObjectId,
+    ) -> ChangeHistory {
+        let (head, owned_base) = published.last().map_or((None, None), |(_, head)| {
+            let revision = graph.revision(*head).expect("literal published revision");
+            (Some(*head), Some(revision.first_parent()))
+        });
+        normalize_published_history(id, head, owned_base, &tags(published.iter().copied()), graph)
+            .expect("normalized test history")
+            .with_proposal(proposed, graph)
+            .expect("literal proposed revision")
+    }
+
     #[test]
     fn normalizes_only_absent_or_complete_history() {
         let repository = TestRepository::new();
@@ -703,11 +849,12 @@ mod tests {
 
                     match (has_head, has_base, has_tags) {
                         (false, false, false) => assert!(
-                            matches!(result, Ok(None)),
+                            result.is_ok_and(|history| history.published.is_none()),
                             "absent evidence must remain absent"
                         ),
                         (true, true, true) => {
-                            let history = result.expect("complete history").expect("published");
+                            let normalized = result.expect("complete history");
+                            let history = normalized.published.expect("published");
                             assert_eq!(history.current().number(), Version::FIRST);
                             assert_eq!(history.current().revision().head(), head);
                             assert_eq!(history.current().revision().first_parent(), root);
@@ -728,28 +875,217 @@ mod tests {
         let graph = load(&repository, [a, b]);
         let id = change_id("Gone");
 
-        let history = normalize_published_history(
+        let normalized = normalize_published_history(
             &id,
             Some(a),
             Some(root),
             &tags([(1, a), (2, b), (3, a)]),
             &graph,
         )
-        .expect("valid revert history")
-        .expect("published history");
+        .expect("valid revert history");
+        let history = normalized
+            .with_proposal(a, &graph)
+            .expect("literal repeated proposal")
+            .validate(&id, &graph, None)
+            .expect("valid complete history");
         assert_eq!(
             history
-                .versioned()
+                .published_versions()
                 .map(|(version, revision)| (version.get(), revision.head()))
                 .collect::<Vec<_>>(),
             [(1, a), (2, b), (3, a)]
         );
-        assert_eq!(history.current().number(), version(3));
+        assert_eq!(history.published_current().unwrap().number(), version(3));
+        assert!(!history.needs_publication());
+        assert_eq!(
+            history
+                .projected_versions()
+                .map(|(version, revision)| (version.get(), revision.head()))
+                .collect::<Vec<_>>(),
+            [(1, a), (2, b), (3, a)]
+        );
 
         let error =
             normalize_published_history(&id, Some(a), Some(root), &tags([(1, a), (2, a)]), &graph)
                 .expect_err("adjacent duplicate revisions are unreachable");
         assert!(error.to_string().contains("adjacent versions"), "{error:?}");
+    }
+
+    #[test]
+    fn absent_published_history_still_requires_and_validates_one_proposal() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[], &[]);
+        let proposed = repository.commit("proposal", &[root], &["Gone"]);
+        let graph = load(&repository, [proposed]);
+        let id = change_id("Gone");
+
+        let validated = change_history(&id, &graph, &[], proposed)
+            .validate(&id, &graph, None)
+            .expect("new change with one mandatory proposal");
+
+        assert_eq!(validated.published_len(), 0);
+        assert_eq!(validated.published_current(), None);
+        assert_eq!(validated.proposed().head(), proposed);
+        assert!(validated.needs_publication());
+        assert_eq!(validated.projected_current().number(), Version::FIRST);
+        assert_eq!(validated.projected_current().revision().head(), proposed);
+        assert_eq!(
+            validated
+                .projected_versions()
+                .map(|(number, revision)| (number.get(), revision.head()))
+                .collect::<Vec<_>>(),
+            [(1, proposed)]
+        );
+        assert!(!validated.contains_published_head(proposed));
+        assert!(!validated.contains_published_first_parent(root));
+    }
+
+    #[test]
+    fn validated_accessors_retain_complete_published_and_projected_history() {
+        let repository = TestRepository::new();
+        let published_base = repository.commit("published base", &[], &[]);
+        let proposed_base = repository.commit("proposed base", &[], &[]);
+        let a = repository.commit("A", &[published_base], &["Gone"]);
+        let b = repository.commit("B", &[published_base], &["Gone"]);
+        let proposed = repository.commit("proposal", &[proposed_base], &["Gone"]);
+        let graph = load(&repository, [a, b, proposed]);
+        let id = change_id("Gone");
+
+        let validated = change_history(&id, &graph, &[(1, a), (2, b)], proposed)
+            .validate(&id, &graph, None)
+            .expect("complete history is safe");
+
+        assert_eq!(validated.published_len(), 2);
+        assert_eq!(
+            validated
+                .published_versions()
+                .map(|(number, revision)| (number.get(), revision.head()))
+                .collect::<Vec<_>>(),
+            [(1, a), (2, b)]
+        );
+        assert_eq!(validated.published_current().unwrap().revision().head(), b);
+        assert_eq!(validated.proposed().head(), proposed);
+        assert!(validated.needs_publication());
+        assert_eq!(
+            validated
+                .projected_versions()
+                .map(|(number, revision)| (number.get(), revision.head()))
+                .collect::<Vec<_>>(),
+            [(1, a), (2, b), (3, proposed)]
+        );
+        assert_eq!(validated.projected_current().number(), version(3));
+        assert_eq!(validated.projected_current().revision().head(), proposed);
+        assert!(validated.contains_published_head(a));
+        assert!(validated.contains_published_head(b));
+        assert!(!validated.contains_published_head(proposed));
+        assert!(validated.contains_published_first_parent(published_base));
+        assert!(!validated.contains_published_first_parent(proposed_base));
+    }
+
+    #[test]
+    fn unsafe_middle_published_revision_cannot_be_omitted_from_validation() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[], &[]);
+        let first = repository.commit("first", &[root], &["Gone"]);
+        let unsafe_middle = repository.commit("unsafe middle", &[root], &["Gother"]);
+        let current = repository.commit("current", &[root], &["Gone"]);
+        let proposed = repository.commit("proposal", &[root], &["Gone"]);
+        let graph = load(&repository, [first, unsafe_middle, current, proposed]);
+        let id = change_id("Gone");
+        let observed = tags([(1, first), (2, unsafe_middle), (3, current)]);
+
+        let normalized =
+            normalize_published_history(&id, Some(current), Some(root), &observed, &graph)
+                .expect("structurally complete published history");
+        assert_eq!(normalized.published.as_ref().unwrap().len(), 3);
+        let error = normalized
+            .with_proposal(proposed, &graph)
+            .expect("literal proposal")
+            .validate(&id, &graph, None)
+            .expect_err("the sole validation path must include the unsafe middle revision");
+        assert!(error.to_string().contains(&unsafe_middle.to_string()), "{error:?}");
+    }
+
+    #[test]
+    fn existing_nonlocal_validation_rejects_absence_and_checks_full_history() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[], &[]);
+        let a = repository.commit("A", &[root], &["Gone"]);
+        let b = repository.commit("B", &[root], &["Gone"]);
+        let unsafe_middle = repository.commit("unsafe middle", &[root], &["Gother"]);
+        let current = repository.commit("current", &[root], &["Gone"]);
+        let graph = load(&repository, [a, b, unsafe_middle, current]);
+        let id = change_id("Gone");
+
+        let absent = normalize_published_history(&id, None, None, &BTreeMap::new(), &graph)
+            .expect("genuinely absent history");
+        let absent_error = absent
+            .validate_existing(&id, &graph, None)
+            .expect_err("an existing nonlocal change must have published history");
+        assert!(absent_error.to_string().contains("no published history"));
+
+        let unsafe_history = normalize_published_history(
+            &id,
+            Some(current),
+            Some(root),
+            &tags([(1, a), (2, unsafe_middle), (3, current)]),
+            &graph,
+        )
+        .expect("structurally complete nonlocal history");
+        let unsafe_error = unsafe_history
+            .validate_existing(&id, &graph, None)
+            .expect_err("full nonlocal validation must retain the unsafe middle revision");
+        assert!(unsafe_error.to_string().contains(&unsafe_middle.to_string()));
+
+        let validated = normalize_published_history(
+            &id,
+            Some(a),
+            Some(root),
+            &tags([(1, a), (2, b), (3, a)]),
+            &graph,
+        )
+        .expect("complete nonlocal history")
+        .validate_existing(&id, &graph, Some(root))
+        .expect("entire nonlocal history and exact root tip are safe");
+        assert_eq!(validated.published_len(), 3);
+        assert_eq!(
+            validated
+                .published_versions()
+                .map(|(number, revision)| (number.get(), revision.head()))
+                .collect::<Vec<_>>(),
+            [(1, a), (2, b), (3, a)]
+        );
+        assert_eq!(validated.published_current().number(), version(3));
+        assert_eq!(validated.published_current().revision().head(), a);
+        assert!(validated.contains_published_head(a));
+        assert!(validated.contains_published_head(b));
+        assert!(!validated.contains_published_head(current));
+        assert!(validated.contains_published_first_parent(root));
+    }
+
+    #[test]
+    fn proposed_revision_identity_and_reachability_are_both_mandatory() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[], &[]);
+        let wrong_identity = repository.commit("wrong proposal", &[root], &["Gother"]);
+        let published = repository.commit("published", &[root], &["Gone"]);
+        let descendant_base = repository.commit("descendant base", &[published], &[]);
+        let unsafe_proposal = repository.commit("unsafe proposal", &[descendant_base], &["Gone"]);
+        let graph = load(&repository, [wrong_identity, unsafe_proposal]);
+        let id = change_id("Gone");
+
+        let identity_error = change_history(&id, &graph, &[], wrong_identity)
+            .validate(&id, &graph, None)
+            .expect_err("a proposal is not optional identity evidence");
+        assert!(identity_error.to_string().contains("exactly one gherrit-pr-id"));
+
+        let reachability_error = change_history(&id, &graph, &[(1, published)], unsafe_proposal)
+            .validate(&id, &graph, None)
+            .expect_err("a proposal's owned base cannot contain a published head");
+        assert!(
+            reachability_error.to_string().contains("reachable from"),
+            "{reachability_error:?}"
+        );
     }
 
     #[test]
@@ -854,12 +1190,14 @@ mod tests {
         let graph = load(&repository, [valid, wrong, repeated, body_only, unfolded]);
         let id = change_id("Gone");
 
-        graph
-            .validate_change(&id, [graph.revision(valid).unwrap()])
+        change_history(&id, &graph, &[], valid)
+            .validate(&id, &graph, None)
             .expect("one exact canonical trailer");
         for head in [wrong, repeated, body_only, unfolded] {
-            let revision = graph.revision(head).unwrap();
-            assert!(graph.validate_change(&id, [revision]).is_err(), "head={head}");
+            assert!(
+                change_history(&id, &graph, &[], head).validate(&id, &graph, None).is_err(),
+                "head={head}"
+            );
         }
     }
 
@@ -870,10 +1208,9 @@ mod tests {
         let duplicate = repository.commit("duplicate", &[root], &["Gone"]);
         let head = repository.commit("merge head", &[root, duplicate], &["Gone"]);
         let graph = load(&repository, [head]);
-        let revision = graph.revision(head).unwrap();
-
-        let error = graph
-            .validate_change(&change_id("Gone"), [revision])
+        let id = change_id("Gone");
+        let error = change_history(&id, &graph, &[], head)
+            .validate(&id, &graph, None)
             .expect_err("non-first-parent duplicate identity");
         assert!(error.to_string().contains("contains 2 commits"), "{error:?}");
     }
@@ -899,14 +1236,15 @@ mod tests {
                 ancestry_identity_count: 1,
             })
         };
-        validate_change_proof("Gone", &proof([first, safe_later]), |from, target| {
-            graph.is_reachable(from, target)
+        validate_change_proof("Gone", &proof([first, safe_later]), |from, targets| {
+            graph.first_reachable_target(from, targets)
         })
         .expect("parents being reachable from heads is the safe orientation");
-        let error = validate_change_proof("Gone", &proof([first, unsafe_later]), |from, target| {
-            graph.is_reachable(from, target)
-        })
-        .expect_err("an older head is reachable from a later owned base");
+        let error =
+            validate_change_proof("Gone", &proof([first, unsafe_later]), |from, targets| {
+                graph.first_reachable_target(from, targets)
+            })
+            .expect_err("an older head is reachable from a later owned base");
         assert!(error.to_string().contains("reachable from"), "{error:?}");
     }
 
@@ -918,14 +1256,19 @@ mod tests {
         let advanced_default = repository.commit("advanced default", &[head], &[]);
         let unrelated_default = repository.commit("other root", &[], &[]);
         let graph = load(&repository, [advanced_default, unrelated_default]);
-        let revision = graph.revision(head).unwrap();
+        let id = change_id("Gone");
 
-        graph.validate_root_safety(root, [revision]).expect("original default is safe");
-        graph
-            .validate_root_safety(unrelated_default, [revision])
+        change_history(&id, &graph, &[], head)
+            .validate(&id, &graph, None)
+            .expect("non-root validation has no default-tip requirement");
+        change_history(&id, &graph, &[], head)
+            .validate(&id, &graph, Some(root))
+            .expect("original default is safe");
+        change_history(&id, &graph, &[], head)
+            .validate(&id, &graph, Some(unrelated_default))
             .expect("an unrelated exact default is safe");
-        let error = graph
-            .validate_root_safety(advanced_default, [revision])
+        let error = change_history(&id, &graph, &[], head)
+            .validate(&id, &graph, Some(advanced_default))
             .expect_err("default tip containing the head is unsafe");
         assert!(error.to_string().contains("reachable from default tip"), "{error:?}");
     }
@@ -946,10 +1289,9 @@ mod tests {
         let b2 = repository.commit("B2", &[default], &["Gb"]);
         let a2 = repository.commit("A2", &[b2], &["Ga"]);
         let evidence = load(&repository, [b1, a2]);
-        let b1 = evidence.revision(b1).unwrap();
-        let b2 = evidence.revision(b2).unwrap();
-        evidence
-            .validate_change(&change_id("Gb"), [b1, b2])
+        let id = change_id("Gb");
+        change_history(&id, &evidence, &[(1, b1)], b2)
+            .validate(&id, &evidence, None)
             .expect("B's own historical first parents are safe across the reorder");
     }
 
@@ -1092,8 +1434,8 @@ mod tests {
                                     .count(),
                             })
                             .collect::<Vec<_>>();
-                        let validated = validate_change_proof("Gmodel", &proof, |from, target| {
-                            Ok(graph.reaches(from, target))
+                        let validated = validate_change_proof("Gmodel", &proof, |from, targets| {
+                            Ok(targets.iter().copied().find(|target| graph.reaches(from, *target)))
                         });
                         assert_eq!(
                             validated.is_ok(),
@@ -1103,8 +1445,11 @@ mod tests {
                         );
                         if identity_safe && reachability_safe {
                             let heads = heads.iter().copied().collect::<HashSet<_>>();
-                            validate_root_proof(0, &heads, |from, target| {
-                                Ok(graph.reaches(from, target))
+                            validate_root_proof(0, &heads, |from, targets| {
+                                Ok(targets
+                                    .iter()
+                                    .copied()
+                                    .find(|target| graph.reaches(from, *target)))
                             })
                             .unwrap_or_else(|error| {
                                 panic!("root case {case_index}, heads={heads:?}: {error:?}")
