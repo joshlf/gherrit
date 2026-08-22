@@ -465,8 +465,6 @@ async fn sync_prs(
                 latest_version,
                 base_branch: &entry.base_branch,
                 gherrit_id: &c.gherrit_id,
-                parent_id: entry.parent_id.as_deref(),
-                child_id: entry.child_id.as_deref(),
             }
             .render();
 
