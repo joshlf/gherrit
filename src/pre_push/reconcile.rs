@@ -65,13 +65,11 @@ pub(super) fn ensure_pull_requests_open(
     if pull_requests.is_empty() { Ok(()) } else { Err(NonOpenPullRequests { pull_requests }) }
 }
 
-/// A stack item annotated with the relationships needed to project it as a PR.
+/// A stack item annotated with the base branch needed to project it as a PR.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct StackEntry<T> {
     pub(super) item: T,
     pub(super) base_branch: String,
-    pub(super) parent_id: Option<String>,
-    pub(super) child_id: Option<String>,
 }
 
 /// Derives stack topology from items ordered from base to head.
@@ -80,24 +78,17 @@ pub(super) fn link_stack<T>(
     items: impl IntoIterator<Item = T>,
     mut id_of: impl FnMut(&T) -> String,
 ) -> Vec<StackEntry<T>> {
-    let mut items = items
+    let mut previous_id = None;
+
+    items
         .into_iter()
         .map(|item| {
             let id = id_of(&item);
-            (item, id)
+            let base_branch = previous_id.replace(id).unwrap_or_else(|| base_branch.to_owned());
+
+            StackEntry { item, base_branch }
         })
-        .peekable();
-    let mut previous_id = None;
-
-    std::iter::from_fn(|| {
-        let (item, id) = items.next()?;
-        let child_id = items.peek().map(|(_, id)| id.clone());
-        let parent_id = previous_id.replace(id);
-        let base_branch = parent_id.as_deref().unwrap_or(base_branch).to_owned();
-
-        Some(StackEntry { item, base_branch, parent_id, child_id })
-    })
-    .collect()
+        .collect()
 }
 
 /// Metadata currently stored on a PR.
@@ -232,38 +223,18 @@ mod tests {
     fn links_a_single_commit_to_the_base() {
         assert_eq!(
             link_ids("main", &["A"]),
-            [StackEntry {
-                item: "A".to_string(),
-                base_branch: "main".to_string(),
-                parent_id: None,
-                child_id: None,
-            }]
+            [StackEntry { item: "A".to_string(), base_branch: "main".to_string() }]
         );
     }
 
     #[test]
-    fn links_each_commit_to_its_neighbors() {
+    fn links_each_commit_to_its_parent() {
         assert_eq!(
             link_ids("main", &["A", "B", "C"]),
             [
-                StackEntry {
-                    item: "A".to_string(),
-                    base_branch: "main".to_string(),
-                    parent_id: None,
-                    child_id: Some("B".to_string()),
-                },
-                StackEntry {
-                    item: "B".to_string(),
-                    base_branch: "A".to_string(),
-                    parent_id: Some("A".to_string()),
-                    child_id: Some("C".to_string()),
-                },
-                StackEntry {
-                    item: "C".to_string(),
-                    base_branch: "B".to_string(),
-                    parent_id: Some("B".to_string()),
-                    child_id: None,
-                },
+                StackEntry { item: "A".to_string(), base_branch: "main".to_string() },
+                StackEntry { item: "B".to_string(), base_branch: "A".to_string() },
+                StackEntry { item: "C".to_string(), base_branch: "B".to_string() },
             ]
         );
     }
@@ -272,12 +243,7 @@ mod tests {
     fn respects_a_custom_base() {
         assert_eq!(
             link_ids("release", &["A"]),
-            [StackEntry {
-                item: "A".to_string(),
-                base_branch: "release".to_string(),
-                parent_id: None,
-                child_id: None,
-            }]
+            [StackEntry { item: "A".to_string(), base_branch: "release".to_string() }]
         );
     }
 
@@ -286,24 +252,9 @@ mod tests {
         assert_eq!(
             link_ids("release", &["C", "A", "B"]),
             [
-                StackEntry {
-                    item: "C".to_string(),
-                    base_branch: "release".to_string(),
-                    parent_id: None,
-                    child_id: Some("A".to_string()),
-                },
-                StackEntry {
-                    item: "A".to_string(),
-                    base_branch: "C".to_string(),
-                    parent_id: Some("C".to_string()),
-                    child_id: Some("B".to_string()),
-                },
-                StackEntry {
-                    item: "B".to_string(),
-                    base_branch: "A".to_string(),
-                    parent_id: Some("A".to_string()),
-                    child_id: None,
-                },
+                StackEntry { item: "C".to_string(), base_branch: "release".to_string() },
+                StackEntry { item: "A".to_string(), base_branch: "C".to_string() },
+                StackEntry { item: "B".to_string(), base_branch: "A".to_string() },
             ]
         );
     }
