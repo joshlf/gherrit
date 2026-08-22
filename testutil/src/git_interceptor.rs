@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     path::PathBuf,
     sync::{Arc, RwLock},
 };
@@ -13,7 +13,7 @@ use crate::{mock_server::MockState, FailureKind, GitOperation, TestEnvironment};
 pub(super) struct State {
     pushes: Vec<Push>,
     invocations: Vec<(GitOperation, Vec<String>)>,
-    before_push_updates: VecDeque<RemoteRefUpdate>,
+    remote_ref_transactions: VecDeque<ScheduledRemoteRefTransaction>,
 }
 
 impl State {
@@ -37,17 +37,38 @@ impl State {
         self.invocations.push((operation, args));
     }
 
-    pub(super) fn schedule_remote_ref_update(&mut self, update: RemoteRefUpdate) {
-        self.before_push_updates.push_back(update);
+    pub(super) fn schedule_remote_ref_transaction(
+        &mut self,
+        transaction: ScheduledRemoteRefTransaction,
+    ) {
+        self.remote_ref_transactions.push_back(transaction);
     }
 
-    pub(super) fn pending_remote_ref_updates(&self) -> &VecDeque<RemoteRefUpdate> {
-        &self.before_push_updates
+    pub(super) fn pending_remote_ref_transactions(
+        &self,
+    ) -> &VecDeque<ScheduledRemoteRefTransaction> {
+        &self.remote_ref_transactions
     }
 
-    fn take_remote_ref_update(&mut self) -> Option<RemoteRefUpdate> {
-        self.before_push_updates.pop_front()
+    fn take_remote_ref_transaction(
+        &mut self,
+        trigger: RemoteRefTransactionTrigger,
+    ) -> Option<ScheduledRemoteRefTransaction> {
+        (self.remote_ref_transactions.front()?.trigger == trigger)
+            .then(|| self.remote_ref_transactions.pop_front().expect("front transaction exists"))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RemoteRefTransactionTrigger {
+    BeforePush,
+    BeforeActiveVersionObservation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ScheduledRemoteRefTransaction {
+    pub(super) trigger: RemoteRefTransactionTrigger,
+    pub(super) updates: Vec<RemoteRefUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,22 +151,26 @@ impl GitOperation {
     }
 
     fn from_args(args: &[String]) -> Option<Self> {
-        match subcommand(args)? {
+        let (subcommand, _) = command(args)?;
+        match subcommand {
             "config" if args.iter().any(|argument| argument == "--get-urlmatch") => {
                 Some(Self::HttpRedirectPolicy)
             }
             "ls-remote" if args.iter().any(|argument| argument == "--get-url") => {
                 Some(Self::LsRemoteUrl)
             }
-            "ls-remote" if args.iter().any(|argument| argument == "--symref") => {
-                Some(Self::LsRemoteDefaultBranch)
+            "ls-remote" => {
+                let Some((remote, arguments)) = private_remote_ls_remote(args) else {
+                    return Some(Self::LsRemoteOther);
+                };
+                if is_global_head_query(remote, arguments) {
+                    Some(Self::LsRemoteHeads)
+                } else if is_active_version_query(remote, arguments) {
+                    Some(Self::LsRemoteActiveVersions)
+                } else {
+                    Some(Self::LsRemoteOther)
+                }
             }
-            "ls-remote"
-                if args.iter().any(|argument| argument.starts_with("refs/tags/gherrit/")) =>
-            {
-                Some(Self::LsRemoteActiveVersions)
-            }
-            "ls-remote" => Some(Self::LsRemoteManagedBranches),
             subcommand => Self::from_subcommand(subcommand),
         }
     }
@@ -156,11 +181,96 @@ impl GitOperation {
             Self::InterpretTrailers => "interpret-trailers",
             Self::HttpRedirectPolicy => "config --get-urlmatch",
             Self::LsRemoteUrl
-            | Self::LsRemoteDefaultBranch
-            | Self::LsRemoteManagedBranches
-            | Self::LsRemoteActiveVersions => "ls-remote",
+            | Self::LsRemoteHeads
+            | Self::LsRemoteActiveVersions
+            | Self::LsRemoteOther => "ls-remote",
         }
     }
+}
+
+/// Recognizes only the suffix emitted by `PushDestination::remote_command`.
+///
+/// This deliberately does not implement Git's general `ls-remote` grammar.
+fn is_global_head_query(remote: &str, arguments: &[String]) -> bool {
+    let [quiet, symref, separator, operand, head, heads, version_root] = arguments else {
+        return false;
+    };
+
+    quiet == "--quiet"
+        && symref == "--symref"
+        && separator == "--"
+        && operand == remote
+        && head == "HEAD"
+        && heads == "refs/heads/*"
+        && version_root == "refs/tags/gherrit"
+}
+
+fn is_active_version_query(remote: &str, arguments: &[String]) -> bool {
+    let [quiet, separator, operand, patterns @ ..] = arguments else {
+        return false;
+    };
+    if quiet != "--quiet"
+        || separator != "--"
+        || operand != remote
+        || patterns.is_empty()
+        || !patterns.len().is_multiple_of(2)
+    {
+        return false;
+    }
+
+    let mut ids = HashSet::with_capacity(patterns.len() / 2);
+    patterns.chunks_exact(2).all(|pair| {
+        let [root, wildcard] = pair else {
+            unreachable!("chunks_exact(2) always yields pairs");
+        };
+        let Some(id) = root.strip_prefix("refs/tags/gherrit/") else {
+            return false;
+        };
+        !id.is_empty()
+            && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            && wildcard.strip_suffix("/*") == Some(root.as_str())
+            && ids.insert(id)
+    })
+}
+
+/// Extracts the one exact private-remote adapter invocation production emits.
+fn private_remote_ls_remote(args: &[String]) -> Option<(&str, &[String])> {
+    const DESTINATION: &str = "GHERRIT_PRIVATE_PUSH_DESTINATION";
+
+    let [program, no_replace_objects, url, pushurl, config, redirect, subcommand, arguments @ ..] =
+        args
+    else {
+        return None;
+    };
+    if program != "git"
+        || no_replace_objects != "--no-replace-objects"
+        || config != "-c"
+        || redirect != "http.followRedirects=false"
+        || subcommand != "ls-remote"
+    {
+        return None;
+    }
+
+    let url = url.strip_prefix("--config-env=remote.")?;
+    let remote = url.strip_suffix(&format!(".url={DESTINATION}"))?;
+    let pushurl = pushurl.strip_prefix("--config-env=remote.")?;
+    let push_remote = pushurl.strip_suffix(&format!(".pushurl={DESTINATION}"))?;
+    (remote == push_remote && is_internal_remote(remote)).then_some((remote, arguments))
+}
+
+fn is_internal_remote(remote: &str) -> bool {
+    const STEM: &str = "gherrit-publication";
+
+    let Some(suffix) = remote.strip_prefix(STEM) else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return true;
+    }
+    let Some(index) = suffix.strip_prefix('-') else {
+        return false;
+    };
+    index.parse::<usize>().is_ok_and(|parsed| parsed != 0 && parsed.to_string() == index)
 }
 
 fn check_and_apply_failure(
@@ -184,18 +294,26 @@ fn check_and_apply_failure(
 /// not emulate Git's general global-option grammar. Direct fixture commands
 /// still use the ordinary `git <subcommand>` shape.
 fn subcommand(args: &[String]) -> Option<&str> {
-    let mut arguments = args.iter().skip(1).map(String::as_str);
-    if arguments.next()? != "--no-replace-objects" {
-        return args.get(1).map(String::as_str).filter(|argument| !argument.starts_with('-'));
+    command(args).map(|(subcommand, _)| subcommand)
+}
+
+fn command(args: &[String]) -> Option<(&str, &[String])> {
+    let first = args.get(1)?;
+    if first != "--no-replace-objects" {
+        return (!first.starts_with('-')).then_some((first, &args[2..]));
     }
 
+    let mut index = 2;
     loop {
-        match arguments.next()? {
+        match args.get(index)?.as_str() {
             "-c" => {
-                arguments.next()?;
+                args.get(index + 1)?;
+                index += 2;
             }
-            argument if argument.starts_with("--config-env=") => {}
-            subcommand if !subcommand.starts_with('-') => return Some(subcommand),
+            argument if argument.starts_with("--config-env=") => index += 1,
+            subcommand if !subcommand.starts_with('-') => {
+                return Some((subcommand, &args[index + 1..]));
+            }
             _ => return None,
         }
     }
@@ -238,23 +356,15 @@ async fn handle_git(
         None => {}
     }
 
+    if operation == Some(GitOperation::LsRemoteActiveVersions) {
+        apply_remote_ref_transaction(
+            &handler,
+            RemoteRefTransactionTrigger::BeforeActiveVersionObservation,
+        );
+    }
+
     if is_push {
-        let update = handler.shared.write().unwrap().git.take_remote_ref_update();
-        if let Some(update) = update {
-            let remote = handler
-                .remote
-                .as_ref()
-                .expect("scheduled remote update requires a remote repository");
-            remote
-                .environment
-                .command(&remote.system_git)
-                .current_dir(&remote.path)
-                .arg("update-ref")
-                .arg(update.ref_name)
-                .arg(update.target)
-                .assert()
-                .success();
-        }
+        apply_remote_ref_transaction(&handler, RemoteRefTransactionTrigger::BeforePush);
         let state = handler.shared.read().unwrap();
         let stderr = format!(
             "remote: \nremote: Create a pull request for 'feature' on GitHub by visiting:\nremote:      https://github.com/{}/{}/pull/new/feature\nremote: \n",
@@ -276,6 +386,35 @@ async fn handle_git(
         passthrough: true,
         report_exit_status: false,
     })
+}
+
+fn apply_remote_ref_transaction(handler: &HandlerState, trigger: RemoteRefTransactionTrigger) {
+    let transaction = handler.shared.write().unwrap().git.take_remote_ref_transaction(trigger);
+    let Some(transaction) = transaction else { return };
+    let remote =
+        handler.remote.as_ref().expect("scheduled remote update requires a remote repository");
+
+    // `git update-ref --stdin` applies every command in one ref transaction.
+    // This lets a process test place a coherent publication tuple exactly
+    // between two observations without exposing an impossible intermediate
+    // state to either observation.
+    let input = std::iter::once("start\n".to_owned())
+        .chain(
+            transaction
+                .updates
+                .into_iter()
+                .map(|update| format!("update {} {}\n", update.ref_name, update.target)),
+        )
+        .chain(["prepare\n".to_owned(), "commit\n".to_owned()])
+        .collect::<String>();
+    remote
+        .environment
+        .command(&remote.system_git)
+        .current_dir(&remote.path)
+        .args(["update-ref", "--stdin"])
+        .input(input)
+        .assert()
+        .success();
 }
 
 async fn complete_git(
@@ -373,19 +512,308 @@ mod tests {
                 Some(GitOperation::LsRemoteUrl),
             ),
             (
-                &["git", "--no-replace-objects", "ls-remote", "--symref"][..],
-                Some(GitOperation::LsRemoteDefaultBranch),
+                &[
+                    "git",
+                    "--no-replace-objects",
+                    "ls-remote",
+                    "--quiet",
+                    "--symref",
+                    "--",
+                    "gherrit-publication",
+                    "HEAD",
+                    "refs/heads/*",
+                    "refs/tags/gherrit",
+                ][..],
+                Some(GitOperation::LsRemoteOther),
+            ),
+            (
+                &["git", "--no-replace-objects", "ls-remote", "--symref", "HEAD"][..],
+                Some(GitOperation::LsRemoteOther),
             ),
             (
                 &["git", "--no-replace-objects", "ls-remote", "refs/heads/Gone"][..],
-                Some(GitOperation::LsRemoteManagedBranches),
+                Some(GitOperation::LsRemoteOther),
             ),
             (
-                &["git", "--no-replace-objects", "ls-remote", "refs/tags/gherrit/Gone/*"][..],
-                Some(GitOperation::LsRemoteActiveVersions),
+                &[
+                    "git",
+                    "--no-replace-objects",
+                    "ls-remote",
+                    "--quiet",
+                    "--",
+                    "gherrit-publication",
+                    "refs/tags/gherrit/Gone",
+                    "refs/tags/gherrit/Gone/*",
+                ][..],
+                Some(GitOperation::LsRemoteOther),
             ),
         ] {
             assert_eq!(GitOperation::from_args(&args(arguments)), expected);
+        }
+    }
+
+    fn production_ls_remote(remote: &str, arguments: &[&str]) -> Vec<String> {
+        [
+            "git".to_owned(),
+            "--no-replace-objects".to_owned(),
+            format!("--config-env=remote.{remote}.url=GHERRIT_PRIVATE_PUSH_DESTINATION"),
+            format!("--config-env=remote.{remote}.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION"),
+            "-c".to_owned(),
+            "http.followRedirects=false".to_owned(),
+            "ls-remote".to_owned(),
+        ]
+        .into_iter()
+        .chain(arguments.iter().map(|argument| (*argument).to_owned()))
+        .collect()
+    }
+
+    fn assert_ls_remote_other(remote: &str, arguments: &[&str]) {
+        assert_eq!(
+            GitOperation::from_args(&production_ls_remote(remote, arguments)),
+            Some(GitOperation::LsRemoteOther),
+            "remote={remote:?}, arguments={arguments:?}"
+        );
+    }
+
+    fn assert_not_known_remote_observation(arguments: &[String]) {
+        assert!(
+            !matches!(
+                GitOperation::from_args(arguments),
+                Some(GitOperation::LsRemoteHeads | GitOperation::LsRemoteActiveVersions)
+            ),
+            "arguments={arguments:?}"
+        );
+    }
+
+    #[test]
+    fn remote_observation_requires_the_exact_private_adapter_prefix() {
+        let tail = [
+            "--quiet",
+            "--symref",
+            "--",
+            "gherrit-publication-2",
+            "HEAD",
+            "refs/heads/*",
+            "refs/tags/gherrit",
+        ];
+        let canonical = production_ls_remote("gherrit-publication-2", &tail);
+        assert_eq!(GitOperation::from_args(&canonical), Some(GitOperation::LsRemoteHeads));
+
+        for index in 0..7 {
+            let mut missing = canonical.clone();
+            missing.remove(index);
+            assert_not_known_remote_observation(&missing);
+        }
+        for index in 0..6 {
+            let mut reordered = canonical.clone();
+            reordered.swap(index, index + 1);
+            assert_not_known_remote_observation(&reordered);
+        }
+
+        for (index, replacement) in [
+            (0, "not-git"),
+            (1, "--replace-objects"),
+            (
+                2,
+                "--config-env=remote.gherrit-publication.url=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            ),
+            (
+                3,
+                "--config-env=remote.gherrit-publication-3.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            ),
+            (
+                3,
+                "--config-env=remote.gherrit-publication-2.pushurl=OTHER_DESTINATION",
+            ),
+            (4, "--config"),
+            (5, "http.followRedirects=true"),
+            (6, "fetch"),
+        ] {
+            let mut invalid = canonical.clone();
+            invalid[index] = replacement.to_owned();
+            assert_not_known_remote_observation(&invalid);
+        }
+    }
+
+    #[test]
+    fn global_head_operation_requires_the_complete_ordered_production_tail() {
+        let canonical = [
+            "--quiet",
+            "--symref",
+            "--",
+            "gherrit-publication-2",
+            "HEAD",
+            "refs/heads/*",
+            "refs/tags/gherrit",
+        ];
+        assert_eq!(
+            GitOperation::from_args(&production_ls_remote("gherrit-publication-2", &canonical)),
+            Some(GitOperation::LsRemoteHeads)
+        );
+
+        for index in 0..canonical.len() {
+            let mut missing = canonical.to_vec();
+            missing.remove(index);
+            assert_ls_remote_other("gherrit-publication-2", &missing);
+
+            let mut duplicated = canonical.to_vec();
+            duplicated.insert(index, canonical[index]);
+            assert_ls_remote_other("gherrit-publication-2", &duplicated);
+        }
+        for index in 0..canonical.len() - 1 {
+            let mut reordered = canonical;
+            reordered.swap(index, index + 1);
+            assert_ls_remote_other("gherrit-publication-2", &reordered);
+        }
+        for index in 0..=canonical.len() {
+            let mut extra = canonical.to_vec();
+            extra.insert(index, "unexpected");
+            assert_ls_remote_other("gherrit-publication-2", &extra);
+        }
+
+        for remote in ["gherrit-publication", "gherrit-publication-1", "gherrit-publication-42"] {
+            let mut query = canonical;
+            query[3] = remote;
+            assert_eq!(
+                GitOperation::from_args(&production_ls_remote(remote, &query)),
+                Some(GitOperation::LsRemoteHeads)
+            );
+        }
+        for remote in [
+            "",
+            "origin",
+            "gherrit-publication-0",
+            "gherrit-publication-01",
+            "gherrit-publication--1",
+            "gherrit-publication-9999999999999999999999999999999999999999",
+        ] {
+            let mut query = canonical;
+            query[3] = remote;
+            assert_ls_remote_other(remote, &query);
+        }
+
+        assert_ls_remote_other("gherrit-publication", &["--symref", "HEAD"]);
+        assert_ls_remote_other(
+            "gherrit-publication",
+            &[
+                "--quiet",
+                "--symref",
+                "--",
+                "gherrit-publication",
+                "HEAD",
+                "refs/heads/*",
+                "refs/tags/gherrit/Gone",
+                "refs/tags/gherrit/Gone/*",
+            ],
+        );
+    }
+
+    #[test]
+    fn active_version_operation_requires_complete_unique_root_wildcard_pairs() {
+        let one = [
+            "--quiet",
+            "--",
+            "gherrit-publication",
+            "refs/tags/gherrit/Gone",
+            "refs/tags/gherrit/Gone/*",
+        ];
+        let two = [
+            "--quiet",
+            "--",
+            "gherrit-publication-12",
+            "refs/tags/gherrit/Gone",
+            "refs/tags/gherrit/Gone/*",
+            "refs/tags/gherrit/G2",
+            "refs/tags/gherrit/G2/*",
+        ];
+        assert_eq!(
+            GitOperation::from_args(&production_ls_remote("gherrit-publication", &one)),
+            Some(GitOperation::LsRemoteActiveVersions)
+        );
+        assert_eq!(
+            GitOperation::from_args(&production_ls_remote("gherrit-publication-12", &two)),
+            Some(GitOperation::LsRemoteActiveVersions)
+        );
+
+        for index in 0..two.len() {
+            let mut missing = two.to_vec();
+            missing.remove(index);
+            assert_ls_remote_other("gherrit-publication-12", &missing);
+
+            let mut duplicated = two.to_vec();
+            duplicated.insert(index, two[index]);
+            assert_ls_remote_other("gherrit-publication-12", &duplicated);
+        }
+        for index in 0..two.len() - 1 {
+            let mut reordered = two;
+            reordered.swap(index, index + 1);
+            assert_ls_remote_other("gherrit-publication-12", &reordered);
+        }
+        for index in 0..=two.len() {
+            let mut extra = two.to_vec();
+            extra.insert(index, "unexpected");
+            assert_ls_remote_other("gherrit-publication-12", &extra);
+        }
+
+        for malformed in [
+            &[
+                "--quiet",
+                "--",
+                "gherrit-publication",
+                "refs/tags/gherrit/Gone",
+                "refs/tags/gherrit/Gone/*",
+                "refs/tags/gherrit/Gone",
+                "refs/tags/gherrit/Gone/*",
+            ][..],
+            &["--quiet", "--", "gherrit-publication", "refs/tags/gherrit/Gone"][..],
+            &[
+                "--quiet",
+                "--",
+                "gherrit-publication",
+                "refs/tags/gherrit/Gone/*",
+                "refs/tags/gherrit/Gone",
+            ][..],
+            &[
+                "--quiet",
+                "--",
+                "gherrit-publication",
+                "refs/tags/gherrit/Gone",
+                "refs/tags/gherrit/Gtwo/*",
+            ][..],
+            &[
+                "--quiet",
+                "--",
+                "gherrit-publication",
+                "refs/tags/gherrit/G-one",
+                "refs/tags/gherrit/G-one/*",
+            ][..],
+            &["--quiet", "--", "gherrit-publication", "refs/tags/gherrit/", "refs/tags/gherrit//*"]
+                [..],
+            &[
+                "--quiet",
+                "--",
+                "gherrit-publication",
+                "refs/tags/gherrit/G/one",
+                "refs/tags/gherrit/G/one/*",
+            ][..],
+            &[
+                "--quiet",
+                "--",
+                "gherrit-publication",
+                "refs/tags/gherrit/G雪",
+                "refs/tags/gherrit/G雪/*",
+            ][..],
+            &[
+                "--quiet",
+                "--symref",
+                "--",
+                "gherrit-publication",
+                "refs/tags/gherrit/Gone",
+                "refs/tags/gherrit/Gone/*",
+            ][..],
+            &["--quiet", "--", "gherrit-publication", "HEAD", "refs/heads/*"][..],
+        ] {
+            assert_ls_remote_other("gherrit-publication", malformed);
         }
     }
 
@@ -393,19 +821,19 @@ mod tests {
     fn git_faults_match_in_script_order() {
         let expected = VecDeque::from([
             FailureKind::Git(GitOperation::Var),
-            FailureKind::Git(GitOperation::LsRemoteDefaultBranch),
+            FailureKind::Git(GitOperation::LsRemoteHeads),
         ]);
         let mut state = MockState { faults: expected.clone(), ..Default::default() };
 
-        assert_eq!(check_and_apply_failure(&mut state, GitOperation::LsRemoteDefaultBranch), None);
+        assert_eq!(check_and_apply_failure(&mut state, GitOperation::LsRemoteHeads), None);
         assert_eq!(state.faults, expected);
         assert_eq!(
             check_and_apply_failure(&mut state, GitOperation::Var),
             Some(FailureKind::Git(GitOperation::Var))
         );
         assert_eq!(
-            check_and_apply_failure(&mut state, GitOperation::LsRemoteDefaultBranch),
-            Some(FailureKind::Git(GitOperation::LsRemoteDefaultBranch))
+            check_and_apply_failure(&mut state, GitOperation::LsRemoteHeads),
+            Some(FailureKind::Git(GitOperation::LsRemoteHeads))
         );
         assert!(state.faults.is_empty());
 

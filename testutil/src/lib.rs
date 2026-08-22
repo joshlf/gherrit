@@ -458,9 +458,9 @@ pub enum GitOperation {
     InterpretTrailers,
     HttpRedirectPolicy,
     LsRemoteUrl,
-    LsRemoteDefaultBranch,
-    LsRemoteManagedBranches,
+    LsRemoteHeads,
     LsRemoteActiveVersions,
+    LsRemoteOther,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -660,22 +660,28 @@ impl Drop for TestContext {
         // Stop the server before fixture directories and state are released.
         drop(self.mock_server.take());
 
-        let (state_poisoned, pending_faults, pending_remote_updates) = self
+        let (state_poisoned, pending_faults, pending_remote_transactions) = self
             .mock_server_state
             .as_ref()
             .map(|state| match state.read() {
-                Ok(state) => {
-                    (false, state.faults.clone(), state.git.pending_remote_ref_updates().clone())
-                }
+                Ok(state) => (
+                    false,
+                    state.faults.clone(),
+                    state.git.pending_remote_ref_transactions().clone(),
+                ),
                 Err(poisoned) => {
                     let state = poisoned.into_inner();
-                    (true, state.faults.clone(), state.git.pending_remote_ref_updates().clone())
+                    (
+                        true,
+                        state.faults.clone(),
+                        state.git.pending_remote_ref_transactions().clone(),
+                    )
                 }
             })
             .unwrap_or_default();
         if state_poisoned {
             let message = format!(
-                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}; unconsumed remote updates: {pending_remote_updates:?}"
+                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}; unconsumed remote ref transactions: {pending_remote_transactions:?}"
             );
             if thread::panicking() {
                 eprintln!("{message}");
@@ -691,13 +697,15 @@ impl Drop for TestContext {
                 panic!("Test fixture has unconsumed faults: {pending_faults:?}");
             }
         }
-        if !pending_remote_updates.is_empty() {
+        if !pending_remote_transactions.is_empty() {
             if thread::panicking() {
                 eprintln!(
-                    "Test fixture also has unconsumed remote updates: {pending_remote_updates:?}"
+                    "Test fixture also has unconsumed remote ref transactions: {pending_remote_transactions:?}"
                 );
             } else {
-                panic!("Test fixture has unconsumed remote updates: {pending_remote_updates:?}");
+                panic!(
+                    "Test fixture has unconsumed remote ref transactions: {pending_remote_transactions:?}"
+                );
             }
         }
     }
@@ -933,8 +941,41 @@ impl TestContext {
     ) {
         assert!(self.has_remote, "missing test capability: .with_remote()");
         assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
-        self.mock_state().write().unwrap().git.schedule_remote_ref_update(
-            git_interceptor::RemoteRefUpdate { ref_name: ref_name.into(), target: target.into() },
+        self.mock_state().write().unwrap().git.schedule_remote_ref_transaction(
+            git_interceptor::ScheduledRemoteRefTransaction {
+                trigger: git_interceptor::RemoteRefTransactionTrigger::BeforePush,
+                updates: vec![git_interceptor::RemoteRefUpdate {
+                    ref_name: ref_name.into(),
+                    target: target.into(),
+                }],
+            },
+        );
+    }
+
+    /// Atomically changes remote refs after the global head observation and
+    /// immediately before the next active-version observation.
+    pub fn update_remote_refs_before_active_version_observation<I, R, T>(&self, updates: I)
+    where
+        I: IntoIterator<Item = (R, T)>,
+        R: Into<String>,
+        T: Into<String>,
+    {
+        assert!(self.has_remote, "missing test capability: .with_remote()");
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        let updates = updates
+            .into_iter()
+            .map(|(ref_name, target)| git_interceptor::RemoteRefUpdate {
+                ref_name: ref_name.into(),
+                target: target.into(),
+            })
+            .collect::<Vec<_>>();
+        assert!(!updates.is_empty(), "remote ref transaction must contain an update");
+        self.mock_state().write().unwrap().git.schedule_remote_ref_transaction(
+            git_interceptor::ScheduledRemoteRefTransaction {
+                trigger:
+                    git_interceptor::RemoteRefTransactionTrigger::BeforeActiveVersionObservation,
+                updates,
+            },
         );
     }
 

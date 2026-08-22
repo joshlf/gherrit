@@ -160,10 +160,15 @@ the PR description.
 The tags advertised by the configured push destination are the authoritative
 version history. GHerrit neither reads nor creates local version tags, so a
 fresh clone and an older working copy select the same next version. Before any
-write, GHerrit observes the active managed heads and exact active tag
-namespaces, then requires every published history to be contiguous from `v1`
-and its latest tag to agree with the managed head. It validates and plans the
-complete local stack before publishing any prefix of it.
+write, one global observation establishes the default branch and every remote
+head. After deriving the local stack, one or more byte-bounded requests observe
+exact version-tag namespaces only for active changes. Attempts therefore use
+one global Git read plus one or more active-history reads; ordinary stacks need
+two Git reads total. Response and backend work scale with all heads plus active
+histories rather than every historical version tag. GHerrit then
+requires every published history to be contiguous from `v1` and its latest tag
+to agree with the managed head. It validates and plans the complete local stack
+before publishing any prefix of it.
 
 #### Leased Git Updates
 

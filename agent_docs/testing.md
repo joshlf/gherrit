@@ -169,13 +169,15 @@ call into `gix`, `Command`, Octocrab, or an HTTP client.
 The Git boundary should support:
 
 - observing the local stack and branch configuration;
-- observing every relevant managed branch and exact active tag namespace at
-  the bound push destination; and
+- observing the default branch and every remote head in one global request;
+- observing exact active tag namespaces in separate byte-bounded requests;
 - publishing bounded atomic batches with explicit branch and tag leases.
 
 Remote immutable tags are version authority. The boundary must not consult or
 persist local version tags: tests must produce the same next version from a
 fresh clone, a clone with stale local tags, and a split fetch/push remote.
+Ordinary attempts use two Git reads. Observation work scales with all heads
+plus active immutable histories, not every historical version tag.
 
 The GitHub boundary should support:
 

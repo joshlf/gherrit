@@ -39,7 +39,7 @@ use reconcile::{
     CurrentPr, DesiredPr, PrUpdate, PullRequestState, ensure_pull_requests_open, link_stack,
     plan_update,
 };
-use remote::observe_publications;
+use remote::{ObservedStack, observe_active_version_tags, observe_remote_heads};
 
 const INDETERMINATE_GRAPHQL_MUTATION: &str = "GraphQL mutation acknowledgement is indeterminate; stop this publication attempt and retry the push to reobserve GitHub state";
 
@@ -93,7 +93,8 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     let configured_remote =
         repo.default_remote_name().wrap_err("Failed to read the configured GHerrit remote")?;
     let destination = PushDestination::resolve(configured_remote)?;
-    let git_default_branch = destination.observe_default_branch()?;
+    let remote_heads = observe_remote_heads(&destination)?;
+    let git_default_branch = remote_heads.default_branch().clone();
     git_default_branch.ensure_local(repo)?;
     let commits = LocalStack::collect(repo, &git_default_branch, destination.configured_remote())
         .wrap_err("Failed to collect commits")?;
@@ -107,9 +108,13 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
         bail!("The GHerrit test driver cannot sync PRs without a configured GitHub endpoint");
     }
 
-    // Git state is authoritative for publication versions. Observe and plan
-    // the complete stack before any write can be exposed.
-    let observed = observe_publications(&destination, &commits)?;
+    // Missing heads are meaningful because the global observation covered the
+    // complete namespace. Missing version histories remain an error because
+    // only these active IDs were queried. Couple both domains before planning
+    // so the complete stack is validated before any write can be exposed.
+    let versions =
+        observe_active_version_tags(&destination, commits.iter().map(|change| change.id()))?;
+    let observed = ObservedStack::couple(&commits, &remote_heads, versions)?;
     let publication = plan_git_publication(&observed)?;
 
     let token = util::get_github_token()?;
