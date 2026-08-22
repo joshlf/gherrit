@@ -114,6 +114,8 @@ impl LocalStack {
     /// Reads and validates the local managed stack without performing network
     /// writes.
     pub(super) fn collect(repo: &util::Repo) -> Result<Self> {
+        repo.ensure_publishable_history()?;
+
         let head = repo.rev_parse_single("HEAD")?;
         let default_branch = repo.find_default_branch_on_default_remote();
         let default_ref = repo.rev_parse_single(format!("refs/heads/{default_branch}").as_str())?;
@@ -261,7 +263,6 @@ fn ensure_change_ids_unique_in_head_ancestry(stack: &LocalStack, head: ObjectId)
     let output = util::cmd(
         "git",
         [
-            "--no-replace-objects",
             "log",
             "--no-patch",
             "--no-show-signature",
