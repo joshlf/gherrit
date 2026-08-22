@@ -652,6 +652,7 @@ fn test_pre_push_pr_list_retries_a_transient_http_failure() {
         [
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
+            vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::CreatePr],
             vec![testutil::GraphQlOperation::UpdatePr],
         ]
@@ -691,6 +692,7 @@ fn test_pre_push_pr_list_retries_a_response_transport_failure() {
     assert_eq!(
         ctx.github().requests(),
         [
+            vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::CreatePr],
@@ -734,7 +736,11 @@ fn test_pre_push_pr_create_failure() {
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),
-        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::CreatePr],],
+        [
+            vec![testutil::GraphQlOperation::Query],
+            vec![testutil::GraphQlOperation::Query],
+            vec![testutil::GraphQlOperation::CreatePr],
+        ],
         "an indeterminate create response must stop without replay or continuation"
     );
     assert!(ctx.github().pull_requests().is_empty());
@@ -764,7 +770,11 @@ fn test_pre_push_pr_create_service_unavailable_is_not_replayed() {
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),
-        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::CreatePr],],
+        [
+            vec![testutil::GraphQlOperation::Query],
+            vec![testutil::GraphQlOperation::Query],
+            vec![testutil::GraphQlOperation::CreatePr],
+        ],
         "a retryable HTTP response must not replay a mutation request"
     );
     assert!(ctx.github().pull_requests().is_empty());
