@@ -158,6 +158,46 @@ fn literal_graph_open_options() -> gix::sec::trust::Mapping<gix::open::Options> 
     options
 }
 
+/// The configured Git remote whose push repository GHerrit publishes to.
+///
+/// Construction rejects values which cannot be passed to Git and repeated in
+/// diagnostics without changing their meaning. In particular, configuration
+/// decoding is fallible: an unreadable `gherrit.remote` never silently turns
+/// into `origin`.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RemoteName(String);
+
+impl RemoteName {
+    pub(crate) fn from_config(value: &[u8]) -> Result<Self> {
+        let value = std::str::from_utf8(value)
+            .wrap_err("The configured GHerrit remote is not valid UTF-8")?;
+        if value.is_empty() {
+            bail!("The configured GHerrit remote is empty");
+        }
+        if value.chars().any(char::is_control) {
+            bail!("The configured GHerrit remote contains a control character");
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn default_remote_name_from_values<'a>(
+    values: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<RemoteName> {
+    let mut values = values.into_iter();
+    let Some(value) = values.next() else {
+        return Ok(RemoteName("origin".to_string()));
+    };
+    if values.next().is_some() {
+        bail!("The GHerrit remote is configured more than once");
+    }
+    RemoteName::from_config(value)
+}
+
 impl Repo {
     pub fn open(path: &str) -> Result<Self> {
         // NOTE: `gix::discover` is used instead of `gix::open` so that
@@ -319,30 +359,21 @@ impl Repo {
         Ok(latest_log.is_some_and(|log| log.previous_oid.is_null()))
     }
 
-    pub fn default_remote_name(&self) -> String {
-        self.config_string("gherrit.remote")
-            .unwrap_or_default()
-            .unwrap_or_else(|| "origin".to_string())
+    pub fn default_remote_name(&self) -> Result<RemoteName> {
+        let snapshot = self.inner.config_snapshot();
+        let values = snapshot.strings("gherrit.remote").unwrap_or_default();
+        default_remote_name_from_values(values.iter().map(|value| value.as_ref().as_bytes()))
     }
 
-    pub fn default_remote(&self) -> Result<Remote> {
-        let remote_name = self.default_remote_name();
-        let remote_url = self
-            .config_string(&format!("remote.{}.url", remote_name))?
-            .ok_or_else(|| eyre!("Remote '{}' missing URL", remote_name))?;
-        let (owner, repo_name) = get_repo_owner_name(remote_url.as_str())?;
-        Ok(Remote { owner, repo_name })
-    }
-
-    fn find_default_branches(&self, remote_name: &str) -> Vec<String> {
+    fn find_default_branches(&self, remote_name: &RemoteName) -> Result<Vec<String>> {
         let mut branches = Vec::new();
 
         // Try to infer the default branch from the remote HEAD.
-        let remote_head_ref = format!("refs/remotes/{}/HEAD", remote_name);
+        let remote_head_ref = format!("refs/remotes/{}/HEAD", remote_name.as_str());
         if let Ok(head_ref) = self.inner.find_reference(&remote_head_ref) {
             let target_name = head_ref.target().try_name().map(|n| n.as_bstr().to_string());
             if let Some(target) = target_name {
-                let prefix = format!("refs/remotes/{}/", remote_name);
+                let prefix = format!("refs/remotes/{}/", remote_name.as_str());
                 if let Some(stripped) = target.strip_prefix(&prefix) {
                     branches.push(stripped.to_string());
                 }
@@ -351,8 +382,7 @@ impl Repo {
 
         // Check git config
         //
-        // Note that we swallow errors (e.g. invalid UTF-8) here.
-        if let Some(default_branch) = self.config_string("init.defaultBranch").ok().flatten() {
+        if let Some(default_branch) = self.config_string("init.defaultBranch")? {
             branches.push(default_branch);
         }
 
@@ -366,17 +396,13 @@ impl Repo {
         // Default fallback
         branches.push("main".to_string());
 
-        branches
+        Ok(branches)
     }
 
-    pub fn find_default_branch_on_default_remote(&self) -> String {
-        let branches = self.find_default_branches(&self.default_remote_name());
-        branches.first().cloned().unwrap_or_else(|| "main".to_string())
-    }
-
-    pub fn is_a_default_branch_on_default_remote(&self, branch_name: &str) -> bool {
-        let branches = self.find_default_branches(&self.default_remote_name());
-        branches.iter().any(|b| b == branch_name)
+    pub fn is_a_default_branch_on_default_remote(&self, branch_name: &str) -> Result<bool> {
+        let remote_name = self.default_remote_name()?;
+        let branches = self.find_default_branches(&remote_name)?;
+        Ok(branches.iter().any(|branch| branch == branch_name))
     }
 
     // Check whether the branch is managed by GHerrit.
@@ -496,21 +522,6 @@ impl std::ops::Deref for Repo {
     }
 }
 
-pub struct Remote {
-    pub owner: String,
-    pub repo_name: String,
-}
-
-impl Remote {
-    pub fn pr_url(&self, pr_number: u64) -> String {
-        format!("https://github.com/{}/{}/pull/{}", self.owner, self.repo_name, pr_number)
-    }
-
-    pub fn repo_url_relative(&self) -> String {
-        format!("/{}/{}", self.owner, self.repo_name)
-    }
-}
-
 /// Determines the current HEAD state.
 fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     if let Some(name) = repo.head()?.referent_name() {
@@ -599,28 +610,39 @@ pub fn get_github_token() -> Result<String> {
     ))
 }
 
-/// Parses the owner and repository name from a remote URL.
-///
-/// Supports the following formats:
-/// - https://github.com/owner/repo(.git)
-/// - git@github.com:owner/repo(.git)
-/// - http://localhost:port/owner/repo(.git)
-/// - /absolute/path/to/owner/repo(.git) (for tests)
-/// - owner/repo (for tests)
-fn get_repo_owner_name(remote_url: &str) -> Result<(String, String)> {
-    let re = re!(r"^(?:.*[/:])?(?P<owner>[^/:]+)/(?P<repo>[^/]+?)(?:\.git)?$");
-
-    let caps = re
-        .captures(remote_url)
-        .ok_or_else(|| eyre!("Unsupported remote URL format: {remote_url}"))?;
-    let owner = caps.name("owner").unwrap().as_str().to_string();
-    let repo = caps.name("repo").unwrap().as_str().to_string();
-    Ok((owner, repo))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_names_are_decoded_and_validated_without_fallback() {
+        for value in [b"origin".as_slice(), b"-publish", "rémote".as_bytes()] {
+            assert_eq!(RemoteName::from_config(value).unwrap().as_str().as_bytes(), value);
+        }
+
+        for value in [b"".as_slice(), b"bad\nname", b"bad\rname", b"bad\0name", b"\xff"] {
+            assert!(RemoteName::from_config(value).is_err(), "value: {value:?}");
+        }
+    }
+
+    #[test]
+    fn the_default_remote_requires_at_most_one_configured_value() {
+        assert_eq!(default_remote_name_from_values(std::iter::empty()).unwrap().as_str(), "origin");
+        assert_eq!(
+            default_remote_name_from_values([b"publish".as_slice()]).unwrap().as_str(),
+            "publish"
+        );
+
+        for values in [
+            [b"origin".as_slice(), b"origin".as_slice()],
+            [b"origin".as_slice(), b"publish".as_slice()],
+        ] {
+            let error = default_remote_name_from_values(values)
+                .err()
+                .expect("repeated values must be rejected");
+            assert_eq!(error.to_string(), "The GHerrit remote is configured more than once");
+        }
+    }
 
     #[test]
     fn git_commands_use_the_literal_local_graph_without_lazy_fetches() {
@@ -701,32 +723,5 @@ mod tests {
     #[should_panic(expected = "Command cannot be empty")]
     fn test_cmd_macro_whitespace_panic() {
         cmd!("   ");
-    }
-
-    #[test]
-    fn test_get_repo_owner_name() {
-        for (url, (owner, repo)) in [
-            ("https://github.com/owner/repo.git", ("owner", "repo")),
-            ("https://github.com/owner/repo", ("owner", "repo")),
-            ("git@github.com:owner/repo.git", ("owner", "repo")),
-            ("git@github.com:owner/repo", ("owner", "repo")),
-            ("alias:owner/repo.git", ("owner", "repo")),
-            ("alias:owner/repo", ("owner", "repo")),
-            ("http://localhost:3000/owner/repo.git", ("owner", "repo")),
-            ("http://my-gh.com/owner/repo", ("owner", "repo")),
-            ("/tmp/test/owner/repo.git", ("owner", "repo")),
-            ("/tmp/owner/repo", ("owner", "repo")),
-            ("owner/repo", ("owner", "repo")),
-            ("https://github.com/user-name/repo", ("user-name", "repo")),
-            ("https://github.com/user_name/repo", ("user_name", "repo")),
-            ("https://github.com/user.name/repo", ("user.name", "repo")),
-            ("https://github.com/user/repo-name", ("user", "repo-name")),
-            ("https://github.com/user/repo_name", ("user", "repo_name")),
-            ("https://github.com/user/repo.name", ("user", "repo.name")),
-            ("https://github.com/user/repo.name.git", ("user", "repo.name")),
-        ] {
-            let expect = (owner.to_string(), repo.to_string());
-            assert_eq!(get_repo_owner_name(url).unwrap(), expect);
-        }
     }
 }

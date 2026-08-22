@@ -102,15 +102,17 @@ merge commits.
 Only merge the root PR whose base is the repository's default branch. GHerrit
 does not automatically rebase the remaining stack after the root lands.
 
-Run the following commands with the managed stack branch checked out. Replace
-`<gherrit-remote>` with the remote configured for GHerrit. That remote's fetch
-URL and push destination must identify the same repository.
+Run the following commands with the managed stack branch checked out.
+`<target-fetch-remote>` must fetch from the same repository as GHerrit's
+configured push destination. It need not be the configured GHerrit remote: a
+Git remote can fetch from one repository and push to another. Add or use a
+separate fetch remote when necessary.
 
 Replace `<default-branch>` with the repository's default branch and
 `<merged-root-commit>` with the local commit for the PR which just landed:
 
 ```bash
-git fetch <gherrit-remote> \
+git fetch <target-fetch-remote> \
     refs/heads/<default-branch>:refs/heads/<default-branch>
 git rebase --rebase-merges \
     --onto refs/heads/<default-branch> <merged-root-commit>
@@ -126,10 +128,11 @@ default branch, not a remote-tracking branch, as the start of the stack.
 The rebase omits the landed root while recreating the remaining merge
 topology. Inspect the result and resolve any conflicts before pushing.
 
-For example, if GHerrit uses `origin` and the default branch is `main`:
+For example, if `upstream` fetches from the repository GHerrit pushes to and
+that repository's default branch is `main`:
 
 ```bash
-git fetch origin refs/heads/main:refs/heads/main
+git fetch upstream refs/heads/main:refs/heads/main
 git rebase --rebase-merges --onto refs/heads/main <merged-root-commit>
 git push
 ```
