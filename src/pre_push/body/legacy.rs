@@ -2,15 +2,15 @@ use std::fmt::{self, Write};
 
 use serde::Serialize;
 
-use super::version::Version;
-use crate::re;
+use super::MAX_BODY_SIZE_BYTES;
+use crate::pre_push::version::Version;
 
-// Per https://github.com/orgs/community/discussions/27190#discussioncomment-3254953,
-// GitHub stores PR bodies in a `mediumblob` with a 262,144-byte limit. Use half
-// of that limit as a safety factor.
-pub(super) const MAX_BODY_SIZE_BYTES: usize = 131_072;
-
-pub(super) struct PrBody<'a> {
+/// Renderer for the legacy publication orchestration.
+///
+/// That orchestration cannot supply validated literal first-parent history,
+/// so it retains its original inputs instead of constructing
+/// [`super::StackBodyRecipes`].
+pub(in crate::pre_push) struct PrBody<'a> {
     pub commit_body: &'a str,
     pub repo_url: &'a str,
     pub public_branch: Option<&'a str>,
@@ -185,10 +185,6 @@ impl PrBody<'_> {
     }
 }
 
-pub(super) fn gherrit_pr_id_re() -> &'static regex::Regex {
-    re!(r"(?m)^gherrit-pr-id[=:][ \t]*([a-zA-Z0-9]+)[ \t]*\r?$")
-}
-
 fn metadata_comment(id: &str, parent: Option<&str>, child: Option<&str>) -> String {
     #[derive(Serialize)]
     struct Metadata<'a> {
@@ -216,12 +212,6 @@ mod tests {
     use super::*;
 
     const STACK: &[u64] = &[11, 22, 33];
-
-    #[test]
-    fn gherrit_id_trailers_require_a_nonempty_identifier() {
-        assert!(gherrit_pr_id_re().is_match("gherrit-pr-id: Gone"));
-        assert!(!gherrit_pr_id_re().is_match("gherrit-pr-id: "));
-    }
 
     fn body<'a>(
         commit_body: &'a str,
