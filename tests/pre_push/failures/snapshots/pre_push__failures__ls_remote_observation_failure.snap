@@ -9,4 +9,4 @@ STDOUT:
 
 STDERR:
 [gherrit] Branch feature-ls-remote-fail is MANAGED. Syncing stack...
-[gherrit] [ERROR] `git ls-remote --symref` failed for GHerrit remote 'origin'
+[gherrit] [ERROR] `git ls-remote` failed for GHerrit remote 'origin'

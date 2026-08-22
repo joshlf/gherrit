@@ -1,6 +1,6 @@
 use std::{
     ffi::OsStr,
-    io::{self, Read},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
     process::{Command, ExitStatus, Output, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
@@ -18,11 +18,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub struct TestCommand {
     command: Command,
     timeout: Duration,
+    input: Option<Vec<u8>>,
 }
 
 impl TestCommand {
     pub(crate) fn new(program: impl AsRef<OsStr>) -> Self {
-        Self { command: Command::new(program), timeout: DEFAULT_TIMEOUT }
+        Self { command: Command::new(program), timeout: DEFAULT_TIMEOUT, input: None }
     }
 
     pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
@@ -69,12 +70,23 @@ impl TestCommand {
         self
     }
 
+    pub(crate) fn input(&mut self, input: impl Into<Vec<u8>>) -> &mut Self {
+        self.input = Some(input.into());
+        self
+    }
+
     pub fn output(&mut self) -> io::Result<Output> {
-        self.command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Back stdin with a temporary file rather than a pipe. A child which
+        // stops reading can fill a pipe and block the caller before the
+        // command timeout is observed. The file makes input delivery
+        // independent of child progress and needs no unsupervised writer
+        // thread.
+        let stdin = command_stdin(self.input.take())?;
+        self.command.stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = spawn_command_group(&mut self.command)?;
+        let deadline = Instant::now() + self.timeout;
         let stdout = child.inner().stdout.take().map(read_pipe);
         let stderr = child.inner().stderr.take().map(read_pipe);
-        let deadline = Instant::now() + self.timeout;
 
         let status = loop {
             match child.try_wait() {
@@ -116,6 +128,14 @@ impl TestCommand {
         assert_cmd::assert::Assert::new(output)
             .append_context("command", format!("{:?}", self.command))
     }
+}
+
+fn command_stdin(input: Option<Vec<u8>>) -> io::Result<Stdio> {
+    let Some(input) = input else { return Ok(Stdio::null()) };
+    let mut file = tempfile::tempfile()?;
+    file.write_all(&input)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(Stdio::from(file))
 }
 
 fn spawn_command_group(command: &mut Command) -> io::Result<GroupChild> {
@@ -190,6 +210,7 @@ mod tests {
     use super::*;
 
     const DESCENDANT_TEST_MODE: &str = "GHERRIT_DESCENDANT_TIMEOUT_TEST";
+    const UNREAD_INPUT_TEST_MODE: &str = "GHERRIT_UNREAD_INPUT_TIMEOUT_TEST";
 
     #[test]
     fn terminates_descendants_on_timeout() {
@@ -227,6 +248,35 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "descendant retained command output pipes for {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn input_does_not_depend_on_child_reading() {
+        if env::var(UNREAD_INPUT_TEST_MODE).is_ok() {
+            thread::sleep(Duration::from_secs(2));
+            return;
+        }
+
+        let mut command = TestCommand::new(env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "command::tests::input_does_not_depend_on_child_reading",
+                "--nocapture",
+            ])
+            .env(UNREAD_INPUT_TEST_MODE, "1")
+            .input(vec![b'x'; 4 * 1024 * 1024])
+            .timeout(Duration::from_millis(100));
+
+        let started = Instant::now();
+        let error = command.output().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "unread input retained command execution for {:?}",
             started.elapsed()
         );
     }
