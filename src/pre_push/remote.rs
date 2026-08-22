@@ -913,8 +913,10 @@ mod tests {
         env,
         ffi::{OsStr, OsString},
         fs,
-        path::Path,
-        process::Output,
+        io::Write as _,
+        path::{Path, PathBuf},
+        process::{self, Output},
+        thread,
     };
 
     use super::*;
@@ -923,6 +925,10 @@ mod tests {
     const ONE: &str = "2222222222222222222222222222222222222222";
     const TWO: &str = "3333333333333333333333333333333333333333";
     const SHA256: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+    const REEXEC_MODE: &str = "GHERRIT_REMOTE_COMMAND_TEST_MODE";
+    const REEXEC_STDERR: &str = "GHERRIT_REMOTE_COMMAND_TEST_STDERR";
+    const REEXEC_STATUS: &str = "GHERRIT_REMOTE_COMMAND_TEST_STATUS";
+    const REEXEC_TEST: &str = "pre_push::remote::tests::remote_command_reexec_helper";
 
     fn head_advertisement(records: &str) -> Vec<u8> {
         format!("ref: refs/heads/main\tHEAD\n{MAIN}\tHEAD\n{MAIN}\trefs/heads/main\n{records}")
@@ -941,18 +947,33 @@ mod tests {
         values.get(&id(value)).expect("requested change must be present")
     }
 
-    #[cfg(unix)]
-    fn shell(script: &str) -> Command {
-        let mut command = Command::new("/bin/sh");
-        command.env_clear().arg("-c").arg(script);
+    fn failing_reexec(stderr: &str, status: i32) -> Command {
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .args(["--exact", REEXEC_TEST, "--nocapture"])
+            .env(REEXEC_MODE, "fail")
+            .env(REEXEC_STDERR, stderr)
+            .env(REEXEC_STATUS, status.to_string());
         command
     }
 
-    #[cfg(unix)]
-    fn shell_output(stdout: &str, status: i32) -> Command {
-        let mut command = shell("printf '%s' \"$1\"; exit \"$2\"");
-        command.arg("gherrit-test").arg(stdout).arg(status.to_string());
+    fn hanging_reexec() -> Command {
+        let mut command = Command::new(env::current_exe().unwrap());
+        command.args(["--exact", REEXEC_TEST, "--nocapture"]).env(REEXEC_MODE, "hang");
         command
+    }
+
+    #[test]
+    fn remote_command_reexec_helper() {
+        let Ok(mode) = env::var(REEXEC_MODE) else { return };
+        match mode.as_str() {
+            "fail" => {
+                std::io::stderr().write_all(env::var(REEXEC_STDERR).unwrap().as_bytes()).unwrap();
+                process::exit(env::var(REEXEC_STATUS).unwrap().parse().unwrap());
+            }
+            "hang" => thread::sleep(Duration::from_secs(10)),
+            other => panic!("unknown remote-command re-exec mode {other}"),
+        }
     }
 
     #[derive(Clone)]
@@ -1010,6 +1031,25 @@ mod tests {
             output
         }
 
+        fn ls_remote(
+            &self,
+            current_dir: &Path,
+            remote: &Path,
+            options: &[&str],
+            patterns: &[&str],
+        ) -> Command {
+            let mut command = Command::new("git");
+            command
+                .env_clear()
+                .envs(self.variables.iter().cloned())
+                .current_dir(current_dir)
+                .args(options)
+                .arg("--")
+                .arg(remote)
+                .args(patterns);
+            command
+        }
+
         fn command_fails(
             &self,
             current_dir: &Path,
@@ -1038,12 +1078,41 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    fn seeded_remote() -> (tempfile::TempDir, GitTestEnvironment, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let environment = GitTestEnvironment::new(root);
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        environment.command(root, ["init", "--bare", "--initial-branch=main", "remote.git"]);
+        environment.command(root, ["init", "--initial-branch=main", "seed"]);
+        environment.command(
+            &seed,
+            [
+                "-c",
+                "user.name=GHerrit Test",
+                "-c",
+                "user.email=gherrit@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        environment.command(&seed, ["push", remote.to_str().unwrap(), "HEAD:refs/heads/main"]);
+        (directory, environment, remote)
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn async_head_observation_accepts_success_and_rejects_nonzero_status() {
-        let advertisement = String::from_utf8(head_advertisement("")).unwrap();
+        let (directory, environment, remote) = seeded_remote();
         let heads = observe_remote_heads_command(
-            shell_output(&advertisement, 0),
+            environment.ls_remote(
+                directory.path(),
+                &remote,
+                &["ls-remote", "--quiet", "--symref"],
+                &["HEAD", "refs/heads/*", "refs/tags/gherrit"],
+            ),
             "origin",
             Duration::from_secs(5),
         )
@@ -1052,7 +1121,7 @@ mod tests {
         assert_eq!(heads.default_branch().name(), "main");
 
         let error = observe_remote_heads_command(
-            shell("printf private-destination >&2; exit 23"),
+            failing_reexec("private-destination", 23),
             "origin",
             Duration::from_secs(5),
         )
@@ -1063,38 +1132,52 @@ mod tests {
         assert!(!diagnostic.contains("private-destination"), "{diagnostic}");
     }
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn async_head_observation_has_a_finite_execution_deadline() {
-        let error = observe_remote_heads_command(
-            shell("while :; do :; done"),
-            "origin",
-            Duration::from_millis(25),
-        )
-        .await
-        .unwrap_err();
+        let error =
+            observe_remote_heads_command(hanging_reexec(), "origin", Duration::from_millis(100))
+                .await
+                .unwrap_err();
 
         assert!(format!("{error:?}").contains("timed out"), "error={error:?}");
     }
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn async_version_observation_accepts_success_and_rejects_nonzero_status() {
+        let (directory, environment, remote) = seeded_remote();
+        let main = environment.stdout(
+            directory.path(),
+            ["--git-dir", remote.to_str().unwrap(), "rev-parse", "refs/heads/main"],
+        );
+        environment.command(
+            directory.path(),
+            [
+                "--git-dir",
+                remote.to_str().unwrap(),
+                "update-ref",
+                "refs/tags/gherrit/Gone/v1",
+                main.as_str(),
+            ],
+        );
         let requested = ids(&["Gone"]);
         let query = Query::new(requested[0].clone());
-        let advertisement = format!("{ONE}\trefs/tags/gherrit/Gone/v1\n");
         let output = observe_active_version_query(
-            shell_output(&advertisement, 0),
+            environment.ls_remote(
+                directory.path(),
+                &remote,
+                &["ls-remote", "--quiet"],
+                &["refs/tags/gherrit/Gone/v1"],
+            ),
             "origin",
             Duration::from_secs(5),
         )
         .await
         .unwrap();
-        let observed = parse_versions(&output.stdout, query.ids()).unwrap();
+        let observed = parse_versions(output.stdout(), query.ids()).unwrap();
         assert_eq!(for_id(&observed.histories, "Gone").len(), 1);
 
         let error = observe_active_version_query(
-            shell("printf private-ref >&2; exit 29"),
+            failing_reexec("private-ref", 29),
             "origin",
             Duration::from_secs(5),
         )
@@ -1105,16 +1188,12 @@ mod tests {
         assert!(!diagnostic.contains("private-ref"), "{diagnostic}");
     }
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn async_version_observation_has_a_finite_execution_deadline() {
-        let error = observe_active_version_query(
-            shell("while :; do :; done"),
-            "origin",
-            Duration::from_millis(25),
-        )
-        .await
-        .unwrap_err();
+        let error =
+            observe_active_version_query(hanging_reexec(), "origin", Duration::from_millis(100))
+                .await
+                .unwrap_err();
 
         assert!(format!("{error:?}").contains("timed out"), "error={error:?}");
     }
