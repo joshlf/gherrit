@@ -32,8 +32,14 @@ struct GitResponse {
     exit_code: i32,
     passthrough: bool,
     report_exit_status: bool,
+    push_stdout: Option<PushStdout>,
 }
 
+#[derive(Deserialize)]
+enum PushStdout {
+    Replace(String),
+    CrLf,
+}
 #[derive(Serialize)]
 struct GitCompletion<'a> {
     args: &'a [String],
@@ -66,11 +72,32 @@ pub fn run() -> ExitCode {
         return exit_code(response.exit_code);
     }
 
-    let status = Command::new(env::var("SYSTEM_GIT_PATH").expect("missing system Git path"))
-        .args(&args[1..])
-        .status()
-        .expect("failed to run system Git");
-    let code = status.code().unwrap_or(1);
+    let system_git = env::var("SYSTEM_GIT_PATH").expect("missing system Git path");
+    let code = match response.push_stdout {
+        None => Command::new(system_git)
+            .args(&args[1..])
+            .status()
+            .expect("failed to run system Git")
+            .code()
+            .unwrap_or(1),
+        Some(rewrite) => {
+            let output = Command::new(system_git)
+                .args(&args[1..])
+                .output()
+                .expect("failed to run system Git");
+            let mut stdout = io::stdout().lock();
+            match rewrite {
+                PushStdout::Replace(replacement) => {
+                    stdout.write_all(replacement.as_bytes()).unwrap()
+                }
+                PushStdout::CrLf => write_crlf(&mut stdout, &output.stdout),
+            }
+            io::stderr().write_all(&output.stderr).unwrap();
+            stdout.flush().unwrap();
+            io::stderr().flush().unwrap();
+            output.status.code().unwrap_or(1)
+        }
+    };
 
     if response.report_exit_status {
         let completion = GitCompletion { args: &args, exit_code: code };
@@ -78,6 +105,22 @@ pub fn run() -> ExitCode {
     }
 
     exit_code(code)
+}
+
+fn write_crlf(output: &mut impl io::Write, bytes: &[u8]) {
+    let mut start = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        output.write_all(&bytes[start..index]).unwrap();
+        if index == 0 || bytes[index - 1] != b'\r' {
+            output.write_all(b"\r").unwrap();
+        }
+        output.write_all(b"\n").unwrap();
+        start = index + 1;
+    }
+    output.write_all(&bytes[start..]).unwrap();
 }
 
 fn invocation_argument_offset() -> Option<usize> {
@@ -165,6 +208,13 @@ fn post_json(url: &str, path: &str, body: &impl Serialize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crlf_conversion_preserves_bytes_and_existing_crlf() {
+        let mut output = Vec::new();
+        write_crlf(&mut output, b"one\ntwo\xff\nalready\r\nunterminated");
+        assert_eq!(output, b"one\r\ntwo\xff\r\nalready\r\nunterminated");
+    }
 
     #[test]
     fn recognizes_marker_invocation() {

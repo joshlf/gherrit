@@ -15,6 +15,7 @@ use crate::util;
 
 const DESTINATION_ENV: &str = "GHERRIT_PRIVATE_PUSH_DESTINATION";
 const DISABLE_HTTP_REDIRECTS: &str = "http.followRedirects=false";
+const CLEAR_PUSH_OPTIONS: &str = "push.pushOption=";
 const INTERNAL_REMOTE_STEM: &str = "gherrit-publication";
 const PROBE_REMOTE_STEM: &str = "gherrit-publication-probe";
 const OWNED_BASE_BRANCH_ROOT: &str = "gherrit-bases";
@@ -276,7 +277,19 @@ impl PushDestination {
         options: impl IntoIterator<Item = String>,
         refspecs: impl IntoIterator<Item = String>,
     ) -> Command {
-        self.remote_command("push", options, refspecs)
+        self.adapter_command(
+            [
+                "-c".to_owned(),
+                DISABLE_HTTP_REDIRECTS.to_owned(),
+                "-c".to_owned(),
+                CLEAR_PUSH_OPTIONS.to_owned(),
+                "push".to_owned(),
+            ]
+            .into_iter()
+            .chain(options)
+            .chain(["--".to_string(), self.internal_remote.clone()])
+            .chain(refspecs),
+        )
     }
 
     pub(super) fn configured_remote(&self) -> &str {
@@ -810,6 +823,8 @@ mod tests {
                 "--config-env=remote.gherrit-publication.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
                 "-c",
                 "http.followRedirects=false",
+                "-c",
+                "push.pushOption=",
                 "push",
                 "--atomic",
                 "--",

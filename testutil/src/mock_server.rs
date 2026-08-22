@@ -237,7 +237,7 @@ fn check_and_apply_graphql_failure(
             create_request_number == 2 && operations.contains(&GraphQlOperation::CreatePr)
         }
         UpdatePr => operations.contains(&GraphQlOperation::UpdatePr),
-        Git(_) | GitOutput { .. } => false,
+        Git(_) | GitOutput { .. } | GitPushOutput { .. } | GitPushOutputCrLf => false,
     };
 
     if !matches {
@@ -938,7 +938,7 @@ fn graphql_failure_response(failure: FailureKind) -> Response {
         CreatePrRedirect(status) => redirect_status(status),
         GraphQl | CreatePr | UpdatePr => StatusCode::OK,
         QueryTransport => unreachable!("handled above"),
-        Git(_) | GitOutput { .. } => {
+        Git(_) | GitOutput { .. } | GitPushOutput { .. } | GitPushOutputCrLf => {
             unreachable!("Git failures are not handled by the GraphQL endpoint")
         }
     };
