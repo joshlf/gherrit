@@ -1,3 +1,5 @@
+use std::fs;
+
 use predicates::prelude::*;
 
 fn stack_with_raw_commit_message(message: &str) -> testutil::TestContext {
@@ -17,6 +19,42 @@ fn assert_identity_failure_before_external_io(ctx: testutil::TestContext, diagno
 
     assert!(ctx.github().requests().is_empty());
     assert!(ctx.recorded_pushes().is_empty());
+}
+
+fn linked_managed_stack(ctx: &testutil::TestContext, branch: &str, id: &str) -> std::path::PathBuf {
+    let linked = ctx.dir.path().join(branch);
+    ctx.git_cmd()
+        .args(["worktree", "add", "-b", branch])
+        .arg(&linked)
+        .arg("main")
+        .assert()
+        .success();
+    for (suffix, value) in [
+        ("gherritManaged", testutil::MANAGED_PRIVATE),
+        ("pushRemote", "."),
+        ("remote", "."),
+        ("merge", &format!("refs/heads/{branch}")),
+    ] {
+        ctx.git_cmd()
+            .current_dir(&linked)
+            .arg("config")
+            .arg(format!("branch.{branch}.{suffix}"))
+            .arg(value)
+            .assert()
+            .success();
+    }
+    ctx.git_cmd()
+        .current_dir(&linked)
+        .args([
+            "commit",
+            "--allow-empty",
+            "--no-verify",
+            "-m",
+            &format!("Linked work\n\ngherrit-pr-id: {id}"),
+        ])
+        .assert()
+        .success();
+    linked
 }
 
 #[test]
@@ -44,14 +82,34 @@ fn test_body_lookalike_is_not_a_stack_id() {
 
 #[test]
 fn test_continued_stack_id_fails_before_external_io() {
-    let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: Gone\n continuation");
+    for continuation in [" continuation", " \t"] {
+        let ctx =
+            stack_with_raw_commit_message(&format!("Work\n\ngherrit-pr-id: Gone\n{continuation}"));
 
-    assert_identity_failure_before_external_io(ctx, "invalid gherrit-pr-id trailer");
+        assert_identity_failure_before_external_io(ctx, "invalid gherrit-pr-id trailer");
+    }
 }
 
 #[test]
 fn test_empty_and_valid_stack_ids_are_multiple() {
     let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: \ngherrit-pr-id: Gvalid");
+
+    assert_identity_failure_before_external_io(ctx, "multiple gherrit-pr-id trailers");
+}
+
+#[test]
+fn test_noncanonical_stack_id_separators_fail_before_external_io() {
+    for trailer in ["gherrit-pr-id:Gone", "gherrit-pr-id=Gone", "gherrit-pr-id:\tGone"] {
+        let ctx = stack_with_raw_commit_message(&format!("Work\n\n{trailer}"));
+
+        assert_identity_failure_before_external_io(ctx, "invalid gherrit-pr-id trailer syntax");
+    }
+}
+
+#[test]
+fn test_malformed_stack_id_beside_an_exact_id_is_multiple() {
+    let ctx =
+        stack_with_raw_commit_message("Work\n\ngherrit-pr-id: Gvalid\ngherrit-pr-id:Gmalformed");
 
     assert_identity_failure_before_external_io(ctx, "multiple gherrit-pr-id trailers");
 }
@@ -75,6 +133,214 @@ fn test_duplicate_stack_ids_fail_before_external_io() {
 
     assert!(ctx.github().requests().is_empty());
     assert!(ctx.recorded_pushes().is_empty());
+}
+
+#[test]
+fn test_replacement_cannot_hide_a_stack_id_duplicated_through_a_merge() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("duplicate-merged-id");
+    ctx.commit_with_explicit_gherrit_id("Stack change", "Gduplicate");
+    ctx.run_git(&["checkout", "-b", "side", "main"]);
+    ctx.commit_with_explicit_gherrit_id("Side change", "Gduplicate");
+    let side = ctx.head_oid();
+    let tree = String::from_utf8(
+        ctx.git_cmd()
+            .args(["rev-parse", "HEAD^{tree}"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let parent = String::from_utf8(
+        ctx.git_cmd().args(["rev-parse", "HEAD^"]).assert().success().get_output().stdout.clone(),
+    )
+    .unwrap();
+    let replacement = String::from_utf8(
+        ctx.git_cmd()
+            .arg("commit-tree")
+            .arg(tree.trim())
+            .arg("-p")
+            .arg(parent.trim())
+            .args(["-m", "Replacement without a GHerrit ID"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    ctx.git_cmd().arg("replace").arg(side).arg(replacement.trim()).assert().success();
+    ctx.git_cmd()
+        .args(["log", "-1", "--format=%B", "side"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Replacement without a GHerrit ID"))
+        .stdout(predicate::str::contains("gherrit-pr-id").not());
+    ctx.git_cmd()
+        .args(["--no-replace-objects", "log", "-1", "--format=%B", "side"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("gherrit-pr-id: Gduplicate"));
+    ctx.run_git(&["checkout", "duplicate-merged-id"]);
+    ctx.run_git(&["merge", "--no-ff", "side", "-m", "Merge side\n\ngherrit-pr-id: Gmerge"]);
+
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
+        "HEAD ancestry contains multiple commits with gherrit-pr-id 'Gduplicate'",
+    ));
+
+    assert!(ctx.github().requests().is_empty());
+    assert!(ctx.recorded_pushes().is_empty());
+}
+
+#[test]
+fn test_stack_id_duplicated_in_default_history_fails_before_github_or_writes() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.commit_with_explicit_gherrit_id("Default-branch history", "Gduplicate");
+    ctx.run_git(&["push", "--quiet", "--no-verify", "origin", "refs/heads/main:refs/heads/main"]);
+    let fixture_pushes = ctx.recorded_pushes();
+    ctx.checkout_managed_private("duplicate-default-id");
+    ctx.commit_with_explicit_gherrit_id("Stack change", "Gduplicate");
+
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
+        "HEAD ancestry contains multiple commits with gherrit-pr-id 'Gduplicate'",
+    ));
+
+    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.recorded_pushes(), fixture_pushes);
+}
+
+#[test]
+fn test_case_variant_id_in_default_history_is_still_a_duplicate() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.commit("Default-branch history\n\nGherrit-Pr-Id: Gduplicate");
+    ctx.run_git(&["push", "--quiet", "--no-verify", "origin", "refs/heads/main:refs/heads/main"]);
+    let fixture_pushes = ctx.recorded_pushes();
+    ctx.checkout_managed_private("case-variant-duplicate-default-id");
+    ctx.commit_with_explicit_gherrit_id("Stack change", "Gduplicate");
+
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
+        "HEAD ancestry contains multiple commits with gherrit-pr-id 'Gduplicate'",
+    ));
+
+    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.recorded_pushes(), fixture_pushes);
+}
+
+#[test]
+fn test_default_branch_must_be_on_the_first_parent_stack_path() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("first-parent");
+    ctx.commit_with_gherrit_id("Stack change");
+
+    ctx.run_git(&["checkout", "main"]);
+    ctx.commit("Advance the default branch");
+    ctx.run_git(&["checkout", "first-parent"]);
+    ctx.run_git(&["merge", "--no-ff", "main", "-m", "Merge the default branch"]);
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not descend from 'main' on its first-parent path"));
+
+    assert!(ctx.github().requests().is_empty());
+    assert!(ctx.recorded_pushes().is_empty());
+}
+
+#[test]
+fn test_nonempty_common_grafts_file_in_linked_worktree_blocks_publication() {
+    let ctx = testutil::test_context!().with_remote().with_initial_commit().build();
+    let linked = linked_managed_stack(&ctx, "linked-feature", "Glinked");
+    let linked_head = ctx
+        .git_cmd()
+        .current_dir(&linked)
+        .args(["rev-parse", "HEAD"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let grafts = ctx.repo_path.join(".git/info/grafts");
+    fs::write(grafts, linked_head).unwrap();
+
+    ctx.gherrit_cmd().current_dir(&linked).args(["hook", "pre-push"]).assert().failure().stderr(
+        predicate::str::contains(
+            "info/grafts file is nonempty because grafts rewrite commit ancestry",
+        ),
+    );
+    assert!(ctx.remote_ref_oid("refs/heads/Glinked").is_none());
+}
+
+#[test]
+fn test_common_shallow_file_is_checked_despite_gix_config_redirection() {
+    let ctx = testutil::test_context!().with_remote().with_initial_commit().build();
+    let linked = linked_managed_stack(&ctx, "shallow-feature", "Gshallow");
+    ctx.git_cmd()
+        .current_dir(&linked)
+        .args(["config", "gitoxide.core.shallowFile", "redirected-shallow"])
+        .assert()
+        .success();
+    let linked_head = ctx
+        .git_cmd()
+        .current_dir(&linked)
+        .args(["rev-parse", "HEAD"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    fs::write(ctx.repo_path.join(".git/shallow"), linked_head).unwrap();
+    ctx.git_cmd()
+        .current_dir(&linked)
+        .args(["rev-parse", "--is-shallow-repository"])
+        .assert()
+        .success()
+        .stdout("true\n");
+
+    ctx.gherrit_cmd().current_dir(&linked).args(["hook", "pre-push"]).assert().failure().stderr(
+        predicate::str::contains(
+            "common Git directory's shallow file is nonempty because shallow history omits",
+        ),
+    );
+    assert!(ctx.remote_ref_oid("refs/heads/Gshallow").is_none());
+}
+
+#[test]
+fn test_effective_shallow_file_from_gix_config_blocks_publication() {
+    let ctx = testutil::test_context!().with_remote().with_initial_commit().build();
+    ctx.checkout_managed_private("configured-shallow");
+    let id = ctx.commit_with_gherrit_id("Configured shallow work");
+    ctx.run_git(&["config", "gitoxide.core.shallowFile", "alternate-shallow"]);
+    fs::write(ctx.repo_path.join(".git/alternate-shallow"), format!("{}\n", ctx.head_oid()))
+        .unwrap();
+
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
+        "effective shallow file is nonempty because shallow history omits",
+    ));
+    assert!(ctx.remote_ref_oid(&format!("refs/heads/{id}")).is_none());
 }
 
 #[test]
