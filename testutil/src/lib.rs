@@ -461,6 +461,7 @@ pub enum GitOperation {
     LsRemoteHeads,
     LsRemoteActiveVersions,
     LsRemoteOther,
+    Push,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,6 +488,8 @@ pub enum FailureKind {
     UpdatePr,
     Git(GitOperation),
     GitOutput { operation: GitOperation, stdout: &'static str },
+    GitPushOutput { stdout: &'static str },
+    GitPushOutputCrLf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -774,6 +777,11 @@ impl TestContext {
         cmd
     }
 
+    pub fn remote_path(&self) -> &Path {
+        assert!(self.has_remote, "missing test capability: .with_remote()");
+        &self.remote_path
+    }
+
     pub fn run_git(&self, args: &[&str]) {
         self.git_cmd().args(args).assert().success();
     }
@@ -925,7 +933,10 @@ impl TestContext {
 
     pub fn inject_failure(&self, kind: FailureKind) {
         match kind {
-            FailureKind::Git(_) | FailureKind::GitOutput { .. } => assert!(
+            FailureKind::Git(_)
+            | FailureKind::GitOutput { .. }
+            | FailureKind::GitPushOutput { .. }
+            | FailureKind::GitPushOutputCrLf => assert!(
                 self.has_git_interceptor,
                 "missing test capability: .with_git_interceptor()"
             ),
@@ -940,6 +951,17 @@ impl TestContext {
 
     pub fn expect_git_output(&self, operation: GitOperation, stdout: &'static str) {
         self.inject_failure(FailureKind::GitOutput { operation, stdout });
+    }
+
+    /// Replaces stdout only after a real push has run, preserving the remote
+    /// effect while modeling a lost or malformed acknowledgement.
+    pub fn replace_push_stdout_after_passthrough(&self, stdout: &'static str) {
+        self.inject_failure(FailureKind::GitPushOutput { stdout });
+    }
+
+    /// Converts real push stdout to CRLF without changing its receipt bytes.
+    pub fn convert_push_stdout_to_crlf_after_passthrough(&self) {
+        self.inject_failure(FailureKind::GitPushOutputCrLf);
     }
 
     /// Changes one remote ref after observation and immediately before push.
