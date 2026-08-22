@@ -78,6 +78,117 @@ fn test_duplicate_stack_ids_fail_before_external_io() {
 }
 
 #[test]
+fn test_replacement_cannot_hide_a_stack_id_duplicated_through_a_merge() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("duplicate-merged-id");
+    ctx.commit_with_explicit_gherrit_id("Stack change", "Gduplicate");
+    ctx.run_git(&["checkout", "-b", "side", "main"]);
+    ctx.commit_with_explicit_gherrit_id("Side change", "Gduplicate");
+    let side = ctx.head_oid();
+    let tree = String::from_utf8(
+        ctx.git_cmd()
+            .args(["rev-parse", "HEAD^{tree}"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let parent = String::from_utf8(
+        ctx.git_cmd().args(["rev-parse", "HEAD^"]).assert().success().get_output().stdout.clone(),
+    )
+    .unwrap();
+    let replacement = String::from_utf8(
+        ctx.git_cmd()
+            .arg("commit-tree")
+            .arg(tree.trim())
+            .arg("-p")
+            .arg(parent.trim())
+            .args(["-m", "Replacement without a GHerrit ID"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    ctx.git_cmd().arg("replace").arg(side).arg(replacement.trim()).assert().success();
+    ctx.git_cmd()
+        .args(["log", "-1", "--format=%B", "side"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Replacement without a GHerrit ID"))
+        .stdout(predicate::str::contains("gherrit-pr-id").not());
+    ctx.git_cmd()
+        .args(["--no-replace-objects", "log", "-1", "--format=%B", "side"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("gherrit-pr-id: Gduplicate"));
+    ctx.run_git(&["checkout", "duplicate-merged-id"]);
+    ctx.run_git(&["merge", "--no-ff", "side", "-m", "Merge side\n\ngherrit-pr-id: Gmerge"]);
+
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
+        "HEAD ancestry contains multiple commits with gherrit-pr-id 'Gduplicate'",
+    ));
+
+    assert!(ctx.github().requests().is_empty());
+    assert!(ctx.recorded_pushes().is_empty());
+}
+
+#[test]
+fn test_stack_id_duplicated_in_default_history_fails_before_github_or_writes() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.commit_with_explicit_gherrit_id("Default-branch history", "Gduplicate");
+    ctx.run_git(&["push", "--quiet", "--no-verify", "origin", "refs/heads/main:refs/heads/main"]);
+    let fixture_pushes = ctx.recorded_pushes();
+    ctx.checkout_managed_private("duplicate-default-id");
+    ctx.commit_with_explicit_gherrit_id("Stack change", "Gduplicate");
+
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
+        "HEAD ancestry contains multiple commits with gherrit-pr-id 'Gduplicate'",
+    ));
+
+    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.recorded_pushes(), fixture_pushes);
+}
+
+#[test]
+fn test_default_branch_must_be_on_the_first_parent_stack_path() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("first-parent");
+    ctx.commit_with_gherrit_id("Stack change");
+
+    ctx.run_git(&["checkout", "main"]);
+    ctx.commit("Advance the default branch");
+    ctx.run_git(&["checkout", "first-parent"]);
+    ctx.run_git(&["merge", "--no-ff", "main", "-m", "Merge the default branch"]);
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not descend from 'main' on its first-parent path"));
+
+    assert!(ctx.github().requests().is_empty());
+    assert!(ctx.recorded_pushes().is_empty());
+}
+
+#[test]
 fn test_unavailable_remote_observation_failure() {
     let ctx = testutil::test_context!().repository("missing", "repo").with_mock_github().build();
     ctx.commit("Init");
