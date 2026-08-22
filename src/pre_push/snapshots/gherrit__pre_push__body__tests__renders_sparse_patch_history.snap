@@ -58,5 +58,3 @@ git pull origin refs/heads/Gmiddle
 </details>
 
 *Stacked PRs enabled by [GHerrit](https://github.com/joshlf/gherrit).*
-
-<!-- WARNING: GHerrit relies on the following metadata to work properly. DO NOT EDIT OR REMOVE. --><!-- gherrit-meta: {"id":"Gmiddle","parent":"Groot","child":"Gtip"} -->
