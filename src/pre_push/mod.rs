@@ -23,6 +23,8 @@ mod reconcile;
 #[cfg(test)]
 mod remote;
 #[cfg(test)]
+mod subprocess;
+#[cfg(test)]
 mod version;
 
 use batching::{
