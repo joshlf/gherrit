@@ -541,7 +541,9 @@ pub struct PullRequestSeed {
     pub title: String,
     pub body: String,
     pub head: String,
+    pub head_oid: String,
     pub base: String,
+    pub base_oid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -552,7 +554,9 @@ pub struct PullRequestSnapshot {
     pub title: Option<String>,
     pub body: Option<String>,
     pub head: String,
+    pub head_oid: String,
     pub base: String,
+    pub base_oid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -580,7 +584,9 @@ impl From<&mock_server::PrEntry> for PullRequestSnapshot {
             title: pr.title.clone(),
             body: pr.body.clone(),
             head: pr.head.ref_field.clone(),
+            head_oid: pr.head.sha.clone(),
             base: pr.base.ref_field.clone(),
+            base_oid: pr.base.sha.clone(),
         }
     }
 }
@@ -635,6 +641,9 @@ impl MockGithub<'_> {
                 repo_owner: &state.repo_owner,
                 repo_name: &state.repo_name,
             });
+            let mut pr = pr;
+            pr.head.sha = seed.head_oid;
+            pr.base.sha = seed.base_oid;
             state.add_pr(pr);
         });
     }
