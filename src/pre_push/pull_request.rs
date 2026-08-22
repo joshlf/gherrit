@@ -293,6 +293,22 @@ pub(super) struct ManagedOpenPullRequest {
     has_landing_automation: bool,
 }
 
+pub(super) struct ManagedOpenParts {
+    id: GherritPrId,
+    identity: PullRequestIdentity,
+    observed_base: ObservedBase,
+    title: Box<str>,
+    body: Box<str>,
+}
+
+impl ManagedOpenParts {
+    pub(super) fn into_parts(
+        self,
+    ) -> (GherritPrId, PullRequestIdentity, ObservedBase, Box<str>, Box<str>) {
+        (self.id, self.identity, self.observed_base, self.title, self.body)
+    }
+}
+
 impl ManagedOpenPullRequest {
     pub(super) fn id(&self) -> &GherritPrId {
         &self.id
@@ -320,6 +336,16 @@ impl ManagedOpenPullRequest {
 
     pub(super) fn has_landing_automation(&self) -> bool {
         self.has_landing_automation
+    }
+
+    pub(super) fn into_validated_parts(self) -> ManagedOpenParts {
+        ManagedOpenParts {
+            id: self.id,
+            identity: self.identity,
+            observed_base: self.base,
+            title: self.title,
+            body: self.body,
+        }
     }
 }
 
@@ -358,6 +384,16 @@ impl CorrelatedPullRequests {
 
     pub(super) fn initial_identities(&self) -> &InitialPullRequestIdentities {
         &self.initial_identities
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        Box<[LocalPullRequestObservation]>,
+        Box<[ManagedOpenPullRequest]>,
+        InitialPullRequestIdentities,
+    ) {
+        (self.local, self.nonlocal, self.initial_identities)
     }
 }
 
@@ -645,7 +681,7 @@ impl TerminalExhaustionAccumulator {
     }
 }
 
-/// Exact completed terminal-exhaustion evidence, consumed one ID at a time.
+/// Exact completed terminal-exhaustion evidence.
 #[derive(Debug)]
 pub(super) struct CreateAuthorizations {
     by_id: HashMap<GherritPrId, CreateAuthorization>,
@@ -657,6 +693,7 @@ impl CreateAuthorizations {
         self.by_id.len()
     }
 
+    /// FIXME(#264): Delete this subset seam with the pre-activation publisher.
     pub(super) fn take(&mut self, id: &GherritPrId) -> Result<CreateAuthorization> {
         self.by_id.remove(id).ok_or_else(|| {
             eyre!("no unconsumed terminal-exhaustion authorization exists for '{}'", id.as_str())
@@ -667,11 +704,56 @@ impl CreateAuthorizations {
         self.by_id.is_empty()
     }
 
+    /// Consumes the complete authorization set against one exact ordered set.
+    pub(super) fn into_exact(
+        mut self,
+        expected_in_stack_order: &[GherritPrId],
+    ) -> Result<Box<[CreateAuthorization]>> {
+        let mut expected = HashSet::with_capacity(expected_in_stack_order.len());
+        for id in expected_in_stack_order {
+            if !expected.insert(id.clone()) {
+                bail!("creation authorization join repeats expected change '{}'", id.as_str());
+            }
+        }
+        if expected != self.expected {
+            if let Some(missing) =
+                expected_in_stack_order.iter().find(|id| !self.expected.contains(*id))
+            {
+                bail!(
+                    "creation authorization join has no terminal proof for '{}'",
+                    missing.as_str()
+                );
+            }
+            let mut extra =
+                self.expected.difference(&expected).map(GherritPrId::as_str).collect::<Vec<_>>();
+            extra.sort_unstable();
+            bail!(
+                "creation authorization join has unexpected terminal proof(s): {}",
+                extra.join(", ")
+            );
+        }
+
+        let authorizations = expected_in_stack_order
+            .iter()
+            .map(|id| {
+                self.by_id.remove(id).ok_or_else(|| {
+                    eyre!(
+                        "creation authorization join has no unconsumed proof for '{}'",
+                        id.as_str()
+                    )
+                })
+            })
+            .collect::<Result<Box<[_]>>>()?;
+        debug_assert!(self.by_id.is_empty());
+        Ok(authorizations)
+    }
+
     /// Consumes the complete authorization set and returns its original IDs.
     ///
     /// A caller may take tokens one at a time to construct create operations,
     /// but preparation must still prove that no authorization was left behind
     /// and that no taken token's operation was subsequently omitted.
+    /// FIXME(#264): Delete this subset seam with the pre-activation publisher.
     pub(super) fn into_expected_ids(self) -> Result<HashSet<GherritPrId>> {
         if !self.by_id.is_empty() {
             let mut leftovers = self.by_id.keys().map(GherritPrId::as_str).collect::<Vec<_>>();
@@ -745,6 +827,36 @@ mod tests {
             .unwrap();
         }
         remote::parse_remote_heads_for_test(advertisement.as_bytes()).unwrap()
+    }
+
+    fn authorizations(values: &[&str]) -> CreateAuthorizations {
+        let ids = values.iter().map(|value| id(value)).collect::<Vec<_>>();
+        let mut accumulator = TerminalExhaustionAccumulator::new(ids.iter().cloned()).unwrap();
+        for id in ids {
+            accumulator = accumulator
+                .record_page(TerminalPullRequestEvidence::for_test(
+                    id,
+                    None,
+                    TerminalPullRequestPage { pull_requests: Vec::new(), next_cursor: None },
+                ))
+                .unwrap();
+        }
+        accumulator.into_authorizations().unwrap()
+    }
+
+    #[test]
+    fn exact_authorization_join_rejects_every_set_and_order_contradiction() {
+        assert!(authorizations(&["A", "B"]).into_exact(&[id("A")]).is_err());
+        assert!(authorizations(&["A"]).into_exact(&[id("A"), id("B")]).is_err());
+        assert!(authorizations(&["A"]).into_exact(&[id("A"), id("A")]).is_err());
+        let missing = authorizations(&[]).into_exact(&[id("B"), id("A")]).unwrap_err();
+        assert!(missing.to_string().contains("'B'"));
+
+        let exact = authorizations(&["A", "B"]).into_exact(&[id("B"), id("A")]).unwrap();
+        assert_eq!(
+            exact.iter().map(|authorization| authorization.id().as_str()).collect::<Vec<_>>(),
+            ["B", "A"]
+        );
     }
 
     fn raw_open(

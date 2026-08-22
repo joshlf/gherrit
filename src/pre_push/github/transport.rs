@@ -13,16 +13,18 @@ use octocrab::Octocrab;
 use serde_json::Value;
 
 use super::{
-    CompleteCreateReceipts, CompleteOpenRows, FirstOpenPullRequests, FirstOpenPullRequestsPage,
-    NextOpenPullRequests, OpenPullRequest, PreparedCreates, PreparedUpdates, Repository,
-    TerminalPullRequestQuery, TerminalPullRequests, graphql_error_detail,
+    CompleteCreateReceipts, CompleteOpenRows, CorrelatedRepository, FirstOpenPullRequests,
+    FirstOpenPullRequestsPage, NextOpenPullRequests, OpenPullRequest, PreparedCreates,
+    PreparedUpdates, Repository, RepositoryCreateAuthorizations, TerminalPullRequestQuery,
+    TerminalPullRequests, graphql_error_detail,
 };
 use crate::pre_push::{
     bounded_diagnostic_detail,
+    destination::{PushDestination, RepositoryCoordinates},
     local::GherritPrId,
     pull_request::{
-        CorrelatedPullRequests, CreateAuthorizations, InitialPullRequestIdentities,
-        TerminalExhaustionAccumulator, correlate_complete,
+        CreateAuthorizations, InitialPullRequestIdentities, TerminalExhaustionAccumulator,
+        correlate_complete,
     },
     remote::RemoteHeads,
 };
@@ -127,8 +129,7 @@ impl Timeouts {
 /// A concrete GitHub adapter bound to one repository for one attempt.
 pub(in crate::pre_push) struct Github {
     http: Octocrab,
-    owner: Box<str>,
-    repository: Box<str>,
+    coordinates: RepositoryCoordinates,
     timeouts: Timeouts,
 }
 
@@ -144,19 +145,28 @@ pub(in crate::pre_push) struct OpenObservation {
 }
 
 impl OpenObservation {
-    #[allow(dead_code)] // Consumed by the pending owned-base activation path.
-    pub(in crate::pre_push) fn repository(&self) -> &Repository {
-        &self.repository
+    #[cfg(test)]
+    pub(in crate::pre_push) fn from_complete_response_for_test(
+        owner: &str,
+        repository: &str,
+        response: Value,
+    ) -> Result<Self> {
+        let page = FirstOpenPullRequests::new(owner.to_owned(), repository.to_owned(), 100)
+            .decode(response)?;
+        if page.next_cursor.is_some() {
+            bail!("a complete test OPEN response cannot advertise another page");
+        }
+        Ok(Self { repository: page.repository, rows: CompleteOpenRows::new(page.pull_requests)? })
     }
 
     #[allow(dead_code)] // Consumed by the pending owned-base activation path.
-    pub(in crate::pre_push) fn correlate<'a>(
+    pub(in crate::pre_push) fn correlate<'a, 'destination>(
         self,
         local_ids: impl IntoIterator<Item = &'a GherritPrId>,
-        heads: &RemoteHeads,
-    ) -> Result<(Repository, CorrelatedPullRequests)> {
+        heads: &RemoteHeads<'destination>,
+    ) -> Result<CorrelatedRepository<'destination>> {
         let correlated = correlate_complete(local_ids, heads, self.rows)?;
-        Ok((self.repository, correlated))
+        Ok(CorrelatedRepository::new(heads.destination(), self.repository, correlated))
     }
 
     fn into_legacy_selection(self, local_ids: &[GherritPrId]) -> Result<LegacyOpenSelection> {
@@ -253,17 +263,20 @@ impl Github {
     pub(in crate::pre_push) fn new(
         token: String,
         api_url: Option<&str>,
-        owner: String,
-        repository: String,
+        destination: &PushDestination,
     ) -> Result<Self> {
-        Self::with_timeouts(token, api_url, owner, repository, Timeouts::PRODUCTION)
+        Self::with_timeouts(
+            token,
+            api_url,
+            destination.repository_coordinates(),
+            Timeouts::PRODUCTION,
+        )
     }
 
     fn with_timeouts(
         token: String,
         api_url: Option<&str>,
-        owner: String,
-        repository: String,
+        coordinates: RepositoryCoordinates,
         timeouts: Timeouts,
     ) -> Result<Self> {
         let mut builder = Octocrab::builder()
@@ -274,23 +287,15 @@ impl Github {
         if let Some(api_url) = api_url {
             builder = builder.base_uri(api_url)?;
         }
-        Ok(Self {
-            http: builder.build()?,
-            owner: owner.into_boxed_str(),
-            repository: repository.into_boxed_str(),
-            timeouts,
-        })
+        Ok(Self { http: builder.build()?, coordinates, timeouts })
     }
 
     /// Observes every page of the repository-wide OPEN connection.
     pub(in crate::pre_push) async fn observe_open_pull_requests(&self) -> Result<OpenObservation> {
         let mut page_len = 100;
         let first_page = loop {
-            let operation = FirstOpenPullRequests::new(
-                self.owner.to_string(),
-                self.repository.to_string(),
-                page_len,
-            );
+            let operation =
+                FirstOpenPullRequests::for_repository(self.coordinates.clone(), page_len);
             let Some(response) = self.run_observation_query(&operation.document()).await? else {
                 if page_len == 1 {
                     bail!(
@@ -316,9 +321,8 @@ impl Github {
         let mut cursor = next_cursor;
 
         while let Some(current_cursor) = cursor {
-            let operation = NextOpenPullRequests::new(
-                self.owner.to_string(),
-                self.repository.to_string(),
+            let operation = NextOpenPullRequests::for_repository(
+                self.coordinates.clone(),
                 current_cursor.clone(),
                 page_len,
             );
@@ -353,7 +357,7 @@ impl Github {
     pub(in crate::pre_push) async fn observe_terminal_pull_requests(
         &self,
         ids: Box<[GherritPrId]>,
-    ) -> Result<CreateAuthorizations> {
+    ) -> Result<RepositoryCreateAuthorizations> {
         #[derive(Debug)]
         struct Pending {
             id: GherritPrId,
@@ -383,8 +387,8 @@ impl Github {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let operation = TerminalPullRequests::new(
-                self.owner.to_string(),
-                self.repository.to_string(),
+                self.coordinates.owner().to_owned(),
+                self.coordinates.repository().to_owned(),
                 queries,
             )?;
             let response = self.run_observation_query(&operation.document()).await?;
@@ -429,7 +433,10 @@ impl Github {
                 }
             }
         }
-        accumulator.into_authorizations()
+        Ok(RepositoryCreateAuthorizations::from_transport(
+            self.coordinates.clone(),
+            accumulator.into_authorizations()?,
+        ))
     }
 
     /// Temporary adapter for the legacy orchestration retained until activation.
@@ -439,6 +446,9 @@ impl Github {
     ) -> Result<LegacyGithubObservation> {
         let selection = self.observe_open_pull_requests().await?.into_legacy_selection(ids)?;
         let authorizations = self.observe_terminal_pull_requests(selection.missing).await?;
+        let authorizations = authorizations
+            .into_legacy_for(&selection.repository.coordinates)
+            .wrap_err("terminal pull request evidence does not match the legacy OPEN repository")?;
         Ok(LegacyGithubObservation {
             repository: selection.repository,
             local_pull_requests: selection.local_pull_requests,
@@ -738,11 +748,16 @@ mod tests {
     }
 
     fn test_github(api_url: &str, timeouts: Timeouts) -> Github {
+        let destination = PushDestination::for_test(
+            "origin",
+            &format!("https://github.com/owner/{}.git", testutil::DEFAULT_REPO),
+            Vec::new(),
+        )
+        .unwrap();
         Github::with_timeouts(
             "token".to_owned(),
             Some(api_url),
-            "owner".to_owned(),
-            testutil::DEFAULT_REPO.to_owned(),
+            destination.repository_coordinates(),
             timeouts,
         )
         .unwrap()

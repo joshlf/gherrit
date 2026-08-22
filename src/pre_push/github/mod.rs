@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::{
     bounded_diagnostic_detail,
-    destination::DefaultBranch,
+    destination::{DefaultBranch, PushDestination, RepositoryCoordinates},
     local::GherritPrId,
     pull_request::{
         CreateAuthorization, CreateAuthorizations, InitialPullRequestIdentities,
@@ -132,22 +132,97 @@ fn mutation_response_data(
 /// Repository facts which must agree with the exact Git push destination.
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct Repository {
-    pub(super) node_id: String,
-    pub(super) default_branch: DefaultBranch,
+    node_id: String,
+    default_branch: DefaultBranch,
+    coordinates: RepositoryCoordinates,
+}
+
+impl Repository {
+    pub(super) fn into_parts(self) -> (String, DefaultBranch) {
+        (self.node_id, self.default_branch)
+    }
+}
+
+/// One complete repository row inseparably correlated with its OPEN PR set.
+///
+/// Its destination link proves the same opaque publication capability. It
+/// does not claim that GitHub and Git facts came from one remote-head query.
+pub(super) struct CorrelatedRepository<'destination> {
+    destination: &'destination PushDestination,
+    repository: Repository,
+    pull_requests: super::pull_request::CorrelatedPullRequests,
+}
+
+/// Complete terminal-exhaustion evidence bound to one GitHub repository.
+pub(super) struct RepositoryCreateAuthorizations {
+    coordinates: RepositoryCoordinates,
+    exact: CreateAuthorizations,
+}
+
+impl RepositoryCreateAuthorizations {
+    fn from_transport(coordinates: RepositoryCoordinates, exact: CreateAuthorizations) -> Self {
+        Self { coordinates, exact }
+    }
+
+    /// FIXME(#264): Delete this legacy unwrap with the pre-activation
+    /// observation adapter.
+    fn into_legacy_for(self, expected: &RepositoryCoordinates) -> Result<CreateAuthorizations> {
+        if &self.coordinates != expected {
+            bail!("terminal pull request evidence came from a different GitHub repository");
+        }
+        Ok(self.exact)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(destination: &PushDestination, exact: CreateAuthorizations) -> Self {
+        Self::from_transport(destination.repository_coordinates(), exact)
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.exact.len()
+    }
+}
+
+impl<'destination> CorrelatedRepository<'destination> {
+    fn new(
+        destination: &'destination PushDestination,
+        repository: Repository,
+        pull_requests: super::pull_request::CorrelatedPullRequests,
+    ) -> Self {
+        Self { destination, repository, pull_requests }
+    }
+
+    pub(super) fn into_authorized_parts_for(
+        self,
+        destination: &PushDestination,
+        authorizations: RepositoryCreateAuthorizations,
+    ) -> Result<(Repository, super::pull_request::CorrelatedPullRequests, CreateAuthorizations)>
+    {
+        if !std::ptr::eq(self.destination, destination) {
+            bail!("Git and GitHub evidence came from different push-destination capabilities");
+        }
+        let destination_coordinates = destination.repository_coordinates();
+        if self.repository.coordinates != destination_coordinates {
+            bail!("Git and GitHub planning evidence identify different repositories");
+        }
+        if authorizations.coordinates != destination_coordinates {
+            bail!("terminal pull request evidence came from a different GitHub repository");
+        }
+        Ok((self.repository, self.pull_requests, authorizations.exact))
+    }
 }
 
 /// The first page of the repository-wide open-pull-request connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FirstOpenPullRequests {
-    owner: String,
-    repository: String,
+    coordinates: RepositoryCoordinates,
     first: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NextOpenPullRequests {
-    owner: String,
-    repository: String,
+    coordinates: RepositoryCoordinates,
     after: String,
     first: usize,
 }
@@ -165,16 +240,32 @@ struct NextOpenPullRequestsPage {
     next_cursor: Option<String>,
 }
 
+#[cfg(test)]
+fn repository_coordinates_for_test(owner: &str, repository: &str) -> RepositoryCoordinates {
+    PushDestination::for_test(
+        "origin",
+        &format!("https://github.com/{owner}/{repository}.git"),
+        Vec::new(),
+    )
+    .unwrap()
+    .repository_coordinates()
+}
+
 impl FirstOpenPullRequests {
+    #[cfg(test)]
     fn new(owner: String, repository: String, first: usize) -> Self {
+        Self::for_repository(repository_coordinates_for_test(&owner, &repository), first)
+    }
+
+    fn for_repository(coordinates: RepositoryCoordinates, first: usize) -> Self {
         assert!(first > 0, "an open pull request page size must be positive");
-        Self { owner, repository, first }
+        Self { coordinates, first }
     }
 
     fn document(&self) -> String {
         open_pull_requests_document(
-            &self.owner,
-            &self.repository,
+            self.coordinates.owner(),
+            self.coordinates.repository(),
             self.first,
             OpenPullRequestPage::First,
         )
@@ -210,6 +301,7 @@ impl FirstOpenPullRequests {
             node_id,
             default_branch: DefaultBranch::new(default_branch.name, tip)
                 .map_err(|_| eyre!("GitHub reported an invalid default branch"))?,
+            coordinates: self.coordinates.clone(),
         };
 
         Ok(FirstOpenPullRequestsPage { repository, pull_requests, next_cursor })
@@ -217,16 +309,21 @@ impl FirstOpenPullRequests {
 }
 
 impl NextOpenPullRequests {
+    #[cfg(test)]
     fn new(owner: String, repository: String, after: String, first: usize) -> Self {
+        Self::for_repository(repository_coordinates_for_test(&owner, &repository), after, first)
+    }
+
+    fn for_repository(coordinates: RepositoryCoordinates, after: String, first: usize) -> Self {
         assert!(!after.is_empty(), "an open pull request cursor must be nonempty");
         assert!(first > 0, "an open pull request page size must be positive");
-        Self { owner, repository, after, first }
+        Self { coordinates, after, first }
     }
 
     fn document(&self) -> String {
         open_pull_requests_document(
-            &self.owner,
-            &self.repository,
+            self.coordinates.owner(),
+            self.coordinates.repository(),
             self.first,
             OpenPullRequestPage::Next { after: &self.after },
         )
@@ -892,6 +989,8 @@ pub(super) struct PreparedCreates {
 }
 
 impl PreparedCreates {
+    /// FIXME(#264): Delete this subset-oriented legacy constructor with the
+    /// pre-activation publisher.
     pub(super) fn new(
         initial: InitialPullRequestIdentities,
         authorizations: CreateAuthorizations,
@@ -926,6 +1025,27 @@ impl PreparedCreates {
             );
         }
 
+        Self::from_exact(initial, operations)
+    }
+
+    /// Prepares operations whose complete authorization set was consumed by
+    /// the planner's exact ordered join.
+    pub(super) fn from_exact(
+        initial: InitialPullRequestIdentities,
+        operations: Vec<CreatePullRequest>,
+    ) -> Result<Self> {
+        if operations.is_empty() {
+            bail!("A prepared create action requires at least one operation");
+        }
+        let mut expected = HashSet::with_capacity(operations.len());
+        for (index, operation) in operations.iter().enumerate() {
+            if !expected.insert(operation.id.clone()) {
+                bail!(
+                    "GraphQL create mutation at item {index} repeats change '{}'. No mutation was sent.",
+                    operation.id.as_str()
+                );
+            }
+        }
         let order = operations.iter().map(|operation| operation.id.clone()).collect::<Vec<_>>();
         let batches = prepare_create_batches(&operations)?;
         let receipts = CreateReceiptPlan {
@@ -938,6 +1058,25 @@ impl PreparedCreates {
         };
         Ok(Self { batches, receipts })
     }
+
+    #[cfg(test)]
+    pub(super) fn complete_for_test(
+        mut self,
+        receipts: Vec<(GherritPrId, PullRequestIdentity)>,
+    ) -> Result<CompleteCreateReceipts> {
+        self.receipts.record(receipts)?;
+        self.receipts.finish()
+    }
+
+    #[cfg(test)]
+    pub(super) fn operation_count(&self) -> usize {
+        self.batches.iter().map(|batch| batch.expected.len()).sum()
+    }
+
+    #[cfg(test)]
+    pub(super) fn request_text(&self) -> String {
+        self.batches.iter().map(|batch| batch.request.to_string()).collect::<Vec<_>>().join("\n")
+    }
 }
 
 /// Opaque proof that every planned create has one globally valid receipt.
@@ -947,17 +1086,58 @@ pub(super) struct CompleteCreateReceipts {
     by_change: HashMap<GherritPrId, PullRequestIdentity>,
 }
 
+/// Create receipts after an exact consuming ordered join.
+#[derive(Debug)]
+pub(super) struct ExactCreateReceipts {
+    values: Box<[(GherritPrId, PullRequestIdentity)]>,
+}
+
+impl ExactCreateReceipts {
+    pub(super) fn iter(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&GherritPrId, &PullRequestIdentity)> {
+        self.values.iter().map(|(id, identity)| (id, identity))
+    }
+
+    pub(super) fn into_values(self) -> Box<[(GherritPrId, PullRequestIdentity)]> {
+        self.values
+    }
+}
+
 impl CompleteCreateReceipts {
     #[allow(dead_code)] // Consumed by the pending owned-base activation path.
     pub(super) fn len(&self) -> usize {
         self.by_change.len()
     }
 
-    #[allow(dead_code)] // Consumed by the pending owned-base activation path.
+    #[cfg(test)]
     pub(super) fn identity(&self, id: &GherritPrId) -> Option<&PullRequestIdentity> {
         self.by_change.get(id)
     }
 
+    /// Consumes this receipt proof against one exact expected order.
+    pub(super) fn into_exact(mut self, expected: &[GherritPrId]) -> Result<ExactCreateReceipts> {
+        if self.order.as_ref() != expected {
+            bail!("createPullRequest receipt order does not match the projection seed");
+        }
+        if self.by_change.len() != expected.len() {
+            bail!("createPullRequest receipt count does not match the projection seed");
+        }
+        let values = expected
+            .iter()
+            .map(|id| {
+                self.by_change.remove(id).map(|identity| (id.clone(), identity)).ok_or_else(|| {
+                    eyre!("createPullRequest receipts omit projection change '{}'", id.as_str())
+                })
+            })
+            .collect::<Result<Box<[_]>>>()?;
+        if !self.by_change.is_empty() {
+            bail!("createPullRequest receipts contain a change outside the projection seed");
+        }
+        Ok(ExactCreateReceipts { values })
+    }
+
+    /// FIXME(#264): Delete with the pre-activation publisher.
     pub(super) fn into_legacy_created(mut self) -> Vec<CreatedPullRequest> {
         self.order
             .into_vec()
@@ -1006,18 +1186,87 @@ impl UpdatePullRequest {
     }
 
     fn document(&self) -> String {
-        let fields = std::iter::once(("pullRequestId", self.identity.node_id().as_str()))
-            .chain(self.base_branch.as_deref().map(|value| ("baseRefName", value)))
-            .chain(self.title.as_deref().map(|value| ("title", value)))
-            .chain(self.body.as_deref().map(|value| ("body", value)))
-            .chain(std::iter::once(("clientMutationId", self.client_mutation_id.as_str())))
-            .map(|(name, value)| format!("{name}: {}", json!(value)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "updatePullRequest(input: {{ {fields} }}) {{ clientMutationId, pullRequest {{ number, id }} }}"
+        update_document(
+            &self.identity,
+            self.title.as_deref(),
+            self.body.as_deref(),
+            self.base_branch.as_deref(),
+            &self.client_mutation_id,
         )
     }
+}
+
+fn update_document(
+    identity: &PullRequestIdentity,
+    title: Option<&str>,
+    body: Option<&str>,
+    base_branch: Option<&str>,
+    client_mutation_id: &str,
+) -> String {
+    let fields = std::iter::once(("pullRequestId", identity.node_id().as_str()))
+        .chain(base_branch.map(|value| ("baseRefName", value)))
+        .chain(title.map(|value| ("title", value)))
+        .chain(body.map(|value| ("body", value)))
+        .chain(std::iter::once(("clientMutationId", client_mutation_id)))
+        .map(|(name, value)| format!("{name}: {}", json!(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "updatePullRequest(input: {{ {fields} }}) {{ clientMutationId, pullRequest {{ number, id }} }}"
+    )
+}
+
+/// One borrowed conservative update used only for request-size preflight.
+pub(super) struct UpdatePreflight<'a> {
+    identity: &'a PullRequestIdentity,
+    title: Option<&'a str>,
+    body: Option<&'a str>,
+    base_branch: Option<&'a str>,
+    client_mutation_id: String,
+}
+
+impl<'a> UpdatePreflight<'a> {
+    pub(super) fn new(
+        identity: &'a PullRequestIdentity,
+        title: Option<&'a str>,
+        body: Option<&'a str>,
+        base_branch: Option<&'a str>,
+    ) -> Result<Self> {
+        if title.is_none() && body.is_none() && base_branch.is_none() {
+            bail!("A pull request update preflight must include at least one field");
+        }
+        Ok(Self {
+            identity,
+            title,
+            body,
+            base_branch,
+            client_mutation_id: format!("gherrit:update:{}", identity.node_id().as_str()),
+        })
+    }
+
+    fn document(&self) -> String {
+        update_document(
+            self.identity,
+            self.title,
+            self.body,
+            self.base_branch,
+            &self.client_mutation_id,
+        )
+    }
+}
+
+/// Preflights a complete conservative update set without retaining its bytes.
+pub(super) fn preflight_updates(operations: &[UpdatePreflight<'_>]) -> Result<()> {
+    for (index, operation) in operations.iter().enumerate() {
+        let fields = format!("op0: {}", operation.document());
+        let (_, bytes) = serialized_mutation_request(fields)?;
+        if bytes > MAX_MUTATION_REQUEST_BYTES {
+            bail!(
+                "GraphQL update preflight at item {index} serializes to {bytes} bytes, which exceeds the {MAX_MUTATION_REQUEST_BYTES}-byte request limit. No mutation was sent."
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1180,6 +1429,16 @@ impl PreparedUpdates {
             }
         }
         Ok(Self { batches: prepare_update_batches(&operations)? })
+    }
+
+    #[cfg(test)]
+    pub(super) fn operation_count(&self) -> usize {
+        self.batches.iter().map(|batch| batch.expected.len()).sum()
+    }
+
+    #[cfg(test)]
+    pub(super) fn request_text(&self) -> String {
+        self.batches.iter().map(|batch| batch.request.to_string()).collect::<Vec<_>>().join("\n")
     }
 }
 
@@ -1799,6 +2058,31 @@ mod mutation_tests {
         let complete = complete.finish().unwrap();
         assert_eq!(complete.len(), 2);
         assert_eq!(complete.identity(&id("B")).unwrap().number().get(), 2);
+
+        let mut ordered = receipt_plan(&["A", "B"], initial(Vec::new()));
+        ordered
+            .record(vec![
+                (id("A"), PullRequestIdentity::new(1, "PR_1".to_owned()).unwrap()),
+                (id("B"), PullRequestIdentity::new(2, "PR_2".to_owned()).unwrap()),
+            ])
+            .unwrap();
+        assert!(ordered.finish().unwrap().into_exact(&[id("B"), id("A")]).is_err());
+
+        let mut ordered = receipt_plan(&["A", "B"], initial(Vec::new()));
+        ordered
+            .record(vec![
+                (id("B"), PullRequestIdentity::new(2, "PR_2".to_owned()).unwrap()),
+                (id("A"), PullRequestIdentity::new(1, "PR_1".to_owned()).unwrap()),
+            ])
+            .unwrap();
+        let exact = ordered.finish().unwrap().into_exact(&[id("A"), id("B")]).unwrap();
+        assert_eq!(
+            exact
+                .iter()
+                .map(|(id, identity)| (id.as_str(), identity.number().get()))
+                .collect::<Vec<_>>(),
+            [("A", 1), ("B", 2)]
+        );
     }
 
     #[test]

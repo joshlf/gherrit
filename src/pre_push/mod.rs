@@ -14,6 +14,10 @@ mod github;
 #[allow(dead_code)]
 mod history;
 mod local;
+// Activated by the owned-base orchestration cutover after its pure planning
+// contract has landed independently.
+#[allow(dead_code)]
+mod plan;
 mod publication;
 mod pull_request;
 mod reconcile;
@@ -52,8 +56,7 @@ use body::PrBody;
 use destination::{DefaultBranch, PushDestination};
 use github::{
     CreatePullRequest, CreatedPullRequest, Github, LegacyGithubObservation,
-    OpenPullRequest as PrState, PreparedCreates, PreparedUpdates, Repository as GithubRepository,
-    UpdatePullRequest,
+    OpenPullRequest as PrState, PreparedCreates, PreparedUpdates, UpdatePullRequest,
 };
 use local::{GherritPrId, LocalStack};
 use publication::{GitPublicationPlan, PlannedChanges, PushOutcome, plan_git_publication};
@@ -113,7 +116,6 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     let destination = PushDestination::resolve(configured_remote).await?;
     let remote_heads = observe_remote_heads(&destination).await?;
     let git_default_branch = remote_heads.default_branch().clone();
-    git_default_branch.ensure_local(repo)?;
     let commits = LocalStack::collect(repo, &git_default_branch, destination.configured_remote())
         .wrap_err("Failed to collect commits")?;
 
@@ -142,12 +144,8 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
         log::warn!("Using custom GitHub API URL: {}", api_url);
     }
 
-    let github = Github::new(
-        util::get_github_token()?,
-        github_endpoint.custom_url(),
-        destination.owner().to_owned(),
-        destination.repository().to_owned(),
-    )?;
+    let github =
+        Github::new(util::get_github_token()?, github_endpoint.custom_url(), &destination)?;
     let gherrit_ids = commits.iter().map(|commit| commit.id().clone()).collect::<Vec<_>>();
     let LegacyGithubObservation {
         repository,
@@ -155,8 +153,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
         initial_identities,
         create_authorizations,
     } = github.observe_legacy_pull_requests(&gherrit_ids).await?;
-    let GithubRepository { node_id: repository_id, default_branch: github_default_branch } =
-        repository;
+    let (repository_id, github_default_branch) = repository.into_parts();
     let default_branch = DefaultBranch::agree(git_default_branch, github_default_branch)?;
     let planned_changes = push_to_origin(&destination, publication)?;
     let public_branch = public_branch(repo, branch_name);

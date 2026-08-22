@@ -93,6 +93,26 @@ impl RemoteHeads<'_> {
 }
 
 impl<'destination> RemoteHeads<'destination> {
+    /// Returns the exact opaque destination capability which produced this
+    /// complete head observation.
+    pub(super) fn destination(&self) -> &'destination PushDestination {
+        self.destination
+    }
+
+    #[cfg(test)]
+    pub(super) fn into_active_for_test(
+        self,
+        local_ids: &[GherritPrId],
+        nonlocal_ids: &[GherritPrId],
+        version_output: &[u8],
+    ) -> Result<ActiveRemoteChanges<'destination>> {
+        let expected = local_ids.iter().chain(nonlocal_ids);
+        let ParsedVersionTags { histories } = parse_versions(version_output, expected)?;
+        DestinationObservation { heads: self, histories }.into_active(local_ids, nonlocal_ids)
+    }
+}
+
+impl<'destination> RemoteHeads<'destination> {
     /// Consumes the complete head observation to begin cumulative history
     /// observation at the same exact destination.
     #[allow(dead_code)]
@@ -259,6 +279,17 @@ impl fmt::Debug for ActiveRemoteChanges<'_> {
 }
 
 impl<'destination> ActiveRemoteChanges<'destination> {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        &'destination PushDestination,
+        DefaultBranch,
+        Box<[ObservedChangeHistory]>,
+        Box<[ObservedChangeHistory]>,
+    ) {
+        (self.destination, self.default_branch, self.local, self.nonlocal)
+    }
+
     #[cfg(test)]
     pub(super) fn destination(&self) -> &'destination PushDestination {
         self.destination
@@ -967,6 +998,14 @@ pub(super) fn parse_remote_heads_for_test(output: &[u8]) -> Result<RemoteHeads<'
         "https://github.com/owner/repository.git",
         Vec::new(),
     )?));
+    parse_remote_heads_for_destination_for_test(destination, output)
+}
+
+#[cfg(test)]
+pub(super) fn parse_remote_heads_for_destination_for_test<'destination>(
+    destination: &'destination PushDestination,
+    output: &[u8],
+) -> Result<RemoteHeads<'destination>> {
     Ok(RemoteHeads { destination, parsed: parse_remote_heads(output)? })
 }
 

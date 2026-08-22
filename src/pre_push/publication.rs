@@ -13,6 +13,7 @@ use color_eyre::eyre::{Result, bail, eyre};
 use gix::ObjectId;
 
 use super::{
+    history::ValidatedChangeHistory,
     local::{GherritPrId, LocalChange},
     remote::{ObservedChange, ObservedStack},
     version::Version,
@@ -35,6 +36,157 @@ const FIXED_PUSH_OPTIONS: [&str; 7] = [
 // reserved remote name, quoting, and terminating NUL. It also bounds POSIX
 // argv encoding conservatively.
 const PUSH_VARIABLE_ARGV_BUDGET_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Copy)]
+enum LeaseExpectation {
+    Absent,
+    At(ObjectId),
+}
+
+impl LeaseExpectation {
+    fn render(self) -> String {
+        match self {
+            Self::Absent => String::new(),
+            Self::At(oid) => oid.to_string(),
+        }
+    }
+
+    fn receipt_transition(self) -> ExpectedRefTransition {
+        match self {
+            Self::Absent => ExpectedRefTransition::CreateOrAlreadyDesired,
+            Self::At(_) => ExpectedRefTransition::UpdateOrAlreadyDesired,
+        }
+    }
+}
+
+struct OwnedPushTupleArguments {
+    options: [String; 3],
+    refspecs: [String; 3],
+    expected_receipts: [(String, ExpectedRefReceipt); 3],
+}
+
+impl OwnedPushTupleArguments {
+    fn from_history(history: &ValidatedChangeHistory) -> Result<Option<Self>> {
+        if !history.needs_publication() {
+            return Ok(None);
+        }
+        let id = history.id().as_str();
+        let proposed = history.proposed();
+        let current = history.published_current();
+        let head_expectation = current
+            .map(|current| LeaseExpectation::At(current.revision().head()))
+            .unwrap_or(LeaseExpectation::Absent);
+        let base_expectation = current
+            .map(|current| LeaseExpectation::At(current.revision().first_parent()))
+            .unwrap_or(LeaseExpectation::Absent);
+        let head = format!("refs/heads/{id}");
+        let base = format!("refs/heads/gherrit-bases/{id}");
+        let tag = format!("refs/tags/gherrit/{id}/v{}", history.projected_current().number());
+        let options = [
+            format!("--force-with-lease={head}:{}", head_expectation.render()),
+            format!("--force-with-lease={base}:{}", base_expectation.render()),
+            format!("--force-with-lease={tag}:"),
+        ];
+        let desired_head = proposed.head().to_string();
+        let desired_base = proposed.first_parent().to_string();
+        let refspecs = [
+            format!("{desired_head}:{head}"),
+            format!("{desired_base}:{base}"),
+            format!("{desired_head}:{tag}"),
+        ];
+        let expected_receipts = [
+            (
+                head,
+                ExpectedRefReceipt::new(
+                    desired_head.clone(),
+                    head_expectation.receipt_transition(),
+                ),
+            ),
+            (base, ExpectedRefReceipt::new(desired_base, base_expectation.receipt_transition())),
+            (
+                tag,
+                ExpectedRefReceipt::new(
+                    desired_head,
+                    ExpectedRefTransition::CreateOrAlreadyDesired,
+                ),
+            ),
+        ];
+        Ok(Some(Self { options, refspecs, expected_receipts }))
+    }
+
+    fn encoded_argv_bytes(&self) -> usize {
+        self.options.iter().chain(&self.refspecs).map(|argument| argument.len() + 1).sum()
+    }
+}
+
+struct BudgetedOwnedPushTuple {
+    arguments: OwnedPushTupleArguments,
+    encoded_argv_bytes: usize,
+}
+
+/// Plans exact, tuple-indivisible owned-base publication from validated history.
+pub(super) fn plan_owned_base_pushes(
+    histories: &[&ValidatedChangeHistory],
+) -> Result<Box<[PushRequest]>> {
+    plan_owned_base_pushes_with_budget(histories, PUSH_VARIABLE_ARGV_BUDGET_BYTES)
+}
+
+fn plan_owned_base_pushes_with_budget(
+    histories: &[&ValidatedChangeHistory],
+    budget: usize,
+) -> Result<Box<[PushRequest]>> {
+    let arguments = histories
+        .iter()
+        .map(|history| OwnedPushTupleArguments::from_history(history))
+        .collect::<Result<Vec<_>>>()?;
+    let tuples = arguments
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, arguments)| {
+            let encoded_argv_bytes = arguments.encoded_argv_bytes();
+            if encoded_argv_bytes > budget {
+                bail!(
+                    "Git publication target {index} requires {encoded_argv_bytes} bytes of variable push arguments, which exceeds the {budget}-byte variable-argument budget"
+                );
+            }
+            Ok(BudgetedOwnedPushTuple { arguments, encoded_argv_bytes })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ExpectedReceipts::new(
+        tuples.iter().flat_map(|tuple| tuple.arguments.expected_receipts.iter().cloned()),
+    )?;
+
+    let mut batches = Vec::<Vec<BudgetedOwnedPushTuple>>::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 0;
+    for tuple in tuples {
+        if !current.is_empty() && current_bytes > budget - tuple.encoded_argv_bytes {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += tuple.encoded_argv_bytes;
+        current.push(tuple);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    batches
+        .into_iter()
+        .map(|batch| {
+            let mut options = FIXED_PUSH_OPTIONS.map(str::to_owned).to_vec();
+            let mut refspecs = Vec::with_capacity(batch.len() * 3);
+            let mut receipts = Vec::with_capacity(batch.len() * 3);
+            for tuple in batch {
+                options.extend(tuple.arguments.options);
+                refspecs.extend(tuple.arguments.refspecs);
+                receipts.extend(tuple.arguments.expected_receipts);
+            }
+            Ok(PushRequest { options, refspecs, expected: ExpectedReceipts::new(receipts)? })
+        })
+        .collect::<Result<Box<[_]>>>()
+}
 
 #[derive(Clone, Debug)]
 enum PushTarget {
@@ -615,10 +767,19 @@ fn plan_push_batches_with_budget<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, fmt::Write as _};
+
+    use tempfile::TempDir;
 
     use super::*;
-    use crate::pre_push::{local::LocalStack, remote::ObservedStack};
+    use crate::{
+        pre_push::{
+            history::{CommitGraphEvidence, NormalizedPublishedHistory, ValidatedChangeHistory},
+            local::LocalStack,
+            remote::{self, ObservedStack},
+        },
+        util,
+    };
 
     fn object_id(byte: u8) -> ObjectId {
         ObjectId::from_bytes_or_panic(&[byte; 20])
@@ -681,6 +842,213 @@ mod tests {
 
     fn batch_tuple_count(batch: &PushPlan) -> usize {
         batch.tuples().count()
+    }
+
+    struct HistoryRepository {
+        directory: TempDir,
+        writer: gix::Repository,
+    }
+
+    impl HistoryRepository {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let writer = gix::init_bare(directory.path()).unwrap();
+            Self { directory, writer }
+        }
+
+        fn commit(&self, subject: &str, parents: &[ObjectId], id: Option<&str>) -> ObjectId {
+            let message = id.map_or_else(
+                || subject.to_owned(),
+                |id| format!("{subject}\n\ngherrit-pr-id: {id}\n"),
+            );
+            let signature = gix::actor::Signature {
+                name: "GHerrit test".into(),
+                email: "test@example.com".into(),
+                time: gix::actor::date::Time::new(0, 0),
+            };
+            self.writer
+                .write_object(&gix::objs::Commit {
+                    tree: ObjectId::empty_tree(self.writer.object_hash()),
+                    parents: parents.iter().copied().collect(),
+                    author: signature.clone(),
+                    committer: signature,
+                    encoding: None,
+                    message: message.into(),
+                    extra_headers: Vec::new(),
+                })
+                .unwrap()
+                .detach()
+        }
+
+        fn graph(&self, roots: impl IntoIterator<Item = ObjectId>) -> CommitGraphEvidence {
+            let repository = util::Repo::open(self.directory.path().to_str().unwrap()).unwrap();
+            CommitGraphEvidence::load(&repository, roots).unwrap()
+        }
+    }
+
+    struct ValidatedFixture {
+        history: ValidatedChangeHistory,
+        published: Option<(ObjectId, ObjectId)>,
+        proposed: (ObjectId, ObjectId),
+    }
+
+    fn validated_history(id: &str, published: bool, advances: bool) -> ValidatedFixture {
+        assert!(published || advances, "an absent history always has a proposal to publish");
+        let repository = HistoryRepository::new();
+        let published_revision = published.then(|| {
+            let base = repository.commit(&format!("{id} published base"), &[], None);
+            let head = repository.commit(&format!("{id} published"), &[base], Some(id));
+            (head, base)
+        });
+        let proposed = if advances {
+            let base = repository.commit(&format!("{id} proposed base"), &[], None);
+            let head = repository.commit(&format!("{id} proposed"), &[base], Some(id));
+            (head, base)
+        } else {
+            published_revision.expect("a current proposal must already be published")
+        };
+        let graph = repository.graph(
+            published_revision.into_iter().map(|(head, _)| head).chain(std::iter::once(proposed.0)),
+        );
+        let id = change_id(id);
+        let default = published_revision.map_or(proposed.1, |(_, base)| base);
+        let mut heads =
+            format!("ref: refs/heads/main\tHEAD\n{default}\tHEAD\n{default}\trefs/heads/main\n");
+        let mut tags = String::new();
+        if let Some((head, base)) = published_revision {
+            writeln!(heads, "{head}\trefs/heads/{}", id.as_str()).unwrap();
+            writeln!(heads, "{base}\trefs/heads/gherrit-bases/{}", id.as_str()).unwrap();
+            writeln!(tags, "{head}\trefs/tags/gherrit/{}/v1", id.as_str()).unwrap();
+        }
+        let observed =
+            remote::parse_active_change_for_test(id.clone(), heads.as_bytes(), tags.as_bytes())
+                .unwrap();
+        let normalized = NormalizedPublishedHistory::from_observation(observed, &graph).unwrap();
+        let stack = LocalStack::for_test(proposed.1, [(id, proposed.0)]);
+        let history = normalized
+            .with_proposal(stack.iter().next().unwrap(), &graph)
+            .unwrap()
+            .validate(&graph, None)
+            .unwrap();
+        ValidatedFixture { history, published: published_revision, proposed }
+    }
+
+    #[test]
+    fn owned_base_publication_plans_one_exact_three_ref_tuple() {
+        let fixture = validated_history("Gone", true, true);
+        let requests = plan_owned_base_pushes(&[&fixture.history]).unwrap();
+        let (published_head, published_base) = fixture.published.unwrap();
+        let (proposed_head, proposed_base) = fixture.proposed;
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].options,
+            [
+                "--porcelain".to_owned(),
+                "--atomic".to_owned(),
+                "--no-verify".to_owned(),
+                "--no-follow-tags".to_owned(),
+                "--recurse-submodules=no".to_owned(),
+                "--no-signed".to_owned(),
+                "--no-force-if-includes".to_owned(),
+                format!("--force-with-lease=refs/heads/Gone:{published_head}"),
+                format!("--force-with-lease=refs/heads/gherrit-bases/Gone:{published_base}"),
+                "--force-with-lease=refs/tags/gherrit/Gone/v2:".to_owned(),
+            ]
+        );
+        assert_eq!(
+            requests[0].refspecs,
+            [
+                format!("{proposed_head}:refs/heads/Gone"),
+                format!("{proposed_base}:refs/heads/gherrit-bases/Gone"),
+                format!("{proposed_head}:refs/tags/gherrit/Gone/v2"),
+            ]
+        );
+        assert_eq!(requests[0].expected.refs.len(), 3);
+        assert_eq!(
+            requests[0].expected.refs["refs/heads/Gone"].transition,
+            ExpectedRefTransition::UpdateOrAlreadyDesired
+        );
+        assert_eq!(
+            requests[0].expected.refs["refs/heads/gherrit-bases/Gone"].transition,
+            ExpectedRefTransition::UpdateOrAlreadyDesired
+        );
+        assert_eq!(
+            requests[0].expected.refs["refs/tags/gherrit/Gone/v2"].transition,
+            ExpectedRefTransition::CreateOrAlreadyDesired
+        );
+    }
+
+    #[test]
+    fn owned_base_publication_uses_absence_leases_for_first_publication() {
+        let fixture = validated_history("Gnew", false, true);
+        let requests = plan_owned_base_pushes(&[&fixture.history]).unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            &requests[0].options[FIXED_PUSH_OPTIONS.len()..],
+            [
+                "--force-with-lease=refs/heads/Gnew:",
+                "--force-with-lease=refs/heads/gherrit-bases/Gnew:",
+                "--force-with-lease=refs/tags/gherrit/Gnew/v1:",
+            ]
+        );
+        assert!(
+            requests[0]
+                .expected
+                .refs
+                .values()
+                .all(|receipt| receipt.transition == ExpectedRefTransition::CreateOrAlreadyDesired)
+        );
+    }
+
+    #[test]
+    fn current_owned_base_history_is_a_git_no_op() {
+        let fixture = validated_history("Gone", true, false);
+        assert!(plan_owned_base_pushes(&[&fixture.history]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mixed_current_and_changed_histories_emit_only_the_changed_tuple() {
+        let current = validated_history("Gone", true, false);
+        let changed = validated_history("Gtwo", true, true);
+        let requests = plan_owned_base_pushes(&[&current.history, &changed.history]).unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].refspecs.len(), 3);
+        assert!(requests[0].refspecs.iter().all(|refspec| refspec.contains("Gtwo")));
+        assert!(requests[0].refspecs.iter().all(|refspec| !refspec.contains("Gone")));
+    }
+
+    #[test]
+    fn owned_base_batching_never_splits_a_three_ref_tuple() {
+        let first = validated_history("Gone", false, true);
+        let second = validated_history("Gtwo", false, true);
+        let first_bytes = OwnedPushTupleArguments::from_history(&first.history)
+            .unwrap()
+            .unwrap()
+            .encoded_argv_bytes();
+        let second_bytes = OwnedPushTupleArguments::from_history(&second.history)
+            .unwrap()
+            .unwrap()
+            .encoded_argv_bytes();
+
+        assert_eq!(
+            plan_owned_base_pushes_with_budget(
+                &[&first.history, &second.history],
+                first_bytes + second_bytes,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        let split = plan_owned_base_pushes_with_budget(
+            &[&first.history, &second.history],
+            first_bytes + second_bytes - 1,
+        )
+        .unwrap();
+        assert_eq!(split.len(), 2);
+        assert!(split.iter().all(|request| request.refspecs.len() == 3));
     }
 
     #[test]
