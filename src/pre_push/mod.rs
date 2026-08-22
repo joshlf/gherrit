@@ -14,6 +14,9 @@ mod autosquash;
 mod body;
 mod destination;
 mod github;
+// Removed when the activation orchestration consumes the history domain.
+#[allow(dead_code)]
+mod history;
 mod local;
 mod publication;
 mod pull_request;
