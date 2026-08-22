@@ -96,8 +96,8 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
 
     let configured_remote =
         repo.default_remote_name().wrap_err("Failed to read the configured GHerrit remote")?;
-    let destination = PushDestination::resolve(configured_remote)?;
-    let remote_heads = observe_remote_heads(&destination)?;
+    let destination = PushDestination::resolve(configured_remote).await?;
+    let remote_heads = observe_remote_heads(&destination).await?;
     let git_default_branch = remote_heads.default_branch().clone();
     git_default_branch.ensure_local(repo)?;
     let commits = LocalStack::collect(repo, &git_default_branch, destination.configured_remote())
@@ -117,7 +117,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     // only these active IDs were queried. Couple both domains before planning
     // so the complete stack is validated before any write can be exposed.
     let versions =
-        observe_active_version_tags(&destination, commits.iter().map(|change| change.id()))?;
+        observe_active_version_tags(&destination, commits.iter().map(|change| change.id())).await?;
     let observed = ObservedStack::couple(&commits, &remote_heads, versions)?;
     let publication = plan_git_publication(&observed)?;
 

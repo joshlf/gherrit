@@ -280,7 +280,12 @@ impl Repo {
         })
     }
 
-    fn has_promisor_remote(&self) -> Result<bool> {
+    /// Reports the same validated promisor fact used by history hardening.
+    ///
+    /// Explicit object acquisition may use this to decide whether Git's one
+    /// `--refetch` fallback is applicable. Keep configuration decoding here so
+    /// callers cannot drift from `ensure_publishable_history`.
+    pub(crate) fn has_promisor_remote(&self) -> Result<bool> {
         let config = self.inner.config_snapshot();
         if config.string("extensions.partialClone").is_some() {
             return Ok(true);
