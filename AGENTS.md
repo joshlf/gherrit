@@ -44,8 +44,10 @@ It achieves this by:
     - `process.rs`: Process setup shared by the two executable targets.
     - `test_git.rs`: Git interceptor compiled only into the test driver.
     - `lib.rs`: Fallible asynchronous command dispatch and runtime inputs.
-    - `pre_push/mod.rs`: **CORE LOGIC**. Handles commit analysis, ref creation,
-      pushing, and PR syncing.
+    - `pre_push/mod.rs`: Pre-push orchestration, remote ref publication, and
+      pull-request synchronization.
+    - `pre_push/local.rs`: Local stack collection, commit representation,
+      trailer parsing, and identity validation.
     - `manage.rs`: Handles the state of branches (Managed vs Unmanaged) via `git config`.
     - `commit_msg.rs`: Ensures commits have `gherrit-pr-id` trailers.
 - `hooks/`: Git hooks (`pre-push`, `commit-msg`, `post-checkout`) that shell out to the `gherrit` binary.
