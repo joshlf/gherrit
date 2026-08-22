@@ -7,8 +7,10 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
+    fmt,
+    process::Command,
     str,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
@@ -17,8 +19,10 @@ use gix::{ObjectId, bstr::ByteSlice as _};
 use super::{
     destination::{DefaultBranch, PushDestination, git_output_records},
     local::{GherritPrId, LocalChange, LocalStack},
+    subprocess,
     version::Version,
 };
+use crate::util;
 
 // Variable arguments are kept well below Windows' roughly 32-KiB command-line
 // limit. This also gives POSIX implementations a conservative bound.
@@ -56,10 +60,101 @@ impl RemoteHeads {
     }
 }
 
-/// Complete immutable histories for exactly the explicitly requested IDs.
-#[derive(Debug)]
-pub(super) struct ActiveVersionTags {
-    histories: HashMap<GherritPrId, BTreeMap<Version, ObjectId>>,
+/// Complete immutable histories from one destination for exactly the
+/// explicitly requested IDs.
+pub(super) struct ActiveVersionTags<'destination> {
+    destination: &'destination PushDestination,
+    histories: HashMap<GherritPrId, BTreeMap<Version, AdvertisedVersionRef>>,
+}
+
+impl fmt::Debug for ActiveVersionTags<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActiveVersionTags")
+            .field("covered_change_count", &self.histories.len())
+            .field(
+                "advertised_ref_count",
+                &self.histories.values().map(BTreeMap::len).sum::<usize>(),
+            )
+            .finish()
+    }
+}
+
+impl<'destination> ActiveVersionTags<'destination> {
+    /// Returns the complete version/object evidence for one covered change.
+    ///
+    /// Source refs stay private. Normalization can inspect every advertised
+    /// object without recovering or fabricating the ref which carried it.
+    #[allow(dead_code)]
+    pub(super) fn history(
+        &self,
+        id: &GherritPrId,
+    ) -> Option<impl ExactSizeIterator<Item = (Version, ObjectId)> + '_> {
+        self.histories.get(id).map(|history| {
+            history.iter().map(|(version, advertised)| (*version, advertised.object_id))
+        })
+    }
+
+    /// Constructs an acquisition bound to this observation's destination.
+    ///
+    /// Each object ID may be requested once and must occur in this
+    /// observation. If multiple version tags advertise the same object, all
+    /// of their exact refs are selected in deterministic order. That makes a
+    /// repeated object unambiguous without inventing a preferred source ref.
+    #[allow(dead_code)]
+    pub(super) fn acquisition(
+        &self,
+        object_ids: impl IntoIterator<Item = ObjectId>,
+    ) -> Result<ObjectAcquisition<'destination>> {
+        let mut requested = HashSet::new();
+        let mut source_refs = Vec::new();
+        for object_id in object_ids {
+            if !requested.insert(object_id) {
+                bail!("object acquisition requested the same advertised object twice");
+            }
+            let previous_len = source_refs.len();
+            source_refs.extend(
+                self.histories
+                    .values()
+                    .flat_map(BTreeMap::values)
+                    .filter(|advertised| advertised.object_id == object_id)
+                    .map(|advertised| advertised.source_ref.clone()),
+            );
+            if source_refs.len() == previous_len {
+                bail!("object acquisition requested an object absent from the observation");
+            }
+        }
+        if requested.is_empty() {
+            bail!("object acquisition requires at least one advertised object");
+        }
+
+        let source_ref_count = source_refs.len();
+        let batches = plan_fetches(&source_refs)?;
+        Ok(ObjectAcquisition {
+            destination: self.destination,
+            object_count: requested.len(),
+            source_ref_count,
+            batches,
+        })
+    }
+
+    fn take_history(&mut self, id: &GherritPrId) -> Option<BTreeMap<Version, ObjectId>> {
+        self.histories.remove(id).map(|history| {
+            history
+                .into_iter()
+                .map(|(version, advertised)| (version, advertised.object_id))
+                .collect()
+        })
+    }
+}
+
+/// One exact lightweight version tag accepted from an advertisement.
+///
+/// `source_ref` remains private so acquisition cannot be redirected to a raw
+/// object ID, a derived tag spelling, or a ref absent from the observation.
+struct AdvertisedVersionRef {
+    object_id: ObjectId,
+    source_ref: String,
 }
 
 /// Remote head and immutable history for each local change, in stack order.
@@ -72,12 +167,12 @@ impl<'stack> ObservedStack<'stack> {
     pub(super) fn couple(
         stack: &'stack LocalStack,
         heads: &RemoteHeads,
-        mut versions: ActiveVersionTags,
+        mut versions: ActiveVersionTags<'_>,
     ) -> Result<Self> {
         let changes = stack
             .iter()
             .map(|change| {
-                let history = versions.histories.remove(change.id()).ok_or_else(|| {
+                let history = versions.take_history(change.id()).ok_or_else(|| {
                     eyre!(
                         "version history for GHerrit change '{}' was not observed",
                         change.id().as_str()
@@ -152,65 +247,67 @@ impl<'stack> ObservedChange<'stack> {
 }
 
 /// Observes the default branch and every remote head with constant arguments.
-pub(super) fn observe_remote_heads(destination: &PushDestination) -> Result<RemoteHeads> {
+pub(super) async fn observe_remote_heads(destination: &PushDestination) -> Result<RemoteHeads> {
+    let command = destination.ls_remote(
+        ["--quiet".to_owned(), "--symref".to_owned()],
+        HEAD_ADVERTISEMENT_PATTERNS.map(str::to_owned),
+    );
+    observe_remote_heads_command(
+        command,
+        destination.configured_remote(),
+        subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
+    )
+    .await
+}
+
+async fn observe_remote_heads_command(
+    command: Command,
+    configured_remote: &str,
+    timeout: Duration,
+) -> Result<RemoteHeads> {
     let started = Instant::now();
-    let output = destination
-        .ls_remote(
-            ["--quiet".to_owned(), "--symref".to_owned()],
-            HEAD_ADVERTISEMENT_PATTERNS.map(str::to_owned),
-        )
-        .output()
-        .wrap_err_with(|| {
-            format!("Failed to observe GHerrit remote '{}'", destination.configured_remote())
-        })?;
-    if !output.status.success() {
-        bail!("`git ls-remote` failed for GHerrit remote '{}'", destination.configured_remote());
+    let output = subprocess::output(command, timeout)
+        .await
+        .wrap_err_with(|| format!("Failed to observe GHerrit remote '{configured_remote}'"))?;
+    if !output.status().success() {
+        bail!("`git ls-remote` failed for GHerrit remote '{configured_remote}'");
     }
-    let record_count = git_output_records(&output.stdout).count();
+    let record_count = git_output_records(output.stdout()).count();
     log::trace!(
         "Observed GHerrit remote heads ({} bytes, {} records) in {:?}",
-        output.stdout.len(),
+        output.stdout().len(),
         record_count,
         started.elapsed()
     );
-    parse_remote_heads(&output.stdout).wrap_err_with(|| {
-        format!(
-            "GHerrit remote '{}' reported an invalid head advertisement",
-            destination.configured_remote()
-        )
+    parse_remote_heads(output.stdout()).wrap_err_with(|| {
+        format!("GHerrit remote '{configured_remote}' reported an invalid head advertisement")
     })
 }
 
 /// Observes exact immutable histories only for explicitly requested IDs.
-pub(super) fn observe_active_version_tags<'a>(
-    destination: &PushDestination,
-    ids: impl IntoIterator<Item = &'a GherritPrId>,
-) -> Result<ActiveVersionTags> {
+pub(super) async fn observe_active_version_tags<'destination, 'id>(
+    destination: &'destination PushDestination,
+    ids: impl IntoIterator<Item = &'id GherritPrId>,
+) -> Result<ActiveVersionTags<'destination>> {
     let ids = ids.into_iter().collect::<Vec<_>>();
     let version_queries = plan_queries(&ids, version_pattern_bytes)?;
     let started = Instant::now();
-    let mut total_bytes = 0;
-    let mut total_records = 0;
+    let mut total_bytes = 0_usize;
+    let mut total_records = 0_usize;
     let mut histories = HashMap::new();
     for query in &version_queries {
-        let output = destination
-            .ls_remote(["--quiet".to_owned()], query.version_patterns())
-            .output()
-            .wrap_err_with(|| {
-                format!(
-                    "Failed to observe active version history at GHerrit remote '{}'",
-                    destination.configured_remote()
-                )
-            })?;
-        if !output.status.success() {
-            bail!(
-                "`git ls-remote` failed while observing active version history at GHerrit remote '{}'",
-                destination.configured_remote()
-            );
-        }
-        total_bytes += output.stdout.len();
-        total_records += git_output_records(&output.stdout).count();
-        for (id, versions) in parse_versions(&output.stdout, query.ids())? {
+        let command = destination.ls_remote(["--quiet".to_owned()], query.version_patterns());
+        let output = observe_active_version_query(
+            command,
+            destination.configured_remote(),
+            subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
+        )
+        .await?;
+        total_bytes = total_bytes.saturating_add(output.stdout().len());
+        total_records = total_records.saturating_add(git_output_records(output.stdout()).count());
+        let ParsedVersionTags { histories: query_histories } =
+            parse_versions(output.stdout(), query.ids())?;
+        for (id, versions) in query_histories {
             if histories.insert(id, versions).is_some() {
                 bail!("version history was returned by more than one query");
             }
@@ -225,7 +322,23 @@ pub(super) fn observe_active_version_tags<'a>(
         total_records,
         started.elapsed()
     );
-    Ok(ActiveVersionTags { histories })
+    Ok(ActiveVersionTags { destination, histories })
+}
+
+async fn observe_active_version_query(
+    command: Command,
+    configured_remote: &str,
+    timeout: Duration,
+) -> Result<subprocess::CommandOutput> {
+    let output = subprocess::output(command, timeout).await.wrap_err_with(|| {
+        format!("Failed to observe active version history at GHerrit remote '{configured_remote}'")
+    })?;
+    if !output.status().success() {
+        bail!(
+            "`git ls-remote` failed while observing active version history at GHerrit remote '{configured_remote}'"
+        );
+    }
+    Ok(output)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -305,6 +418,136 @@ fn version_patterns(id: &GherritPrId) -> [String; 2] {
 
 fn version_pattern_bytes(id: &GherritPrId) -> usize {
     version_patterns(id).iter().map(|pattern| pattern.len() + 1).sum()
+}
+
+/// A source-only acquisition inseparably bound to one remote observation.
+///
+/// Construction is private to [`ActiveVersionTags`]. The action owns its
+/// exact advertised refs and validated command batches, while retaining the
+/// destination which produced them. It therefore has no destination or ref
+/// parameter which a caller could substitute at execution time.
+pub(super) struct ObjectAcquisition<'destination> {
+    destination: &'destination PushDestination,
+    object_count: usize,
+    source_ref_count: usize,
+    batches: Vec<FetchBatch>,
+}
+
+impl ObjectAcquisition<'_> {
+    /// Acquires the selected objects through this action's bound destination.
+    ///
+    /// `refetch` is deliberately one explicit caller choice rather than an
+    /// internal retry loop. A caller may set it only after the repository's
+    /// existing promisor fact is true and a normal acquisition still leaves
+    /// history missing.
+    #[allow(dead_code)]
+    pub(super) async fn execute(&self, repo: &util::Repo, refetch: bool) -> Result<()> {
+        if refetch && !repo.has_promisor_remote()? {
+            bail!("`git fetch --refetch` requires a repository with promisor configuration");
+        }
+        let started = Instant::now();
+        let mut response_bytes = 0_u64;
+
+        for batch in &self.batches {
+            let mut command = self.destination.fetch(batch.source_refs(), refetch);
+            command.current_dir(repo.workdir().unwrap_or(repo.path()));
+            let output = acquire_batch(
+                command,
+                self.destination.configured_remote(),
+                subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
+            )
+            .await?;
+            response_bytes = response_bytes
+                .saturating_add(u64::try_from(output.stdout().len()).unwrap_or(u64::MAX))
+                .saturating_add(output.stderr_bytes());
+        }
+
+        log::trace!(
+            "Acquired {} advertised object(s) through {} exact version ref(s) in {} request(s) ({} response bytes) in {:?}",
+            self.object_count,
+            self.source_ref_count,
+            self.batches.len(),
+            response_bytes,
+            started.elapsed()
+        );
+        Ok(())
+    }
+}
+
+async fn acquire_batch(
+    command: Command,
+    configured_remote: &str,
+    timeout: Duration,
+) -> Result<subprocess::CommandOutput> {
+    let output = subprocess::output(command, timeout).await.wrap_err_with(|| {
+        format!("Failed to acquire remote Git objects for GHerrit remote '{configured_remote}'")
+    })?;
+    if !output.status().success() {
+        bail!(
+            "`git fetch` failed while acquiring objects for GHerrit remote '{configured_remote}'"
+        );
+    }
+    Ok(output)
+}
+
+struct FetchBatch {
+    first: String,
+    rest: Vec<String>,
+}
+
+impl FetchBatch {
+    fn new(first: String) -> Self {
+        Self { first, rest: Vec::new() }
+    }
+
+    fn source_refs(&self) -> impl Iterator<Item = String> + '_ {
+        std::iter::once(&self.first).chain(&self.rest).cloned()
+    }
+}
+
+fn plan_fetches(source_refs: &[String]) -> Result<Vec<FetchBatch>> {
+    plan_fetches_with_budget(source_refs, QUERY_ARGV_BUDGET_BYTES)
+}
+
+fn plan_fetches_with_budget(source_refs: &[String], budget: usize) -> Result<Vec<FetchBatch>> {
+    let mut source_refs = source_refs.to_vec();
+    source_refs.sort_unstable();
+    let mut seen = HashSet::new();
+    let planned = source_refs
+        .into_iter()
+        .map(|source| {
+            if !seen.insert(source.clone()) {
+                bail!("object acquisition requested the same advertised source ref twice");
+            }
+            let bytes = source.len() + 1;
+            if bytes > budget {
+                bail!(
+                    "An advertised version ref is too long for an object-acquisition request ({} bytes)",
+                    source.len()
+                );
+            }
+            Ok((source, bytes))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut batches = Vec::new();
+    let mut current = None::<FetchBatch>;
+    let mut current_bytes = 0;
+    for (source, bytes) in planned {
+        if current.is_some() && current_bytes > budget - bytes {
+            batches.push(current.take().expect("a full fetch batch exists"));
+            current_bytes = 0;
+        }
+        current_bytes += bytes;
+        match &mut current {
+            Some(batch) => batch.rest.push(source),
+            None => current = Some(FetchBatch::new(source)),
+        }
+    }
+    if let Some(batch) = current {
+        batches.push(batch);
+    }
+    Ok(batches)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -568,10 +811,27 @@ fn requested_names<'a>(
     })
 }
 
+struct ParsedVersionTags {
+    histories: HashMap<GherritPrId, BTreeMap<Version, AdvertisedVersionRef>>,
+}
+
+impl fmt::Debug for ParsedVersionTags {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ParsedVersionTags")
+            .field("covered_change_count", &self.histories.len())
+            .field(
+                "advertised_ref_count",
+                &self.histories.values().map(BTreeMap::len).sum::<usize>(),
+            )
+            .finish()
+    }
+}
+
 fn parse_versions<'a>(
     output: &[u8],
     ids: impl IntoIterator<Item = &'a GherritPrId>,
-) -> Result<HashMap<GherritPrId, BTreeMap<Version, ObjectId>>> {
+) -> Result<ParsedVersionTags> {
     let requested = requested_names(ids, |id| id.as_str().to_owned())?;
     let mut histories =
         requested.values().cloned().map(|id| (id, BTreeMap::new())).collect::<HashMap<_, _>>();
@@ -610,10 +870,14 @@ fn parse_versions<'a>(
         let version = parse_version(suffix).wrap_err_with(|| {
             format!("remote version tag for GHerrit change '{}' is not canonical", id.as_str())
         })?;
+        let source_ref = str::from_utf8(record.name)
+            .expect("a validated managed version ref is ASCII")
+            .to_owned();
+        let advertised = AdvertisedVersionRef { object_id: record.object_id, source_ref };
         if histories
             .get_mut(id)
             .expect("requested changes have initialized histories")
-            .insert(version, record.object_id)
+            .insert(version, advertised)
             .is_some()
         {
             bail!(
@@ -622,7 +886,7 @@ fn parse_versions<'a>(
             );
         }
     }
-    Ok(histories)
+    Ok(ParsedVersionTags { histories })
 }
 
 fn parse_version(suffix: &[u8]) -> Result<Version> {
@@ -645,6 +909,14 @@ fn parse_version(suffix: &[u8]) -> Result<Version> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        env,
+        ffi::{OsStr, OsString},
+        fs,
+        path::Path,
+        process::Output,
+    };
+
     use super::*;
 
     const MAIN: &str = "1111111111111111111111111111111111111111";
@@ -667,6 +939,365 @@ mod tests {
 
     fn for_id<'a, T>(values: &'a HashMap<GherritPrId, T>, value: &str) -> &'a T {
         values.get(&id(value)).expect("requested change must be present")
+    }
+
+    #[cfg(unix)]
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.env_clear().arg("-c").arg(script);
+        command
+    }
+
+    #[cfg(unix)]
+    fn shell_output(stdout: &str, status: i32) -> Command {
+        let mut command = shell("printf '%s' \"$1\"; exit \"$2\"");
+        command.arg("gherrit-test").arg(stdout).arg(status.to_string());
+        command
+    }
+
+    #[derive(Clone)]
+    struct GitTestEnvironment {
+        variables: Vec<(OsString, OsString)>,
+    }
+
+    impl GitTestEnvironment {
+        fn new(root: &Path) -> Self {
+            let home = root.join("home");
+            let temporary = root.join("tmp");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&temporary).unwrap();
+
+            let mut variables = vec![
+                (OsString::from("HOME"), home.clone().into_os_string()),
+                (OsString::from("XDG_CONFIG_HOME"), home.join(".config").into_os_string()),
+                (OsString::from("TMPDIR"), temporary.clone().into_os_string()),
+                (OsString::from("TMP"), temporary.clone().into_os_string()),
+                (OsString::from("TEMP"), temporary.into_os_string()),
+                (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+                (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
+                (OsString::from("LANG"), OsString::from("C")),
+                (OsString::from("LC_ALL"), OsString::from("C")),
+            ];
+            if let Some(path) = env::var_os("PATH") {
+                variables.push((OsString::from("PATH"), path));
+            }
+            #[cfg(windows)]
+            for name in ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"] {
+                if let Some(value) = env::var_os(name) {
+                    variables.push((OsString::from(name), value));
+                }
+            }
+            Self { variables }
+        }
+
+        fn command(
+            &self,
+            current_dir: &Path,
+            arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
+        ) -> Output {
+            let mut command = Command::new("git");
+            command
+                .env_clear()
+                .envs(self.variables.iter().cloned())
+                .current_dir(current_dir)
+                .args(arguments);
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+
+        fn command_fails(
+            &self,
+            current_dir: &Path,
+            arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
+        ) -> Output {
+            let mut command = Command::new("git");
+            command
+                .env_clear()
+                .envs(self.variables.iter().cloned())
+                .current_dir(current_dir)
+                .args(arguments);
+            let output = command.output().unwrap();
+            assert!(!output.status.success());
+            output
+        }
+
+        fn stdout(
+            &self,
+            current_dir: &Path,
+            arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
+        ) -> String {
+            String::from_utf8(self.command(current_dir, arguments).stdout)
+                .unwrap()
+                .trim()
+                .to_owned()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_head_observation_accepts_success_and_rejects_nonzero_status() {
+        let advertisement = String::from_utf8(head_advertisement("")).unwrap();
+        let heads = observe_remote_heads_command(
+            shell_output(&advertisement, 0),
+            "origin",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(heads.default_branch().name(), "main");
+
+        let error = observe_remote_heads_command(
+            shell("printf private-destination >&2; exit 23"),
+            "origin",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        let diagnostic = format!("{error:?}");
+        assert!(diagnostic.contains("`git ls-remote` failed"), "{diagnostic}");
+        assert!(!diagnostic.contains("private-destination"), "{diagnostic}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_head_observation_has_a_finite_execution_deadline() {
+        let error = observe_remote_heads_command(
+            shell("while :; do :; done"),
+            "origin",
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:?}").contains("timed out"), "error={error:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_version_observation_accepts_success_and_rejects_nonzero_status() {
+        let requested = ids(&["Gone"]);
+        let query = Query::new(requested[0].clone());
+        let advertisement = format!("{ONE}\trefs/tags/gherrit/Gone/v1\n");
+        let output = observe_active_version_query(
+            shell_output(&advertisement, 0),
+            "origin",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let observed = parse_versions(output.stdout(), query.ids()).unwrap();
+        assert_eq!(for_id(&observed.histories, "Gone").len(), 1);
+
+        let error = observe_active_version_query(
+            shell("printf private-ref >&2; exit 29"),
+            "origin",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        let diagnostic = format!("{error:?}");
+        assert!(diagnostic.contains("`git ls-remote` failed"), "{diagnostic}");
+        assert!(!diagnostic.contains("private-ref"), "{diagnostic}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_version_observation_has_a_finite_execution_deadline() {
+        let error = observe_active_version_query(
+            shell("while :; do :; done"),
+            "origin",
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:?}").contains("timed out"), "error={error:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observation_bound_action_cannot_be_redirected_and_has_no_repository_side_effects() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let environment = GitTestEnvironment::new(root);
+        let push_remote = root.join("push-owner/push-repo.git");
+        let fetch_remote = root.join("fetch-owner/fetch-repo.git");
+        let push_seed = root.join("push-seed");
+        let fetch_seed = root.join("fetch-seed");
+        let client = root.join("client");
+        fs::create_dir_all(push_remote.parent().unwrap()).unwrap();
+        fs::create_dir_all(fetch_remote.parent().unwrap()).unwrap();
+
+        for remote in [&push_remote, &fetch_remote] {
+            environment.command(
+                root,
+                ["init", "--bare", "--initial-branch=main", remote.to_str().unwrap()],
+            );
+        }
+        for (seed, message, remote) in [
+            (&push_seed, "push history", &push_remote),
+            (&fetch_seed, "fetch history", &fetch_remote),
+        ] {
+            environment.command(root, ["init", "--initial-branch=main", seed.to_str().unwrap()]);
+            environment.command(
+                seed,
+                [
+                    "-c",
+                    "user.name=GHerrit Test",
+                    "-c",
+                    "user.email=gherrit@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    message,
+                ],
+            );
+            environment.command(
+                seed,
+                [
+                    "push",
+                    remote.to_str().unwrap(),
+                    "HEAD:refs/heads/main",
+                    "HEAD:refs/tags/gherrit/Gone/v1",
+                ],
+            );
+        }
+        let push_oid = environment.stdout(&push_seed, ["rev-parse", "HEAD"]);
+        let fetch_oid = environment.stdout(&fetch_seed, ["rev-parse", "HEAD"]);
+        assert_ne!(push_oid, fetch_oid);
+
+        environment.command(root, ["init", "--initial-branch=main", client.to_str().unwrap()]);
+        environment.command(
+            &client,
+            [
+                "-c",
+                "user.name=GHerrit Test",
+                "-c",
+                "user.email=gherrit@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "local history",
+            ],
+        );
+        environment.command(&client, ["remote", "add", "origin", fetch_remote.to_str().unwrap()]);
+
+        let push_destination = PushDestination::for_test(
+            "origin",
+            push_remote.to_str().unwrap(),
+            environment.variables.clone(),
+        )
+        .unwrap();
+        let fetch_destination = PushDestination::for_test(
+            "upstream",
+            fetch_remote.to_str().unwrap(),
+            environment.variables.clone(),
+        )
+        .unwrap();
+        let heads = observe_remote_heads(&push_destination).await.unwrap();
+        assert_eq!(heads.default_branch().name(), "main");
+        assert_eq!(heads.candidate_head(&id("main")).unwrap().to_string(), push_oid);
+
+        let requested = id("Gone");
+        let push_versions =
+            observe_active_version_tags(&push_destination, [&requested]).await.unwrap();
+        let fetch_versions =
+            observe_active_version_tags(&fetch_destination, [&requested]).await.unwrap();
+        let push_history = push_versions.history(&requested).unwrap().collect::<Vec<_>>();
+        let fetch_history = fetch_versions.history(&requested).unwrap().collect::<Vec<_>>();
+        assert_eq!(push_history.len(), 1);
+        assert_eq!(push_history[0].1.to_string(), push_oid);
+        assert_eq!(fetch_history.len(), 1);
+        assert_eq!(fetch_history[0].1.to_string(), fetch_oid);
+
+        let push_object = ObjectId::from_hex(push_oid.as_bytes()).unwrap();
+        let unknown_object = ObjectId::from_hex(MAIN.as_bytes()).unwrap();
+        let error = push_versions
+            .acquisition(std::iter::empty())
+            .err()
+            .expect("an empty acquisition must be rejected");
+        assert!(error.to_string().contains("at least one"), "error={error:?}");
+        let error = push_versions
+            .acquisition([unknown_object])
+            .err()
+            .expect("an unknown object must be rejected");
+        assert!(error.to_string().contains("absent"), "error={error:?}");
+        let error = push_versions
+            .acquisition([push_object, push_object])
+            .err()
+            .expect("a duplicate object must be rejected");
+        assert!(error.to_string().contains("same advertised object"), "error={error:?}");
+        let acquisition = push_versions.acquisition([push_object]).unwrap();
+
+        let push_commit = format!("{push_oid}^{{commit}}");
+        let fetch_commit = format!("{fetch_oid}^{{commit}}");
+        environment.command_fails(&client, ["cat-file", "-e", &push_commit]);
+        environment.command_fails(&client, ["cat-file", "-e", &fetch_commit]);
+        let refs_before =
+            environment.command(&client, ["for-each-ref", "--format=%(refname)%00%(objectname)"]);
+        let config_before = environment.command(&client, ["config", "--local", "--null", "--list"]);
+        let repo = util::Repo::open(client.to_str().unwrap()).unwrap();
+
+        acquisition.execute(&repo, false).await.unwrap();
+
+        environment.command(&client, ["cat-file", "-e", &push_commit]);
+        environment.command_fails(&client, ["cat-file", "-e", &fetch_commit]);
+        assert_eq!(
+            environment
+                .command(&client, ["for-each-ref", "--format=%(refname)%00%(objectname)"])
+                .stdout,
+            refs_before.stdout
+        );
+        assert_eq!(
+            environment.command(&client, ["config", "--local", "--null", "--list"]).stdout,
+            config_before.stdout
+        );
+        assert!(!client.join(".git/FETCH_HEAD").exists());
+        assert!(!client.join(".git/gc.log").exists());
+        assert!(!client.join(".git/objects/info/commit-graph").exists());
+        assert!(!client.join(".git/objects/pack/multi-pack-index").exists());
+        assert!(
+            fs::read_dir(client.join(".git/objects/pack")).unwrap().all(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                != Some(OsStr::new("promisor")))
+        );
+
+        let error = acquisition.execute(&repo, true).await.unwrap_err();
+        assert!(error.to_string().contains("promisor configuration"), "error={error:?}");
+
+        environment.command(&client, ["config", "remote.origin.promisor", "true"]);
+        let config_before_refetch =
+            environment.command(&client, ["config", "--local", "--null", "--list"]);
+        let promisor_repo = util::Repo::open(client.to_str().unwrap()).unwrap();
+        acquisition.execute(&promisor_repo, true).await.unwrap();
+
+        assert_eq!(
+            environment
+                .command(&client, ["for-each-ref", "--format=%(refname)%00%(objectname)"])
+                .stdout,
+            refs_before.stdout
+        );
+        assert_eq!(
+            environment.command(&client, ["config", "--local", "--null", "--list"]).stdout,
+            config_before_refetch.stdout
+        );
+        assert!(!client.join(".git/FETCH_HEAD").exists());
+        assert!(!client.join(".git/gc.log").exists());
+        assert!(!client.join(".git/objects/info/commit-graph").exists());
+        assert!(!client.join(".git/objects/pack/multi-pack-index").exists());
+        assert!(
+            fs::read_dir(client.join(".git/objects/pack")).unwrap().all(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                != Some(OsStr::new("promisor")))
+        );
     }
 
     #[test]
@@ -902,16 +1533,21 @@ mod tests {
         let output =
             format!("{ONE}\trefs/tags/gherrit/Gone/v2\n{ONE}\trefs/tags/gherrit/Gone/v1\n");
         let requested = ids(&["Gone", "Gmissing"]);
-        let histories = parse_versions(output.as_bytes(), &requested).unwrap();
+        let observation = parse_versions(output.as_bytes(), &requested).unwrap();
 
         assert_eq!(
-            for_id(&histories, "Gone")
+            for_id(&observation.histories, "Gone")
                 .iter()
-                .map(|(version, object)| (version.get(), object.to_string()))
+                .map(|(version, advertised)| { (version.get(), advertised.object_id.to_string()) })
                 .collect::<Vec<_>>(),
             [(1, ONE.to_owned()), (2, ONE.to_owned())]
         );
-        assert!(for_id(&histories, "Gmissing").is_empty());
+        assert!(for_id(&observation.histories, "Gmissing").is_empty());
+        let sources = for_id(&observation.histories, "Gone").values().collect::<Vec<_>>();
+        assert_eq!(sources[0].object_id.to_string(), ONE);
+        assert_eq!(sources[0].source_ref, "refs/tags/gherrit/Gone/v1");
+        assert_eq!(sources[1].object_id.to_string(), ONE);
+        assert_eq!(sources[1].source_ref, "refs/tags/gherrit/Gone/v2");
     }
 
     #[test]
@@ -960,6 +1596,50 @@ mod tests {
     }
 
     #[test]
+    fn acquisition_batches_only_exact_advertised_source_refs() {
+        let sources =
+            ["refs/tags/gherrit/Gone/v1".to_owned(), "refs/tags/gherrit/Gtwo/v1".to_owned()];
+        let refs = sources.iter().rev().cloned().collect::<Vec<_>>();
+        let first_bytes = sources[0].len() + 1;
+        let second_bytes = sources[1].len() + 1;
+        let batches = plan_fetches_with_budget(&refs, first_bytes + second_bytes - 1).unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].source_refs().collect::<Vec<_>>(), ["refs/tags/gherrit/Gone/v1"]);
+        assert_eq!(batches[1].source_refs().collect::<Vec<_>>(), ["refs/tags/gherrit/Gtwo/v1"]);
+        assert!(plan_fetches_with_budget(&refs, first_bytes - 1).is_err());
+        assert!(
+            plan_fetches_with_budget(&[sources[0].clone(), sources[0].clone()], usize::MAX)
+                .is_err()
+        );
+        assert!(plan_fetches_with_budget(&[], usize::MAX).unwrap().is_empty());
+    }
+
+    #[test]
+    fn acquisition_selects_every_exact_ref_when_versions_repeat_an_object() {
+        let requested = ids(&["Gone"]);
+        let output =
+            format!("{ONE}\trefs/tags/gherrit/Gone/v2\n{ONE}\trefs/tags/gherrit/Gone/v1\n");
+        let ParsedVersionTags { histories } =
+            parse_versions(output.as_bytes(), &requested).unwrap();
+        let destination =
+            PushDestination::for_test("origin", "https://github.com/owner/repo.git", Vec::new())
+                .unwrap();
+        let observation = ActiveVersionTags { destination: &destination, histories };
+
+        let acquisition =
+            observation.acquisition([ObjectId::from_hex(ONE.as_bytes()).unwrap()]).unwrap();
+
+        assert_eq!(acquisition.object_count, 1);
+        assert_eq!(acquisition.source_ref_count, 2);
+        assert_eq!(acquisition.batches.len(), 1);
+        assert_eq!(
+            acquisition.batches[0].source_refs().collect::<Vec<_>>(),
+            ["refs/tags/gherrit/Gone/v1", "refs/tags/gherrit/Gone/v2"]
+        );
+    }
+
+    #[test]
     fn coupling_rejects_missing_active_version_coverage() {
         let change = id("Gone");
         let stack = LocalStack::for_test(
@@ -967,7 +1647,10 @@ mod tests {
             [(change, ObjectId::from_hex(ONE.as_bytes()).unwrap())],
         );
         let heads = parse_remote_heads(&head_advertisement("")).unwrap();
-        let versions = ActiveVersionTags { histories: HashMap::new() };
+        let destination =
+            PushDestination::for_test("origin", "https://github.com/owner/repo.git", Vec::new())
+                .unwrap();
+        let versions = ActiveVersionTags { destination: &destination, histories: HashMap::new() };
 
         let error = ObservedStack::couple(&stack, &heads, versions).unwrap_err();
         assert!(error.to_string().contains("was not observed"), "error={error:?}");
@@ -981,7 +1664,11 @@ mod tests {
             [(change.clone(), ObjectId::from_hex(ONE.as_bytes()).unwrap())],
         );
         let heads = parse_remote_heads(&head_advertisement("")).unwrap();
+        let destination =
+            PushDestination::for_test("origin", "https://github.com/owner/repo.git", Vec::new())
+                .unwrap();
         let versions = ActiveVersionTags {
+            destination: &destination,
             histories: HashMap::from([(change, BTreeMap::new()), (id("Gextra"), BTreeMap::new())]),
         };
 
