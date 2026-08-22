@@ -98,6 +98,10 @@ impl PublishedHistory {
         (0..self.len()).map(|index| if index == 0 { self.first } else { self.later[index - 1] })
     }
 
+    fn at(&self, index: usize) -> Revision {
+        if index == 0 { self.first } else { self.later[index - 1] }
+    }
+
     fn versioned(&self) -> impl ExactSizeIterator<Item = (Version, Revision)> + '_ {
         self.iter().enumerate().map(|(index, revision)| {
             let version = Version::from_history_index(index)
@@ -335,13 +339,24 @@ impl ValidatedChangeHistory {
         self.published_current().is_none_or(|current| current.revision() != self.proposed)
     }
 
-    pub(super) fn projected_versions(&self) -> impl Iterator<Item = (Version, Revision)> + '_ {
-        let proposed = self.needs_publication().then(|| {
-            let version = Version::from_history_index(self.published_len())
+    pub(super) fn projected_versions(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (Version, Revision)> + ExactSizeIterator + '_ {
+        let published_len = self.published_len();
+        let projected_len = published_len + usize::from(self.needs_publication());
+        (0..projected_len).map(move |index| {
+            let version = Version::from_history_index(index)
                 .expect("an in-memory history position always fits in u64");
-            (version, self.proposed)
-        });
-        self.published_versions().chain(proposed)
+            let revision = if index < published_len {
+                self.published
+                    .as_ref()
+                    .expect("a published position has published history")
+                    .at(index)
+            } else {
+                self.proposed
+            };
+            (version, revision)
+        })
     }
 
     pub(super) fn projected_current(&self) -> CurrentVersion {

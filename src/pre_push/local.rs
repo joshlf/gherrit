@@ -12,8 +12,53 @@ use std::{
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::ObjectId;
 
-use super::{autosquash, body::gherrit_pr_id_re, destination::DefaultBranch};
-use crate::util::{self, CommandExt as _};
+use super::{autosquash, destination::DefaultBranch};
+use crate::{
+    re,
+    util::{self, CommandExt as _},
+};
+
+const MAX_TITLE_SCALARS: usize = 256;
+const METADATA_PREFIX: &str = "<!-- gherrit-meta:";
+
+/// A nonempty title of at most 256 Unicode scalar values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PullRequestTitle(String);
+
+impl PullRequestTitle {
+    fn new(value: String) -> Result<Self> {
+        if value.is_empty() {
+            bail!("A pull request title must not be empty");
+        }
+        if value.chars().nth(MAX_TITLE_SCALARS).is_some() {
+            bail!(
+                "A pull request title must contain at most {MAX_TITLE_SCALARS} Unicode scalar values"
+            );
+        }
+        Ok(Self(value))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// User commit-body text which cannot claim GHerrit's reserved metadata.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct CommitBody(String);
+
+impl CommitBody {
+    fn new(value: String) -> Result<Self> {
+        if value.contains(METADATA_PREFIX) {
+            bail!("Commit body contains the reserved GHerrit metadata marker");
+        }
+        Ok(Self(value))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// A nonempty ASCII alphanumeric GHerrit pull request ID.
 ///
@@ -64,8 +109,8 @@ pub(super) struct LocalChange {
     id: GherritPrId,
     head: ObjectId,
     first_parent: ObjectId,
-    title: String,
-    body: String,
+    title: PullRequestTitle,
+    body: CommitBody,
 }
 
 impl LocalChange {
@@ -93,7 +138,11 @@ impl LocalChange {
             .next()
             .ok_or_else(|| eyre!("Commit {} has no first parent", commit.id))?
             .detach();
-        let body = strip_gherrit_id(body, id.as_str());
+        let title = PullRequestTitle::new(title)
+            .wrap_err_with(|| format!("Commit {} has an invalid pull request title", commit.id))?;
+        let body = validated_commit_body(body, id.as_str()).wrap_err_with(|| {
+            format!("Commit {} has an invalid pull request message body", commit.id)
+        })?;
 
         Ok(Self { id, head: commit.id, first_parent, title, body })
     }
@@ -111,11 +160,20 @@ impl LocalChange {
     }
 
     pub(super) fn title(&self) -> &str {
+        self.title.as_str()
+    }
+
+    #[allow(dead_code)] // Consumed by the pending owned-base planner.
+    pub(super) fn pull_request_title(&self) -> &PullRequestTitle {
         &self.title
     }
 
     pub(super) fn body(&self) -> &str {
-        &self.body
+        self.body.as_str()
+    }
+
+    pub(super) fn into_body_parts(self) -> (GherritPrId, PullRequestTitle, CommitBody) {
+        (self.id, self.title, self.body)
     }
 }
 
@@ -131,23 +189,37 @@ impl LocalStack {
         default_tip: ObjectId,
         changes: impl IntoIterator<Item = (GherritPrId, ObjectId)>,
     ) -> Self {
+        Self::for_test_with_content(
+            default_tip,
+            changes
+                .into_iter()
+                .map(|(id, head)| (id, head, "Test change".to_owned(), String::new())),
+        )
+        .expect("valid test stack")
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test_with_content(
+        default_tip: ObjectId,
+        changes: impl IntoIterator<Item = (GherritPrId, ObjectId, String, String)>,
+    ) -> Result<Self> {
         let mut first_parent = default_tip;
         let changes = changes
             .into_iter()
-            .map(|(id, head)| {
-                let change = LocalChange {
+            .map(|(id, head, title, body)| {
+                let change = Ok(LocalChange {
                     id,
                     head,
                     first_parent,
-                    title: String::new(),
-                    body: String::new(),
-                };
+                    title: PullRequestTitle::new(title)?,
+                    body: CommitBody::new(body)?,
+                });
                 first_parent = head;
                 change
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        Self::new(default_tip, "main", changes).expect("valid test stack")
+        Self::new(default_tip, "main", changes)
     }
 
     /// Reads and validates the local managed stack without performing network
@@ -236,6 +308,10 @@ impl LocalStack {
 
     pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = &LocalChange> {
         self.changes.iter()
+    }
+
+    pub(super) fn into_changes(self) -> Vec<LocalChange> {
+        self.changes
     }
 }
 
@@ -387,6 +463,14 @@ fn strip_gherrit_id(body: &str, id: &str) -> String {
     body
 }
 
+fn validated_commit_body(body: &str, id: &str) -> Result<CommitBody> {
+    CommitBody::new(strip_gherrit_id(body, id))
+}
+
+fn gherrit_pr_id_re() -> &'static regex::Regex {
+    re!(r"(?m)^gherrit-pr-id[=:][ \t]*([a-zA-Z0-9]+)[ \t]*\r?$")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,9 +484,15 @@ mod tests {
             id: GherritPrId::from_trailer(object_id(head), id.as_bytes()).unwrap(),
             head: object_id(head),
             first_parent: object_id(first_parent),
-            title: String::new(),
-            body: String::new(),
+            title: PullRequestTitle::new("Test change".to_owned()).unwrap(),
+            body: CommitBody::new(String::new()).unwrap(),
         }
+    }
+
+    #[test]
+    fn gherrit_id_trailers_require_a_nonempty_identifier() {
+        assert!(gherrit_pr_id_re().is_match("gherrit-pr-id: Gone"));
+        assert!(!gherrit_pr_id_re().is_match("gherrit-pr-id: "));
     }
 
     #[test]
@@ -417,6 +507,25 @@ mod tests {
         for id in [b"".as_slice(), b"with-dash", b"with space", "snowman-☃".as_bytes()] {
             assert!(GherritPrId::from_trailer(object_id(1), id).is_err(), "id={id:?}");
         }
+    }
+
+    #[test]
+    fn pull_request_titles_use_unicode_scalar_limits() {
+        assert!(PullRequestTitle::new(String::new()).is_err());
+        assert_eq!(PullRequestTitle::new("雪".to_owned()).unwrap().as_str(), "雪");
+
+        let ascii_256 = "x".repeat(256);
+        assert_eq!(PullRequestTitle::new(ascii_256.clone()).unwrap().as_str(), ascii_256);
+        assert!(PullRequestTitle::new("x".repeat(257)).is_err());
+
+        let multibyte_256 = "雪".repeat(256);
+        assert!(multibyte_256.len() > 256);
+        assert!(PullRequestTitle::new(multibyte_256).is_ok());
+
+        let combining_256 = "e\u{301}".repeat(128);
+        assert_eq!(combining_256.chars().count(), 256);
+        assert!(PullRequestTitle::new(combining_256).is_ok());
+        assert!(PullRequestTitle::new(format!("{}x", "e\u{301}".repeat(128))).is_err());
     }
 
     #[test]
@@ -497,5 +606,25 @@ mod tests {
             "Summary\n\ngherrit-pr-id: Gexample\n\nNotes\n\n\n"
         );
         assert_eq!(strip_gherrit_id(body, "Gmissing"), body);
+    }
+
+    #[test]
+    fn reserved_metadata_is_rejected_after_the_trailer_is_removed() {
+        let marker = "<!-- gherrit-meta:";
+        for body in [
+            format!("{marker} forged -->\n\ngherrit-pr-id: Greal\n"),
+            format!("user text {marker} forged --> tail\n\ngherrit-pr-id: Greal\n"),
+            format!("user text\n{marker}\n\ngherrit-pr-id: Greal\n"),
+        ] {
+            let error = validated_commit_body(&body, "Greal").unwrap_err();
+            assert!(error.to_string().contains("reserved GHerrit metadata marker"));
+        }
+
+        let body = validated_commit_body("user text\n\ngherrit-pr-id: Greal\n", "Greal")
+            .expect("the ordinary trailer is removed before validation");
+        assert!(!body.as_str().contains("gherrit-pr-id: Greal"));
+
+        let marker_free = "Keep ordinary markdown and <!-- unrelated comments -->.";
+        assert_eq!(CommitBody::new(marker_free.to_owned()).unwrap().as_str(), marker_free);
     }
 }
