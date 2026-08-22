@@ -199,8 +199,8 @@ impl PushDestination {
                     self.configured_remote()
                 )
             })?;
-        let mut records = git_output_records(&output.stdout);
-        if !output.status.success()
+        let mut records = git_output_records(output.stdout());
+        if !output.status().success()
             || records.next() != Some(self.resolved.literal.as_bytes())
             || records.next().is_some()
         {
