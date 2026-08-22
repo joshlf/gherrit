@@ -30,7 +30,7 @@ use github::{
     prepare_mutation_batches,
 };
 use local::{GherritPrId, LocalStack};
-use publication::{GitPublicationPlan, PlannedChanges, plan_git_publication};
+use publication::{GitPublicationPlan, PlannedChanges, PushOutcome, plan_git_publication};
 use reconcile::{
     CurrentPr, DesiredPr, PrUpdate, RetiredPullRequest, ensure_pull_request_ids_available,
     link_stack, plan_update,
@@ -159,20 +159,25 @@ fn push_to_origin<'stack>(
     publication: GitPublicationPlan<'stack>,
 ) -> Result<PlannedChanges<'stack>> {
     let (pushes, changes) = publication.into_parts();
-    for push in pushes {
-        let (options, refspecs) = push.into_arguments();
+    // Render and validate every request before the first push. A duplicate
+    // planned destination in a later batch must not be discovered after an
+    // earlier batch has already changed the remote.
+    let requests =
+        pushes.into_iter().map(publication::PushPlan::into_request).collect::<Result<Vec<_>>>()?;
+    for request in requests {
         log::info!("Pushing chunk to remote...");
-        let output =
-            destination.push(options, refspecs).output().wrap_err("Failed to run `git push`")?;
-
-        if !output.status.success() {
-            // Git can normalize a URL or local path before printing it, so
-            // destination-bearing command output does not cross this trust
-            // boundary. The exact branch and tag leases protect the observed
-            // publication state from concurrent modification.
+        let output = destination
+            .push(request.options(), request.refspecs())
+            .output()
+            .map_err(|error| {
+                eyre!(
+                    "Could not execute or acknowledge `git push` for GHerrit remote '{}'; remote refs may or may not have changed. Run GHerrit again to observe them before continuing: {error}",
+                    destination.configured_remote()
+                )
+            })?;
+        if request.outcome(&output.status, &output.stdout) == PushOutcome::Indeterminate {
             bail!(
-                "`git push` failed for GHerrit remote '{}'. Its push \
-                 destination might be ahead or have changed.",
+                "Could not acknowledge `git push` for GHerrit remote '{}'; remote refs may or may not have changed. Run GHerrit again to observe them before continuing.",
                 destination.configured_remote()
             );
         }

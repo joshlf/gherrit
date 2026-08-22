@@ -4,6 +4,11 @@
 //! are deliberately not inputs: a fresh clone must derive the same next
 //! version as the repository which originally published the change.
 
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    process::ExitStatus,
+};
+
 use color_eyre::eyre::{Result, bail, eyre};
 use gix::ObjectId;
 
@@ -13,7 +18,15 @@ use super::{
     version::Version,
 };
 
-const FIXED_PUSH_OPTIONS: [&str; 3] = ["--quiet", "--no-verify", "--atomic"];
+const FIXED_PUSH_OPTIONS: [&str; 7] = [
+    "--porcelain",
+    "--atomic",
+    "--no-verify",
+    "--no-follow-tags",
+    "--recurse-submodules=no",
+    "--no-signed",
+    "--no-force-if-includes",
+];
 // Windows command lines are limited to roughly 32 KiB. All variable push
 // arguments are ASCII, so their byte lengths equal their UTF-16 code-unit
 // lengths before the platform's quoting. Limiting those arguments to 16 KiB,
@@ -114,17 +127,189 @@ impl PushPlan {
         (options, refspecs)
     }
 
-    pub(super) fn into_arguments(self) -> (Vec<String>, Vec<String>) {
+    pub(super) fn into_request(self) -> Result<PushRequest> {
         let tuple_count = 1 + self.rest.len();
         let mut options = FIXED_PUSH_OPTIONS.map(str::to_owned).to_vec();
         let mut refspecs = Vec::with_capacity(tuple_count * 2);
+        let mut expected_receipts = Vec::with_capacity(tuple_count * 2);
         options.reserve(tuple_count * 2);
         for tuple in std::iter::once(self.first).chain(self.rest) {
             options.extend(tuple.arguments.options);
             refspecs.extend(tuple.arguments.refspecs);
+            expected_receipts.extend(tuple.arguments.expected_receipts);
         }
-        (options, refspecs)
+        Ok(PushRequest { options, refspecs, expected: ExpectedReceipts::new(expected_receipts)? })
     }
+
+    #[cfg(test)]
+    fn into_arguments(self) -> (Vec<String>, Vec<String>) {
+        let request = self.into_request().expect("a planned request has unique destinations");
+        (request.options, request.refspecs)
+    }
+}
+
+/// The immutable boundary between publication planning and a `git push`
+/// invocation. Receipt expectations are rendered while the plan is built,
+/// rather than reconstructed from later mutable state or process output.
+#[derive(Debug)]
+pub(super) struct PushRequest {
+    options: Vec<String>,
+    refspecs: Vec<String>,
+    expected: ExpectedReceipts,
+}
+
+impl PushRequest {
+    pub(super) fn options(&self) -> impl Iterator<Item = String> + '_ {
+        self.options.iter().cloned()
+    }
+
+    pub(super) fn refspecs(&self) -> impl Iterator<Item = String> + '_ {
+        self.refspecs.iter().cloned()
+    }
+
+    pub(super) fn outcome(&self, status: &ExitStatus, stdout: &[u8]) -> PushOutcome {
+        if status.code() == Some(0) {
+            classify_push_receipts(&self.expected, stdout)
+        } else {
+            PushOutcome::Indeterminate
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ExpectedReceipts {
+    refs: BTreeMap<String, ExpectedRefReceipt>,
+}
+
+impl ExpectedReceipts {
+    fn new(receipts: impl IntoIterator<Item = (String, ExpectedRefReceipt)>) -> Result<Self> {
+        let mut refs = BTreeMap::new();
+        for (destination, receipt) in receipts {
+            if refs.insert(destination.clone(), receipt).is_some() {
+                bail!("Git publication plans destination '{destination}' more than once");
+            }
+        }
+        Ok(Self { refs })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpectedRefReceipt {
+    source: String,
+    transition: ExpectedRefTransition,
+}
+
+impl ExpectedRefReceipt {
+    fn new(source: String, transition: ExpectedRefTransition) -> Self {
+        Self { source, transition }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpectedRefTransition {
+    CreateOrAlreadyDesired,
+    UpdateOrAlreadyDesired,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum PushOutcome {
+    AcknowledgedSuccess,
+    Indeterminate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiptStatus {
+    FastForward,
+    Forced,
+    New,
+    AlreadyDesired,
+    Failed,
+}
+
+impl ReceiptStatus {
+    fn satisfies(self, expected: ExpectedRefTransition) -> bool {
+        matches!(
+            (expected, self),
+            (ExpectedRefTransition::CreateOrAlreadyDesired, Self::New | Self::AlreadyDesired)
+                | (
+                    ExpectedRefTransition::UpdateOrAlreadyDesired,
+                    Self::FastForward | Self::Forced | Self::AlreadyDesired
+                )
+        )
+    }
+}
+
+/// Classifies `git push --porcelain` standard output without allowing its
+/// human-readable destination header to escape into a diagnostic.
+fn classify_push_receipts(expected: &ExpectedReceipts, stdout: &[u8]) -> PushOutcome {
+    let Some(receipts) = parse_push_receipts(expected, stdout) else {
+        return PushOutcome::Indeterminate;
+    };
+    if receipts.iter().all(|(expected, status)| status.satisfies(*expected)) {
+        PushOutcome::AcknowledgedSuccess
+    } else {
+        PushOutcome::Indeterminate
+    }
+}
+
+fn parse_push_receipts(
+    expected: &ExpectedReceipts,
+    stdout: &[u8],
+) -> Option<Vec<(ExpectedRefTransition, ReceiptStatus)>> {
+    let output = std::str::from_utf8(stdout).ok()?;
+    let (output, line_ending) = output
+        .strip_suffix("\r\n")
+        .map(|output| (output, "\r\n"))
+        .or_else(|| output.strip_suffix('\n').map(|output| (output, "\n")))?;
+    let lines = output.split(line_ending).collect::<Vec<_>>();
+    let (header, body) = lines.split_first()?;
+    let (footer, status_lines) = body.split_last()?;
+    let displayed_destination = header.strip_prefix("To ")?;
+    if displayed_destination.is_empty()
+        || displayed_destination.chars().any(char::is_control)
+        || *footer != "Done"
+    {
+        return None;
+    }
+
+    let mut receipts = Vec::with_capacity(expected.refs.len());
+    let mut seen = BTreeSet::new();
+    for line in status_lines {
+        if line.is_empty() {
+            return None;
+        }
+        let mut fields = line.split('\t');
+        let flag = fields.next()?;
+        let refs = fields.next()?;
+        let summary = fields.next()?;
+        if fields.next().is_some() {
+            return None;
+        }
+        let status = match flag.as_bytes() {
+            [b' '] => ReceiptStatus::FastForward,
+            [b'+'] => ReceiptStatus::Forced,
+            [b'*'] => ReceiptStatus::New,
+            [b'='] => ReceiptStatus::AlreadyDesired,
+            [b'!'] => ReceiptStatus::Failed,
+            _ => return None,
+        };
+        let (source, destination) = refs.split_once(':')?;
+        let expected_ref = expected.refs.get(destination)?;
+        if source.is_empty()
+            || destination.is_empty()
+            || summary.is_empty()
+            || !destination.starts_with("refs/")
+            || [source, destination, summary]
+                .into_iter()
+                .any(|field| field.chars().any(char::is_control))
+            || source != expected_ref.source
+            || !seen.insert(destination)
+        {
+            return None;
+        }
+        receipts.push((expected_ref.transition, status));
+    }
+    (seen.len() == expected.refs.len()).then_some(receipts)
 }
 
 /// Every Git publication decision and ready push batch for one local stack.
@@ -319,6 +504,7 @@ fn normalize_remote_publication(
 struct PushTupleArguments {
     options: [String; 2],
     refspecs: [String; 2],
+    expected_receipts: [(String, ExpectedRefReceipt); 2],
 }
 
 /// One exact rendered change tuple which has passed the variable-argument
@@ -357,7 +543,22 @@ impl PushTupleArguments {
         ];
         let desired_head = target.desired_head();
         let refspecs = [format!("{desired_head}:{branch}"), format!("{desired_head}:{tag}")];
-        Self { options, refspecs }
+        let branch_transition = if target.expected_head().is_some() {
+            ExpectedRefTransition::UpdateOrAlreadyDesired
+        } else {
+            ExpectedRefTransition::CreateOrAlreadyDesired
+        };
+        let expected_receipts = [
+            (branch, ExpectedRefReceipt::new(desired_head.to_string(), branch_transition)),
+            (
+                tag,
+                ExpectedRefReceipt::new(
+                    desired_head.to_string(),
+                    ExpectedRefTransition::CreateOrAlreadyDesired,
+                ),
+            ),
+        ];
+        Self { options, refspecs, expected_receipts }
     }
 
     fn encoded_argv_bytes(&self) -> usize {
@@ -383,6 +584,12 @@ fn plan_push_batches_with_budget<'a>(
         .enumerate()
         .map(|(index, target)| BudgetedPushTuple::new(index, target, budget))
         .collect::<Result<Vec<_>>>()?;
+    // Validate destinations across the complete plan before constructing its
+    // first executable batch. A repeated destination in different batches is
+    // just as invalid as a repeat within one atomic push.
+    ExpectedReceipts::new(
+        tuples.iter().flat_map(|tuple| tuple.arguments.expected_receipts.iter().cloned()),
+    )?;
 
     let mut batches = Vec::new();
     let mut current = None::<PushPlan>;
@@ -709,9 +916,13 @@ mod tests {
         assert_eq!(
             options,
             [
-                "--quiet".to_string(),
-                "--no-verify".to_string(),
+                "--porcelain".to_string(),
                 "--atomic".to_string(),
+                "--no-verify".to_string(),
+                "--no-follow-tags".to_string(),
+                "--recurse-submodules=no".to_string(),
+                "--no-signed".to_string(),
+                "--no-force-if-includes".to_string(),
                 format!("--force-with-lease=refs/heads/Gone:{}", object_id(0x33)),
                 "--force-with-lease=refs/tags/gherrit/Gone/v2:".to_string(),
                 "--force-with-lease=refs/heads/Gtwo:".to_string(),
@@ -727,5 +938,120 @@ mod tests {
                 format!("{}:refs/tags/gherrit/Gtwo/v1", object_id(0x22)),
             ]
         );
+    }
+
+    fn expected_receipts(receipts: &[(&str, ExpectedRefTransition)]) -> ExpectedReceipts {
+        ExpectedReceipts::new(receipts.iter().map(|(destination, transition)| {
+            ((*destination).to_owned(), ExpectedRefReceipt::new("object".to_owned(), *transition))
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn push_receipts_accept_every_reachable_success_flag_and_line_ending() {
+        let expected = expected_receipts(&[
+            ("refs/heads/fast-forward", ExpectedRefTransition::UpdateOrAlreadyDesired),
+            ("refs/heads/forced", ExpectedRefTransition::UpdateOrAlreadyDesired),
+            ("refs/heads/new", ExpectedRefTransition::CreateOrAlreadyDesired),
+            ("refs/heads/unchanged", ExpectedRefTransition::CreateOrAlreadyDesired),
+        ]);
+        let success = concat!(
+            "To private destination\n",
+            "=\tobject:refs/heads/unchanged\t[up to date]\n",
+            "*\tobject:refs/heads/new\t[new branch]\n",
+            " \tobject:refs/heads/fast-forward\told..new\n",
+            "+\tobject:refs/heads/forced\told...new (forced update)\n",
+            "Done\n",
+        );
+        for output in [success.to_owned(), success.replace('\n', "\r\n")] {
+            assert_eq!(
+                classify_push_receipts(&expected, output.as_bytes()),
+                PushOutcome::AcknowledgedSuccess
+            );
+        }
+    }
+
+    #[test]
+    fn push_receipts_enforce_transition_source_and_remote_failure() {
+        for (transition, accepted) in [
+            (ExpectedRefTransition::CreateOrAlreadyDesired, ["*", "="]),
+            (ExpectedRefTransition::UpdateOrAlreadyDesired, [" ", "+"]),
+        ] {
+            let expected = expected_receipts(&[("refs/heads/Gone", transition)]);
+            for flag in [" ", "+", "*", "=", "!"] {
+                for source in ["object", "wrong-object"] {
+                    let receipt =
+                        format!("To private\n{flag}\t{source}:refs/heads/Gone\tstatus\nDone\n");
+                    let outcome = if source == "object" && (accepted.contains(&flag) || flag == "=")
+                    {
+                        PushOutcome::AcknowledgedSuccess
+                    } else {
+                        PushOutcome::Indeterminate
+                    };
+                    assert_eq!(classify_push_receipts(&expected, receipt.as_bytes()), outcome);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn push_receipts_reject_bad_framing_records_and_coverage() {
+        let expected = expected_receipts(&[
+            ("refs/heads/Gone", ExpectedRefTransition::CreateOrAlreadyDesired),
+            ("refs/tags/gherrit/Gone/v1", ExpectedRefTransition::CreateOrAlreadyDesired),
+        ]);
+        for output in [
+            "",
+            "To private\n*\tobject:refs/heads/Gone\t[new branch]\nDone",
+            "To \n*\tobject:refs/heads/Gone\t[new branch]\nDone\n",
+            "To private\n*\tobject:refs/heads/Gone\t[new branch]\nComplete\n",
+            "To private\n*\tobject:refs/heads/Gone\t[new branch]\nDone\n\n",
+            "To private\r\n*\tobject:refs/heads/Gone\t[new branch]\nDone\r\n",
+            "To private\n*\tobject:refs/heads/Gone\t[new branch]\n=\tobject:refs/heads/Gone\t[up to date]\nDone\n",
+            "To private\n*\tobject:refs/heads/Gone\t[new branch]\n*\tobject:refs/tags/gherrit/Gone/v2\t[new tag]\nDone\n",
+            "To private\n* object:refs/heads/Gone [new branch]\nDone\n",
+            "To private\n?\tobject:refs/heads/Gone\tstatus\nDone\n",
+        ] {
+            assert_eq!(
+                classify_push_receipts(&expected, output.as_bytes()),
+                PushOutcome::Indeterminate
+            );
+        }
+        assert_eq!(
+            classify_push_receipts(&expected, b"To private\n\xff\nDone\n"),
+            PushOutcome::Indeterminate
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_zero_exit_status_can_acknowledge_on_unix() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let target = push_target("Gone", object_id(2), Version::FIRST, None);
+        let request = plan_push_batches([&target]).unwrap().pop().unwrap().into_request().unwrap();
+        let receipt = format!(
+            "To private\n*\t{}:refs/heads/Gone\t[new branch]\n*\t{}:refs/tags/gherrit/Gone/v1\t[new tag]\nDone\n",
+            object_id(2),
+            object_id(2)
+        );
+        assert_eq!(
+            request.outcome(&std::process::ExitStatus::from_raw(0), receipt.as_bytes()),
+            PushOutcome::AcknowledgedSuccess
+        );
+        assert_eq!(
+            request.outcome(&std::process::ExitStatus::from_raw(1 << 8), receipt.as_bytes()),
+            PushOutcome::Indeterminate
+        );
+        assert_eq!(
+            request.outcome(&std::process::ExitStatus::from_raw(9), receipt.as_bytes()),
+            PushOutcome::Indeterminate
+        );
+    }
+
+    #[test]
+    fn duplicate_planned_destinations_are_rejected_before_batching() {
+        let target = push_target("Gone", object_id(2), Version::FIRST, None);
+        let error = plan_push_batches([&target, &target]).unwrap_err();
+        assert!(error.to_string().contains("refs/heads/Gone"));
     }
 }

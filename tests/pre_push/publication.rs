@@ -304,7 +304,7 @@ fn test_replacement_ref_is_ignored_even_with_gix_075_false_polarity() {
     assert_eq!(pull_requests.len(), 1);
     assert_eq!(pull_requests[0].title.as_deref(), Some("Literal commit"));
     assert_eq!(
-        &ctx.recorded_pushes()[0].arguments()[..7],
+        &ctx.recorded_pushes()[0].arguments()[..9],
         [
             "git",
             "--no-replace-objects",
@@ -312,6 +312,8 @@ fn test_replacement_ref_is_ignored_even_with_gix_075_false_polarity() {
             "--config-env=remote.gherrit-publication.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
             "-c",
             "http.followRedirects=false",
+            "-c",
+            "push.pushOption=",
             "push",
         ]
     );
@@ -662,7 +664,7 @@ fn concurrent_head_change_fails_the_atomic_branch_and_tag_leases() {
     ctx.hook_cmd("pre-push")
         .assert()
         .failure()
-        .stderr(predicates::str::contains("might be ahead or have changed"));
+        .stderr(predicates::str::contains("Could not acknowledge `git push`"));
 
     let pushes = ctx.recorded_pushes();
     assert_eq!(pushes.len(), 2);
@@ -710,7 +712,7 @@ fn concurrent_tag_creation_fails_the_atomic_branch_and_tag_leases() {
     ctx.hook_cmd("pre-push")
         .assert()
         .failure()
-        .stderr(predicates::str::contains("might be ahead or have changed"));
+        .stderr(predicates::str::contains("Could not acknowledge `git push`"));
 
     let pushes = ctx.recorded_pushes();
     assert_eq!(pushes.len(), 2);
@@ -731,6 +733,111 @@ fn concurrent_tag_creation_fails_the_atomic_branch_and_tag_leases() {
             .flatten()
             .all(|operation| *operation == testutil::GraphQlOperation::Query)
     );
+}
+
+fn assert_lost_push_receipt_stops_before_github_mutation(replacement: &'static str) {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("lost-push-receipt");
+    let id = ctx.commit_with_gherrit_id("Publish despite a lost receipt");
+    let head = ctx.head_oid();
+    ctx.replace_push_stdout_after_passthrough(replacement);
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Could not acknowledge `git push`"));
+
+    ctx.assert_failure_consumed();
+    assert_eq!(ctx.remote_ref_oid(&format!("refs/heads/{id}")).as_deref(), Some(head.as_str()));
+    assert_eq!(
+        ctx.remote_ref_oid(&format!("refs/tags/gherrit/{id}/v1")).as_deref(),
+        Some(head.as_str())
+    );
+    assert!(ctx.github().pull_requests().is_empty());
+    assert!(
+        ctx.github()
+            .requests()
+            .iter()
+            .flatten()
+            .all(|operation| { *operation == testutil::GraphQlOperation::Query })
+    );
+
+    ctx.hook_cmd("pre-push").assert().success();
+    assert_eq!(ctx.recorded_pushes().len(), 1, "retry must observe instead of replaying");
+    assert_eq!(ctx.github().pull_requests().len(), 1);
+}
+
+#[test]
+fn a_successful_push_with_a_dropped_receipt_is_indeterminate() {
+    assert_lost_push_receipt_stops_before_github_mutation("");
+}
+
+#[test]
+fn a_successful_push_with_a_malformed_receipt_is_indeterminate() {
+    assert_lost_push_receipt_stops_before_github_mutation("To \nDone\n");
+}
+
+#[test]
+fn a_complete_crlf_receipt_acknowledges_a_real_push() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("crlf-push-receipt");
+    ctx.run_git(&[
+        "commit",
+        "--allow-empty",
+        "--no-verify",
+        "-m",
+        "Accept CRLF receipts\n\ngherrit-pr-id: Gcrlf",
+    ]);
+    let head = ctx.head_oid();
+    ctx.convert_push_stdout_to_crlf_after_passthrough();
+
+    ctx.hook_cmd("pre-push").assert().success();
+    ctx.assert_failure_consumed();
+    assert_eq!(ctx.remote_ref_oid("refs/heads/Gcrlf").as_deref(), Some(head.as_str()));
+    assert_eq!(ctx.remote_ref_oid("refs/tags/gherrit/Gcrlf/v1").as_deref(), Some(head.as_str()));
+    assert_eq!(ctx.github().pull_requests().len(), 1);
+}
+
+#[test]
+fn command_scoped_empty_push_option_sends_no_inherited_push_options() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.remote_git_cmd()
+        .args(["config", "receive.advertisePushOptions", "true"])
+        .assert()
+        .success();
+    let hook = ctx.remote_path().join("hooks/pre-receive");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"${GIT_PUSH_OPTION_COUNT-unset}\" >push-option-count\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hook, permissions).unwrap();
+    }
+    ctx.set_config("push.pushOption", Some("untrusted"));
+    ctx.checkout_managed_private("clear-push-option");
+    ctx.commit_with_gherrit_id("Do not inherit a push option");
+    ctx.hook_cmd("pre-push").assert().success();
+    assert_eq!(fs::read_to_string(ctx.remote_path().join("push-option-count")).unwrap(), "0\n");
 }
 
 #[test]

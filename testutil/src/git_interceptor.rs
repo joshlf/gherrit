@@ -118,6 +118,13 @@ struct GitResponse {
     exit_code: i32,
     passthrough: bool,
     report_exit_status: bool,
+    push_stdout: Option<PushStdout>,
+}
+
+#[derive(Serialize)]
+enum PushStdout {
+    Replace(String),
+    CrLf,
 }
 
 #[derive(Deserialize)]
@@ -146,6 +153,7 @@ impl GitOperation {
         match subcommand {
             "var" => Some(Self::Var),
             "interpret-trailers" => Some(Self::InterpretTrailers),
+            "push" => Some(Self::Push),
             _ => None,
         }
     }
@@ -184,6 +192,7 @@ impl GitOperation {
             | Self::LsRemoteHeads
             | Self::LsRemoteActiveVersions
             | Self::LsRemoteOther => "ls-remote",
+            Self::Push => "push",
         }
     }
 }
@@ -280,6 +289,9 @@ fn check_and_apply_failure(
     let matches = match mock_state.faults.front()? {
         FailureKind::Git(expected) => *expected == operation,
         FailureKind::GitOutput { operation: expected, .. } => *expected == operation,
+        FailureKind::GitPushOutput { .. } | FailureKind::GitPushOutputCrLf => {
+            operation == GitOperation::Push
+        }
         _ => false,
     };
     if !matches {
@@ -326,14 +338,18 @@ async fn handle_git(
     let subcommand = subcommand(&request.args);
     let is_push = subcommand == Some("push");
 
+    let is_production =
+        request.args.get(1).is_some_and(|argument| argument == "--no-replace-objects");
     let operation = GitOperation::from_args(&request.args);
-    if let Some(operation) = operation {
-        handler.shared.write().unwrap().git.record_invocation(operation, request.args.clone());
+    if is_production {
+        if let Some(operation) = operation {
+            handler.shared.write().unwrap().git.record_invocation(operation, request.args.clone());
+        }
     }
     let failure = operation.and_then(|operation| {
         check_and_apply_failure(&mut handler.shared.write().unwrap(), operation)
     });
-    match failure {
+    let push_stdout = match failure {
         Some(FailureKind::Git(operation)) => {
             return Json(GitResponse {
                 stdout: String::new(),
@@ -341,6 +357,7 @@ async fn handle_git(
                 exit_code: 1,
                 passthrough: false,
                 report_exit_status: false,
+                push_stdout: None,
             });
         }
         Some(FailureKind::GitOutput { stdout, .. }) => {
@@ -350,11 +367,14 @@ async fn handle_git(
                 exit_code: 0,
                 passthrough: false,
                 report_exit_status: false,
+                push_stdout: None,
             });
         }
+        Some(FailureKind::GitPushOutput { stdout }) => Some(PushStdout::Replace(stdout.to_owned())),
+        Some(FailureKind::GitPushOutputCrLf) => Some(PushStdout::CrLf),
         Some(_) => unreachable!("only Git failures are matched by the Git interceptor"),
-        None => {}
-    }
+        None => None,
+    };
 
     if operation == Some(GitOperation::LsRemoteActiveVersions) {
         apply_remote_ref_transaction(
@@ -376,6 +396,7 @@ async fn handle_git(
             exit_code: 0,
             passthrough: true,
             report_exit_status: true,
+            push_stdout,
         });
     }
 
@@ -385,6 +406,7 @@ async fn handle_git(
         exit_code: 0,
         passthrough: true,
         report_exit_status: false,
+        push_stdout: None,
     })
 }
 
@@ -488,7 +510,7 @@ mod tests {
             ("var", Some(GitOperation::Var)),
             ("interpret-trailers", Some(GitOperation::InterpretTrailers)),
             ("ls-remote", None),
-            ("push", None),
+            ("push", Some(GitOperation::Push)),
             ("status", None),
         ] {
             assert_eq!(GitOperation::from_subcommand(subcommand), expected);
