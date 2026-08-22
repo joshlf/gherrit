@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    time::Duration,
+};
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
 use gix::reference::Category;
@@ -8,7 +11,6 @@ use owo_colors::OwoColorize;
 use crate::util::{self, HeadState};
 
 mod autosquash;
-mod batching;
 mod body;
 mod destination;
 mod github;
@@ -18,23 +20,20 @@ mod reconcile;
 mod remote;
 mod version;
 
-use batching::{
-    BatchPlan, INITIAL_QUERY_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
-    classify_response, query_exceeds_limit,
-};
 use body::PrBody;
 use destination::{DefaultBranch, PushDestination};
 use github::{
-    CreatePullRequest, CreatedPullRequest, FindPullRequest, MutationOperation,
-    PullRequest as PrState, QueryOperation, Repository as GithubRepository, UpdatePullRequest,
-    decode_mutation_batch_response, decode_query_batch_response, prepare_mutation_batches,
-    query_batch_document,
+    CreatePullRequest, CreatedPullRequest, FirstOpenPullRequests, FirstOpenPullRequestsPage,
+    MutationOperation, NextOpenPullRequests, OpenPullRequest as PrState,
+    Repository as GithubRepository, TerminalPullRequestQuery, TerminalPullRequestState,
+    TerminalPullRequests, UpdatePullRequest, decode_mutation_batch_response,
+    prepare_mutation_batches,
 };
 use local::LocalStack;
 use publication::{GitPublicationPlan, PlannedChanges, plan_git_publication};
 use reconcile::{
-    CurrentPr, DesiredPr, PrUpdate, PullRequestState, ensure_pull_requests_open, link_stack,
-    plan_update,
+    CurrentPr, DesiredPr, PrUpdate, RetiredPullRequest, ensure_pull_request_ids_available,
+    link_stack, plan_update,
 };
 use remote::{observe_active_version_tags, observe_remote_heads};
 
@@ -134,8 +133,6 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     let GithubRepository { node_id: repository_id, default_branch: github_default_branch } =
         github_repository;
     let default_branch = DefaultBranch::agree(git_default_branch, github_default_branch)?;
-    ensure_pull_requests_open(prs.iter().map(|pr| (pr.number, pr.state)))?;
-
     let planned_changes = push_to_origin(&destination, publication)?;
     let public_branch = public_branch(repo, branch_name);
     let pr_repository = PrRepository {
@@ -199,30 +196,43 @@ async fn sync_prs(
     repository: PrRepository<'_>,
     public_branch: Option<&str>,
     planned_changes: PlannedChanges<'_>,
-    prs: Vec<PrState>,
+    prs: Vec<Option<PrState>>,
 ) -> Result<()> {
     let commits = link_stack(repository.default_branch, planned_changes, |change| {
         change.change().id().as_str().to_owned()
     });
+    if commits.len() != prs.len() {
+        bail!("GitHub observation no longer aligns with the planned local stack");
+    }
 
     enum PrResolution {
         Existing(PrState),
         ToCreate(BatchCreate),
     }
 
+    struct PrProjectionState {
+        number: u64,
+        node_id: String,
+        title: String,
+        body: String,
+        base_branch: String,
+    }
+
     // 1. Identify existing PRs or queue for creation
     let resolutions: Vec<_> = commits
         .iter()
-        .map(|entry| {
+        .zip(prs)
+        .map(|(entry, pr)| {
             let c = entry.item.change();
 
-            if let Some(pr) = prs.iter().find(|pr| pr.head_branch == c.id().as_str()) {
+            if let Some(pr) = pr {
+                debug_assert_eq!(pr.head_branch, c.id().as_str());
                 log::debug!(
                     "Found existing PR #{} for {}",
                     pr.number.green().bold(),
                     c.id().as_str()
                 );
-                PrResolution::Existing(pr.clone())
+                PrResolution::Existing(pr)
             } else {
                 log::debug!("No GitHub PR exists for {}; queuing creation...", c.id().as_str());
                 PrResolution::ToCreate(BatchCreate {
@@ -264,7 +274,13 @@ async fn sync_prs(
         .zip(resolutions)
         .map(|(entry, resolution)| {
             let pr_state = match resolution {
-                PrResolution::Existing(state) => state,
+                PrResolution::Existing(state) => PrProjectionState {
+                    number: state.number,
+                    node_id: state.node_id,
+                    title: state.title,
+                    body: state.body,
+                    base_branch: state.base_branch,
+                },
                 PrResolution::ToCreate(create) => {
                     let created = new_prs.get(&create.head_branch).ok_or_else(|| {
                         eyre::eyre!("Failed to resolve created PR for {}", create.head_branch)
@@ -274,16 +290,12 @@ async fn sync_prs(
                         created.number.green().bold(),
                         repository.destination.pr_url(created.number).blue().underline()
                     );
-                    PrState {
+                    PrProjectionState {
                         number: created.number,
                         node_id: created.node_id.clone(),
-                        title: Some(create.title),
-                        body: Some(create.body),
+                        title: create.title,
+                        body: create.body,
                         base_branch: create.base_branch,
-                        head_branch: create.head_branch,
-                        // NOTE: We assume that newly-created PRs are in the
-                        // OPEN state.
-                        state: PullRequestState::Open,
                     }
                 }
             };
@@ -321,8 +333,8 @@ async fn sync_prs(
             let update = plan_update(
                 CurrentPr {
                     node_id: &pr_state.node_id,
-                    title: pr_state.title.as_deref(),
-                    body: pr_state.body.as_deref(),
+                    title: &pr_state.title,
+                    body: &pr_state.body,
                     base_branch: &pr_state.base_branch,
                 },
                 DesiredPr { title: c.title(), body: &body, base_branch: &entry.base_branch },
@@ -419,30 +431,290 @@ async fn batch_fetch_prs(
     octocrab: &Octocrab,
     destination: &PushDestination,
     head_refs: &[String],
-) -> Result<(GithubRepository, Vec<PrState>)> {
+) -> Result<(GithubRepository, Vec<Option<PrState>>)> {
     let owner = destination.owner();
     let repo_name = destination.repository();
-    let queries = head_refs.iter().cloned().enumerate().map(|(index, head_ref)| {
-        if index == 0 {
-            FindPullRequest::with_repository(owner.to_owned(), repo_name.to_owned(), head_ref)
-        } else {
-            FindPullRequest::new(owner.to_owned(), repo_name.to_owned(), head_ref)
-        }
-    });
+    let (repository, pull_requests) =
+        observe_open_pull_requests(octocrab, owner, repo_name).await?;
+    let local_ids = head_refs.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut candidates = HashMap::<String, Vec<PrState>>::new();
 
-    let mut repository = None;
-    let mut pull_requests = Vec::new();
-    run_batched_queries(octocrab, queries).await?.into_iter().try_for_each(|lookup| {
-        if let Some(observed) = lookup.repository
-            && repository.replace(observed).is_some()
-        {
-            bail!("GitHub returned repository identity more than once");
+    for pull_request in pull_requests.into_iter().filter(|pr| !pr.is_cross_repository) {
+        if local_ids.contains(pull_request.head_branch.as_str()) {
+            candidates.entry(pull_request.head_branch.clone()).or_default().push(pull_request);
         }
-        pull_requests.extend(lookup.pull_request);
-        Ok(())
-    })?;
-    let repository = repository.ok_or_else(|| eyre!("GitHub omitted the repository identity"))?;
-    Ok((repository, pull_requests))
+    }
+
+    let mut selected = Vec::with_capacity(head_refs.len());
+    let mut missing = Vec::new();
+    for head_ref in head_refs {
+        match candidates.remove(head_ref) {
+            None => {
+                missing.push(head_ref.clone());
+                selected.push(None);
+            }
+            Some(mut candidates) if candidates.len() == 1 => {
+                selected.push(Some(candidates.pop().expect("one candidate is present")));
+            }
+            Some(candidates) => {
+                let mut numbers = candidates.iter().map(|pr| pr.number).collect::<Vec<_>>();
+                numbers.sort_unstable();
+                let numbers = numbers
+                    .into_iter()
+                    .map(|number| format!("#{number}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "Found multiple open pull requests for GHerrit ID '{head_ref}': {numbers}. GHerrit cannot safely choose one."
+                );
+            }
+        }
+    }
+
+    let retired = observe_terminal_pull_requests(octocrab, owner, repo_name, missing).await?;
+    ensure_pull_request_ids_available(retired)?;
+    Ok((repository, selected))
+}
+
+/// Observes every page in GitHub's repository-wide open PR connection.
+///
+/// The compatibility selection in `batch_fetch_prs` deliberately knows only
+/// legacy head names. This observation remains neutral about the owned-base
+/// representation which will replace that selection.
+async fn observe_open_pull_requests(
+    octocrab: &Octocrab,
+    owner: &str,
+    repository: &str,
+) -> Result<(GithubRepository, Vec<PrState>)> {
+    let mut page_len = 100;
+    let first_page = loop {
+        let operation =
+            FirstOpenPullRequests::new(owner.to_owned(), repository.to_owned(), page_len);
+        let Some(response) = run_graphql_observation_query(octocrab, &operation.document()).await?
+        else {
+            if page_len == 1 {
+                bail!("The repository-wide open pull request query exceeds GitHub resource limits");
+            }
+            let retry_page_len = page_len / 2;
+            log::warn!(
+                "Backing off the repository-wide open pull request page size from {page_len} to {retry_page_len}."
+            );
+            page_len = retry_page_len;
+            continue;
+        };
+        break operation.decode(response)?;
+    };
+    let FirstOpenPullRequestsPage {
+        repository: observed_repository,
+        pull_requests: first_pull_requests,
+        next_cursor,
+    } = first_page;
+    let mut seen_cursors = next_cursor.iter().cloned().collect::<HashSet<_>>();
+    let mut numbers = HashSet::new();
+    let mut node_ids = HashSet::new();
+    let mut pull_requests = Vec::new();
+    record_open_pull_requests(
+        first_pull_requests,
+        &mut numbers,
+        &mut node_ids,
+        &mut pull_requests,
+    )?;
+
+    let mut cursor = next_cursor;
+    while let Some(current_cursor) = cursor {
+        let operation = NextOpenPullRequests::new(
+            owner.to_owned(),
+            repository.to_owned(),
+            current_cursor.clone(),
+            page_len,
+        );
+        let Some(response) = run_graphql_observation_query(octocrab, &operation.document()).await?
+        else {
+            if page_len == 1 {
+                bail!("The repository-wide open pull request query exceeds GitHub resource limits");
+            }
+            let retry_page_len = page_len / 2;
+            log::warn!(
+                "Backing off the repository-wide open pull request page size from {page_len} to {retry_page_len}."
+            );
+            page_len = retry_page_len;
+            cursor = Some(current_cursor);
+            continue;
+        };
+        let page = operation.decode(response)?;
+        record_open_pull_requests(
+            page.pull_requests,
+            &mut numbers,
+            &mut node_ids,
+            &mut pull_requests,
+        )?;
+        if let Some(next_cursor) = &page.next_cursor
+            && !seen_cursors.insert(next_cursor.clone())
+        {
+            bail!("GitHub repeated an open pull request pagination cursor");
+        }
+        cursor = page.next_cursor;
+    }
+
+    Ok((observed_repository, pull_requests))
+}
+
+fn record_open_pull_requests(
+    page_pull_requests: Vec<PrState>,
+    numbers: &mut HashSet<u64>,
+    node_ids: &mut HashSet<String>,
+    pull_requests: &mut Vec<PrState>,
+) -> Result<()> {
+    for pull_request in page_pull_requests {
+        if !pull_request.is_cross_repository {
+            if !numbers.insert(pull_request.number) {
+                bail!(
+                    "GitHub returned duplicate same-repository open pull request number {}",
+                    pull_request.number
+                );
+            }
+            if !node_ids.insert(pull_request.node_id.clone()) {
+                bail!(
+                    "GitHub returned duplicate same-repository open pull request node ID '{}'",
+                    pull_request.node_id
+                );
+            }
+        }
+        pull_requests.push(pull_request);
+    }
+    Ok(())
+}
+
+/// Returns terminal lifecycle evidence for local IDs absent from the open scan.
+async fn observe_terminal_pull_requests(
+    octocrab: &Octocrab,
+    owner: &str,
+    repository: &str,
+    ids: Vec<String>,
+) -> Result<Vec<RetiredPullRequest>> {
+    #[derive(Debug)]
+    struct Pending {
+        id: String,
+        cursor: Option<String>,
+        seen_cursors: HashSet<String>,
+        terminal_pull_request: Option<github::TerminalPullRequest>,
+    }
+
+    let mut pending = ids
+        .into_iter()
+        .map(|id| Pending {
+            id,
+            cursor: None,
+            seen_cursors: HashSet::new(),
+            terminal_pull_request: None,
+        })
+        .collect::<VecDeque<_>>();
+    let mut batch_len = TerminalPullRequests::MAX_ALIASES;
+    let mut page_len = 100;
+    let mut retired = Vec::new();
+    let mut numbers = HashSet::new();
+    let mut node_ids = HashSet::new();
+
+    while !pending.is_empty() {
+        let count = pending.len().min(batch_len);
+        let batch = pending.drain(..count).collect::<Vec<_>>();
+        let operations = batch
+            .iter()
+            .map(|pending| {
+                TerminalPullRequestQuery::new(pending.id.clone(), pending.cursor.clone(), page_len)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let operation =
+            TerminalPullRequests::new(owner.to_owned(), repository.to_owned(), operations)?;
+        let response = run_graphql_observation_query(octocrab, &operation.document()).await?;
+        let Some(response) = response else {
+            if batch.len() == 1 {
+                if page_len == 1 {
+                    bail!(
+                        "GitHub terminal pull request query for '{}' exceeds resource limits",
+                        batch[0].id
+                    );
+                }
+                let retry_page_len = page_len / 2;
+                log::warn!(
+                    "Backing off terminal pull request page size from {page_len} to {retry_page_len}."
+                );
+                page_len = retry_page_len;
+                pending.push_front(batch.into_iter().next().expect("one terminal query"));
+                continue;
+            }
+            let retry_batch_len = batch.len() / 2;
+            log::warn!("Hit GitHub resource limit with GraphQL batch of size {}", batch.len());
+            log::warn!("Backing off GraphQL batch size from {} to {retry_batch_len}.", batch.len());
+            batch_len = retry_batch_len;
+            for pending_item in batch.into_iter().rev() {
+                pending.push_front(pending_item);
+            }
+            continue;
+        };
+        let data =
+            response.get("data").and_then(|data| data.get("repository")).cloned().ok_or_else(
+                || eyre!("GitHub terminal pull request response is missing repository data"),
+            )?;
+        for (mut pending_item, page) in batch.into_iter().zip(operation.decode(data)?) {
+            for pull_request in page.pull_requests {
+                if !numbers.insert(pull_request.number) {
+                    bail!(
+                        "GitHub returned duplicate same-repository terminal pull request number {}",
+                        pull_request.number
+                    );
+                }
+                if !node_ids.insert(pull_request.node_id.clone()) {
+                    bail!(
+                        "GitHub returned duplicate same-repository terminal pull request node ID '{}'",
+                        pull_request.node_id
+                    );
+                }
+                record_terminal_pull_request(
+                    &pending_item.id,
+                    &mut pending_item.terminal_pull_request,
+                    pull_request,
+                )?;
+            }
+            if let Some(cursor) = page.next_cursor {
+                if !pending_item.seen_cursors.insert(cursor.clone()) {
+                    bail!(
+                        "GitHub repeated a terminal pull request pagination cursor for '{}'",
+                        pending_item.id
+                    );
+                }
+                pending_item.cursor = Some(cursor);
+                pending.push_back(pending_item);
+            } else if let Some(pull_request) = pending_item.terminal_pull_request {
+                let pull_request = match pull_request.state {
+                    TerminalPullRequestState::Closed => {
+                        RetiredPullRequest::Closed { number: pull_request.number }
+                    }
+                    TerminalPullRequestState::Merged => {
+                        RetiredPullRequest::Merged { number: pull_request.number }
+                    }
+                };
+                retired.push(pull_request);
+            }
+        }
+    }
+    Ok(retired)
+}
+
+fn record_terminal_pull_request(
+    change_id: &str,
+    observed: &mut Option<github::TerminalPullRequest>,
+    pull_request: github::TerminalPullRequest,
+) -> Result<()> {
+    if let Some(previous) = observed {
+        bail!(
+            "Found multiple historical pull requests for GHerrit ID '{change_id}': #{}, #{}. GHerrit cannot safely choose one.",
+            previous.number,
+            pull_request.number
+        );
+    }
+    *observed = Some(pull_request);
+    Ok(())
 }
 
 /// Executes mutation batches without retrying after transmission.
@@ -565,105 +837,74 @@ async fn run_graphql_query(
     }
 }
 
-/// Executes adaptively sized, read-only GraphQL query batches.
+/// Sends one read-only document under the shared bounded retry policy.
 ///
-/// Builds a combined query for each adaptive batch and decodes each operation
-/// in a successful response.
-async fn run_batched_queries<O>(
+/// `None` is an explicit resource-limit result so callers that can split a
+/// logical observation do so before retrying it. Pagination itself is never
+/// retried as a different cursor.
+const MAX_GRAPHQL_QUERY_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseDisposition {
+    Success,
+    RetryLimit,
+    Fatal,
+}
+
+fn query_exceeds_limit(query: &str) -> bool {
+    query.len() > MAX_GRAPHQL_QUERY_BYTES
+}
+
+fn classify_response(response: &serde_json::Value) -> ResponseDisposition {
+    let Some(errors) = response.get("errors") else {
+        return ResponseDisposition::Success;
+    };
+    let has_no_data = response.get("data").is_none_or(serde_json::Value::is_null);
+    let has_only_resource_errors = errors
+        .as_array()
+        .is_some_and(|errors| !errors.is_empty() && errors.iter().all(is_resource_limit_error));
+
+    if has_no_data && has_only_resource_errors {
+        ResponseDisposition::RetryLimit
+    } else {
+        ResponseDisposition::Fatal
+    }
+}
+
+fn is_resource_limit_error(error: &serde_json::Value) -> bool {
+    let is_typed_resource_error = matches!(
+        error.get("type").and_then(serde_json::Value::as_str),
+        Some("RESOURCE_LIMITS_EXCEEDED" | "MAX_NODE_LIMIT_EXCEEDED")
+    );
+    // GitHub middleware has also returned this parse error after silently
+    // dropping or truncating an oversized request.
+    let is_oversized_request_error = matches!(
+        error.get("message").and_then(serde_json::Value::as_str),
+        Some("A query attribute must be specified and must be a string.")
+    );
+
+    is_typed_resource_error || is_oversized_request_error
+}
+
+async fn run_graphql_observation_query(
     octocrab: &Octocrab,
-    operations: impl IntoIterator<Item = O>,
-) -> Result<Vec<O::Output>>
-where
-    O: QueryOperation,
-{
-    let operations: Vec<O> = operations.into_iter().collect();
-    if operations.is_empty() {
-        return Ok(Vec::new());
+    query: &str,
+) -> Result<Option<serde_json::Value>> {
+    if query_exceeds_limit(query) {
+        return Ok(None);
     }
-
-    let mut outputs = Vec::with_capacity(operations.len());
-
-    // GitHub imposes a limit on the number of nodes that can be processed in a
-    // single GraphQL query (500,000 as of this writing [1]), and also imposes
-    // limits on the amount of computation resources required to process the
-    // query [2]. In order to avoid hitting these limits while still processing
-    // large batches in the optimistic case, we start with a large batch size
-    // and perform exponential backoff if we hit the limits. This also ensures
-    // that we are resilient in the face of GitHub changing these limits in the
-    // future.
-    //
-    // [1] https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit
-    // [2] https://github.blog/changelog/2025-09-01-graphql-api-resource-limits/
-    let mut batches = BatchPlan::new(operations.len(), INITIAL_QUERY_BATCH_LEN);
-    while let Some(range) = batches.current() {
-        let chunk = &operations[range];
-        let query = query_batch_document(chunk);
-
-        // Attempt to perform the query. Returns:
-        // - Ok(Some(response)): Success
-        // - Ok(None): Heuristic or API limit hit (needs backoff)
-        // - Err(e): Fatal error (bail)
-        let response = async {
-            // HEURISTIC: Check query size before sending. GitHub's WAF/load
-            // balancer/some other middleware seems to silently drop or truncate
-            // requests larger than ~600KB, leading to confusing "missing query
-            // attribute" errors. We preemptively backoff if we exceed a
-            // conservative limit (256KB).
-            if query_exceeds_limit(&query) {
-                log::warn!(
-                    "GraphQL query size ({} bytes) exceeds heuristic limit ({} bytes).",
-                    query.len(),
-                    MAX_GRAPHQL_QUERY_BYTES
-                );
-                return Ok(None);
-            }
-
-            log::trace!("Sending GraphQL Query (Length: {}): {}", query.len(), query);
-            let request_payload = serde_json::json!({ "query": query });
-            let response = run_graphql_query(octocrab, &request_payload)
-                .await
-                .wrap_err("GraphQL batched operation failed")?;
-
-            match classify_response(&response) {
-                ResponseDisposition::Success => {}
-                ResponseDisposition::RetryLimit => {
-                    log::warn!(
-                        "Hit GitHub resource limit with GraphQL batch of size {}",
-                        chunk.len()
-                    );
-                    return Ok(None);
-                }
-                ResponseDisposition::Fatal => {
-                    let errors = response.get("errors").expect("fatal response has errors");
-                    log::error!("GraphQL errors: {errors}");
-                    bail!("GraphQL errors: {errors:?}");
-                }
-            }
-
-            Ok(Some(response))
+    let request = serde_json::json!({ "query": query });
+    let response = run_graphql_query(octocrab, &request)
+        .await
+        .wrap_err("GraphQL read-only observation failed")?;
+    match classify_response(&response) {
+        ResponseDisposition::Success => Ok(Some(response)),
+        ResponseDisposition::RetryLimit => Ok(None),
+        ResponseDisposition::Fatal => {
+            let errors = response.get("errors").expect("fatal response has errors");
+            bail!("GraphQL errors: {errors:?}");
         }
-        .await?;
-
-        let Some(response) = response else {
-            match batches.reject() {
-                Ok(backoff) => log::warn!(
-                    "Backing off GraphQL batch size from {} to {}.",
-                    backoff.attempted,
-                    backoff.retry
-                ),
-                Err(item) => bail!(
-                    "GraphQL operation at item {} exceeds GitHub resource limits. Cannot sync.",
-                    item.index
-                ),
-            }
-            continue;
-        };
-
-        outputs.extend(decode_query_batch_response(chunk, response)?);
-
-        batches.accept();
     }
-    Ok(outputs)
 }
 
 #[cfg(test)]
@@ -677,7 +918,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::pre_push::batching::MAX_MUTATION_ALIASES;
+    use crate::pre_push::github::MAX_MUTATION_ALIASES;
 
     const ADAPTER_TIMEOUT: Duration = Duration::from_secs(5);
     const MAX_TEST_REQUEST_BYTES: usize = 1024 * 1024;
@@ -764,6 +1005,115 @@ mod tests {
             .expect("build test client")
     }
 
+    async fn scripted_graphql(
+        responses: Vec<Value>,
+    ) -> (Octocrab, tokio::task::JoinHandle<Vec<Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
+        let octocrab = test_octocrab(&listener);
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.expect("accept GraphQL request");
+                requests.push(read_json_request(&mut stream).await);
+                write_json_response(&mut stream, &response).await;
+            }
+            requests
+        });
+        (octocrab, server)
+    }
+
+    async fn finish_scripted_graphql(server: tokio::task::JoinHandle<Vec<Value>>) -> Vec<Value> {
+        tokio::time::timeout(ADAPTER_TIMEOUT, server)
+            .await
+            .expect("scripted GraphQL server stopped")
+            .expect("scripted GraphQL server completed")
+    }
+
+    fn request_query(request: &Value) -> &str {
+        request.get("query").and_then(Value::as_str).expect("GraphQL request query")
+    }
+
+    fn open_observation_node(number: u64, head: &str) -> Value {
+        json!({
+            "number": number,
+            "id": format!("PR_{number}"),
+            "title": format!("Title {number}"),
+            "body": format!("Body {number}"),
+            "baseRefName": "main",
+            "baseRefOid": "1".repeat(40),
+            "headRefName": head,
+            "headRefOid": "2".repeat(40),
+            "state": "OPEN",
+            "isCrossRepository": false,
+            "autoMergeRequest": null,
+            "isInMergeQueue": false,
+        })
+    }
+
+    fn open_observation_page(
+        nodes: Vec<Value>,
+        next_cursor: Option<&str>,
+        include_repository: bool,
+    ) -> Value {
+        let mut repository = serde_json::Map::from_iter([(
+            "pullRequests".to_string(),
+            json!({
+                "nodes": nodes,
+                "pageInfo": {
+                    "hasNextPage": next_cursor.is_some(),
+                    "endCursor": next_cursor,
+                },
+            }),
+        )]);
+        if include_repository {
+            repository.insert("id".to_string(), json!("R_1"));
+            repository.insert(
+                "defaultBranchRef".to_string(),
+                json!({ "name": "main", "target": { "oid": "3".repeat(40) } }),
+            );
+        }
+        json!({ "data": { "repository": Value::Object(repository) } })
+    }
+
+    fn terminal_observation_node(number: u64, head: &str, is_cross_repository: bool) -> Value {
+        json!({
+            "number": number,
+            "id": format!("PR_{number}"),
+            "headRefName": head,
+            "state": "CLOSED",
+            "isCrossRepository": is_cross_repository,
+        })
+    }
+
+    fn terminal_observation_page(pages: Vec<(Vec<Value>, Option<&str>)>) -> Value {
+        let repository = pages
+            .into_iter()
+            .enumerate()
+            .map(|(index, (nodes, next_cursor))| {
+                (
+                    format!("op{index}"),
+                    json!({
+                        "nodes": nodes,
+                        "pageInfo": {
+                            "hasNextPage": next_cursor.is_some(),
+                            "endCursor": next_cursor,
+                        },
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        json!({ "data": { "repository": Value::Object(repository) } })
+    }
+
+    fn resource_limit_response() -> Value {
+        json!({
+            "errors": [{
+                "type": "RESOURCE_LIMITS_EXCEEDED",
+                "message": "scripted resource limit",
+            }],
+        })
+    }
+
     #[test]
     fn query_retry_delay_policy_is_exact_nonzero_and_bounded() {
         assert_eq!(
@@ -779,6 +1129,225 @@ mod tests {
         );
         assert_eq!(graphql_query_retry_delay(usize::MAX), None);
         assert!(GRAPHQL_QUERY_RETRY_DELAYS.into_iter().all(|delay| !delay.is_zero()));
+    }
+
+    #[test]
+    fn query_limit_is_inclusive() {
+        assert!(!query_exceeds_limit(&"x".repeat(MAX_GRAPHQL_QUERY_BYTES)));
+        assert!(query_exceeds_limit(&"x".repeat(MAX_GRAPHQL_QUERY_BYTES + 1)));
+    }
+
+    #[test]
+    fn classifies_resource_limit_responses() {
+        for error in [
+            json!({ "type": "RESOURCE_LIMITS_EXCEEDED" }),
+            json!({ "type": "MAX_NODE_LIMIT_EXCEEDED" }),
+            json!({
+                "message": "A query attribute must be specified and must be a string."
+            }),
+        ] {
+            assert_eq!(
+                classify_response(&json!({ "errors": [error] })),
+                ResponseDisposition::RetryLimit
+            );
+            assert_eq!(
+                classify_response(&json!({ "data": null, "errors": [error] })),
+                ResponseDisposition::RetryLimit
+            );
+        }
+    }
+
+    #[test]
+    fn treats_partial_or_mixed_query_errors_as_fatal() {
+        let resource_error = json!({ "type": "RESOURCE_LIMITS_EXCEEDED" });
+        let fatal_error = json!({ "type": "FORBIDDEN" });
+
+        for response in [
+            json!({ "errors": [fatal_error.clone()] }),
+            json!({ "errors": [resource_error.clone(), fatal_error] }),
+            json!({ "errors": [] }),
+            json!({ "errors": "not an array" }),
+            json!({ "data": {}, "errors": [resource_error] }),
+        ] {
+            assert_eq!(classify_response(&response), ResponseDisposition::Fatal);
+        }
+    }
+
+    #[tokio::test]
+    async fn open_observation_pages_with_the_exact_cursor_and_rejects_a_loop() {
+        let (octocrab, server) = scripted_graphql(vec![
+            open_observation_page(vec![open_observation_node(1, "G1")], Some("cursor-1"), true),
+            open_observation_page(vec![open_observation_node(2, "G2")], Some("cursor-1"), false),
+        ])
+        .await;
+
+        let error = observe_open_pull_requests(&octocrab, "owner", "repo")
+            .await
+            .expect_err("a repeated cursor must stop observation");
+        let requests = finish_scripted_graphql(server).await;
+
+        assert!(error.to_string().contains("repeated an open pull request pagination cursor"));
+        assert_eq!(requests.len(), 2);
+        assert!(!request_query(&requests[0]).contains("after:"));
+        assert!(request_query(&requests[1]).contains("after: \"cursor-1\""));
+        assert!(!request_query(&requests[1]).contains("defaultBranchRef"));
+    }
+
+    #[tokio::test]
+    async fn open_observation_rejects_duplicate_identity_across_pages() {
+        let (octocrab, server) = scripted_graphql(vec![
+            open_observation_page(vec![open_observation_node(1, "G1")], Some("cursor-1"), true),
+            open_observation_page(vec![open_observation_node(1, "G2")], None, false),
+        ])
+        .await;
+
+        let error = observe_open_pull_requests(&octocrab, "owner", "repo")
+            .await
+            .expect_err("one PR number cannot occur on two pages");
+        finish_scripted_graphql(server).await;
+
+        assert!(error.to_string().contains("duplicate same-repository open pull request number 1"));
+    }
+
+    #[tokio::test]
+    async fn terminal_observation_rejects_ambiguity_discovered_on_a_later_page() {
+        let (octocrab, server) = scripted_graphql(vec![
+            terminal_observation_page(vec![(
+                vec![terminal_observation_node(7, "G42", false)],
+                Some("cursor-1"),
+            )]),
+            terminal_observation_page(vec![(
+                vec![terminal_observation_node(9, "G42", false)],
+                None,
+            )]),
+        ])
+        .await;
+
+        let error =
+            observe_terminal_pull_requests(&octocrab, "owner", "repo", vec!["G42".to_string()])
+                .await
+                .expect_err("the first historical PR must remain known across pages");
+        let requests = finish_scripted_graphql(server).await;
+
+        assert_eq!(
+            error.to_string(),
+            "Found multiple historical pull requests for GHerrit ID 'G42': #7, #9. GHerrit cannot safely choose one."
+        );
+        assert!(request_query(&requests[1]).contains("after: \"cursor-1\""));
+    }
+
+    #[tokio::test]
+    async fn terminal_observation_ignores_forks_and_resumes_only_unfinished_ids() {
+        let (octocrab, server) = scripted_graphql(vec![
+            terminal_observation_page(vec![
+                (vec![terminal_observation_node(7, "G1", true)], Some("cursor-1")),
+                (vec![terminal_observation_node(8, "G2", true)], Some("cursor-2")),
+                (vec![], None),
+            ]),
+            terminal_observation_page(vec![
+                (vec![], None),
+                (vec![terminal_observation_node(9, "G2", false)], None),
+            ]),
+        ])
+        .await;
+
+        let retired = observe_terminal_pull_requests(
+            &octocrab,
+            "owner",
+            "repo",
+            vec!["G1".to_string(), "G2".to_string(), "G3".to_string()],
+        )
+        .await
+        .unwrap();
+        let requests = finish_scripted_graphql(server).await;
+
+        assert_eq!(retired, [RetiredPullRequest::Closed { number: 9 }]);
+        assert!(request_query(&requests[0]).contains("G1"));
+        assert!(request_query(&requests[0]).contains("G2"));
+        assert!(request_query(&requests[0]).contains("G3"));
+        assert!(request_query(&requests[1]).contains("G1"));
+        assert!(request_query(&requests[1]).contains("G2"));
+        assert!(!request_query(&requests[1]).contains("G3"));
+        assert!(request_query(&requests[1]).contains("after: \"cursor-1\""));
+        assert!(request_query(&requests[1]).contains("after: \"cursor-2\""));
+    }
+
+    #[tokio::test]
+    async fn terminal_observation_rejects_a_repeated_per_id_cursor() {
+        let (octocrab, server) = scripted_graphql(vec![
+            terminal_observation_page(vec![(vec![], Some("cursor-1"))]),
+            terminal_observation_page(vec![(vec![], Some("cursor-1"))]),
+        ])
+        .await;
+
+        let error =
+            observe_terminal_pull_requests(&octocrab, "owner", "repo", vec!["G1".to_string()])
+                .await
+                .expect_err("a repeated terminal cursor must stop observation");
+        finish_scripted_graphql(server).await;
+
+        assert!(error.to_string().contains("repeated a terminal pull request pagination cursor"));
+    }
+
+    #[tokio::test]
+    async fn observation_reduces_connection_page_sizes_after_resource_limits() {
+        let (open_octocrab, open_server) = scripted_graphql(vec![
+            open_observation_page(vec![], Some("cursor-1"), true),
+            resource_limit_response(),
+            open_observation_page(vec![], None, false),
+        ])
+        .await;
+        observe_open_pull_requests(&open_octocrab, "owner", "repo").await.unwrap();
+        let open_requests = finish_scripted_graphql(open_server).await;
+        assert!(request_query(&open_requests[0]).contains("first: 100"));
+        assert!(request_query(&open_requests[1]).contains("first: 100"));
+        assert!(request_query(&open_requests[1]).contains("after: \"cursor-1\""));
+        assert!(request_query(&open_requests[2]).contains("first: 50"));
+        assert!(request_query(&open_requests[2]).contains("after: \"cursor-1\""));
+
+        let (terminal_octocrab, terminal_server) = scripted_graphql(vec![
+            terminal_observation_page(vec![(
+                vec![terminal_observation_node(7, "G42", false)],
+                Some("cursor-1"),
+            )]),
+            resource_limit_response(),
+            terminal_observation_page(vec![(vec![], None)]),
+        ])
+        .await;
+        let retired = observe_terminal_pull_requests(
+            &terminal_octocrab,
+            "owner",
+            "repo",
+            vec!["G42".to_string()],
+        )
+        .await
+        .unwrap();
+        let terminal_requests = finish_scripted_graphql(terminal_server).await;
+        assert_eq!(retired, [RetiredPullRequest::Closed { number: 7 }]);
+        assert!(request_query(&terminal_requests[0]).contains("first: 100"));
+        assert!(request_query(&terminal_requests[1]).contains("first: 100"));
+        assert!(request_query(&terminal_requests[1]).contains("after: \"cursor-1\""));
+        assert!(request_query(&terminal_requests[2]).contains("first: 50"));
+        assert!(request_query(&terminal_requests[2]).contains("after: \"cursor-1\""));
+    }
+
+    #[test]
+    fn terminal_history_rejects_a_second_candidate_from_any_page() {
+        let pull_request = |number| github::TerminalPullRequest {
+            number,
+            node_id: format!("PR_{number}"),
+            state: TerminalPullRequestState::Closed,
+        };
+        let mut observed = None;
+
+        record_terminal_pull_request("G42", &mut observed, pull_request(7)).unwrap();
+        let error = record_terminal_pull_request("G42", &mut observed, pull_request(9))
+            .expect_err("a later page may not add another same-repository candidate");
+
+        assert_eq!(
+            error.to_string(),
+            "Found multiple historical pull requests for GHerrit ID 'G42': #7, #9. GHerrit cannot safely choose one."
+        );
     }
 
     #[derive(Debug, Clone, Copy)]
