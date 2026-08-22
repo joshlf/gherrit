@@ -1,50 +1,209 @@
-use std::{collections::HashSet, str};
+//! Validated local input for one pre-push publication attempt.
+//!
+//! A local stack is the ordered first-parent path from the default branch to
+//! `HEAD`. Its order is the source of parent, child, and root relationships.
+//! Those relationships are deliberately not stored alongside each change.
 
-use color_eyre::eyre::{Context, Result, bail, eyre};
+use std::{
+    collections::{HashMap, HashSet},
+    str,
+};
+
+use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::ObjectId;
 
 use super::{autosquash, body::gherrit_pr_id_re};
 use crate::util::{self, CommandExt as _};
 
-pub(super) fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
-    let head = repo.rev_parse_single("HEAD")?;
-    let default_branch = repo.find_default_branch_on_default_remote();
-    let default_ref = repo.rev_parse_single(format!("refs/heads/{}", default_branch).as_str())?;
+const MAX_GHERRIT_PR_ID_BYTES: usize = 128;
 
-    let commits = repo.commits_between(default_ref, head).map_err(|err| match err {
-        util::CommitsBetweenError::NotAncestor => {
-            let branch_name = repo.current_branch().name().unwrap_or("current branch");
-            eyre!(
-                "The branch '{branch_name}' is not based on '{default_branch}'.\n\
-                 GHerrit only supports stacked branches that share history with the default branch.\n\
-                 Maybe you want to 'git rebase' on '{default_branch}' before pushing?"
-            )
+/// An ASCII alphanumeric `gherrit-pr-id` of 1 through 128 bytes.
+///
+/// Constructing a `GherritPrId` is validation. Code which has one can therefore
+/// use it as a managed ref-name component without repeating trailer checks.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct GherritPrId(
+    // INVARIANT: `.0` is nonempty, ASCII alphanumeric, and at most
+    // `MAX_GHERRIT_PR_ID_BYTES` bytes long.
+    String,
+);
+
+impl GherritPrId {
+    fn from_trailer(commit: ObjectId, value: &[u8]) -> Result<Self> {
+        if value.is_empty() {
+            bail!("Commit {commit} missing gherrit-pr-id trailer");
         }
-        util::CommitsBetweenError::Eyre(e) => e,
-    })?;
+        if value.len() > MAX_GHERRIT_PR_ID_BYTES {
+            bail!(
+                "Commit {commit} has a gherrit-pr-id trailer longer than the {MAX_GHERRIT_PR_ID_BYTES}-byte limit"
+            );
+        }
+        if !value.iter().all(u8::is_ascii_alphanumeric) {
+            bail!("Commit {commit} has invalid gherrit-pr-id trailer");
+        }
 
-    let commits = commits
-        .into_iter()
-        .map(|commit| -> Result<_> {
-            let title = core::str::from_utf8(commit.message()?.title)?.to_owned();
-            Ok((commit, title))
-        })
-        .collect::<Result<Vec<_>>>()?;
+        Ok(Self(str::from_utf8(value)?.to_owned()))
+    }
 
-    autosquash::ensure_publishable(
-        commits.iter().map(|(_, title)| title.as_str()),
-        &repo.default_remote_name(),
-        &default_branch,
-    )?;
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
-    let trailers = read_commit_trailers(&commits)?;
-    let commits = commits
-        .into_iter()
-        .zip(trailers)
-        .map(|((commit, _), trailers)| Commit::from_git(commit, &trailers))
-        .collect::<Result<Vec<_>>>()?;
-    ensure_unique_gherrit_ids(commits.iter().map(|commit| commit.gherrit_id.as_str()))?;
-    Ok(commits)
+/// One local commit which GHerrit can publish.
+///
+/// The commit's identity, first parent, and user-visible metadata are read
+/// together. `LocalChange` instances exist only inside a validated
+/// [`LocalStack`].
+#[derive(Debug)]
+pub(super) struct LocalChange {
+    id: GherritPrId,
+    head: ObjectId,
+    first_parent: ObjectId,
+    title: String,
+    body: String,
+}
+
+impl LocalChange {
+    fn from_commit(commit: gix::Commit<'_>, title: String, trailers: &[u8]) -> Result<Self> {
+        let message = commit.message()?;
+        let body = message
+            .body
+            .map(|body| str::from_utf8(body.as_ref()))
+            .transpose()
+            .wrap_err_with(|| format!("Commit {} has a non-UTF-8 message body", commit.id))?
+            .unwrap_or("");
+        let mut ids = trailers.split(|byte| *byte == b'\n').filter_map(gherrit_id_trailer_value);
+        let id = ids
+            .next()
+            .ok_or_else(|| eyre!("Commit {} missing gherrit-pr-id trailer", commit.id))?;
+        if ids.next().is_some() {
+            bail!("Commit {} has multiple gherrit-pr-id trailers", commit.id);
+        }
+
+        let id = GherritPrId::from_trailer(commit.id, id)?;
+        let first_parent = commit
+            .parent_ids()
+            .next()
+            .ok_or_else(|| eyre!("Commit {} has no first parent", commit.id))?
+            .detach();
+        let body = strip_gherrit_id(body, id.as_str());
+
+        Ok(Self { id, head: commit.id, first_parent, title, body })
+    }
+
+    pub(super) fn id(&self) -> &GherritPrId {
+        &self.id
+    }
+
+    pub(super) fn head(&self) -> ObjectId {
+        self.head
+    }
+
+    pub(super) fn first_parent(&self) -> ObjectId {
+        self.first_parent
+    }
+
+    pub(super) fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub(super) fn body(&self) -> &str {
+        &self.body
+    }
+}
+
+/// An ordered, validated first-parent path from the default branch to `HEAD`.
+#[derive(Debug)]
+pub(super) struct LocalStack {
+    changes: Vec<LocalChange>,
+}
+
+impl LocalStack {
+    /// Reads and validates the local managed stack without performing network
+    /// writes.
+    pub(super) fn collect(repo: &util::Repo) -> Result<Self> {
+        let head = repo.rev_parse_single("HEAD")?;
+        let default_branch = repo.find_default_branch_on_default_remote();
+        let default_ref = repo.rev_parse_single(format!("refs/heads/{default_branch}").as_str())?;
+        if head == default_ref {
+            return Self::new(default_ref.detach(), Vec::new());
+        }
+
+        repo.ensure_publishable_history()?;
+        let commits = repo.first_parent_commits_between(default_ref, head).map_err(|err| match err {
+            util::FirstParentCommitsBetweenError::NotOnFirstParentPath => {
+                let branch_name = repo.current_branch().name().unwrap_or("current branch");
+                eyre!(
+                    "The branch '{branch_name}' does not descend from '{default_branch}' on its first-parent path.\n\
+                     GHerrit defines stack order using first-parent ancestry.\n\
+                     Maybe you want to 'git rebase' on '{default_branch}' before pushing?"
+                )
+            }
+            util::FirstParentCommitsBetweenError::Eyre(error) => error,
+        })?;
+
+        let commits = commits
+            .into_iter()
+            .map(|commit| -> Result<_> {
+                let title = str::from_utf8(commit.message()?.title)
+                    .wrap_err_with(|| format!("Commit {} has a non-UTF-8 title", commit.id))?
+                    .to_owned();
+                Ok((commit, title))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        autosquash::ensure_publishable(
+            commits.iter().map(|(_, title)| title.as_str()),
+            &repo.default_remote_name(),
+            &default_branch,
+        )?;
+
+        let trailers = read_commit_trailers(&commits)?;
+        let changes = commits
+            .into_iter()
+            .zip(trailers)
+            .map(|((commit, title), trailers)| LocalChange::from_commit(commit, title, &trailers))
+            .collect::<Result<Vec<_>>>()?;
+
+        let stack = Self::new(default_ref.detach(), changes)?;
+        ensure_change_ids_unique_in_head_ancestry(&stack, head.detach())?;
+        Ok(stack)
+    }
+
+    fn new(default_tip: ObjectId, changes: Vec<LocalChange>) -> Result<Self> {
+        let ids = changes.iter().map(|change| change.id.as_str());
+        ensure_unique_change_ids(ids)?;
+
+        let mut expected_parent = default_tip;
+        for change in &changes {
+            if change.first_parent() != expected_parent {
+                bail!(
+                    "Commit {} is not on the first-parent path from the default branch",
+                    change.head
+                );
+            }
+            expected_parent = change.head;
+        }
+
+        Ok(Self { changes })
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.changes.len()
+    }
+
+    pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = &LocalChange> {
+        self.changes.iter()
+    }
+
+    pub(super) fn as_slice(&self) -> &[LocalChange] {
+        &self.changes
+    }
 }
 
 fn read_commit_trailers(commits: &[(gix::Commit<'_>, String)]) -> Result<Vec<Vec<u8>>> {
@@ -85,7 +244,7 @@ fn read_commit_trailers(commits: &[(gix::Commit<'_>, String)]) -> Result<Vec<Vec
     )
 }
 
-fn ensure_unique_gherrit_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Result<()> {
+fn ensure_unique_change_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Result<()> {
     ids.into_iter().try_fold(HashSet::new(), |mut seen, id| {
         if !seen.insert(id) {
             bail!("Stack contains multiple commits with gherrit-pr-id '{id}'");
@@ -95,39 +254,88 @@ fn ensure_unique_gherrit_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Resu
     Ok(())
 }
 
-pub(super) struct Commit {
-    pub(super) id: ObjectId,
-    pub(super) gherrit_id: String,
-    pub(super) message_title: String,
-    pub(super) message_body: String,
+fn gherrit_id_trailer_value(line: &[u8]) -> Option<&[u8]> {
+    let colon = line.iter().position(|byte| *byte == b':')?;
+    if !line[..colon].eq_ignore_ascii_case(b"gherrit-pr-id")
+        || line.get(colon..colon + 2) != Some(b": ")
+    {
+        return None;
+    }
+    Some(&line[colon + 2..])
 }
 
-impl Commit {
-    fn from_git(c: gix::Commit<'_>, trailers: &[u8]) -> Result<Self> {
-        let message = c.message()?;
-        let message_title = core::str::from_utf8(message.title)?.to_string();
-        let message_body =
-            message.body.map(|body| core::str::from_utf8(body).unwrap()).unwrap_or("").to_string();
-        let mut gherrit_ids = trailers
-            .split(|byte| *byte == b'\n')
-            .filter_map(|line| line.strip_prefix(b"gherrit-pr-id: "));
-        let gherrit_id = gherrit_ids
-            .next()
-            .ok_or_else(|| eyre!("Commit {} missing gherrit-pr-id trailer", c.id))?;
-        if gherrit_ids.next().is_some() {
-            bail!("Commit {} has multiple gherrit-pr-id trailers", c.id);
-        }
-        if gherrit_id.is_empty() {
-            bail!("Commit {} missing gherrit-pr-id trailer", c.id);
-        }
-        if !gherrit_id.iter().all(u8::is_ascii_alphanumeric) {
-            bail!("Commit {} has invalid gherrit-pr-id trailer", c.id);
-        }
-        let gherrit_id = str::from_utf8(gherrit_id)?.to_string();
-        let message_body = strip_gherrit_id(&message_body, &gherrit_id);
+/// Requires each active change ID to identify exactly one reachable commit.
+///
+/// Stack order follows first parents, so commits reachable only through a
+/// merge are not published as changes. They are nevertheless part of every
+/// proposed head which contains the merge. Reusing an active ID anywhere in
+/// that complete ancestry would make the ID describe two different commits.
+fn ensure_change_ids_unique_in_head_ancestry(stack: &LocalStack, head: ObjectId) -> Result<()> {
+    const FORMAT: &str = "--format=tformat:%H%x00%(trailers:only,unfold)";
 
-        Ok(Commit { id: c.id, gherrit_id, message_title, message_body })
+    if stack.is_empty() {
+        return Ok(());
     }
+
+    let expected_heads = stack
+        .iter()
+        .map(|change| (change.id().as_str().as_bytes(), (change.id().as_str(), change.head())))
+        .collect::<HashMap<_, _>>();
+    let head = head.to_string();
+    let output = util::cmd(
+        "git",
+        [
+            "log",
+            "--no-patch",
+            "--no-show-signature",
+            "--no-notes",
+            "--no-decorate",
+            "-z",
+            FORMAT,
+            &head,
+        ],
+    )
+    .checked_output()
+    .wrap_err("Failed to inspect commit identities in HEAD ancestry")?;
+    let mut fields = output.stdout.split(|byte| *byte == 0);
+    let mut observed = HashSet::with_capacity(stack.len());
+
+    loop {
+        let commit =
+            fields.next().ok_or_else(|| eyre!("Git returned malformed commit ancestry data"))?;
+        if commit.is_empty() {
+            if fields.next().is_some() {
+                bail!("Git returned malformed commit ancestry data");
+            }
+            break;
+        }
+        let commit = ObjectId::from_hex(commit)
+            .wrap_err("Git returned an invalid commit ID while inspecting HEAD ancestry")?;
+        let trailers =
+            fields.next().ok_or_else(|| eyre!("Git omitted trailer data for commit {commit}"))?;
+
+        for id in trailers.split(|byte| *byte == b'\n').filter_map(gherrit_id_trailer_value) {
+            let Some((id, expected_head)) = expected_heads.get(id) else {
+                continue;
+            };
+            if commit != *expected_head {
+                bail!(
+                    "HEAD ancestry contains multiple commits with gherrit-pr-id '{id}': \
+                     {expected_head} and {commit}"
+                );
+            }
+            observed.insert(*id);
+        }
+    }
+
+    if let Some(change) = stack.iter().find(|change| !observed.contains(change.id().as_str())) {
+        bail!(
+            "Git omitted gherrit-pr-id '{}' while inspecting HEAD ancestry",
+            change.id().as_str()
+        );
+    }
+
+    Ok(())
 }
 
 fn strip_gherrit_id(body: &str, id: &str) -> String {
@@ -151,4 +359,128 @@ fn strip_gherrit_id(body: &str, id: &str) -> String {
     let range = trailer.range();
     body.replace_range(trailer_start + range.start..trailer_start + range.end, "");
     body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object_id(byte: u8) -> ObjectId {
+        ObjectId::from_bytes_or_panic(&[byte; 20])
+    }
+
+    fn change(id: &str, head: u8, first_parent: u8) -> LocalChange {
+        LocalChange {
+            id: GherritPrId::from_trailer(object_id(head), id.as_bytes()).unwrap(),
+            head: object_id(head),
+            first_parent: object_id(first_parent),
+            title: String::new(),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn gherrit_pr_ids_require_bounded_nonempty_ascii_alphanumeric_values() {
+        for id in [b"A".as_slice(), b"G123", b"abcDEF012"] {
+            assert_eq!(
+                GherritPrId::from_trailer(object_id(1), id).unwrap().as_str(),
+                str::from_utf8(id).unwrap()
+            );
+        }
+
+        for id in [b"".as_slice(), b"with-dash", b"with space", "snowman-☃".as_bytes()] {
+            assert!(GherritPrId::from_trailer(object_id(1), id).is_err(), "id={id:?}");
+        }
+
+        let maximum = "G".repeat(MAX_GHERRIT_PR_ID_BYTES);
+        assert_eq!(
+            GherritPrId::from_trailer(object_id(1), maximum.as_bytes()).unwrap().as_str(),
+            maximum
+        );
+
+        let too_long = "G".repeat(MAX_GHERRIT_PR_ID_BYTES + 1);
+        let error = GherritPrId::from_trailer(object_id(1), too_long.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("longer than the 128-byte limit"));
+
+        assert_eq!(gherrit_id_trailer_value(b"Gherrit-Pr-Id: Gone"), Some(b"Gone".as_slice()));
+        assert_eq!(gherrit_id_trailer_value(b"gherrit-pr-id:Gone"), None);
+    }
+
+    #[test]
+    fn stacks_require_unique_change_ids() {
+        let error =
+            LocalStack::new(object_id(0), vec![change("Gsame", 1, 0), change("Gsame", 2, 1)])
+                .unwrap_err();
+
+        assert_eq!(error.to_string(), "Stack contains multiple commits with gherrit-pr-id 'Gsame'");
+    }
+
+    #[test]
+    fn stacks_require_one_contiguous_first_parent_path() {
+        let stack = LocalStack::new(
+            object_id(0),
+            vec![change("Gone", 1, 0), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
+        )
+        .unwrap();
+
+        assert_eq!(
+            stack.iter().map(|change| change.id().as_str()).collect::<Vec<_>>(),
+            ["Gone", "Gtwo", "Gthree"]
+        );
+
+        let error = LocalStack::new(object_id(0), vec![change("Gone", 1, 0), change("Gtwo", 2, 0)])
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Commit {} is not on the first-parent path from the default branch",
+                object_id(2)
+            )
+        );
+    }
+
+    #[test]
+    fn empty_stack_does_not_require_publishable_history() {
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let default_tip = repository.rev_parse_single("refs/heads/main").unwrap().detach();
+
+        std::fs::create_dir_all(context.repo_path.join(".git/info")).unwrap();
+        std::fs::write(context.repo_path.join(".git/info/grafts"), format!("{default_tip}\n"))
+            .unwrap();
+        std::fs::write(context.repo_path.join(".git/shallow"), format!("{default_tip}\n")).unwrap();
+        context.run_git(&["config", "remote.origin.promisor", "true"]);
+
+        let stack = LocalStack::collect(&repository).unwrap();
+
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn stack_order_derives_root_parent_and_child_positions() {
+        let stack = LocalStack::new(
+            object_id(0),
+            vec![change("Gone", 1, 0), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
+        )
+        .unwrap();
+        let ids = stack.iter().map(|change| change.id().as_str()).collect::<Vec<_>>();
+
+        assert_eq!(ids.first(), Some(&"Gone"));
+        assert_eq!(ids.last(), Some(&"Gthree"));
+        assert_eq!(
+            ids.windows(2).map(|pair| (pair[0], pair[1])).collect::<Vec<_>>(),
+            [("Gone", "Gtwo"), ("Gtwo", "Gthree")]
+        );
+    }
+
+    #[test]
+    fn strips_only_the_matching_trailer_from_the_final_trailer_block() {
+        let body = "Summary\n\ngherrit-pr-id: Gexample\n\nNotes\n\ngherrit-pr-id: Greal\n";
+
+        assert_eq!(
+            strip_gherrit_id(body, "Greal"),
+            "Summary\n\ngherrit-pr-id: Gexample\n\nNotes\n\n\n"
+        );
+        assert_eq!(strip_gherrit_id(body, "Gmissing"), body);
+    }
 }

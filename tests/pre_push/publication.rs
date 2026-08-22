@@ -45,6 +45,36 @@ fn test_full_stack_lifecycle_mocked() {
 }
 
 #[test]
+fn test_first_parent_stack_excludes_commits_reachable_only_through_a_merge() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("first-parent-merge");
+    ctx.commit_with_gherrit_id("Stack change");
+    let stack_id = ctx.gherrit_id("HEAD").unwrap();
+
+    ctx.run_git(&["checkout", "-b", "side", "main"]);
+    ctx.commit_with_gherrit_id("Side change");
+    let side_id = ctx.gherrit_id("HEAD").unwrap();
+    ctx.run_git(&["checkout", "first-parent-merge"]);
+    ctx.run_git(&["merge", "--no-ff", "side", "-m", "Merge side\n\ngherrit-pr-id: Gmerge"]);
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    assert!(ctx.remote_ref_oid(&format!("refs/heads/{stack_id}")).is_some());
+    assert!(ctx.remote_ref_oid("refs/heads/Gmerge").is_some());
+    assert!(ctx.remote_ref_oid(&format!("refs/heads/{side_id}")).is_none());
+    let pull_requests = ctx.github().pull_requests();
+    assert_eq!(
+        pull_requests.iter().map(|pr| (pr.head.as_str(), pr.base.as_str())).collect::<Vec<_>>(),
+        [(stack_id.as_str(), "main"), ("Gmerge", stack_id.as_str())]
+    );
+}
+
+#[test]
 fn test_stack_id_comes_only_from_the_trailer_block() {
     let ctx = testutil::test_context!()
         .with_remote()
@@ -93,6 +123,62 @@ fn test_unrelated_continued_trailer_does_not_hide_stack_id() {
 
     ctx.hook_cmd("pre-push").assert().success();
     assert!(ctx.remote_ref_oid("refs/heads/Gone").is_some());
+}
+
+#[test]
+fn test_replacement_ref_is_ignored_even_with_gix_075_false_polarity() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("replacement-ref");
+    let id = ctx.commit_with_gherrit_id("Literal commit");
+    let original = ctx.head_oid();
+    let tree = String::from_utf8(
+        ctx.git_cmd()
+            .args(["rev-parse", "HEAD^{tree}"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let parent = String::from_utf8(
+        ctx.git_cmd().args(["rev-parse", "HEAD^"]).assert().success().get_output().stdout.clone(),
+    )
+    .unwrap();
+    let replacement = String::from_utf8(
+        ctx.git_cmd()
+            .arg("commit-tree")
+            .arg(tree.trim())
+            .arg("-p")
+            .arg(parent.trim())
+            .args(["-m", "Replacement without a GHerrit ID"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    ctx.git_cmd().arg("replace").arg(&original).arg(replacement.trim()).assert().success();
+    ctx.run_git(&["config", "core.useReplaceRefs", "false"]);
+    ctx.git_cmd()
+        .args(["show-ref", "--verify"])
+        .arg(format!("refs/replace/{original}"))
+        .assert()
+        .success();
+
+    ctx.hook_cmd("pre-push").env("GIT_NO_REPLACE_OBJECTS", "0").assert().success();
+
+    assert_eq!(ctx.remote_ref_oid(&format!("refs/heads/{id}")).as_deref(), Some(original.as_str()));
+    let pull_requests = ctx.github().pull_requests();
+    assert_eq!(pull_requests.len(), 1);
+    assert_eq!(pull_requests[0].title.as_deref(), Some("Literal commit"));
+    assert_eq!(&ctx.recorded_pushes()[0].arguments()[..3], ["git", "--no-replace-objects", "push"]);
 }
 
 #[test]
