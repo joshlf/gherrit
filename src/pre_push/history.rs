@@ -9,14 +9,18 @@
 //! arbitrary head with an arbitrary first parent.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fmt,
 };
 
 use color_eyre::eyre::{Context as _, Report, Result, bail, eyre};
 use gix::ObjectId;
 
-use super::{local::GherritPrId, version::Version};
+use super::{
+    local::{GherritPrId, LocalChange},
+    remote::ObservedChangeHistory,
+    version::Version,
+};
 use crate::util::{self, CommandExt as _};
 
 /// One head and the literal first parent encoded by that head commit.
@@ -119,42 +123,126 @@ impl PublishedHistory {
 /// exist, so neither path accepts a selected subset.
 #[derive(Debug)]
 pub(super) struct NormalizedPublishedHistory {
+    id: GherritPrId,
     published: Option<PublishedHistory>,
 }
 
 impl NormalizedPublishedHistory {
+    /// Consumes one complete, destination-bound remote change observation.
+    pub(super) fn from_observation(
+        observed: ObservedChangeHistory,
+        graph: &CommitGraphEvidence,
+    ) -> Result<Self> {
+        let id = observed.id().clone();
+        let head = observed.candidate_head();
+        let owned_base = observed.owned_base();
+        let tags = observed.versions();
+        match (head, owned_base, tags.len() == 0) {
+            (None, None, true) => return Ok(Self { id, published: None }),
+            (Some(_), Some(_), false) => {}
+            (None, _, false) => {
+                bail!(
+                    "Remote GHerrit change '{}' has version tags but no managed head",
+                    id.as_str()
+                );
+            }
+            (_, None, _) => {
+                bail!(
+                    "Remote GHerrit change '{}' does not have a complete owned base",
+                    id.as_str()
+                );
+            }
+            (_, _, true) => {
+                bail!(
+                    "Remote GHerrit change '{}' has managed refs but no version tags",
+                    id.as_str()
+                );
+            }
+        }
+
+        let revisions = tags
+            .enumerate()
+            .map(|(index, (actual, target))| {
+                let expected = Version::from_history_index(index).ok_or_else(|| {
+                    eyre!("Remote GHerrit change '{}' has too many versions", id.as_str())
+                })?;
+                if actual != expected {
+                    bail!(
+                        "Remote GHerrit change '{}' has noncontiguous version tags: expected v{expected}, observed v{actual}",
+                        id.as_str()
+                    );
+                }
+                graph.revision(target).wrap_err_with(|| {
+                    format!(
+                        "Version v{actual} of GHerrit change '{}' is not a complete commit",
+                        id.as_str()
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let history = PublishedHistory::from_revisions(revisions.into_iter())?;
+        let current = history.current().revision();
+        if head != Some(current.head()) {
+            bail!(
+                "Remote GHerrit change '{}' head does not match its latest version tag",
+                id.as_str()
+            );
+        }
+        if owned_base != Some(current.first_parent()) {
+            bail!(
+                "Remote GHerrit change '{}' owned base does not match the latest version's first parent",
+                id.as_str()
+            );
+        }
+        Ok(Self { id, published: Some(history) })
+    }
+
     /// Consumes normalized history and couples it to one real proposed commit.
     pub(super) fn with_proposal(
         self,
-        proposed_head: ObjectId,
+        change: &LocalChange,
         graph: &CommitGraphEvidence,
     ) -> Result<ChangeHistory> {
-        let proposed = graph.revision(proposed_head)?;
-        Ok(ChangeHistory { published: self.published, proposed })
+        if self.id != *change.id() {
+            bail!(
+                "Observed GHerrit change '{}' cannot be coupled to local change '{}'",
+                self.id.as_str(),
+                change.id().as_str()
+            );
+        }
+        let proposed = graph.revision(change.head())?;
+        if proposed.first_parent() != change.first_parent() {
+            bail!("Local change {} does not retain its literal first parent", change.head());
+        }
+        Ok(ChangeHistory { id: self.id, published: self.published, proposed })
     }
 
     /// Consumes and validates all history for an existing nonlocal change.
     pub(super) fn validate_existing(
         self,
-        id: &GherritPrId,
         graph: &CommitGraphEvidence,
         default_tip: Option<ObjectId>,
     ) -> Result<ValidatedPublishedHistory> {
         let published = self.published.ok_or_else(|| {
-            eyre!("Existing GHerrit change '{}' has no published history", id.as_str())
+            eyre!("Existing GHerrit change '{}' has no published history", self.id.as_str())
         })?;
-        graph.validate_complete_revisions(id, published.iter(), default_tip)?;
-        Ok(ValidatedPublishedHistory { published })
+        graph.validate_complete_revisions(&self.id, published.iter(), default_tip)?;
+        Ok(ValidatedPublishedHistory { id: self.id, published })
     }
 }
 
 /// Complete published-only evidence for an existing nonlocal change.
 #[derive(Debug)]
 pub(super) struct ValidatedPublishedHistory {
+    id: GherritPrId,
     published: PublishedHistory,
 }
 
 impl ValidatedPublishedHistory {
+    pub(super) fn id(&self) -> &GherritPrId {
+        &self.id
+    }
+
     pub(super) fn published_len(&self) -> usize {
         self.published.len()
     }
@@ -184,6 +272,7 @@ impl ValidatedPublishedHistory {
 /// value and checks the entire published sequence together with its proposal.
 #[derive(Debug)]
 pub(super) struct ChangeHistory {
+    id: GherritPrId,
     published: Option<PublishedHistory>,
     proposed: Revision,
 }
@@ -192,12 +281,15 @@ impl ChangeHistory {
     /// Validates the complete history and optionally its exact root base.
     pub(super) fn validate(
         self,
-        id: &GherritPrId,
         graph: &CommitGraphEvidence,
         default_tip: Option<ObjectId>,
     ) -> Result<ValidatedChangeHistory> {
-        graph.validate_complete_revisions(id, self.revisions(), default_tip)?;
-        Ok(ValidatedChangeHistory { published: self.published, proposed: self.proposed })
+        graph.validate_complete_revisions(&self.id, self.revisions(), default_tip)?;
+        Ok(ValidatedChangeHistory {
+            id: self.id,
+            published: self.published,
+            proposed: self.proposed,
+        })
     }
 
     fn revisions(&self) -> impl Iterator<Item = Revision> + '_ {
@@ -213,11 +305,16 @@ impl ChangeHistory {
 /// intent but does not project an adjacent duplicate version.
 #[derive(Debug)]
 pub(super) struct ValidatedChangeHistory {
+    id: GherritPrId,
     published: Option<PublishedHistory>,
     proposed: Revision,
 }
 
 impl ValidatedChangeHistory {
+    pub(super) fn id(&self) -> &GherritPrId {
+        &self.id
+    }
+
     pub(super) fn published_len(&self) -> usize {
         self.published.as_ref().map_or(0, PublishedHistory::len)
     }
@@ -265,68 +362,6 @@ impl ValidatedChangeHistory {
     pub(super) fn contains_published_first_parent(&self, first_parent: ObjectId) -> bool {
         self.published_versions().any(|(_, revision)| revision.first_parent() == first_parent)
     }
-}
-
-/// Normalizes complete remote evidence for one covered change namespace.
-///
-/// `tags` must be the complete result for the requested change ID, including
-/// an empty map when the exact namespace was observed to be empty. This
-/// function deliberately does not interpret a missing observation as an empty
-/// history.
-pub(super) fn normalize_published_history(
-    id: &GherritPrId,
-    head: Option<ObjectId>,
-    owned_base: Option<ObjectId>,
-    tags: &BTreeMap<Version, ObjectId>,
-    graph: &CommitGraphEvidence,
-) -> Result<NormalizedPublishedHistory> {
-    match (head, owned_base, tags.is_empty()) {
-        (None, None, true) => return Ok(NormalizedPublishedHistory { published: None }),
-        (Some(_), Some(_), false) => {}
-        (None, _, false) => {
-            bail!("Remote GHerrit change '{}' has version tags but no managed head", id.as_str());
-        }
-        (_, None, _) => {
-            bail!("Remote GHerrit change '{}' does not have a complete owned base", id.as_str());
-        }
-        (_, _, true) => {
-            bail!("Remote GHerrit change '{}' has managed refs but no version tags", id.as_str());
-        }
-    }
-
-    let revisions = tags
-        .iter()
-        .enumerate()
-        .map(|(index, (actual, target))| {
-            let expected = Version::from_history_index(index).ok_or_else(|| {
-                eyre!("Remote GHerrit change '{}' has too many versions", id.as_str())
-            })?;
-            if *actual != expected {
-                bail!(
-                    "Remote GHerrit change '{}' has noncontiguous version tags: expected v{expected}, observed v{actual}",
-                    id.as_str()
-                );
-            }
-            graph.revision(*target).wrap_err_with(|| {
-                format!(
-                    "Version v{actual} of GHerrit change '{}' is not a complete commit",
-                    id.as_str()
-                )
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let history = PublishedHistory::from_revisions(revisions.into_iter())?;
-    let current = history.current().revision();
-    if head != Some(current.head()) {
-        bail!("Remote GHerrit change '{}' head does not match its latest version tag", id.as_str());
-    }
-    if owned_base != Some(current.first_parent()) {
-        bail!(
-            "Remote GHerrit change '{}' owned base does not match the latest version's first parent",
-            id.as_str()
-        );
-    }
-    Ok(NormalizedPublishedHistory { published: Some(history) })
 }
 
 #[derive(Debug)]
@@ -718,12 +753,16 @@ fn read_commit_trailers(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashSet};
+    use std::{
+        collections::{BTreeMap, HashSet},
+        fmt::Write as _,
+    };
 
     use gix::ObjectId;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::pre_push::{local::LocalStack, remote};
 
     fn change_id(value: &str) -> GherritPrId {
         GherritPrId::from_ref_component(value.as_bytes()).expect("valid test change ID")
@@ -796,6 +835,42 @@ mod tests {
         entries.into_iter().map(|(number, oid)| (version(number), oid)).collect()
     }
 
+    fn observed_change(
+        id: &GherritPrId,
+        head: Option<ObjectId>,
+        owned_base: Option<ObjectId>,
+        tags: &BTreeMap<Version, ObjectId>,
+    ) -> remote::ObservedChangeHistory {
+        let default = ObjectId::from_bytes_or_panic(&[1; 20]);
+        let mut heads =
+            format!("ref: refs/heads/main\tHEAD\n{default}\tHEAD\n{default}\trefs/heads/main\n");
+        if let Some(head) = head {
+            writeln!(heads, "{head}\trefs/heads/{}", id.as_str()).unwrap();
+        }
+        if let Some(owned_base) = owned_base {
+            writeln!(heads, "{owned_base}\trefs/heads/gherrit-bases/{}", id.as_str()).unwrap();
+        }
+        let versions = tags
+            .iter()
+            .map(|(version, oid)| format!("{oid}\trefs/tags/gherrit/{}/v{version}\n", id.as_str()))
+            .collect::<String>();
+        remote::parse_active_change_for_test(id.clone(), heads.as_bytes(), versions.as_bytes())
+            .expect("complete test observation")
+    }
+
+    fn normalize(
+        id: &GherritPrId,
+        head: Option<ObjectId>,
+        owned_base: Option<ObjectId>,
+        tags: &BTreeMap<Version, ObjectId>,
+        graph: &CommitGraphEvidence,
+    ) -> Result<NormalizedPublishedHistory> {
+        NormalizedPublishedHistory::from_observation(
+            observed_change(id, head, owned_base, tags),
+            graph,
+        )
+    }
+
     fn change_history(
         id: &GherritPrId,
         graph: &CommitGraphEvidence,
@@ -806,9 +881,13 @@ mod tests {
             let revision = graph.revision(*head).expect("literal published revision");
             (Some(*head), Some(revision.first_parent()))
         });
-        normalize_published_history(id, head, owned_base, &tags(published.iter().copied()), graph)
-            .expect("normalized test history")
-            .with_proposal(proposed, graph)
+        let normalized = normalize(id, head, owned_base, &tags(published.iter().copied()), graph)
+            .expect("normalized test history");
+        let first_parent =
+            graph.revision(proposed).expect("literal proposed revision").first_parent();
+        let stack = LocalStack::for_test(first_parent, [(id.clone(), proposed)]);
+        normalized
+            .with_proposal(stack.iter().next().expect("one local change"), graph)
             .expect("literal proposed revision")
     }
 
@@ -826,13 +905,8 @@ mod tests {
                     let observed_head = has_head.then_some(head);
                     let observed_base = has_base.then_some(root);
                     let observed_tags = if has_tags { tags([(1, head)]) } else { BTreeMap::new() };
-                    let result = normalize_published_history(
-                        &id,
-                        observed_head,
-                        observed_base,
-                        &observed_tags,
-                        &graph,
-                    );
+                    let result =
+                        normalize(&id, observed_head, observed_base, &observed_tags, &graph);
 
                     match (has_head, has_base, has_tags) {
                         (false, false, false) => assert!(
@@ -862,18 +936,8 @@ mod tests {
         let graph = load(&repository, [a, b]);
         let id = change_id("Gone");
 
-        let normalized = normalize_published_history(
-            &id,
-            Some(a),
-            Some(root),
-            &tags([(1, a), (2, a), (3, b), (4, a)]),
-            &graph,
-        )
-        .expect("valid repeated history");
-        let history = normalized
-            .with_proposal(a, &graph)
-            .expect("literal repeated proposal")
-            .validate(&id, &graph, None)
+        let history = change_history(&id, &graph, &[(1, a), (2, a), (3, b), (4, a)], a)
+            .validate(&graph, None)
             .expect("valid complete history");
         assert_eq!(
             history
@@ -902,9 +966,10 @@ mod tests {
         let id = change_id("Gone");
 
         let validated = change_history(&id, &graph, &[], proposed)
-            .validate(&id, &graph, None)
+            .validate(&graph, None)
             .expect("new change with one mandatory proposal");
 
+        assert_eq!(validated.id(), &id);
         assert_eq!(validated.published_len(), 0);
         assert_eq!(validated.published_current(), None);
         assert_eq!(validated.proposed().head(), proposed);
@@ -923,6 +988,27 @@ mod tests {
     }
 
     #[test]
+    fn opaque_observation_id_cannot_be_replaced_by_a_local_proposal() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[], &[]);
+        let proposed = repository.commit("proposal", &[root], &["Gother"]);
+        let graph = load(&repository, [proposed]);
+        let observed_id = change_id("Gone");
+        let local_id = change_id("Gother");
+        let normalized = normalize(&observed_id, None, None, &BTreeMap::new(), &graph)
+            .expect("opaque absent observation");
+        let stack = LocalStack::for_test(root, [(local_id, proposed)]);
+
+        let error = normalized
+            .with_proposal(stack.iter().next().unwrap(), &graph)
+            .expect_err("a caller cannot replace the retained observed ID");
+
+        assert!(error.to_string().contains("cannot be coupled"), "{error:?}");
+        assert!(error.to_string().contains("Gone"), "{error:?}");
+        assert!(error.to_string().contains("Gother"), "{error:?}");
+    }
+
+    #[test]
     fn validated_accessors_retain_complete_published_and_projected_history() {
         let repository = TestRepository::new();
         let published_base = repository.commit("published base", &[], &[]);
@@ -934,9 +1020,10 @@ mod tests {
         let id = change_id("Gone");
 
         let validated = change_history(&id, &graph, &[(1, a), (2, b)], proposed)
-            .validate(&id, &graph, None)
+            .validate(&graph, None)
             .expect("complete history is safe");
 
+        assert_eq!(validated.id(), &id);
         assert_eq!(validated.published_len(), 2);
         assert_eq!(
             validated
@@ -976,14 +1063,14 @@ mod tests {
         let id = change_id("Gone");
         let observed = tags([(1, first), (2, unsafe_middle), (3, current)]);
 
-        let normalized =
-            normalize_published_history(&id, Some(current), Some(root), &observed, &graph)
-                .expect("structurally complete published history");
+        let normalized = normalize(&id, Some(current), Some(root), &observed, &graph)
+            .expect("structurally complete published history");
         assert_eq!(normalized.published.as_ref().unwrap().len(), 3);
+        let stack = LocalStack::for_test(root, [(id.clone(), proposed)]);
         let error = normalized
-            .with_proposal(proposed, &graph)
+            .with_proposal(stack.iter().next().unwrap(), &graph)
             .expect("literal proposal")
-            .validate(&id, &graph, None)
+            .validate(&graph, None)
             .expect_err("the sole validation path must include the unsafe middle revision");
         assert!(error.to_string().contains(&unsafe_middle.to_string()), "{error:?}");
     }
@@ -999,14 +1086,14 @@ mod tests {
         let graph = load(&repository, [a, b, unsafe_middle, current]);
         let id = change_id("Gone");
 
-        let absent = normalize_published_history(&id, None, None, &BTreeMap::new(), &graph)
-            .expect("genuinely absent history");
+        let absent =
+            normalize(&id, None, None, &BTreeMap::new(), &graph).expect("genuinely absent history");
         let absent_error = absent
-            .validate_existing(&id, &graph, None)
+            .validate_existing(&graph, None)
             .expect_err("an existing nonlocal change must have published history");
         assert!(absent_error.to_string().contains("no published history"));
 
-        let unsafe_history = normalize_published_history(
+        let unsafe_history = normalize(
             &id,
             Some(current),
             Some(root),
@@ -1015,20 +1102,16 @@ mod tests {
         )
         .expect("structurally complete nonlocal history");
         let unsafe_error = unsafe_history
-            .validate_existing(&id, &graph, None)
+            .validate_existing(&graph, None)
             .expect_err("full nonlocal validation must retain the unsafe middle revision");
         assert!(unsafe_error.to_string().contains(&unsafe_middle.to_string()));
 
-        let validated = normalize_published_history(
-            &id,
-            Some(a),
-            Some(root),
-            &tags([(1, a), (2, b), (3, a)]),
-            &graph,
-        )
-        .expect("complete nonlocal history")
-        .validate_existing(&id, &graph, Some(root))
-        .expect("entire nonlocal history and exact root tip are safe");
+        let validated =
+            normalize(&id, Some(a), Some(root), &tags([(1, a), (2, b), (3, a)]), &graph)
+                .expect("complete nonlocal history")
+                .validate_existing(&graph, Some(root))
+                .expect("entire nonlocal history and exact root tip are safe");
+        assert_eq!(validated.id(), &id);
         assert_eq!(validated.published_len(), 3);
         assert_eq!(
             validated
@@ -1057,12 +1140,12 @@ mod tests {
         let id = change_id("Gone");
 
         let identity_error = change_history(&id, &graph, &[], wrong_identity)
-            .validate(&id, &graph, None)
+            .validate(&graph, None)
             .expect_err("a proposal is not optional identity evidence");
         assert!(identity_error.to_string().contains("exactly one gherrit-pr-id"));
 
         let reachability_error = change_history(&id, &graph, &[(1, published)], unsafe_proposal)
-            .validate(&id, &graph, None)
+            .validate(&graph, None)
             .expect_err("a proposal's owned base cannot contain a published head");
         assert!(
             reachability_error.to_string().contains("reachable from"),
@@ -1088,13 +1171,8 @@ mod tests {
                 .map(|(index, oid)| ((index + 1) as u64, *oid))
                 .collect::<Vec<_>>();
             let current = observed.last().expect("nonempty mask").1;
-            let normalized = normalize_published_history(
-                &id,
-                Some(current),
-                Some(root),
-                &tags(observed.iter().copied()),
-                &graph,
-            );
+            let normalized =
+                normalize(&id, Some(current), Some(root), &tags(observed.iter().copied()), &graph);
             let contiguous = mask == (1 << observed.len()) - 1;
             assert_eq!(normalized.is_ok(), contiguous, "mask={mask:04b}");
         }
@@ -1110,14 +1188,12 @@ mod tests {
         let id = change_id("Gone");
         let history = tags([(1, head)]);
 
-        let head_error =
-            normalize_published_history(&id, Some(other), Some(root), &history, &graph)
-                .expect_err("head disagreement");
+        let head_error = normalize(&id, Some(other), Some(root), &history, &graph)
+            .expect_err("head disagreement");
         assert!(head_error.to_string().contains("head does not match"));
 
-        let base_error =
-            normalize_published_history(&id, Some(head), Some(other), &history, &graph)
-                .expect_err("owned-base disagreement");
+        let base_error = normalize(&id, Some(head), Some(other), &history, &graph)
+            .expect_err("owned-base disagreement");
         assert!(base_error.to_string().contains("owned base does not match"));
     }
 
@@ -1145,7 +1221,7 @@ mod tests {
         let graph = load(&repository, [root]);
         assert!(graph.revision(root).is_err());
         assert!(
-            normalize_published_history(
+            normalize(
                 &change_id("Gone"),
                 Some(missing),
                 Some(root),
@@ -1173,11 +1249,11 @@ mod tests {
         let id = change_id("Gone");
 
         change_history(&id, &graph, &[], valid)
-            .validate(&id, &graph, None)
+            .validate(&graph, None)
             .expect("one exact canonical trailer");
         for head in [wrong, repeated, body_only, unfolded] {
             assert!(
-                change_history(&id, &graph, &[], head).validate(&id, &graph, None).is_err(),
+                change_history(&id, &graph, &[], head).validate(&graph, None).is_err(),
                 "head={head}"
             );
         }
@@ -1192,7 +1268,7 @@ mod tests {
         let graph = load(&repository, [head]);
         let id = change_id("Gone");
         let error = change_history(&id, &graph, &[], head)
-            .validate(&id, &graph, None)
+            .validate(&graph, None)
             .expect_err("non-first-parent duplicate identity");
         assert!(error.to_string().contains("contains 2 commits"), "{error:?}");
     }
@@ -1241,16 +1317,16 @@ mod tests {
         let id = change_id("Gone");
 
         change_history(&id, &graph, &[], head)
-            .validate(&id, &graph, None)
+            .validate(&graph, None)
             .expect("non-root validation has no default-tip requirement");
         change_history(&id, &graph, &[], head)
-            .validate(&id, &graph, Some(root))
+            .validate(&graph, Some(root))
             .expect("original default is safe");
         change_history(&id, &graph, &[], head)
-            .validate(&id, &graph, Some(unrelated_default))
+            .validate(&graph, Some(unrelated_default))
             .expect("an unrelated exact default is safe");
         let error = change_history(&id, &graph, &[], head)
-            .validate(&id, &graph, Some(advanced_default))
+            .validate(&graph, Some(advanced_default))
             .expect_err("default tip containing the head is unsafe");
         assert!(error.to_string().contains("reachable from default tip"), "{error:?}");
     }
@@ -1273,7 +1349,7 @@ mod tests {
         let evidence = load(&repository, [b1, a2]);
         let id = change_id("Gb");
         change_history(&id, &evidence, &[(1, b1)], b2)
-            .validate(&id, &evidence, None)
+            .validate(&evidence, None)
             .expect("B's own historical first parents are safe across the reorder");
     }
 

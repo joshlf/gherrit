@@ -2,8 +2,9 @@
 //!
 //! Repository-wide heads and exact active immutable histories have different
 //! completeness domains. A missing `RemoteHeads` entry proves absence because
-//! every head was advertised. A missing `ActiveVersionTags` entry is an error
-//! because only explicitly requested histories are complete.
+//! every head was advertised. Active histories are accumulated only by
+//! consuming the destination-bound head observation, so independently observed
+//! heads and tags cannot be joined for normalization.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
@@ -18,6 +19,7 @@ use gix::{ObjectId, bstr::ByteSlice as _};
 
 use super::{
     destination::{DefaultBranch, PushDestination, git_output_records},
+    history::{CommitGraphEvidence, GraphLoadError},
     local::{GherritPrId, LocalChange, LocalStack},
     subprocess,
     version::Version,
@@ -35,16 +37,46 @@ const VERSION_ROOT: &[u8] = b"refs/tags/gherrit";
 const VERSION_PREFIX: &[u8] = b"refs/tags/gherrit/";
 
 /// Complete, syntactically valid state from one repository-wide head query.
+pub(super) struct RemoteHeads<'destination> {
+    destination: &'destination PushDestination,
+    parsed: ParsedRemoteHeads,
+}
+
 #[derive(Debug)]
-pub(super) struct RemoteHeads {
+struct ParsedRemoteHeads {
     default_branch: DefaultBranch,
     candidate_heads: HashMap<GherritPrId, ObjectId>,
     owned_bases: HashMap<GherritPrId, ObjectId>,
 }
 
-impl RemoteHeads {
-    pub(super) fn default_branch(&self) -> &DefaultBranch {
+impl ParsedRemoteHeads {
+    fn default_branch(&self) -> &DefaultBranch {
         &self.default_branch
+    }
+
+    fn candidate_head(&self, id: &GherritPrId) -> Option<ObjectId> {
+        self.candidate_heads.get(id).copied()
+    }
+
+    fn owned_base(&self, id: &GherritPrId) -> Option<ObjectId> {
+        self.owned_bases.get(id).copied()
+    }
+}
+
+impl fmt::Debug for RemoteHeads<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteHeads")
+            .field("default_branch", &self.parsed.default_branch)
+            .field("candidate_head_count", &self.parsed.candidate_heads.len())
+            .field("owned_base_count", &self.parsed.owned_bases.len())
+            .finish()
+    }
+}
+
+impl RemoteHeads<'_> {
+    pub(super) fn default_branch(&self) -> &DefaultBranch {
+        self.parsed.default_branch()
     }
 
     /// Returns a syntactically eligible top-level head.
@@ -52,16 +84,243 @@ impl RemoteHeads {
     /// A matching name is only candidate evidence. Pull-request metadata or
     /// the corresponding owned-base ref must establish managed identity.
     pub(super) fn candidate_head(&self, id: &GherritPrId) -> Option<ObjectId> {
-        self.candidate_heads.get(id).copied()
+        self.parsed.candidate_head(id)
     }
 
     pub(super) fn owned_base(&self, id: &GherritPrId) -> Option<ObjectId> {
-        self.owned_bases.get(id).copied()
+        self.parsed.owned_base(id)
     }
 }
 
-/// Complete immutable histories from one destination for exactly the
-/// explicitly requested IDs.
+impl<'destination> RemoteHeads<'destination> {
+    /// Consumes the complete head observation to begin cumulative history
+    /// observation at the same exact destination.
+    #[allow(dead_code)]
+    pub(super) async fn observe_versions(
+        self,
+        local_ids: &[GherritPrId],
+    ) -> Result<DestinationObservation<'destination>> {
+        let histories = observe_version_histories(self.destination, local_ids.iter()).await?;
+        Ok(DestinationObservation { heads: self, histories })
+    }
+}
+
+/// Cumulative complete history coverage from the destination which produced
+/// the retained repository-wide head observation.
+pub(super) struct DestinationObservation<'destination> {
+    heads: RemoteHeads<'destination>,
+    histories: HashMap<GherritPrId, BTreeMap<Version, AdvertisedVersionRef>>,
+}
+
+impl fmt::Debug for DestinationObservation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DestinationObservation")
+            .field("heads", &self.heads)
+            .field("covered_change_count", &self.histories.len())
+            .field(
+                "advertised_ref_count",
+                &self.histories.values().map(BTreeMap::len).sum::<usize>(),
+            )
+            .finish()
+    }
+}
+
+impl<'destination> DestinationObservation<'destination> {
+    #[allow(dead_code)]
+    pub(super) fn remote_heads(&self) -> &RemoteHeads<'destination> {
+        &self.heads
+    }
+
+    /// Consumes this capability and adds one disjoint logical wave.
+    ///
+    /// There is deliberately no destination argument. Even empty requested
+    /// namespaces are retained as complete coverage evidence.
+    #[allow(dead_code)]
+    pub(super) async fn observe_additional(mut self, nonlocal_ids: &[GherritPrId]) -> Result<Self> {
+        unique_id_names(nonlocal_ids, "additional remote observation")?;
+        if nonlocal_ids.iter().any(|id| self.histories.contains_key(id)) {
+            bail!("additional remote observation overlaps previously covered changes");
+        }
+
+        let additional =
+            observe_version_histories(self.heads.destination, nonlocal_ids.iter()).await?;
+        for (id, history) in additional {
+            if self.histories.insert(id, history).is_some() {
+                bail!("additional remote observation overlaps previously covered changes");
+            }
+        }
+        Ok(self)
+    }
+
+    /// Consumes cumulative coverage and proves the exact ordered active set.
+    #[allow(dead_code)]
+    pub(super) fn into_active(
+        mut self,
+        local_ids: &[GherritPrId],
+        nonlocal_ids: &[GherritPrId],
+    ) -> Result<ActiveRemoteChanges<'destination>> {
+        let local_names = unique_id_names(local_ids, "local active changes")?;
+        let nonlocal_names = unique_id_names(nonlocal_ids, "nonlocal active changes")?;
+        if !local_names.is_disjoint(&nonlocal_names) {
+            bail!("local and nonlocal active changes overlap");
+        }
+
+        let expected = local_names.union(&nonlocal_names).copied().collect::<HashSet<_>>();
+        if let Some(missing) =
+            local_ids.iter().chain(nonlocal_ids).find(|id| !self.histories.contains_key(*id))
+        {
+            bail!("active remote observation is missing GHerrit change '{}'", missing.as_str());
+        }
+        if self.histories.keys().any(|id| !expected.contains(id.as_str())) {
+            bail!("active remote observation contains a change outside the exact active set");
+        }
+
+        let heads = &self.heads;
+        let observe = |id: &GherritPrId, versions: BTreeMap<Version, AdvertisedVersionRef>| {
+            ObservedChangeHistory {
+                id: id.clone(),
+                candidate_head: heads.candidate_head(id),
+                owned_base: heads.owned_base(id),
+                versions: versions
+                    .into_iter()
+                    .map(|(version, advertised)| (version, advertised.object_id))
+                    .collect(),
+            }
+        };
+        let local = local_ids
+            .iter()
+            .map(|id| {
+                let versions =
+                    self.histories.remove(id).expect("exact local coverage was proved above");
+                observe(id, versions)
+            })
+            .collect();
+        let nonlocal = nonlocal_ids
+            .iter()
+            .map(|id| {
+                let versions =
+                    self.histories.remove(id).expect("exact nonlocal coverage was proved above");
+                observe(id, versions)
+            })
+            .collect();
+        debug_assert!(self.histories.is_empty());
+
+        Ok(ActiveRemoteChanges {
+            destination: self.heads.destination,
+            default_branch: self.heads.parsed.default_branch,
+            local,
+            nonlocal,
+        })
+    }
+
+    /// Selects every exact advertised version ref for one covered wave.
+    fn acquisition_for_changes(
+        &self,
+        wave_ids: &[GherritPrId],
+    ) -> Result<Option<ObjectAcquisition<'destination>>> {
+        unique_id_names(wave_ids, "object-acquisition wave")?;
+        let mut object_ids = HashSet::new();
+        let mut source_refs = Vec::new();
+        for id in wave_ids {
+            let history = self.histories.get(id).ok_or_else(|| {
+                eyre!("object acquisition requested unobserved GHerrit change '{}'", id.as_str())
+            })?;
+            for advertised in history.values() {
+                object_ids.insert(advertised.object_id);
+                source_refs.push(advertised.source_ref.clone());
+            }
+        }
+        if source_refs.is_empty() {
+            return Ok(None);
+        }
+        object_acquisition(self.heads.destination, object_ids.len(), source_refs).map(Some)
+    }
+}
+
+/// Exact active remote evidence, split in caller-supplied logical order.
+#[allow(dead_code)]
+pub(super) struct ActiveRemoteChanges<'destination> {
+    destination: &'destination PushDestination,
+    default_branch: DefaultBranch,
+    local: Box<[ObservedChangeHistory]>,
+    nonlocal: Box<[ObservedChangeHistory]>,
+}
+
+impl fmt::Debug for ActiveRemoteChanges<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActiveRemoteChanges")
+            .field("default_branch", &self.default_branch)
+            .field("local", &self.local)
+            .field("nonlocal", &self.nonlocal)
+            .finish()
+    }
+}
+
+impl<'destination> ActiveRemoteChanges<'destination> {
+    #[cfg(test)]
+    pub(super) fn destination(&self) -> &'destination PushDestination {
+        self.destination
+    }
+
+    #[cfg(test)]
+    pub(super) fn local(&self) -> &[ObservedChangeHistory] {
+        &self.local
+    }
+
+    #[cfg(test)]
+    pub(super) fn nonlocal(&self) -> &[ObservedChangeHistory] {
+        &self.nonlocal
+    }
+}
+
+/// Complete remote tuple evidence for exactly one covered change.
+///
+/// All fields are private and there is no constructor. Only exact cumulative
+/// active-set consumption can produce this value, and history normalization
+/// consumes it whole.
+#[derive(Debug)]
+pub(super) struct ObservedChangeHistory {
+    id: GherritPrId,
+    candidate_head: Option<ObjectId>,
+    owned_base: Option<ObjectId>,
+    versions: Box<[(Version, ObjectId)]>,
+}
+
+impl ObservedChangeHistory {
+    pub(super) fn id(&self) -> &GherritPrId {
+        &self.id
+    }
+
+    pub(super) fn candidate_head(&self) -> Option<ObjectId> {
+        self.candidate_head
+    }
+
+    pub(super) fn owned_base(&self) -> Option<ObjectId> {
+        self.owned_base
+    }
+
+    pub(super) fn versions(&self) -> impl ExactSizeIterator<Item = (Version, ObjectId)> + '_ {
+        self.versions.iter().copied()
+    }
+}
+
+fn unique_id_names<'id>(ids: &'id [GherritPrId], context: &str) -> Result<HashSet<&'id str>> {
+    let mut unique = HashSet::with_capacity(ids.len());
+    for id in ids {
+        if !unique.insert(id.as_str()) {
+            bail!("{context} contains duplicate GHerrit change IDs");
+        }
+    }
+    Ok(unique)
+}
+
+/// Legacy publisher view of separately observed immutable histories.
+///
+/// FIXME(#264): Delete this compatibility value with [`ObservedStack`] when
+/// activation switches orchestration to [`DestinationObservation`]. It cannot
+/// enter complete-history normalization.
 pub(super) struct ActiveVersionTags<'destination> {
     destination: &'destination PushDestination,
     histories: HashMap<GherritPrId, BTreeMap<Version, AdvertisedVersionRef>>,
@@ -80,64 +339,7 @@ impl fmt::Debug for ActiveVersionTags<'_> {
     }
 }
 
-impl<'destination> ActiveVersionTags<'destination> {
-    /// Returns the complete version/object evidence for one covered change.
-    ///
-    /// Source refs stay private. Normalization can inspect every advertised
-    /// object without recovering or fabricating the ref which carried it.
-    #[allow(dead_code)]
-    pub(super) fn history(
-        &self,
-        id: &GherritPrId,
-    ) -> Option<impl ExactSizeIterator<Item = (Version, ObjectId)> + '_> {
-        self.histories.get(id).map(|history| {
-            history.iter().map(|(version, advertised)| (*version, advertised.object_id))
-        })
-    }
-
-    /// Constructs an acquisition bound to this observation's destination.
-    ///
-    /// Each object ID may be requested once and must occur in this
-    /// observation. If multiple version tags advertise the same object, all
-    /// of their exact refs are selected in deterministic order. That makes a
-    /// repeated object unambiguous without inventing a preferred source ref.
-    #[allow(dead_code)]
-    pub(super) fn acquisition(
-        &self,
-        object_ids: impl IntoIterator<Item = ObjectId>,
-    ) -> Result<ObjectAcquisition<'destination>> {
-        let mut requested = HashSet::new();
-        let mut source_refs = Vec::new();
-        for object_id in object_ids {
-            if !requested.insert(object_id) {
-                bail!("object acquisition requested the same advertised object twice");
-            }
-            let previous_len = source_refs.len();
-            source_refs.extend(
-                self.histories
-                    .values()
-                    .flat_map(BTreeMap::values)
-                    .filter(|advertised| advertised.object_id == object_id)
-                    .map(|advertised| advertised.source_ref.clone()),
-            );
-            if source_refs.len() == previous_len {
-                bail!("object acquisition requested an object absent from the observation");
-            }
-        }
-        if requested.is_empty() {
-            bail!("object acquisition requires at least one advertised object");
-        }
-
-        let source_ref_count = source_refs.len();
-        let batches = plan_fetches(&source_refs)?;
-        Ok(ObjectAcquisition {
-            destination: self.destination,
-            object_count: requested.len(),
-            source_ref_count,
-            batches,
-        })
-    }
-
+impl ActiveVersionTags<'_> {
     fn take_history(&mut self, id: &GherritPrId) -> Option<BTreeMap<Version, ObjectId>> {
         self.histories.remove(id).map(|history| {
             history
@@ -157,7 +359,10 @@ struct AdvertisedVersionRef {
     source_ref: String,
 }
 
-/// Remote head and immutable history for each local change, in stack order.
+/// Legacy remote state for each local change, in stack order.
+///
+/// FIXME(#264): Delete this compatibility seam when the active planner consumes
+/// opaque [`ObservedChangeHistory`] values.
 #[derive(Debug)]
 pub(super) struct ObservedStack<'stack> {
     changes: Vec<ObservedChange<'stack>>,
@@ -166,9 +371,12 @@ pub(super) struct ObservedStack<'stack> {
 impl<'stack> ObservedStack<'stack> {
     pub(super) fn couple(
         stack: &'stack LocalStack,
-        heads: &RemoteHeads,
+        heads: &RemoteHeads<'_>,
         mut versions: ActiveVersionTags<'_>,
     ) -> Result<Self> {
+        if !std::ptr::eq(heads.destination, versions.destination) {
+            bail!("legacy head and version observations came from different destinations");
+        }
         let changes = stack
             .iter()
             .map(|change| {
@@ -247,24 +455,25 @@ impl<'stack> ObservedChange<'stack> {
 }
 
 /// Observes the default branch and every remote head with constant arguments.
-pub(super) async fn observe_remote_heads(destination: &PushDestination) -> Result<RemoteHeads> {
+pub(super) async fn observe_remote_heads(destination: &PushDestination) -> Result<RemoteHeads<'_>> {
     let command = destination.ls_remote(
         ["--quiet".to_owned(), "--symref".to_owned()],
         HEAD_ADVERTISEMENT_PATTERNS.map(str::to_owned),
     );
-    observe_remote_heads_command(
+    let parsed = observe_remote_heads_command(
         command,
         destination.configured_remote(),
         subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
     )
-    .await
+    .await?;
+    Ok(RemoteHeads { destination, parsed })
 }
 
 async fn observe_remote_heads_command(
     command: Command,
     configured_remote: &str,
     timeout: Duration,
-) -> Result<RemoteHeads> {
+) -> Result<ParsedRemoteHeads> {
     let started = Instant::now();
     let output = subprocess::output(command, timeout)
         .await
@@ -284,11 +493,22 @@ async fn observe_remote_heads_command(
     })
 }
 
-/// Observes exact immutable histories only for explicitly requested IDs.
+/// Legacy free-standing history observation used only by the active publisher.
+///
+/// FIXME(#264): Delete this wrapper at activation. New code must consume
+/// [`RemoteHeads::observe_versions`] so head and tag provenance cannot diverge.
 pub(super) async fn observe_active_version_tags<'destination, 'id>(
     destination: &'destination PushDestination,
     ids: impl IntoIterator<Item = &'id GherritPrId>,
 ) -> Result<ActiveVersionTags<'destination>> {
+    let histories = observe_version_histories(destination, ids).await?;
+    Ok(ActiveVersionTags { destination, histories })
+}
+
+async fn observe_version_histories<'id>(
+    destination: &PushDestination,
+    ids: impl IntoIterator<Item = &'id GherritPrId>,
+) -> Result<HashMap<GherritPrId, BTreeMap<Version, AdvertisedVersionRef>>> {
     let ids = ids.into_iter().collect::<Vec<_>>();
     let version_queries = plan_queries(&ids, version_pattern_bytes)?;
     let started = Instant::now();
@@ -322,7 +542,7 @@ pub(super) async fn observe_active_version_tags<'destination, 'id>(
         total_records,
         started.elapsed()
     );
-    Ok(ActiveVersionTags { destination, histories })
+    Ok(histories)
 }
 
 async fn observe_active_version_query(
@@ -422,15 +642,28 @@ fn version_pattern_bytes(id: &GherritPrId) -> usize {
 
 /// A source-only acquisition inseparably bound to one remote observation.
 ///
-/// Construction is private to [`ActiveVersionTags`]. The action owns its
-/// exact advertised refs and validated command batches, while retaining the
-/// destination which produced them. It therefore has no destination or ref
-/// parameter which a caller could substitute at execution time.
-pub(super) struct ObjectAcquisition<'destination> {
+/// Construction is private to destination-bound observations. The action owns
+/// its exact advertised refs and validated command batches, while retaining
+/// the destination which produced them. It therefore has no destination or
+/// ref parameter which a caller could substitute at execution time.
+struct ObjectAcquisition<'destination> {
     destination: &'destination PushDestination,
     object_count: usize,
     source_ref_count: usize,
     batches: Vec<FetchBatch>,
+}
+
+fn object_acquisition<'destination>(
+    destination: &'destination PushDestination,
+    object_count: usize,
+    source_refs: Vec<String>,
+) -> Result<ObjectAcquisition<'destination>> {
+    if source_refs.is_empty() {
+        bail!("object acquisition requires at least one exact advertised version ref");
+    }
+    let source_ref_count = source_refs.len();
+    let batches = plan_fetches(&source_refs)?;
+    Ok(ObjectAcquisition { destination, object_count, source_ref_count, batches })
 }
 
 impl ObjectAcquisition<'_> {
@@ -440,8 +673,7 @@ impl ObjectAcquisition<'_> {
     /// internal retry loop. A caller may set it only after the repository's
     /// existing promisor fact is true and a normal acquisition still leaves
     /// history missing.
-    #[allow(dead_code)]
-    pub(super) async fn execute(&self, repo: &util::Repo, refetch: bool) -> Result<()> {
+    async fn execute(&self, repo: &util::Repo, refetch: bool) -> Result<()> {
         if refetch && !repo.has_promisor_remote()? {
             bail!("`git fetch --refetch` requires a repository with promisor configuration");
         }
@@ -471,6 +703,55 @@ impl ObjectAcquisition<'_> {
             started.elapsed()
         );
         Ok(())
+    }
+}
+
+/// Loads one complete literal graph, with at most one ordinary acquisition and
+/// one promisor refetch using the same destination-bound exact refs.
+#[allow(dead_code)]
+pub(super) async fn complete_graph_wave(
+    repo: &util::Repo,
+    observed: &DestinationObservation<'_>,
+    wave_ids: &[GherritPrId],
+    required_roots: &[ObjectId],
+) -> Result<CommitGraphEvidence> {
+    let mut complete_roots = required_roots.to_vec();
+    complete_roots.extend(
+        observed
+            .histories
+            .values()
+            .flat_map(BTreeMap::values)
+            .map(|advertised| advertised.object_id),
+    );
+    complete_roots.sort_unstable();
+    complete_roots.dedup();
+
+    let missing = match CommitGraphEvidence::load(repo, complete_roots.iter().copied()) {
+        Ok(graph) => return Ok(graph),
+        Err(GraphLoadError::Invalid(error)) => return Err(error),
+        Err(error @ GraphLoadError::MissingObject { .. }) => error,
+    };
+
+    let Some(acquisition) = observed.acquisition_for_changes(wave_ids)? else {
+        return Err(graph_load_report(missing));
+    };
+    acquisition.execute(repo, false).await?;
+    match CommitGraphEvidence::load(repo, complete_roots.iter().copied()) {
+        Ok(graph) => Ok(graph),
+        Err(GraphLoadError::Invalid(error)) => Err(error),
+        Err(GraphLoadError::MissingObject { .. }) if repo.has_promisor_remote()? => {
+            acquisition.execute(repo, true).await?;
+            CommitGraphEvidence::load(repo, complete_roots.iter().copied())
+                .map_err(graph_load_report)
+        }
+        Err(error) => Err(graph_load_report(error)),
+    }
+}
+
+fn graph_load_report(error: GraphLoadError) -> color_eyre::Report {
+    match error {
+        GraphLoadError::Invalid(error) => error,
+        error @ GraphLoadError::MissingObject { .. } => color_eyre::Report::new(error),
     }
 }
 
@@ -638,7 +919,7 @@ fn parse_advertised_refs(output: &[u8]) -> Result<AdvertisedRefs> {
     Ok(AdvertisedRefs { direct, symbolic })
 }
 
-fn parse_remote_heads(output: &[u8]) -> Result<RemoteHeads> {
+fn parse_remote_heads(output: &[u8]) -> Result<ParsedRemoteHeads> {
     let AdvertisedRefs { direct, symbolic } = parse_advertised_refs(output)?;
     let symbolic_head =
         symbolic.get(b"HEAD".as_slice()).ok_or_else(|| eyre!("missing symbolic HEAD"))?;
@@ -674,14 +955,37 @@ fn parse_remote_heads(output: &[u8]) -> Result<RemoteHeads> {
             candidate_heads.insert(id, object_id);
         }
     }
-    Ok(RemoteHeads { default_branch, candidate_heads, owned_bases })
+    Ok(ParsedRemoteHeads { default_branch, candidate_heads, owned_bases })
 }
 
 #[cfg(test)]
-pub(super) fn parse_remote_heads_for_test(output: &[u8]) -> Result<RemoteHeads> {
+pub(super) fn parse_remote_heads_for_test(output: &[u8]) -> Result<RemoteHeads<'static>> {
     // Tests in neighboring behavior modules deliberately enter through the
     // production byte parser instead of manufacturing a validated head set.
-    parse_remote_heads(output)
+    let destination = Box::leak(Box::new(PushDestination::for_test(
+        "origin",
+        "https://github.com/owner/repository.git",
+        Vec::new(),
+    )?));
+    Ok(RemoteHeads { destination, parsed: parse_remote_heads(output)? })
+}
+
+#[cfg(test)]
+pub(super) fn parse_active_change_for_test(
+    id: GherritPrId,
+    head_output: &[u8],
+    version_output: &[u8],
+) -> Result<ObservedChangeHistory> {
+    // History-domain tests enter through both production byte parsers and the
+    // exact active-set consumer. They never manufacture the opaque value.
+    let heads = parse_remote_heads_for_test(head_output)?;
+    let ParsedVersionTags { histories } = parse_versions(version_output, [&id])?;
+    let active = DestinationObservation { heads, histories }.into_active(&[id], &[])?;
+    let mut local = active.local.into_vec();
+    if local.len() != 1 {
+        bail!("test active observation did not contain exactly one local change");
+    }
+    Ok(local.pop().expect("the exact test active set has one change"))
 }
 
 fn validate_advertised_ref_name(name: &[u8]) -> Result<()> {
@@ -945,6 +1249,12 @@ mod tests {
 
     fn for_id<'a, T>(values: &'a HashMap<GherritPrId, T>, value: &str) -> &'a T {
         values.get(&id(value)).expect("requested change must be present")
+    }
+
+    fn empty_observation(ids: &[GherritPrId]) -> DestinationObservation<'static> {
+        let heads = parse_remote_heads_for_test(&head_advertisement("")).unwrap();
+        let ParsedVersionTags { histories } = parse_versions(b"", ids).unwrap();
+        DestinationObservation { heads, histories }
     }
 
     fn failing_reexec(stderr: &str, status: i32) -> Command {
@@ -1277,40 +1587,52 @@ mod tests {
             environment.variables.clone(),
         )
         .unwrap();
-        let heads = observe_remote_heads(&push_destination).await.unwrap();
-        assert_eq!(heads.default_branch().name(), "main");
-        assert_eq!(heads.candidate_head(&id("main")).unwrap().to_string(), push_oid);
-
         let requested = id("Gone");
-        let push_versions =
-            observe_active_version_tags(&push_destination, [&requested]).await.unwrap();
-        let fetch_versions =
-            observe_active_version_tags(&fetch_destination, [&requested]).await.unwrap();
-        let push_history = push_versions.history(&requested).unwrap().collect::<Vec<_>>();
-        let fetch_history = fetch_versions.history(&requested).unwrap().collect::<Vec<_>>();
+        let push_observation = observe_remote_heads(&push_destination)
+            .await
+            .unwrap()
+            .observe_versions(std::slice::from_ref(&requested))
+            .await
+            .unwrap();
+        assert_eq!(push_observation.remote_heads().default_branch().name(), "main");
+        assert_eq!(
+            push_observation.remote_heads().candidate_head(&id("main")).unwrap().to_string(),
+            push_oid
+        );
+        let fetch_observation = observe_remote_heads(&fetch_destination)
+            .await
+            .unwrap()
+            .observe_versions(std::slice::from_ref(&requested))
+            .await
+            .unwrap();
+        let push_history = push_observation.histories[&requested]
+            .iter()
+            .map(|(version, advertised)| (*version, advertised.object_id))
+            .collect::<Vec<_>>();
+        let fetch_history = fetch_observation.histories[&requested]
+            .iter()
+            .map(|(version, advertised)| (*version, advertised.object_id))
+            .collect::<Vec<_>>();
         assert_eq!(push_history.len(), 1);
         assert_eq!(push_history[0].1.to_string(), push_oid);
         assert_eq!(fetch_history.len(), 1);
         assert_eq!(fetch_history[0].1.to_string(), fetch_oid);
 
-        let push_object = ObjectId::from_hex(push_oid.as_bytes()).unwrap();
-        let unknown_object = ObjectId::from_hex(MAIN.as_bytes()).unwrap();
-        let error = push_versions
-            .acquisition(std::iter::empty())
-            .err()
-            .expect("an empty acquisition must be rejected");
-        assert!(error.to_string().contains("at least one"), "error={error:?}");
-        let error = push_versions
-            .acquisition([unknown_object])
-            .err()
-            .expect("an unknown object must be rejected");
-        assert!(error.to_string().contains("absent"), "error={error:?}");
-        let error = push_versions
-            .acquisition([push_object, push_object])
-            .err()
-            .expect("a duplicate object must be rejected");
-        assert!(error.to_string().contains("same advertised object"), "error={error:?}");
-        let acquisition = push_versions.acquisition([push_object]).unwrap();
+        let legacy_heads = observe_remote_heads(&push_destination).await.unwrap();
+        let legacy_fetch_versions =
+            observe_active_version_tags(&fetch_destination, [&requested]).await.unwrap();
+        let stack = LocalStack::for_test(
+            ObjectId::from_hex(MAIN.as_bytes()).unwrap(),
+            [(requested.clone(), ObjectId::from_hex(ONE.as_bytes()).unwrap())],
+        );
+        let error = ObservedStack::couple(&stack, &legacy_heads, legacy_fetch_versions)
+            .expect_err("even the legacy seam rejects A-heads/B-tags");
+        assert!(error.to_string().contains("different destinations"), "{error:?}");
+
+        let acquisition = push_observation
+            .acquisition_for_changes(std::slice::from_ref(&requested))
+            .unwrap()
+            .expect("the observed history has one exact ref");
 
         let push_commit = format!("{push_oid}^{{commit}}");
         let fetch_commit = format!("{fetch_oid}^{{commit}}");
@@ -1356,6 +1678,11 @@ mod tests {
         let promisor_repo = util::Repo::open(client.to_str().unwrap()).unwrap();
         acquisition.execute(&promisor_repo, true).await.unwrap();
 
+        let active = push_observation.into_active(std::slice::from_ref(&requested), &[]).unwrap();
+        assert!(std::ptr::eq(active.destination(), &push_destination));
+        assert_eq!(active.local()[0].id(), &requested);
+        assert_eq!(active.local()[0].versions().next().unwrap().1.to_string(), push_oid);
+
         assert_eq!(
             environment
                 .command(&client, ["for-each-ref", "--format=%(refname)%00%(objectname)"])
@@ -1377,6 +1704,146 @@ mod tests {
                 .extension()
                 != Some(OsStr::new("promisor")))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_parent_uses_one_acquisition_and_one_promisor_refetch() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut environment = GitTestEnvironment::new(root);
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let client = root.join("client");
+        environment.command(root, ["init", "--bare", "--initial-branch=main", "remote.git"]);
+        environment.command(root, ["init", "--initial-branch=main", "seed"]);
+        for message in ["parent", "advertised head"] {
+            environment.command(
+                &seed,
+                [
+                    "-c",
+                    "user.name=GHerrit Test",
+                    "-c",
+                    "user.email=gherrit@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    message,
+                ],
+            );
+        }
+        environment.command(
+            &seed,
+            [
+                "push",
+                remote.to_str().unwrap(),
+                "HEAD:refs/heads/main",
+                "HEAD:refs/tags/gherrit/Gone/v1",
+            ],
+        );
+        let head = environment.stdout(&seed, ["rev-parse", "HEAD"]);
+        let parent = environment.stdout(&seed, ["rev-parse", "HEAD^"]);
+        environment.command(root, ["init", "--initial-branch=main", "client"]);
+        environment.command(&client, ["config", "remote.origin.promisor", "true"]);
+
+        let source_object = seed.join(".git/objects").join(&head[..2]).join(&head[2..]);
+        let target_directory = client.join(".git/objects").join(&head[..2]);
+        fs::create_dir_all(&target_directory).unwrap();
+        fs::copy(&source_object, target_directory.join(&head[2..])).unwrap();
+        environment.command(&client, ["cat-file", "-e", &format!("{head}^{{commit}}")]);
+        environment.command_fails(&client, ["cat-file", "-e", &format!("{parent}^{{commit}}")]);
+
+        let real_git = env::split_paths(&env::var_os("PATH").unwrap())
+            .map(|directory| directory.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("git executable on PATH");
+        let wrapper_directory = root.join("git-wrapper");
+        let wrapper = wrapper_directory.join("git");
+        let fetch_log = root.join("fetch.log");
+        fs::create_dir_all(&wrapper_directory).unwrap();
+        fs::write(
+            &wrapper,
+            b"#!/bin/sh\n\
+              case \" $* \" in\n\
+                *\" fetch \"*)\n\
+                  printf 'fetch\\n' >> \"$GHERRIT_TEST_FETCH_LOG\"\n\
+                  case \" $* \" in\n\
+                    *\" --refetch \"*) exec \"$GHERRIT_TEST_REAL_GIT\" \"$@\" ;;\n\
+                    *) exit 0 ;;\n\
+                  esac\n\
+                  ;;\n\
+              esac\n\
+              exec \"$GHERRIT_TEST_REAL_GIT\" \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let original_path = env::var_os("PATH").unwrap();
+        let wrapped_path = env::join_paths(
+            std::iter::once(wrapper_directory.clone()).chain(env::split_paths(&original_path)),
+        )
+        .unwrap();
+        environment.variables.retain(|(name, _)| name != "PATH");
+        environment.variables.extend([
+            (OsString::from("PATH"), wrapped_path),
+            (OsString::from("GHERRIT_TEST_REAL_GIT"), real_git.into_os_string()),
+            (OsString::from("GHERRIT_TEST_FETCH_LOG"), fetch_log.clone().into_os_string()),
+        ]);
+
+        let destination = PushDestination::for_test(
+            "origin",
+            remote.to_str().unwrap(),
+            environment.variables.clone(),
+        )
+        .unwrap();
+        let change = id("Gone");
+        let observed = observe_remote_heads(&destination)
+            .await
+            .unwrap()
+            .observe_versions(std::slice::from_ref(&change))
+            .await
+            .unwrap();
+        let repo = util::Repo::open(client.to_str().unwrap()).unwrap();
+        let head = ObjectId::from_hex(head.as_bytes()).unwrap();
+        let parent = ObjectId::from_hex(parent.as_bytes()).unwrap();
+        assert!(matches!(
+            CommitGraphEvidence::load(&repo, [head]),
+            Err(GraphLoadError::MissingObject { oid }) if oid == parent
+        ));
+
+        let graph = complete_graph_wave(&repo, &observed, std::slice::from_ref(&change), &[head])
+            .await
+            .unwrap();
+
+        drop(graph);
+        assert!(CommitGraphEvidence::load(&repo, [head]).is_ok());
+        assert_eq!(fs::read_to_string(fetch_log).unwrap().lines().count(), 2);
+        assert!(!client.join(".git/FETCH_HEAD").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_acquisition_wave_preserves_missing_error_and_invalid_never_fetches() {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = gix::init_bare(directory.path()).unwrap();
+        let repo = util::Repo::open(directory.path().to_str().unwrap()).unwrap();
+        let change = id("Gone");
+        let observed = empty_observation(std::slice::from_ref(&change));
+        let missing = ObjectId::from_bytes_or_panic(&[0x55; 20]);
+
+        let error =
+            complete_graph_wave(&repo, &observed, std::slice::from_ref(&change), &[missing])
+                .await
+                .err()
+                .expect("no exact refs can repair an unrelated missing object");
+        assert!(error.to_string().contains(&format!("Commit object {missing} is missing")));
+
+        let blob = writer.write_blob(b"not a commit").unwrap().detach();
+        let error = complete_graph_wave(&repo, &observed, std::slice::from_ref(&change), &[blob])
+            .await
+            .err()
+            .expect("invalid evidence never reaches acquisition");
+        assert!(error.to_string().contains("not a commit"));
     }
 
     #[test]
@@ -1701,13 +2168,13 @@ mod tests {
             format!("{ONE}\trefs/tags/gherrit/Gone/v2\n{ONE}\trefs/tags/gherrit/Gone/v1\n");
         let ParsedVersionTags { histories } =
             parse_versions(output.as_bytes(), &requested).unwrap();
-        let destination =
-            PushDestination::for_test("origin", "https://github.com/owner/repo.git", Vec::new())
-                .unwrap();
-        let observation = ActiveVersionTags { destination: &destination, histories };
+        let heads = parse_remote_heads_for_test(&head_advertisement("")).unwrap();
+        let observation = DestinationObservation { heads, histories };
 
-        let acquisition =
-            observation.acquisition([ObjectId::from_hex(ONE.as_bytes()).unwrap()]).unwrap();
+        let acquisition = observation
+            .acquisition_for_changes(&requested)
+            .unwrap()
+            .expect("the covered change has exact refs");
 
         assert_eq!(acquisition.object_count, 1);
         assert_eq!(acquisition.source_ref_count, 2);
@@ -1718,6 +2185,132 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn cumulative_waves_are_disjoint_deterministic_and_retain_empty_coverage() {
+        let (directory, environment, remote) = seeded_remote();
+        let main = environment.stdout(
+            directory.path(),
+            ["--git-dir", remote.to_str().unwrap(), "rev-parse", "refs/heads/main"],
+        );
+        for name in [
+            "refs/tags/gherrit/Gone/v2",
+            "refs/tags/gherrit/Gone/v1",
+            "refs/tags/gherrit/Gnonlocal/v1",
+        ] {
+            environment.command(
+                directory.path(),
+                ["--git-dir", remote.to_str().unwrap(), "update-ref", name, main.as_str()],
+            );
+        }
+        let destination = PushDestination::for_test(
+            "origin",
+            remote.to_str().unwrap(),
+            environment.variables.clone(),
+        )
+        .unwrap();
+        let empty = id("Gempty");
+        let local = id("Gone");
+        let nonlocal = id("Gnonlocal");
+
+        let observed = observe_remote_heads(&destination)
+            .await
+            .unwrap()
+            .observe_versions(&[empty.clone(), local.clone()])
+            .await
+            .unwrap();
+        assert!(observed.histories[&empty].is_empty());
+        assert_eq!(observed.histories[&local].len(), 2);
+        let observed = observed.observe_additional(std::slice::from_ref(&nonlocal)).await.unwrap();
+        let active = observed
+            .into_active(&[local.clone(), empty.clone()], std::slice::from_ref(&nonlocal))
+            .unwrap();
+
+        assert_eq!(
+            active.local().iter().map(ObservedChangeHistory::id).collect::<Vec<_>>(),
+            [&local, &empty]
+        );
+        assert_eq!(
+            active.local()[0].versions().map(|(version, _)| version.get()).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(active.local()[1].versions().len(), 0);
+        assert_eq!(active.nonlocal()[0].id(), &nonlocal);
+
+        let duplicate_error = observe_remote_heads(&destination)
+            .await
+            .unwrap()
+            .observe_versions(&[local.clone(), local.clone()])
+            .await
+            .expect_err("the first wave rejects duplicate IDs");
+        assert!(duplicate_error.to_string().contains("same GHerrit change twice"));
+
+        let observed = observe_remote_heads(&destination)
+            .await
+            .unwrap()
+            .observe_versions(std::slice::from_ref(&local))
+            .await
+            .unwrap();
+        let overlap_error = observed
+            .observe_additional(std::slice::from_ref(&local))
+            .await
+            .expect_err("the second wave rejects prior coverage");
+        assert!(overlap_error.to_string().contains("overlaps"));
+
+        let observed = observe_remote_heads(&destination)
+            .await
+            .unwrap()
+            .observe_versions(std::slice::from_ref(&local))
+            .await
+            .unwrap();
+        let duplicate_error = observed
+            .observe_additional(&[nonlocal.clone(), nonlocal])
+            .await
+            .expect_err("the second wave rejects duplicate IDs");
+        assert!(duplicate_error.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn exact_active_consumption_rejects_alignment_failures_and_preserves_order() {
+        let a = id("Ga");
+        let b = id("Gb");
+        let c = id("Gc");
+
+        let error = empty_observation(&[a.clone(), b.clone()])
+            .into_active(std::slice::from_ref(&a), &[])
+            .expect_err("extra cumulative coverage is rejected");
+        assert!(error.to_string().contains("outside the exact active set"));
+
+        let error = empty_observation(std::slice::from_ref(&a))
+            .into_active(&[a.clone(), b.clone()], &[])
+            .expect_err("missing cumulative coverage is rejected");
+        assert!(error.to_string().contains("missing GHerrit change"));
+
+        let error = empty_observation(&[a.clone(), b.clone()])
+            .into_active(&[a.clone(), a.clone()], std::slice::from_ref(&b))
+            .expect_err("duplicate local IDs are rejected");
+        assert!(error.to_string().contains("duplicate"));
+
+        let error = empty_observation(&[a.clone(), b.clone()])
+            .into_active(std::slice::from_ref(&a), &[b.clone(), b.clone()])
+            .expect_err("duplicate nonlocal IDs are rejected");
+        assert!(error.to_string().contains("duplicate"));
+
+        let error = empty_observation(std::slice::from_ref(&a))
+            .into_active(std::slice::from_ref(&a), std::slice::from_ref(&a))
+            .expect_err("local and nonlocal IDs must be disjoint");
+        assert!(error.to_string().contains("overlap"));
+
+        let active = empty_observation(&[a.clone(), b.clone(), c.clone()])
+            .into_active(&[b.clone(), a.clone()], std::slice::from_ref(&c))
+            .unwrap();
+        assert_eq!(
+            active.local().iter().map(ObservedChangeHistory::id).collect::<Vec<_>>(),
+            [&b, &a]
+        );
+        assert_eq!(active.nonlocal()[0].id(), &c);
+        assert!(active.local().iter().all(|change| change.versions().len() == 0));
+    }
+
     #[test]
     fn coupling_rejects_missing_active_version_coverage() {
         let change = id("Gone");
@@ -1725,10 +2318,13 @@ mod tests {
             ObjectId::from_hex(MAIN.as_bytes()).unwrap(),
             [(change, ObjectId::from_hex(ONE.as_bytes()).unwrap())],
         );
-        let heads = parse_remote_heads(&head_advertisement("")).unwrap();
         let destination =
             PushDestination::for_test("origin", "https://github.com/owner/repo.git", Vec::new())
                 .unwrap();
+        let heads = RemoteHeads {
+            destination: &destination,
+            parsed: parse_remote_heads(&head_advertisement("")).unwrap(),
+        };
         let versions = ActiveVersionTags { destination: &destination, histories: HashMap::new() };
 
         let error = ObservedStack::couple(&stack, &heads, versions).unwrap_err();
@@ -1742,10 +2338,13 @@ mod tests {
             ObjectId::from_hex(MAIN.as_bytes()).unwrap(),
             [(change.clone(), ObjectId::from_hex(ONE.as_bytes()).unwrap())],
         );
-        let heads = parse_remote_heads(&head_advertisement("")).unwrap();
         let destination =
             PushDestination::for_test("origin", "https://github.com/owner/repo.git", Vec::new())
                 .unwrap();
+        let heads = RemoteHeads {
+            destination: &destination,
+            parsed: parse_remote_heads(&head_advertisement("")).unwrap(),
+        };
         let versions = ActiveVersionTags {
             destination: &destination,
             histories: HashMap::from([(change, BTreeMap::new()), (id("Gextra"), BTreeMap::new())]),
