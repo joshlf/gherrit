@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use color_eyre::eyre::{Context, Result, bail, eyre};
+use color_eyre::eyre::{Context, Result, bail};
 use gix::reference::Category;
 use owo_colors::OwoColorize;
 
@@ -59,7 +59,7 @@ use github::{
     OpenPullRequest as PrState, PreparedCreates, PreparedUpdates, UpdatePullRequest,
 };
 use local::{GherritPrId, LocalStack};
-use publication::{GitPublicationPlan, PlannedChanges, PushOutcome, plan_git_publication};
+use publication::{PlannedChanges, plan_git_publication};
 use pull_request::{CreateAuthorizations, InitialPullRequestIdentities, PullRequestIdentity};
 use reconcile::{CurrentPr, DesiredPr, PrUpdate, link_stack, plan_update};
 use remote::{ObservedStack, observe_active_version_tags, observe_remote_heads};
@@ -155,7 +155,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     } = github.observe_legacy_pull_requests(&gherrit_ids).await?;
     let (repository_id, github_default_branch) = repository.into_parts();
     let default_branch = DefaultBranch::agree(git_default_branch, github_default_branch)?;
-    let planned_changes = push_to_origin(&destination, publication)?;
+    let planned_changes = publication.publish().await?;
     let public_branch = public_branch(repo, branch_name);
     let pr_repository = PrRepository {
         destination: &destination,
@@ -177,38 +177,6 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
 
     log::info!("Successfully synced {num_commits} commits.");
     Ok(())
-}
-
-fn push_to_origin<'stack>(
-    destination: &PushDestination,
-    publication: GitPublicationPlan<'stack>,
-) -> Result<PlannedChanges<'stack>> {
-    let (pushes, changes) = publication.into_parts();
-    // Render and validate every request before the first push. A duplicate
-    // planned destination in a later batch must not be discovered after an
-    // earlier batch has already changed the remote.
-    let requests =
-        pushes.into_iter().map(publication::PushPlan::into_request).collect::<Result<Vec<_>>>()?;
-    for request in requests {
-        log::info!("Pushing chunk to remote...");
-        let output = destination
-            .push(request.options(), request.refspecs())
-            .output()
-            .map_err(|error| {
-                eyre!(
-                    "Could not execute or acknowledge `git push` for GHerrit remote '{}'; remote refs may or may not have changed. Run GHerrit again to observe them before continuing: {error}",
-                    destination.configured_remote()
-                )
-            })?;
-        if request.outcome(&output.status, &output.stdout) == PushOutcome::Indeterminate {
-            bail!(
-                "Could not acknowledge `git push` for GHerrit remote '{}'; remote refs may or may not have changed. Run GHerrit again to observe them before continuing.",
-                destination.configured_remote()
-            );
-        }
-    }
-
-    Ok(changes)
 }
 
 /// Syncs the local stack of commits with GitHub Pull Requests.
