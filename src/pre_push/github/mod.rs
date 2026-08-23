@@ -1094,6 +1094,11 @@ impl PreparedCreates {
     pub(super) fn request_text(&self) -> String {
         self.batches.iter().map(|batch| batch.request.to_string()).collect::<Vec<_>>().join("\n")
     }
+
+    #[cfg(test)]
+    pub(super) fn request_batches_for_test(&self) -> impl Iterator<Item = &Value> {
+        self.batches.iter().map(|batch| &batch.request)
+    }
 }
 
 /// Opaque proof that every planned create has one globally valid receipt.
@@ -1456,6 +1461,11 @@ impl PreparedUpdates {
     #[cfg(test)]
     pub(super) fn request_text(&self) -> String {
         self.batches.iter().map(|batch| batch.request.to_string()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[cfg(test)]
+    pub(super) fn request_batches_for_test(&self) -> impl Iterator<Item = &Value> {
+        self.batches.iter().map(|batch| &batch.request)
     }
 }
 

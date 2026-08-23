@@ -751,4 +751,7 @@ fn bodies_equal(observed: &str, desired: &str) -> bool {
 }
 
 #[cfg(test)]
+mod semantic_oracle;
+
+#[cfg(test)]
 mod tests;

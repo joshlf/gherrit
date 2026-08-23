@@ -66,14 +66,16 @@ The suite itself must be:
   failures are controlled explicitly.
 - **Bounded:** subprocesses, servers, and waits have deadlines and deterministic
   teardown.
-- **Fast:** policy and reconciliation changes receive feedback without starting
-  processes, repositories, or servers.
+- **Fast:** focused pure tests provide an interactive feedback loop without
+  running the exhaustive recovery proof or starting external boundaries.
 - **Fail-closed:** unsupported fake operations, unexpected requests, and
   unconsumed expectations fail the test.
 - **Understandable:** a failure identifies the violated behavior and the layer
   responsible for it.
-- **Extensible:** adding a policy, external operation, failure point, or race
-  schedule does not require extending a large simulator.
+- **Extensible:** ordinary policy, formatting, parsing, and adapter changes add
+  focused tests. Only changes to publication stages, durable effects,
+  acknowledgement loss, visibility schedules, or restart and convergence
+  reasoning extend the semantic recovery oracle.
 - **Faithful:** tests use the production artifact and real external tools at the
   boundaries where their behavior is the subject of the test.
 
@@ -185,31 +187,47 @@ The GitHub boundary should support:
 - creating pull requests from complete specifications; and
 - applying minimal pull request updates.
 
-Production adapters use real Git and GitHub protocols. Application tests use a
-small in-memory world that applies only GHerrit's domain semantics and records
-typed effects.
+Production adapters use real Git and GitHub protocols. Application tests use
+focused domain fixtures and a dedicated finite-state semantic recovery oracle.
 
 ## Test Layers
 
 Choose the lowest layer that can faithfully prove the behavior. A higher layer
 is justified only when the boundary itself is material to the claim.
 
-### Pure Model Tests
+### Focused Pure Tests
 
-Most behavior belongs here. These tests use no files, processes, threads,
-locks, ports, environment variables, or sleeps.
+Most local rules belong here. These tests use no files, processes, threads,
+locks, ports, environment variables, or sleeps, and they run independently of
+the exhaustive recovery proof.
 
 They cover:
 
 - stack topology and policy;
-- pull request rendering and minimal updates;
+- pull request rendering, exact body comparison, and minimal updates;
+- parser syntax and exact text equivalence;
 - publication and version decisions;
-- reconciliation ordering;
-- batching boundaries;
-- idempotence and convergence;
-- partial success and restart;
-- stale observations and deterministic writer interleavings; and
-- exhaustive combinations over bounded small worlds.
+- reconciliation ordering and batching boundaries;
+- action masks; and
+- bounded diagnostic formatting.
+
+### Exhaustive Semantic Recovery Proof
+
+The single named test
+`owned_base_and_marker_publication_exhaustively_survive_restarts` compares an
+independent finite-state model with the production planner. It covers bounded
+topologies, publication stages, durable effect prefixes, acknowledgement loss,
+visibility schedules, restarts, and convergence. It is required in CI and
+before publication, but it is deliberately separate from the interactive
+focused-test loop.
+
+Ordinary policy, formatting, parsing, adapter, and feature cases remain in
+focused tests. Update the exhaustive oracle when publication stages, durable
+effects, acknowledgement loss, visibility schedules, or restart and
+convergence reasoning change. Exact body text, rendering, parser syntax, wire
+encoding, and local batching boundaries remain owned by focused tests; those
+details do not enlarge the recovery state space unless they change a durable
+action or visibility schedule.
 
 Before adding a property-testing dependency, exhaustively enumerate bounded
 small state spaces directly. Stacks of up to three commits combined with absent,
@@ -220,12 +238,16 @@ names and failures.
 Universal invariants include:
 
 - rejection produces no mutations;
-- GitHub writes never precede required Git publication;
-- a converged world produces `Done`;
+- GitHub creates never precede exact acknowledgement of required Git
+  publication;
+- final GitHub updates never precede exact acknowledgement of required marker
+  publication;
+- a converged world produces no action;
 - applying a successful action makes measurable progress;
 - retrying from every committed prefix eventually converges;
 - version tags never move;
-- pull request bases refer to published branches; and
+- one change's head, owned base, and new version tag are never split;
+- every created pull request uses its own published base; and
 - merged state is absorbing.
 
 ### Adapter Contract Tests
@@ -372,43 +394,37 @@ production binary remains on the same all-feature test graph, and a dedicated
 regression proves that it rejects the driver protocol. No build environment
 variable changes production control flow.
 
-## Performance Budget
+## Performance Tiers and Baselines
 
 Measure wall-clock time and critical-path tests, not only the sum of individual
 test durations. Parallel system tests contend for process and filesystem
 resources, so increasing test threads is not a general performance strategy.
 
-At the start of this migration, a cached full suite takes roughly 48 seconds on
-the development machine. The pre-push system target accounts for roughly 34
-seconds, and one parameterized repository-URL test can determine the suite's
-critical path at over 40 seconds under contention. The pure unit targets finish
-in a fraction of a second.
+Measure focused feedback, the exhaustive semantic proof, adapter and process
+groups, and the full gate separately. A slow proof must not silently become
+part of every interactive command, and a fast focused subset is not evidence
+that the recovery proof ran.
 
-After moving policy into production-used pure planners and deleting redundant
-process matrices, the same full command takes 13.6 seconds, including 1.6
-seconds of recompilation. Pure library tests take 0.02 seconds and the remaining
-pre-push process target takes 3.0 seconds. These are point-in-time development
-machine measurements, not looser replacements for the budgets below.
+On the 2026-08-23 macOS reference host, with warm artifacts and one Cargo build
+job, the 36-test planner group including the oracle took 30.98 seconds. Repeated
+warm oracle runs took 32.19–36.40 seconds with 10 Rayon workers and about
+186–198 user CPU seconds. The complete required unit-25 one-Cargo-job suite
+took 85.72 seconds. These are dated same-host baselines, not portable pass/fail
+thresholds.
 
-The intended steady-state budget is:
-
-- pure model feedback in well under one second;
-- all adapter contracts in a few seconds;
-- the full required suite in under 15 seconds on a typical development
-  machine; and
-- no individual required test responsible for most of the suite critical
-  path.
-
-Treat regressions against these budgets as architectural signals. Optimize
-after measuring; do not introduce shared mutable state or weaker boundaries for
-speculative savings.
+Comparable validation receipts must record the toolchain, Cargo job count,
+test and Rayon worker counts, warm or cold state, selected layer, and wall
+time. A material regression requires measurement and an explanation. Optimize
+without weakening the oracle's state space, hermeticity, or boundary fidelity.
 
 ## Adding Coverage
 
 When adding a behavior:
 
 1. State the product risk and observable claim.
-2. Put semantic combinations and invariants in a pure model test.
+2. Put a local semantic rule in a focused pure test. Update the exhaustive
+   oracle only when a publication stage, durable effect, acknowledgement-loss
+   case, visibility schedule, or the recovery proof changes.
 3. Add an adapter contract only if new protocol translation is involved.
 4. Add a system scenario only if process or hook composition is the subject.
 5. Include the new operation in the typed trace and canonical report.
@@ -436,7 +452,7 @@ parts compose, but they should not repeat the owner's full input matrix.
 | Batching boundaries and aliases | Pure batching | One multi-item codec contract |
 | CLI diagnostics | Pure typed errors | Focused command snapshots |
 | Hook argument forwarding and blocking | Installed-hook system test | None |
-| Retry and concurrent-writer behavior | Pure state machine | Focused lease contract |
+| Retry and concurrent-writer behavior | Exhaustive semantic recovery proof | Focused lease contract |
 
 This table is also a deletion rule. Once the primary owner and the stated
 composition evidence exist, another process test needs a distinct boundary
@@ -584,8 +600,9 @@ moving lower.
 
 ### 8. Make the CI Shape Match the Architecture
 
-41. Run formatting, linting, pure model tests, codec tests, adapter contracts,
-    and system tests as visibly separate targets.
+41. Run formatting, linting, focused pure tests, the exhaustive recovery proof,
+    codec tests, adapter contracts, and system tests as visibly separate
+    targets.
 42. Put the fastest deterministic signal first while preserving required status
     checks for every supported platform.
 43. Run ordinary tests without credentials or live endpoints. Put a live GitHub
@@ -605,8 +622,8 @@ moving lower.
     coordination; each remaining occurrence needs an explicit boundary reason.
 48. Re-run the evidence table as an audit: every product risk must have a clear
     primary owner and every expensive test must protect a unique claim.
-49. Record final layer timings and update the performance budget from measured
-    CI and development-machine results.
+49. Record final layer timings and update the performance tiers and baselines
+    from measured CI and development-machine results.
 50. Treat future additions that bypass the action model or enlarge a semantic
     protocol fake as architecture changes requiring explicit justification.
 
