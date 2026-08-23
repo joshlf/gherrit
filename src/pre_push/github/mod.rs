@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use serde::Deserialize;
@@ -8,18 +8,17 @@ use super::{
     bounded_diagnostic_detail,
     destination::{DefaultBranch, PushDestination, RepositoryCoordinates},
     local::GherritPrId,
+    plan::{PlannedCreate, PlannedUpdate},
     pull_request::{
-        InitialPullRequestIdentities, PullRequestIdentity, PullRequestNodeId, PullRequestNumber,
-        TerminalHistories,
+        ExactLocalPullRequestIdentities, PullRequestIdentity, PullRequestNodeId, PullRequestNumber,
+        owned_base_name,
     },
 };
-
+mod observation;
 mod transport;
 
-#[allow(unused_imports)]
-pub(super) use transport::{
-    Github, LegacyGithubObservation, MutationAcknowledgement, OpenObservation,
-};
+pub(super) use observation::CompleteLocalPullRequests;
+pub(super) use transport::Github;
 
 const MAX_MUTATION_ALIASES: usize = 64;
 // A 131,072-byte pull-request body made entirely from U+0001 expands to
@@ -27,24 +26,6 @@ const MAX_MUTATION_ALIASES: usize = 64;
 // One MiB accommodates that worst case plus the mutation's other supported
 // fields while retaining a deterministic preflight request limit.
 const MAX_MUTATION_REQUEST_BYTES: usize = 1024 * 1024;
-
-#[cfg(test)]
-fn partition_effects<T>(
-    effects: impl IntoIterator<Item = T>,
-    lengths: impl IntoIterator<Item = usize>,
-) -> super::test_effect::EffectBatches<T> {
-    let mut effects = effects.into_iter();
-    let batches = lengths
-        .into_iter()
-        .map(|length| {
-            let batch = effects.by_ref().take(length).collect::<Box<[_]>>();
-            assert_eq!(batch.len(), length, "a prepared batch outlived its typed effects");
-            batch
-        })
-        .collect();
-    assert!(effects.next().is_none(), "typed effects outlived their prepared batches");
-    batches
-}
 
 fn graphql_error_detail(response: &Value) -> Option<String> {
     response
@@ -67,51 +48,42 @@ enum Nullable<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Complete pull-request facts returned by the repository-wide open scan.
+/// Complete pull-request facts returned by one exact local-head query.
 ///
-/// The compatibility selector currently consumes only identity, lifecycle,
-/// and head-repository facts. Keeping the exact refs, object IDs, and policy
-/// state here makes the observation itself complete, so later validation does
-/// not need another network read.
-pub(super) struct OpenPullRequest {
-    pub(super) number: u64,
-    pub(super) node_id: String,
+/// Correlation consumes identity, lifecycle, and head-repository facts while
+/// retaining the exact refs, object IDs, and policy state. Keeping the row
+/// complete means later validation never needs another network read.
+pub(super) struct ObservedPullRequest {
+    pub(super) identity: PullRequestIdentity,
     pub(super) title: String,
     pub(super) body: String,
     pub(super) base_branch: String,
     pub(super) head_branch: String,
     pub(super) base_oid: gix::ObjectId,
     pub(super) head_oid: gix::ObjectId,
+    pub(super) state: PullRequestState,
     pub(super) is_cross_repository: bool,
     pub(super) has_auto_merge_request: bool,
     pub(super) is_in_merge_queue: bool,
 }
 
-/// Complete repository-wide OPEN rows coupled to their identity namespaces.
-///
-/// Only the paginator constructs this value. It remains nested inside
-/// [`OpenObservation`](transport::OpenObservation) until correlation or the
-/// temporary legacy selector consumes that observation.
-#[derive(Debug)]
-pub(super) struct CompleteOpenRows {
-    pull_requests: Box<[OpenPullRequest]>,
-    initial_identities: InitialPullRequestIdentities,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(super) enum PullRequestState {
+    Open,
+    Closed,
+    Merged,
 }
 
-impl CompleteOpenRows {
-    fn new(pull_requests: Vec<OpenPullRequest>) -> Result<Self> {
-        let initial_identities = InitialPullRequestIdentities::from_open(&pull_requests)?;
-        Ok(Self { pull_requests: pull_requests.into_boxed_slice(), initial_identities })
-    }
+#[derive(Deserialize)]
+struct DefaultBranchRef {
+    name: String,
+    target: Nullable<GitObject>,
+}
 
-    pub(super) fn into_values(self) -> (Box<[OpenPullRequest]>, InitialPullRequestIdentities) {
-        (self.pull_requests, self.initial_identities)
-    }
-
-    #[cfg(test)]
-    pub(super) fn for_test(pull_requests: Vec<OpenPullRequest>) -> Result<Self> {
-        Self::new(pull_requests)
-    }
+#[derive(Deserialize)]
+struct GitObject {
+    oid: Nullable<String>,
 }
 
 fn mutation_response_data(
@@ -161,56 +133,28 @@ impl Repository {
     }
 }
 
-/// One complete repository row inseparably correlated with its OPEN PR set.
+/// One complete GitHub repository row correlated with its exact local PR set.
 ///
-/// Its destination link proves the same opaque publication capability. It
-/// does not claim that GitHub and Git facts came from one remote-head query.
-pub(super) struct CorrelatedRepository<'destination> {
-    destination: &'destination PushDestination,
+/// The retained repository coordinates are the only GitHub-to-Git binding.
+/// Planning compares them with the actual push destination before combining
+/// the observations.
+pub(super) struct CorrelatedRepository {
     repository: Repository,
     pull_requests: super::pull_request::CorrelatedPullRequests,
 }
 
-/// Complete neutral terminal evidence bound to one GitHub repository.
-pub(super) struct RepositoryTerminalHistories {
-    coordinates: RepositoryCoordinates,
-    exact: TerminalHistories,
-}
-
-impl RepositoryTerminalHistories {
-    fn from_transport(coordinates: RepositoryCoordinates, exact: TerminalHistories) -> Self {
-        Self { coordinates, exact }
-    }
-
-    /// FIXME(#264): Delete this legacy unwrap with the pre-activation
-    /// observation adapter.
-    fn into_legacy_for(self, expected: &RepositoryCoordinates) -> Result<TerminalHistories> {
-        if &self.coordinates != expected {
-            bail!("terminal pull request evidence came from a different GitHub repository");
-        }
-        Ok(self.exact)
-    }
-
-    #[cfg(test)]
-    pub(super) fn for_test(destination: &PushDestination, exact: TerminalHistories) -> Self {
-        Self::from_transport(destination.repository_coordinates(), exact)
-    }
-}
-
-impl<'destination> CorrelatedRepository<'destination> {
+impl CorrelatedRepository {
     fn new(
-        destination: &'destination PushDestination,
         repository: Repository,
         pull_requests: super::pull_request::CorrelatedPullRequests,
     ) -> Self {
-        Self { destination, repository, pull_requests }
+        Self { repository, pull_requests }
     }
 
-    /// Constructs decoded and correlated repository evidence for semantic
-    /// tests.
+    /// Constructs decoded and correlated repository evidence for semantic tests.
     #[cfg(test)]
     pub(super) fn from_typed_for_test(
-        destination: &'destination PushDestination,
+        destination: &PushDestination,
         repository_node_id: String,
         default_branch: DefaultBranch,
         local: Vec<super::pull_request::LocalPullRequestObservation>,
@@ -221,579 +165,59 @@ impl<'destination> CorrelatedRepository<'destination> {
             coordinates: destination.repository_coordinates(),
         };
         let pull_requests =
-            super::pull_request::CorrelatedPullRequests::from_typed_for_test(local, Vec::new())?;
-        Ok(Self::new(destination, repository, pull_requests))
+            super::pull_request::CorrelatedPullRequests::from_typed_for_test(local)?;
+        Ok(Self::new(repository, pull_requests))
     }
 
     pub(super) fn into_planning_parts_for(
         self,
         destination: &PushDestination,
-        terminal_histories: RepositoryTerminalHistories,
-    ) -> Result<(Repository, super::pull_request::CorrelatedPullRequests, TerminalHistories)> {
-        if !std::ptr::eq(self.destination, destination) {
-            bail!("Git and GitHub evidence came from different push-destination capabilities");
-        }
+    ) -> Result<(Repository, super::pull_request::CorrelatedPullRequests)> {
         let destination_coordinates = destination.repository_coordinates();
         if self.repository.coordinates != destination_coordinates {
             bail!("Git and GitHub planning evidence identify different repositories");
         }
-        if terminal_histories.coordinates != destination_coordinates {
-            bail!("terminal pull request evidence came from a different GitHub repository");
-        }
-        Ok((self.repository, self.pull_requests, terminal_histories.exact))
-    }
-}
-
-/// The first page of the repository-wide open-pull-request connection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FirstOpenPullRequests {
-    coordinates: RepositoryCoordinates,
-    first: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NextOpenPullRequests {
-    coordinates: RepositoryCoordinates,
-    after: String,
-    first: usize,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct FirstOpenPullRequestsPage {
-    repository: Repository,
-    pull_requests: Vec<OpenPullRequest>,
-    next_cursor: Option<String>,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct NextOpenPullRequestsPage {
-    pull_requests: Vec<OpenPullRequest>,
-    next_cursor: Option<String>,
-}
-
-#[cfg(test)]
-fn repository_coordinates_for_test(owner: &str, repository: &str) -> RepositoryCoordinates {
-    PushDestination::for_test(
-        "origin",
-        &format!("https://github.com/{owner}/{repository}.git"),
-        Vec::new(),
-    )
-    .unwrap()
-    .repository_coordinates()
-}
-
-impl FirstOpenPullRequests {
-    #[cfg(test)]
-    fn new(owner: String, repository: String, first: usize) -> Self {
-        Self::for_repository(repository_coordinates_for_test(&owner, &repository), first)
-    }
-
-    fn for_repository(coordinates: RepositoryCoordinates, first: usize) -> Self {
-        assert!(first > 0, "an open pull request page size must be positive");
-        Self { coordinates, first }
-    }
-
-    fn document(&self) -> String {
-        open_pull_requests_document(
-            self.coordinates.owner(),
-            self.coordinates.repository(),
-            self.first,
-            OpenPullRequestPage::First,
-        )
-    }
-
-    fn decode(&self, response: Value) -> Result<FirstOpenPullRequestsPage> {
-        let DecodedOpenPullRequestsPage {
-            repository_node_id,
-            default_branch_ref,
-            pull_requests,
-            next_cursor,
-        } = decode_open_pull_requests_page(response)?;
-        let node_id = match repository_node_id {
-            Some(node_id) if !node_id.is_empty() => node_id,
-            Some(_) => bail!("GitHub reported an empty repository node ID"),
-            None => bail!("GitHub omitted the repository node ID"),
-        };
-        let default_branch = match default_branch_ref {
-            Some(default_branch) => default_branch,
-            None => bail!("GitHub omitted the repository default branch"),
-        };
-        let target = match default_branch.target {
-            Nullable::Value(target) => target,
-            Nullable::Null(()) => bail!("GitHub omitted the default branch target"),
-        };
-        let oid = match target.oid {
-            Nullable::Value(oid) => oid,
-            Nullable::Null(()) => bail!("GitHub omitted the default branch object ID"),
-        };
-        let tip = gix::ObjectId::from_hex(oid.as_bytes())
-            .map_err(|_| eyre!("GitHub reported an invalid default branch object ID"))?;
-        let repository = Repository {
-            node_id,
-            default_branch: DefaultBranch::new(default_branch.name, tip)
-                .map_err(|_| eyre!("GitHub reported an invalid default branch"))?,
-            coordinates: self.coordinates.clone(),
-        };
-
-        Ok(FirstOpenPullRequestsPage { repository, pull_requests, next_cursor })
-    }
-}
-
-impl NextOpenPullRequests {
-    #[cfg(test)]
-    fn new(owner: String, repository: String, after: String, first: usize) -> Self {
-        Self::for_repository(repository_coordinates_for_test(&owner, &repository), after, first)
-    }
-
-    fn for_repository(coordinates: RepositoryCoordinates, after: String, first: usize) -> Self {
-        assert!(!after.is_empty(), "an open pull request cursor must be nonempty");
-        assert!(first > 0, "an open pull request page size must be positive");
-        Self { coordinates, after, first }
-    }
-
-    fn document(&self) -> String {
-        open_pull_requests_document(
-            self.coordinates.owner(),
-            self.coordinates.repository(),
-            self.first,
-            OpenPullRequestPage::Next { after: &self.after },
-        )
-    }
-
-    fn decode(&self, response: Value) -> Result<NextOpenPullRequestsPage> {
-        if response.pointer("/data/repository").and_then(Value::as_object).is_some_and(
-            |repository| {
-                repository.contains_key("id") || repository.contains_key("defaultBranchRef")
-            },
-        ) {
-            bail!("GitHub returned unrequested repository facts on a later open PR page");
-        }
-        let DecodedOpenPullRequestsPage {
-            repository_node_id: _,
-            default_branch_ref: _,
-            pull_requests,
-            next_cursor,
-        } = decode_open_pull_requests_page(response)?;
-        Ok(NextOpenPullRequestsPage { pull_requests, next_cursor })
-    }
-}
-
-enum OpenPullRequestPage<'a> {
-    First,
-    Next { after: &'a str },
-}
-
-fn open_pull_requests_document(
-    owner: &str,
-    repository: &str,
-    first: usize,
-    page: OpenPullRequestPage<'_>,
-) -> String {
-    let (repository_facts, after) = match page {
-        OpenPullRequestPage::First => {
-            ("id, defaultBranchRef { name, target { oid } } ", String::new())
-        }
-        OpenPullRequestPage::Next { after } => ("", format!(", after: {}", json!(after))),
-    };
-    format!(
-        "query {{ repository(owner: {}, name: {}) {{ {repository_facts}pullRequests(first: {first}{after}, states: [OPEN]) {{ nodes {{ number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, autoMergeRequest {{ enabledAt }}, isInMergeQueue }} pageInfo {{ hasNextPage, endCursor }} }} }} }}",
-        json!(owner),
-        json!(repository),
-    )
-}
-
-struct DecodedOpenPullRequestsPage {
-    repository_node_id: Option<String>,
-    default_branch_ref: Option<DefaultBranchRef>,
-    pull_requests: Vec<OpenPullRequest>,
-    next_cursor: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DefaultBranchRef {
-    name: String,
-    target: Nullable<GitObject>,
-}
-
-#[derive(Deserialize)]
-struct GitObject {
-    oid: Nullable<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum OpenPullRequestState {
-    Open,
-}
-
-fn decode_open_pull_requests_page(response: Value) -> Result<DecodedOpenPullRequestsPage> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Response {
-        id: Option<String>,
-        default_branch_ref: Option<DefaultBranchRef>,
-        pull_requests: PullRequests,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct PullRequests {
-        nodes: Vec<Node>,
-        page_info: PageInfo,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct PageInfo {
-        has_next_page: bool,
-        end_cursor: Nullable<String>,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct AutoMergeRequest {
-        enabled_at: Nullable<String>,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Node {
-        number: i64,
-        id: String,
-        title: String,
-        body: String,
-        base_ref_name: String,
-        base_ref_oid: String,
-        head_ref_name: String,
-        head_ref_oid: String,
-        state: OpenPullRequestState,
-        is_cross_repository: bool,
-        auto_merge_request: Nullable<AutoMergeRequest>,
-        is_in_merge_queue: bool,
-    }
-
-    let response = response
-        .get("data")
-        .and_then(|data| data.get("repository"))
-        .cloned()
-        .ok_or_else(|| eyre!("GitHub open pull request response is missing repository data"))?;
-    let response: Response = serde_json::from_value(response)
-        .map_err(|_| eyre!("Failed to decode pull request query response"))?;
-    let pull_requests = response
-        .pull_requests
-        .nodes
-        .into_iter()
-        .map(|node| {
-            let number = u64::try_from(node.number)
-                .ok()
-                .filter(|number| *number > 0 && *number <= i32::MAX as u64)
-                .ok_or_else(|| {
-                    eyre!("GitHub reported an invalid pull request number {}", node.number)
-                })?;
-            for (field, value) in [
-                ("pull request node ID", &node.id),
-                ("pull request base ref name", &node.base_ref_name),
-                ("pull request head ref name", &node.head_ref_name),
-            ] {
-                if value.is_empty() {
-                    bail!("GitHub reported an empty {field}");
-                }
-            }
-            let parse_oid = |field: &str, oid: &str| {
-                let object_id = gix::ObjectId::from_hex(oid.as_bytes())
-                    .map_err(|_| eyre!("GitHub reported an invalid {field}"))?;
-                if object_id.is_null() {
-                    bail!("GitHub reported a null {field}");
-                }
-                Ok(object_id)
-            };
-            let base_oid = parse_oid("pull request base ref object ID", &node.base_ref_oid)?;
-            let head_oid = parse_oid("pull request head ref object ID", &node.head_ref_oid)?;
-            let OpenPullRequestState::Open = node.state;
-            let has_auto_merge_request = match node.auto_merge_request {
-                Nullable::Value(request) => {
-                    let _ = request.enabled_at;
-                    true
-                }
-                Nullable::Null(()) => false,
-            };
-            Ok(OpenPullRequest {
-                number,
-                node_id: node.id,
-                title: node.title,
-                body: node.body,
-                base_branch: node.base_ref_name,
-                head_branch: node.head_ref_name,
-                base_oid,
-                head_oid,
-                is_cross_repository: node.is_cross_repository,
-                has_auto_merge_request,
-                is_in_merge_queue: node.is_in_merge_queue,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let next_cursor = match response.pull_requests.page_info {
-        PageInfo { has_next_page: true, end_cursor: Nullable::Value(cursor) }
-            if !cursor.is_empty() =>
-        {
-            Some(cursor)
-        }
-        PageInfo { has_next_page: true, .. } => {
-            bail!("GitHub reported another open pull request page without an end cursor");
-        }
-        PageInfo { has_next_page: false, .. } => None,
-    };
-
-    Ok(DecodedOpenPullRequestsPage {
-        repository_node_id: response.id,
-        default_branch_ref: response.default_branch_ref,
-        pull_requests,
-        next_cursor,
-    })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TerminalPullRequestQuery {
-    id: GherritPrId,
-    after: Option<String>,
-    first: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct TerminalPullRequestPage {
-    pub(super) pull_requests: Vec<TerminalPullRequest>,
-    pub(super) next_cursor: Option<String>,
-}
-
-/// One decoded terminal page retaining the exact typed request token.
-///
-/// The ID and input cursor are moved from the query which produced this page;
-/// callers cannot relabel otherwise valid evidence before recording it.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct TerminalPullRequestEvidence {
-    id: GherritPrId,
-    after: Option<String>,
-    page: TerminalPullRequestPage,
-}
-
-impl TerminalPullRequestEvidence {
-    pub(super) fn id(&self) -> &GherritPrId {
-        &self.id
-    }
-
-    pub(super) fn next_cursor(&self) -> Option<&str> {
-        self.page.next_cursor.as_deref()
-    }
-
-    pub(super) fn into_parts(self) -> (GherritPrId, Option<String>, TerminalPullRequestPage) {
-        (self.id, self.after, self.page)
-    }
-
-    #[cfg(test)]
-    pub(super) fn for_test(
-        id: GherritPrId,
-        after: Option<String>,
-        page: TerminalPullRequestPage,
-    ) -> Self {
-        Self { id, after, page }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct TerminalPullRequest {
-    pub(super) number: u64,
-    pub(super) node_id: String,
-    pub(super) state: TerminalPullRequestState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(super) enum TerminalPullRequestState {
-    Closed,
-    Merged,
-}
-
-/// A repository-root terminal-history query with independently paged aliases.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TerminalPullRequests {
-    owner: String,
-    repository: String,
-    queries: Vec<TerminalPullRequestQuery>,
-}
-
-impl TerminalPullRequests {
-    const MAX_ALIASES: usize = 64;
-
-    fn new(
-        owner: String,
-        repository: String,
-        queries: Vec<TerminalPullRequestQuery>,
-    ) -> Result<Self> {
-        if queries.is_empty() || queries.len() > Self::MAX_ALIASES {
-            bail!("A terminal pull request query requires between one and 64 aliases");
-        }
-        Ok(Self { owner, repository, queries })
-    }
-
-    fn document(&self) -> String {
-        let fields = self.queries.iter().enumerate().map(|(index, query)| {
-            let after = query.after.as_ref()
-                .map(|cursor| format!(", after: {}", json!(cursor)))
-                .unwrap_or_default();
-            format!(
-                "op{index}: pullRequests(headRefName: {}, first: {}{after}, states: [CLOSED, MERGED]) {{ nodes {{ number, id, headRefName, state, isCrossRepository }} pageInfo {{ hasNextPage, endCursor }} }}",
-                json!(query.id.as_str()),
-                query.first,
-            )
-        }).collect::<String>();
-        format!(
-            "query {{ repository(owner: {}, name: {}) {{ {fields} }} }}",
-            json!(self.owner),
-            json!(self.repository),
-        )
-    }
-
-    fn decode(self, response: Value) -> Result<Vec<TerminalPullRequestEvidence>> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Connection {
-            nodes: Vec<Node>,
-            page_info: PageInfo,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct PageInfo {
-            has_next_page: bool,
-            end_cursor: Nullable<String>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Node {
-            number: i64,
-            id: String,
-            head_ref_name: String,
-            state: TerminalPullRequestState,
-            is_cross_repository: bool,
-        }
-
-        let connections: BTreeMap<String, Connection> = serde_json::from_value(response)
-            .map_err(|_| eyre!("Failed to decode terminal pull request query response"))?;
-        let expected =
-            (0..self.queries.len()).map(|index| format!("op{index}")).collect::<HashSet<_>>();
-        if connections.len() != expected.len() {
-            bail!("GitHub terminal pull request response has an unexpected alias set");
-        }
-        if let Some(alias) = connections.keys().find(|alias| !expected.contains(*alias)) {
-            let alias = bounded_diagnostic_detail(alias);
-            bail!("GitHub terminal pull request response contains unexpected operation `{alias}`");
-        }
-
-        self.queries
-            .into_iter()
-            .enumerate()
-            .map(|(index, query)| {
-                let alias = format!("op{index}");
-                let connection = connections.get(&alias).ok_or_else(|| {
-                    eyre!("GitHub terminal pull request response is missing operation `{alias}`")
-                })?;
-                let pull_requests = connection
-                    .nodes
-                    .iter()
-                    .map(|node| {
-                        let number = u64::try_from(node.number)
-                            .ok()
-                            .filter(|number| *number > 0 && *number <= i32::MAX as u64)
-                            .ok_or_else(|| {
-                                eyre!(
-                                    "GitHub reported an invalid terminal pull request number {}",
-                                    node.number
-                                )
-                            })?;
-                        if node.id.is_empty() {
-                            bail!("GitHub reported an empty terminal pull request node ID");
-                        }
-                        if node.head_ref_name != query.id.as_str() {
-                            let returned = bounded_diagnostic_detail(&node.head_ref_name);
-                            let expected = bounded_diagnostic_detail(query.id.as_str());
-                            bail!(
-                                "GitHub terminal pull request for '{}' returned head branch '{}'",
-                                expected,
-                                returned
-                            );
-                        }
-                        Ok((!node.is_cross_repository).then(|| TerminalPullRequest {
-                            number,
-                            node_id: node.id.clone(),
-                            state: node.state,
-                        }))
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>();
-                let next_cursor = match &connection.page_info {
-                    PageInfo { has_next_page: true, end_cursor: Nullable::Value(cursor) }
-                        if !cursor.is_empty() =>
-                    {
-                        Some(cursor.clone())
-                    }
-                    PageInfo { has_next_page: true, .. } => bail!(
-                        "GitHub reported another terminal pull request page without an end cursor"
-                    ),
-                    PageInfo { has_next_page: false, .. } => None,
-                };
-                Ok(TerminalPullRequestEvidence {
-                    id: query.id,
-                    after: query.after,
-                    page: TerminalPullRequestPage { pull_requests, next_cursor },
-                })
-            })
-            .collect()
-    }
-}
-
-impl TerminalPullRequestQuery {
-    fn new(id: GherritPrId, after: Option<String>, first: usize) -> Result<Self> {
-        if first == 0 {
-            bail!("A terminal pull request query requires a positive page size");
-        }
-        if after.as_deref() == Some("") {
-            bail!("A terminal pull request query requires a nonempty pagination cursor");
-        }
-        Ok(Self { id, after, first })
+        Ok((self.repository, self.pull_requests))
     }
 }
 
 /// A request to create one pull request.
 ///
-/// The head name and response correlation ID derive from the typed change ID.
-/// Exact agreement with neutral terminal evidence is checked when the complete
-/// create batch is prepared.
+/// Construction is reachable only through a planner-owned specification. The
+/// planner issues that specification at the exact join of OPEN absence,
+/// terminal-history emptiness, and marker absence. The head and response
+/// correlation ID both derive from that authorized change ID.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct CreatePullRequest {
+struct CreatePullRequest {
     id: GherritPrId,
     repository_id: String,
     base_branch: String,
     title: String,
     body: String,
+    head_oid: gix::ObjectId,
+    base_oid: gix::ObjectId,
     client_mutation_id: String,
 }
 
 impl CreatePullRequest {
-    pub(super) fn new(
+    /// Converts one planner-owned create specification into its wire model.
+    fn new(
         id: GherritPrId,
         repository_id: String,
         base_branch: String,
         title: String,
         body: String,
+        head_oid: gix::ObjectId,
+        base_oid: gix::ObjectId,
     ) -> Self {
         let client_mutation_id = format!("gherrit:create:{}", id.as_str());
-        Self { id, repository_id, base_branch, title, body, client_mutation_id }
+        Self { id, repository_id, base_branch, title, body, head_oid, base_oid, client_mutation_id }
     }
 
     fn document(&self) -> String {
         let fields = [
             ("repositoryId", self.repository_id.as_str()),
+            ("headRepositoryId", self.repository_id.as_str()),
             ("baseRefName", self.base_branch.as_str()),
             ("headRefName", self.id.as_str()),
             ("title", self.title.as_str()),
@@ -803,7 +227,7 @@ impl CreatePullRequest {
         .map(|(name, value)| format!("{name}: {}", json!(value)))
         .join(", ");
         format!(
-            "createPullRequest(input: {{ {fields} }}) {{ clientMutationId, pullRequest {{ number, id, headRefName }} }}"
+            "createPullRequest(input: {{ {fields} }}) {{ clientMutationId, pullRequest {{ number, id, state, headRefName, headRefOid, headRepository {{ id }}, baseRefName, baseRefOid, baseRepository {{ id }} }} }}"
         )
     }
 }
@@ -812,7 +236,11 @@ impl CreatePullRequest {
 struct ExpectedCreateReceipt {
     alias: Box<str>,
     id: GherritPrId,
+    repository_id: Box<str>,
     head_branch: Box<str>,
+    base_branch: Box<str>,
+    head_oid: gix::ObjectId,
+    base_oid: gix::ObjectId,
     client_mutation_id: Box<str>,
 }
 
@@ -830,7 +258,18 @@ impl ExpectedCreateReceipt {
         struct CreatedPullRequestResponse {
             number: u64,
             id: String,
+            state: PullRequestState,
             head_ref_name: String,
+            head_ref_oid: String,
+            head_repository: Option<CreatedRepositoryResponse>,
+            base_ref_name: String,
+            base_ref_oid: String,
+            base_repository: Option<CreatedRepositoryResponse>,
+        }
+
+        #[derive(Deserialize)]
+        struct CreatedRepositoryResponse {
+            id: String,
         }
 
         if response.is_null() {
@@ -858,16 +297,45 @@ impl ExpectedCreateReceipt {
             let expected = bounded_diagnostic_detail(&self.head_branch);
             bail!("createPullRequest returned head branch '{}', expected '{}'", returned, expected);
         }
+        if created.base_ref_name != self.base_branch.as_ref() {
+            let returned = bounded_diagnostic_detail(&created.base_ref_name);
+            let expected = bounded_diagnostic_detail(&self.base_branch);
+            bail!("createPullRequest returned base branch '{}', expected '{}'", returned, expected);
+        }
+        if created.state != PullRequestState::Open {
+            bail!("createPullRequest returned a pull request which is not OPEN");
+        }
+        for (kind, repository) in
+            [("head", created.head_repository), ("base", created.base_repository)]
+        {
+            let repository = repository
+                .ok_or_else(|| eyre!("createPullRequest omitted the {kind} repository"))?;
+            if repository.id != self.repository_id.as_ref() {
+                bail!("createPullRequest returned a different {kind} repository");
+            }
+        }
+        let parse_oid = |kind: &str, value: &str| {
+            gix::ObjectId::from_hex(value.as_bytes())
+                .map_err(|_| eyre!("createPullRequest returned an invalid {kind} object ID"))
+        };
+        if parse_oid("head", &created.head_ref_oid)? != self.head_oid {
+            bail!("createPullRequest returned a different head object ID");
+        }
+        if parse_oid("base", &created.base_ref_oid)? != self.base_oid {
+            bail!("createPullRequest returned a different base object ID");
+        }
         let identity = PullRequestIdentity::new(created.number, created.id)?;
         Ok((self.id.clone(), identity))
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct PreparedCreateBatch {
+struct PreparedCreateBatch {
     request: Value,
     serialized_bytes: usize,
     expected: Box<[ExpectedCreateReceipt]>,
+    #[cfg(test)]
+    effects: Vec<super::test_effect::CreateEffect>,
 }
 
 impl PreparedCreateBatch {
@@ -904,18 +372,40 @@ fn serialized_mutation_request(fields: String) -> Result<(Value, usize)> {
 fn create_batch(operations: &[CreatePullRequest]) -> Result<PreparedCreateBatch> {
     let mut fields = String::new();
     let mut expected = Vec::with_capacity(operations.len());
+    #[cfg(test)]
+    let mut effects = Vec::with_capacity(operations.len());
     for (index, operation) in operations.iter().enumerate() {
         let alias = format!("op{index}");
         fields.push_str(&format!("{alias}: {}", operation.document()));
         expected.push(ExpectedCreateReceipt {
             alias: alias.into_boxed_str(),
             id: operation.id.clone(),
+            repository_id: operation.repository_id.as_str().into(),
             head_branch: operation.id.as_str().into(),
+            base_branch: operation.base_branch.as_str().into(),
+            head_oid: operation.head_oid,
+            base_oid: operation.base_oid,
             client_mutation_id: operation.client_mutation_id.as_str().into(),
+        });
+        #[cfg(test)]
+        effects.push(super::test_effect::CreateEffect {
+            id: operation.id.clone(),
+            repository_id: operation.repository_id.clone(),
+            base_branch: operation.base_branch.clone(),
+            title: operation.title.clone(),
+            body: operation.body.clone(),
+            head_oid: operation.head_oid,
+            base_oid: operation.base_oid,
         });
     }
     let (request, serialized_bytes) = serialized_mutation_request(fields)?;
-    Ok(PreparedCreateBatch { request, serialized_bytes, expected: expected.into_boxed_slice() })
+    Ok(PreparedCreateBatch {
+        request,
+        serialized_bytes,
+        expected: expected.into_boxed_slice(),
+        #[cfg(test)]
+        effects,
+    })
 }
 
 fn prepare_create_batches(operations: &[CreatePullRequest]) -> Result<Box<[PreparedCreateBatch]>> {
@@ -947,7 +437,6 @@ fn prepare_create_batches(operations: &[CreatePullRequest]) -> Result<Box<[Prepa
 struct CreateReceiptPlan {
     expected: HashSet<GherritPrId>,
     order: Box<[GherritPrId]>,
-    initial: InitialPullRequestIdentities,
     numbers: HashSet<PullRequestNumber>,
     node_ids: HashSet<PullRequestNodeId>,
     by_change: HashMap<GherritPrId, PullRequestIdentity>,
@@ -962,24 +451,9 @@ impl CreateReceiptPlan {
             if self.by_change.contains_key(&id) {
                 bail!("createPullRequest returned more than one receipt for '{}'", id.as_str());
             }
-            if self.initial.contains_number(identity.number()) {
-                bail!(
-                    "createPullRequest receipt for '{}' repeats initial OPEN pull request number {}",
-                    id.as_str(),
-                    identity.number().get()
-                );
-            }
-            if self.initial.contains_node_id(identity.node_id()) {
-                let node_id = bounded_diagnostic_detail(identity.node_id().as_str());
-                bail!(
-                    "createPullRequest receipt for '{}' repeats initial OPEN pull request node ID '{}'",
-                    id.as_str(),
-                    node_id
-                );
-            }
             if !self.numbers.insert(identity.number()) {
                 bail!(
-                    "createPullRequest receipt for '{}' repeats created pull request number {}",
+                    "createPullRequest receipt for '{}' reuses pull request number {} already retained for this attempt",
                     id.as_str(),
                     identity.number().get()
                 );
@@ -987,7 +461,7 @@ impl CreateReceiptPlan {
             if !self.node_ids.insert(identity.node_id().clone()) {
                 let node_id = bounded_diagnostic_detail(identity.node_id().as_str());
                 bail!(
-                    "createPullRequest receipt for '{}' repeats created pull request node ID '{}'",
+                    "createPullRequest receipt for '{}' reuses pull request node ID '{}' already retained for this attempt",
                     id.as_str(),
                     node_id
                 );
@@ -1017,54 +491,14 @@ impl CreateReceiptPlan {
 pub(super) struct PreparedCreates {
     batches: Box<[PreparedCreateBatch]>,
     receipts: CreateReceiptPlan,
-    #[cfg(test)]
-    effect_batches: super::test_effect::EffectBatches<super::test_effect::CreateEffect>,
 }
 
 impl PreparedCreates {
-    /// FIXME(#264): Delete this subset-oriented legacy constructor with the
-    /// pre-activation publisher.
-    pub(super) fn new(
-        initial: InitialPullRequestIdentities,
-        expected: HashSet<GherritPrId>,
+    /// Prepares operations whose complete authorization set was consumed by
+    /// the planner's exact ordered join.
+    fn from_exact(
         operations: Vec<CreatePullRequest>,
-    ) -> Result<Self> {
-        if operations.is_empty() {
-            bail!("A prepared create action requires at least one operation");
-        }
-        let mut operation_ids = HashSet::with_capacity(operations.len());
-        for (index, operation) in operations.iter().enumerate() {
-            if !operation_ids.insert(operation.id.clone()) {
-                bail!(
-                    "GraphQL create mutation at item {index} repeats change '{}'. No mutation was sent.",
-                    operation.id.as_str()
-                );
-            }
-            if !expected.contains(&operation.id) {
-                bail!(
-                    "GraphQL create mutation at item {index} was not present in the exact missing-OPEN evidence for '{}'. No mutation was sent.",
-                    operation.id.as_str()
-                );
-            }
-        }
-        if operation_ids != expected {
-            let mut missing =
-                expected.difference(&operation_ids).map(GherritPrId::as_str).collect::<Vec<_>>();
-            missing.sort_unstable();
-            bail!(
-                "GraphQL create plan omits evidenced missing change(s): {}. No mutation was sent.",
-                missing.join(", ")
-            );
-        }
-
-        Self::from_exact(initial, operations)
-    }
-
-    /// Prepares operations after the planner consumed the exact terminal
-    /// evidence for their change IDs.
-    pub(super) fn from_exact(
-        initial: InitialPullRequestIdentities,
-        operations: Vec<CreatePullRequest>,
+        observed_identities: ExactLocalPullRequestIdentities,
     ) -> Result<Self> {
         if operations.is_empty() {
             bail!("A prepared create action requires at least one operation");
@@ -1080,31 +514,19 @@ impl PreparedCreates {
         }
         let order = operations.iter().map(|operation| operation.id.clone()).collect::<Vec<_>>();
         let batches = prepare_create_batches(&operations)?;
-        #[cfg(test)]
-        let effect_batches = partition_effects(
-            operations.iter().map(|operation| super::test_effect::CreateEffect {
-                id: operation.id.clone(),
-                repository_id: operation.repository_id.clone(),
-                base_branch: operation.base_branch.clone(),
-                title: operation.title.clone(),
-                body: operation.body.clone(),
-            }),
-            batches.iter().map(|batch| batch.expected.len()),
-        );
+        let (numbers, node_ids) = observed_identities.into_sets();
         let receipts = CreateReceiptPlan {
             expected,
             order: order.into_boxed_slice(),
-            initial,
-            numbers: HashSet::new(),
-            node_ids: HashSet::new(),
+            numbers,
+            node_ids,
             by_change: HashMap::new(),
         };
-        Ok(Self {
-            batches,
-            receipts,
-            #[cfg(test)]
-            effect_batches,
-        })
+        Ok(Self { batches, receipts })
+    }
+
+    pub(super) fn planned_ids(&self) -> Box<[GherritPrId]> {
+        self.receipts.order.clone()
     }
 
     #[cfg(test)]
@@ -1116,7 +538,6 @@ impl PreparedCreates {
         self.receipts.finish()
     }
 
-    #[cfg(test)]
     pub(super) fn operation_count(&self) -> usize {
         self.batches.iter().map(|batch| batch.expected.len()).sum()
     }
@@ -1126,16 +547,13 @@ impl PreparedCreates {
     pub(super) fn effect_batches_for_test(
         &self,
     ) -> super::test_effect::EffectBatches<super::test_effect::CreateEffect> {
-        self.effect_batches.clone()
-    }
-
-    #[cfg(test)]
-    pub(super) fn request_text(&self) -> String {
-        self.batches.iter().map(|batch| batch.request.to_string()).collect::<Vec<_>>().join("\n")
+        self.batches.iter().map(|batch| batch.effects.clone().into_boxed_slice()).collect()
     }
 }
 
-/// Opaque proof that every planned create has one globally valid receipt.
+/// Opaque proof that every planned create has one exact acknowledgement whose
+/// identity is unique across the retained local observation and this attempt's
+/// other create acknowledgements.
 #[derive(Debug)]
 pub(super) struct CompleteCreateReceipts {
     order: Box<[GherritPrId]>,
@@ -1154,21 +572,20 @@ impl ExactCreateReceipts {
     ) -> impl ExactSizeIterator<Item = (&GherritPrId, &PullRequestIdentity)> {
         self.values.iter().map(|(id, identity)| (id, identity))
     }
-
-    pub(super) fn into_values(self) -> Box<[(GherritPrId, PullRequestIdentity)]> {
-        self.values
-    }
 }
 
 impl CompleteCreateReceipts {
-    #[allow(dead_code)] // Consumed by the pending owned-base activation path.
-    pub(super) fn len(&self) -> usize {
-        self.by_change.len()
-    }
-
-    #[cfg(test)]
-    pub(super) fn identity(&self, id: &GherritPrId) -> Option<&PullRequestIdentity> {
-        self.by_change.get(id)
+    /// Visits acknowledged identities in the exact planned create order.
+    pub(super) fn iter(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&GherritPrId, &PullRequestIdentity)> {
+        self.order.iter().map(|id| {
+            let identity = self
+                .by_change
+                .get(id)
+                .expect("complete create receipts retain every planned identity");
+            (id, identity)
+        })
     }
 
     /// Consumes this receipt proof against one exact expected order.
@@ -1192,34 +609,11 @@ impl CompleteCreateReceipts {
         }
         Ok(ExactCreateReceipts { values })
     }
-
-    /// FIXME(#264): Delete with the pre-activation publisher.
-    pub(super) fn into_legacy_created(mut self) -> Vec<CreatedPullRequest> {
-        self.order
-            .into_vec()
-            .into_iter()
-            .map(|id| {
-                let identity = self.by_change.remove(&id).expect("complete receipt has every ID");
-                CreatedPullRequest {
-                    head_branch: id.as_str().to_owned(),
-                    number: u64::from(identity.number().get()),
-                    node_id: identity.node_id().as_str().to_owned(),
-                }
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct CreatedPullRequest {
-    pub(super) head_branch: String,
-    pub(super) number: u64,
-    pub(super) node_id: String,
 }
 
 /// A nonempty minimal update to one exact preplanned pull request identity.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct UpdatePullRequest {
+struct UpdatePullRequest {
     identity: PullRequestIdentity,
     title: Option<String>,
     body: Option<String>,
@@ -1228,7 +622,7 @@ pub(super) struct UpdatePullRequest {
 }
 
 impl UpdatePullRequest {
-    pub(super) fn new(
+    fn new(
         identity: PullRequestIdentity,
         title: Option<String>,
         body: Option<String>,
@@ -1384,10 +778,12 @@ impl ExpectedUpdateReceipt {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct PreparedUpdateBatch {
+struct PreparedUpdateBatch {
     request: Value,
     serialized_bytes: usize,
     expected: Box<[ExpectedUpdateReceipt]>,
+    #[cfg(test)]
+    effects: Vec<super::test_effect::UpdateEffect>,
 }
 
 impl PreparedUpdateBatch {
@@ -1412,6 +808,8 @@ impl PreparedUpdateBatch {
 fn update_batch(operations: &[UpdatePullRequest]) -> Result<PreparedUpdateBatch> {
     let mut fields = String::new();
     let mut expected = Vec::with_capacity(operations.len());
+    #[cfg(test)]
+    let mut effects = Vec::with_capacity(operations.len());
     for (index, operation) in operations.iter().enumerate() {
         let alias = format!("op{index}");
         fields.push_str(&format!("{alias}: {}", operation.document()));
@@ -1420,9 +818,22 @@ fn update_batch(operations: &[UpdatePullRequest]) -> Result<PreparedUpdateBatch>
             identity: operation.identity.clone(),
             client_mutation_id: operation.client_mutation_id.as_str().into(),
         });
+        #[cfg(test)]
+        effects.push(super::test_effect::UpdateEffect {
+            identity: operation.identity.clone(),
+            title: operation.title.clone(),
+            body: operation.body.clone(),
+            base_branch: operation.base_branch.clone(),
+        });
     }
     let (request, serialized_bytes) = serialized_mutation_request(fields)?;
-    Ok(PreparedUpdateBatch { request, serialized_bytes, expected: expected.into_boxed_slice() })
+    Ok(PreparedUpdateBatch {
+        request,
+        serialized_bytes,
+        expected: expected.into_boxed_slice(),
+        #[cfg(test)]
+        effects,
+    })
 }
 
 fn prepare_update_batches(operations: &[UpdatePullRequest]) -> Result<Box<[PreparedUpdateBatch]>> {
@@ -1454,18 +865,15 @@ fn prepare_update_batches(operations: &[UpdatePullRequest]) -> Result<Box<[Prepa
 #[derive(Debug)]
 pub(super) struct PreparedUpdates {
     batches: Box<[PreparedUpdateBatch]>,
-    #[cfg(test)]
-    effect_batches: super::test_effect::EffectBatches<super::test_effect::UpdateEffect>,
 }
 
 impl PreparedUpdates {
-    pub(super) fn new(operations: Vec<UpdatePullRequest>) -> Result<Self> {
+    fn new(operations: Vec<UpdatePullRequest>) -> Result<Self> {
         if operations.is_empty() {
             bail!("A prepared update action requires at least one operation");
         }
         let mut numbers = HashSet::with_capacity(operations.len());
         let mut node_ids = HashSet::with_capacity(operations.len());
-        let mut client_mutation_ids = HashSet::with_capacity(operations.len());
         for (index, operation) in operations.iter().enumerate() {
             if !numbers.insert(operation.identity.number()) {
                 bail!(
@@ -1478,35 +886,18 @@ impl PreparedUpdates {
                     "GraphQL update mutation at item {index} repeats pull request node ID. No mutation was sent."
                 );
             }
-            if !client_mutation_ids.insert(operation.client_mutation_id.as_str()) {
-                let client_mutation_id = bounded_diagnostic_detail(&operation.client_mutation_id);
-                bail!(
-                    "GraphQL update mutation at item {index} repeats clientMutationId '{}'. No mutation was sent.",
-                    client_mutation_id
-                );
-            }
         }
         let batches = prepare_update_batches(&operations)?;
-        #[cfg(test)]
-        let effect_batches = partition_effects(
-            operations.iter().map(|operation| super::test_effect::UpdateEffect {
-                identity: operation.identity.clone(),
-                title: operation.title.clone(),
-                body: operation.body.clone(),
-                base_branch: operation.base_branch.clone(),
-            }),
-            batches.iter().map(|batch| batch.expected.len()),
-        );
-        Ok(Self {
-            batches,
-            #[cfg(test)]
-            effect_batches,
-        })
+        Ok(Self { batches })
     }
 
-    #[cfg(test)]
     pub(super) fn operation_count(&self) -> usize {
         self.batches.iter().map(|batch| batch.expected.len()).sum()
+    }
+
+    /// Visits the exact preplanned update identities in request order.
+    pub(super) fn identities(&self) -> impl Iterator<Item = &PullRequestIdentity> {
+        self.batches.iter().flat_map(|batch| batch.expected.iter().map(|receipt| &receipt.identity))
     }
 
     /// Returns typed update operations in their GraphQL request batches.
@@ -1514,354 +905,38 @@ impl PreparedUpdates {
     pub(super) fn effect_batches_for_test(
         &self,
     ) -> super::test_effect::EffectBatches<super::test_effect::UpdateEffect> {
-        self.effect_batches.clone()
-    }
-
-    #[cfg(test)]
-    pub(super) fn request_text(&self) -> String {
-        self.batches.iter().map(|batch| batch.request.to_string()).collect::<Vec<_>>().join("\n")
+        self.batches.iter().map(|batch| batch.effects.clone().into_boxed_slice()).collect()
     }
 }
 
-#[cfg(test)]
-mod observation_tests {
-    use super::*;
-
-    #[test]
-    fn untrusted_diagnostic_detail_is_ascii_single_line_and_exactly_bounded() {
-        assert_eq!(bounded_diagnostic_detail("line\n\t\u{202e}tail"), "line   tail");
-
-        let detail = bounded_diagnostic_detail(&"x".repeat(1_000));
-        assert_eq!(detail.len(), 256);
-        assert!(detail.ends_with("..."));
-    }
-
-    fn id(value: &str) -> GherritPrId {
-        GherritPrId::from_ref_component(value.as_bytes()).unwrap()
-    }
-
-    fn open_node(number: i64, head: &str) -> Value {
-        json!({
-            "number": number,
-            "id": format!("PR_{number}"),
-            "title": "Title",
-            "body": "Body",
-            "baseRefName": "main",
-            "baseRefOid": "1".repeat(40),
-            "headRefName": head,
-            "headRefOid": "2".repeat(40),
-            "state": "OPEN",
-            "isCrossRepository": false,
-            "autoMergeRequest": null,
-            "isInMergeQueue": false,
+/// Converts planner-owned create specifications into exact GraphQL wire data.
+pub(super) fn prepare_creates(
+    planned: Box<[PlannedCreate]>,
+    observed_identities: ExactLocalPullRequestIdentities,
+) -> Result<PreparedCreates> {
+    let operations = planned
+        .into_vec()
+        .into_iter()
+        .map(|planned| {
+            let (repository_id, id, title, body, head_oid, base_oid) = planned.into_parts();
+            let base_branch = owned_base_name(&id);
+            CreatePullRequest::new(id, repository_id, base_branch, title, body, head_oid, base_oid)
         })
-    }
+        .collect();
+    PreparedCreates::from_exact(operations, observed_identities)
+}
 
-    fn open_response(nodes: Vec<Value>, has_next_page: bool, end_cursor: Value) -> Value {
-        json!({
-            "data": {
-                "repository": {
-                    "id": "R_1",
-                    "defaultBranchRef": {
-                        "name": "main",
-                        "target": { "oid": "3".repeat(40) },
-                    },
-                    "pullRequests": {
-                        "nodes": nodes,
-                        "pageInfo": {
-                            "hasNextPage": has_next_page,
-                            "endCursor": end_cursor,
-                        },
-                    },
-                },
-            },
+/// Converts planner-owned update specifications into exact GraphQL wire data.
+pub(super) fn prepare_updates(planned: Box<[PlannedUpdate]>) -> Result<PreparedUpdates> {
+    let operations = planned
+        .into_vec()
+        .into_iter()
+        .map(|planned| {
+            let (identity, title, body, base_branch) = planned.into_parts();
+            UpdatePullRequest::new(identity, title, body, base_branch)
         })
-    }
-
-    fn terminal_node(number: i64, head: &str, state: &str, is_cross_repository: bool) -> Value {
-        json!({
-            "number": number,
-            "id": format!("PR_{number}"),
-            "headRefName": head,
-            "state": state,
-            "isCrossRepository": is_cross_repository,
-        })
-    }
-
-    fn terminal_query() -> TerminalPullRequests {
-        TerminalPullRequests::new(
-            "owner".to_string(),
-            "repo".to_string(),
-            vec![TerminalPullRequestQuery::new(id("G42"), None, 100).unwrap()],
-        )
-        .unwrap()
-    }
-
-    fn terminal_response(nodes: Vec<Value>, has_next_page: bool, end_cursor: Value) -> Value {
-        json!({
-            "op0": {
-                "nodes": nodes,
-                "pageInfo": { "hasNextPage": has_next_page, "endCursor": end_cursor },
-            },
-        })
-    }
-
-    #[test]
-    fn open_scan_documents_use_one_connection_and_an_exact_cursor() {
-        let first = FirstOpenPullRequests::new("owner".to_string(), "repo".to_string(), 100);
-        let next = NextOpenPullRequests::new(
-            "owner".to_string(),
-            "repo".to_string(),
-            "opaque cursor".to_string(),
-            100,
-        );
-        assert!(first.document().contains("id, defaultBranchRef"));
-        assert!(!next.document().contains("defaultBranchRef"));
-        assert!(next.document().contains("after: \"opaque cursor\""));
-        assert!(!next.document().contains("headRefName:"));
-    }
-
-    #[test]
-    fn open_scan_decoder_requires_a_cursor_only_when_more_pages_exist() {
-        let query = FirstOpenPullRequests::new("owner".to_string(), "repo".to_string(), 100);
-        assert_eq!(
-            query
-                .decode(open_response(vec![open_node(42, "G42")], true, json!("cursor-1")))
-                .unwrap()
-                .next_cursor
-                .as_deref(),
-            Some("cursor-1")
-        );
-        assert!(
-            query.decode(open_response(vec![open_node(42, "G42")], true, Value::Null)).is_err()
-        );
-        assert_eq!(
-            query
-                .decode(open_response(vec![open_node(42, "G42")], false, json!("ignored")))
-                .unwrap()
-                .next_cursor,
-            None
-        );
-    }
-
-    #[test]
-    fn open_scan_decoder_requires_complete_first_page_repository_facts() {
-        let query = FirstOpenPullRequests::new("owner".to_string(), "repo".to_string(), 100);
-        let base = open_response(vec![], false, Value::Null);
-        let mut cases = vec![json!({}), json!({ "data": { "repository": null } })];
-
-        for field in ["id", "defaultBranchRef"] {
-            let mut response = base.clone();
-            response["data"]["repository"].as_object_mut().unwrap().remove(field);
-            cases.push(response);
-        }
-        for (pointer, replacement) in [
-            ("/data/repository/id", json!("")),
-            ("/data/repository/defaultBranchRef/target", Value::Null),
-            ("/data/repository/defaultBranchRef/target/oid", Value::Null),
-            ("/data/repository/defaultBranchRef/target/oid", json!("invalid")),
-        ] {
-            let mut response = base.clone();
-            *response.pointer_mut(pointer).unwrap() = replacement;
-            cases.push(response);
-        }
-
-        for response in cases {
-            assert!(query.decode(response).is_err());
-        }
-    }
-
-    #[test]
-    fn later_open_pages_neither_require_nor_accept_repository_facts() {
-        let query = NextOpenPullRequests::new(
-            "owner".to_string(),
-            "repo".to_string(),
-            "cursor-1".to_string(),
-            100,
-        );
-        let response = open_response(vec![], false, Value::Null);
-        assert!(query.decode(response.clone()).is_err());
-        let mut null_facts = response.clone();
-        null_facts["data"]["repository"]["id"] = Value::Null;
-        null_facts["data"]["repository"]["defaultBranchRef"] = Value::Null;
-        assert!(query.decode(null_facts).is_err());
-
-        let mut response = response;
-        let repository = response["data"]["repository"].as_object_mut().unwrap();
-        repository.remove("id");
-        repository.remove("defaultBranchRef");
-        assert_eq!(query.decode(response).unwrap().next_cursor, None);
-    }
-
-    #[test]
-    fn open_scan_decoder_requires_every_selected_node_field() {
-        let query = FirstOpenPullRequests::new("owner".to_string(), "repo".to_string(), 100);
-
-        for field in [
-            "id",
-            "title",
-            "body",
-            "baseRefName",
-            "baseRefOid",
-            "headRefName",
-            "headRefOid",
-            "state",
-            "isCrossRepository",
-            "autoMergeRequest",
-            "isInMergeQueue",
-        ] {
-            let mut node = open_node(42, "G42");
-            node.as_object_mut().unwrap().remove(field);
-            let error = query
-                .decode(open_response(vec![node], false, Value::Null))
-                .expect_err("a selected field may not be absent");
-            assert_eq!(
-                error.to_string(),
-                "Failed to decode pull request query response",
-                "field={field}"
-            );
-        }
-
-        for field in ["title", "body"] {
-            let mut node = open_node(42, "G42");
-            node[field] = Value::Null;
-            assert!(
-                query.decode(open_response(vec![node], false, Value::Null)).is_err(),
-                "field={field}"
-            );
-        }
-    }
-
-    #[test]
-    fn open_scan_decoder_preserves_projection_and_policy_state() {
-        let query = FirstOpenPullRequests::new("owner".to_string(), "repo".to_string(), 100);
-        let mut node = open_node(i64::from(i32::MAX), "G42");
-        node["autoMergeRequest"] = json!({ "enabledAt": "2026-01-01T00:00:00Z" });
-        node["isInMergeQueue"] = json!(true);
-
-        let pull_requests =
-            query.decode(open_response(vec![node], false, Value::Null)).unwrap().pull_requests;
-        assert_eq!(
-            pull_requests,
-            [OpenPullRequest {
-                number: i32::MAX as u64,
-                node_id: format!("PR_{}", i32::MAX),
-                title: "Title".to_string(),
-                body: "Body".to_string(),
-                base_branch: "main".to_string(),
-                head_branch: "G42".to_string(),
-                base_oid: gix::ObjectId::from_hex("1".repeat(40).as_bytes()).unwrap(),
-                head_oid: gix::ObjectId::from_hex("2".repeat(40).as_bytes()).unwrap(),
-                is_cross_repository: false,
-                has_auto_merge_request: true,
-                is_in_merge_queue: true,
-            }]
-        );
-
-        let mut nullable_enabled_at = open_node(42, "G42");
-        nullable_enabled_at["autoMergeRequest"] = json!({ "enabledAt": null });
-        assert!(
-            query
-                .decode(open_response(vec![nullable_enabled_at], false, Value::Null))
-                .unwrap()
-                .pull_requests[0]
-                .has_auto_merge_request
-        );
-
-        for invalid_request in [json!({}), json!({ "enabledAt": {} })] {
-            let mut node = open_node(42, "G42");
-            node["autoMergeRequest"] = invalid_request;
-            assert!(query.decode(open_response(vec![node], false, Value::Null)).is_err());
-        }
-    }
-
-    #[test]
-    fn terminal_batches_are_bounded_and_keep_each_cursor_independent() {
-        let queries = (0..64)
-            .map(|index| {
-                TerminalPullRequestQuery::new(
-                    id(&format!("G{index}")),
-                    (index == 1).then(|| "cursor-1".to_string()),
-                    100,
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let query =
-            TerminalPullRequests::new("owner".to_string(), "repo".to_string(), queries).unwrap();
-        assert_eq!(query.document().matches("pullRequests(").count(), 64);
-        assert!(TerminalPullRequests::new("o".to_string(), "r".to_string(), vec![]).is_err());
-    }
-
-    #[test]
-    fn terminal_query_rejects_unusable_connection_arguments() {
-        for (after, first) in [(None, 0), (Some(""), 100)] {
-            assert!(
-                TerminalPullRequestQuery::new(id("G42"), after.map(str::to_string), first,)
-                    .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn terminal_decoder_preserves_every_same_repository_candidate() {
-        let query = terminal_query();
-        let pages = query
-            .decode(terminal_response(
-                vec![
-                    terminal_node(7, "G42", "CLOSED", false),
-                    terminal_node(8, "G42", "MERGED", true),
-                    terminal_node(9, "G42", "MERGED", false),
-                ],
-                true,
-                json!("terminal-cursor"),
-            ))
-            .unwrap()
-            .into_iter()
-            .map(|evidence| evidence.into_parts().2)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            pages,
-            [TerminalPullRequestPage {
-                pull_requests: vec![
-                    TerminalPullRequest {
-                        number: 7,
-                        node_id: "PR_7".to_string(),
-                        state: TerminalPullRequestState::Closed,
-                    },
-                    TerminalPullRequest {
-                        number: 9,
-                        node_id: "PR_9".to_string(),
-                        state: TerminalPullRequestState::Merged,
-                    },
-                ],
-                next_cursor: Some("terminal-cursor".to_string()),
-            }]
-        );
-    }
-
-    #[test]
-    fn terminal_decoder_rejects_incomplete_or_contradictory_evidence() {
-        let query = terminal_query();
-        for node in [
-            terminal_node(0, "G42", "CLOSED", false),
-            terminal_node(i64::from(i32::MAX) + 1, "G42", "CLOSED", false),
-            terminal_node(42, "other", "CLOSED", false),
-            terminal_node(42, "G42", "OPEN", false),
-        ] {
-            assert!(
-                query.clone().decode(terminal_response(vec![node], false, Value::Null)).is_err()
-            );
-        }
-
-        let mut missing_id = terminal_node(42, "G42", "CLOSED", false);
-        missing_id.as_object_mut().unwrap().remove("id");
-        assert!(
-            query.clone().decode(terminal_response(vec![missing_id], false, Value::Null)).is_err()
-        );
-        assert!(query.decode(terminal_response(vec![], true, Value::Null)).is_err());
-    }
+        .collect::<Result<Vec<_>>>()?;
+    PreparedUpdates::new(operations)
 }
 
 #[cfg(test)]
@@ -1872,63 +947,84 @@ mod mutation_tests {
         GherritPrId::from_ref_component(value.as_bytes()).unwrap()
     }
 
-    fn initial(pull_requests: Vec<OpenPullRequest>) -> InitialPullRequestIdentities {
-        InitialPullRequestIdentities::from_open(&pull_requests).unwrap()
+    fn oid(byte: u8) -> gix::ObjectId {
+        gix::ObjectId::from_bytes_or_panic(&[byte; 20])
     }
 
-    fn missing_ids(ids: &[&str]) -> HashSet<GherritPrId> {
-        ids.iter().map(|value| id(value)).collect()
+    fn operation() -> CreatePullRequest {
+        CreatePullRequest::new(
+            id("Gone"),
+            "REPO_NODE_ID".to_owned(),
+            "gherrit-bases/Gone".to_owned(),
+            "Title".to_owned(),
+            "Body".to_owned(),
+            oid(1),
+            oid(2),
+        )
     }
 
-    fn creates(ids: &[&str], initial: InitialPullRequestIdentities) -> PreparedCreates {
-        let operations = ids
-            .iter()
-            .map(|value| {
-                CreatePullRequest::new(
-                    id(value),
-                    "REPO_NODE_ID".to_owned(),
-                    "main".to_owned(),
-                    format!("Title {value}"),
-                    String::new(),
-                )
-            })
-            .collect();
-        PreparedCreates::new(initial, missing_ids(ids), operations).unwrap()
+    fn identities(
+        values: impl IntoIterator<Item = (u64, &'static str)>,
+    ) -> ExactLocalPullRequestIdentities {
+        let values = values
+            .into_iter()
+            .map(|(number, node_id)| PullRequestIdentity::new(number, node_id.to_owned()).unwrap())
+            .collect::<Vec<_>>();
+        ExactLocalPullRequestIdentities::new(&values).unwrap()
     }
 
-    fn created(client_id: &str, head: &str, number: u64, node_id: &str) -> Value {
+    fn acknowledgement() -> Value {
         json!({
-            "clientMutationId": client_id,
-            "pullRequest": {
-                "number": number,
-                "id": node_id,
-                "headRefName": head,
-            },
+            "data": {
+                "op0": {
+                    "clientMutationId": "gherrit:create:Gone",
+                    "pullRequest": {
+                        "number": 7,
+                        "id": "PR_7",
+                        "state": "OPEN",
+                        "headRefName": "Gone",
+                        "headRefOid": oid(1).to_string(),
+                        "headRepository": { "id": "REPO_NODE_ID" },
+                        "baseRefName": "gherrit-bases/Gone",
+                        "baseRefOid": oid(2).to_string(),
+                        "baseRepository": { "id": "REPO_NODE_ID" }
+                    }
+                }
+            }
         })
     }
 
-    fn receipt_plan(ids: &[&str], initial: InitialPullRequestIdentities) -> CreateReceiptPlan {
-        let order = ids.iter().map(|value| id(value)).collect::<Vec<_>>().into_boxed_slice();
-        CreateReceiptPlan {
-            expected: order.iter().cloned().collect(),
-            order,
-            initial,
-            numbers: HashSet::new(),
-            node_ids: HashSet::new(),
-            by_change: HashMap::new(),
-        }
+    fn update(number: u64, node_id: &str) -> UpdatePullRequest {
+        UpdatePullRequest::new(
+            PullRequestIdentity::new(number, node_id.to_owned()).unwrap(),
+            Some("Title".to_owned()),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn update_acknowledgement(client_id: &str, number: u64, node_id: &str) -> Value {
+        json!({
+            "data": {
+                "op0": {
+                    "clientMutationId": client_id,
+                    "pullRequest": { "number": number, "id": node_id }
+                }
+            }
+        })
     }
 
     fn raw_create(body_len: usize) -> CreatePullRequest {
-        let id = id("Gsize");
-        CreatePullRequest {
-            client_mutation_id: format!("gherrit:create:{}", id.as_str()),
-            id,
-            repository_id: "REPO_NODE_ID".to_owned(),
-            base_branch: "main".to_owned(),
-            title: "Title".to_owned(),
-            body: "x".repeat(body_len),
-        }
+        CreatePullRequest::new(
+            id("Gsize"),
+            "REPO_NODE_ID".to_owned(),
+            "gherrit-bases/Gsize".to_owned(),
+            "Title".to_owned(),
+            "x".repeat(body_len),
+            oid(1),
+            oid(2),
+        )
     }
 
     fn raw_update(body_len: usize) -> UpdatePullRequest {
@@ -1942,215 +1038,94 @@ mod mutation_tests {
     }
 
     #[test]
-    fn create_preparation_requires_the_exact_missing_id_set() {
-        let operation = CreatePullRequest::new(
-            id("A"),
-            "REPO_NODE_ID".to_owned(),
-            "main".to_owned(),
-            "A".to_owned(),
-            String::new(),
-        );
-        assert!(
-            PreparedCreates::new(initial(Vec::new()), missing_ids(&["A", "B"]), vec![operation])
-                .is_err()
-        );
-
-        let operations = ["A", "B"]
-            .map(|value| {
-                let value = id(value);
-                CreatePullRequest::new(
-                    value,
-                    "REPO_NODE_ID".to_owned(),
-                    "main".to_owned(),
-                    "title".to_owned(),
-                    String::new(),
-                )
-            })
-            .into_iter()
-            .take(1)
-            .collect();
-        assert!(
-            PreparedCreates::new(initial(Vec::new()), missing_ids(&["A", "B"]), operations)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn create_batches_use_the_exact_serialized_one_mibibyte_boundary() {
-        let fixed_bytes = create_batch(&[raw_create(0)]).unwrap().serialized_bytes;
-        let exact_body_len = MAX_MUTATION_REQUEST_BYTES - fixed_bytes;
-        let exact = raw_create(exact_body_len);
-        assert_eq!(create_batch(&[exact]).unwrap().serialized_bytes, MAX_MUTATION_REQUEST_BYTES);
-        assert!(prepare_create_batches(&[raw_create(exact_body_len)]).is_ok());
-        assert!(prepare_create_batches(&[raw_create(exact_body_len + 1)]).is_err());
-
-        let mut operations = (0..MAX_MUTATION_ALIASES)
-            .map(|index| CreatePullRequest {
-                id: id(&format!("G{index}")),
-                repository_id: "REPO_NODE_ID".to_owned(),
-                base_branch: "main".to_owned(),
-                title: "small".to_owned(),
-                body: String::new(),
-                client_mutation_id: format!("create-{index}"),
-            })
-            .collect::<Vec<_>>();
-        operations.push(raw_create(exact_body_len + 1));
-        assert!(prepare_create_batches(&operations).is_err());
-    }
-
-    #[test]
-    fn update_batches_use_the_exact_serialized_one_mibibyte_boundary() {
-        let fixed_bytes = update_batch(&[raw_update(0)]).unwrap().serialized_bytes;
-        let exact_body_len = MAX_MUTATION_REQUEST_BYTES - fixed_bytes;
-        assert_eq!(
-            update_batch(&[raw_update(exact_body_len)]).unwrap().serialized_bytes,
-            MAX_MUTATION_REQUEST_BYTES
-        );
-        assert!(prepare_update_batches(&[raw_update(exact_body_len)]).is_ok());
-        assert!(prepare_update_batches(&[raw_update(exact_body_len + 1)]).is_err());
-
-        let mut operations = (0..MAX_MUTATION_ALIASES)
-            .map(|index| {
-                UpdatePullRequest::new(
-                    PullRequestIdentity::new(
-                        u64::try_from(index + 1).unwrap(),
-                        format!("PR_{index}"),
-                    )
-                    .unwrap(),
-                    Some("small".to_owned()),
-                    None,
-                    None,
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        operations.push(raw_update(exact_body_len + 1));
-        assert!(prepare_update_batches(&operations).is_err());
-    }
-
-    #[test]
-    fn create_decoder_requires_exact_alias_client_id_head_and_typed_identity() {
-        let cases = [
-            json!({ "data": {} }),
-            json!({ "data": { "op0": created("wrong", "A", 1, "PR_1") } }),
-            json!({ "data": { "op0": created("gherrit:create:A", "B", 1, "PR_1") } }),
-            json!({ "data": { "op0": created("gherrit:create:A", "A", 0, "PR_1") } }),
-            json!({ "data": { "op0": created("gherrit:create:A", "A", 1, "") } }),
-            json!({
-                "data": {
-                    "op0": created("gherrit:create:A", "A", 1, "PR_1"),
-                    "extra": created("extra", "A", 2, "PR_2"),
-                }
-            }),
-        ];
-        for response in cases {
-            let prepared = creates(&["A"], initial(Vec::new()));
-            let batch = prepared.batches.into_vec().pop().unwrap();
-            assert!(batch.decode(response).is_err());
-        }
-    }
-
-    #[test]
-    fn response_derived_mutation_diagnostics_are_terminal_safe_and_bounded() {
-        let returned = format!("{}\nnot-disclosed", "x".repeat(1_000));
-        let prepared = creates(&["A"], initial(Vec::new()));
-        let batch = prepared.batches.into_vec().pop().unwrap();
-        let error = batch
-            .decode(json!({
-                "data": {
-                    "op0": created(&returned, "A", 1, "PR_1"),
-                }
-            }))
-            .unwrap_err()
-            .to_string();
-
-        assert!(!error.contains('\n'));
-        assert!(!error.contains("not-disclosed"));
-        assert!(error.len() < 400);
-    }
-
-    #[test]
-    fn create_receipts_are_globally_disjoint_and_complete() {
-        let occupied = vec![OpenPullRequest {
-            number: 7,
-            node_id: "OPEN_NODE".to_owned(),
-            title: String::new(),
-            body: String::new(),
-            base_branch: "main".to_owned(),
-            head_branch: "fork".to_owned(),
-            base_oid: gix::ObjectId::null(gix::hash::Kind::Sha1),
-            head_oid: gix::ObjectId::null(gix::hash::Kind::Sha1),
-            is_cross_repository: true,
-            has_auto_merge_request: false,
-            is_in_merge_queue: false,
-        }];
-        let mut number_collision = receipt_plan(&["A"], initial(occupied.clone()));
-        assert!(
-            number_collision
-                .record(vec![(id("A"), PullRequestIdentity::new(7, "new".to_owned()).unwrap())])
-                .is_err()
-        );
-        let mut node_collision = receipt_plan(&["A"], initial(occupied));
-        assert!(
-            node_collision
-                .record(vec![(
-                    id("A"),
-                    PullRequestIdentity::new(8, "OPEN_NODE".to_owned()).unwrap(),
-                )])
-                .is_err()
-        );
-
-        for second in [
-            PullRequestIdentity::new(1, "PR_2".to_owned()).unwrap(),
-            PullRequestIdentity::new(2, "PR_1".to_owned()).unwrap(),
+    fn create_request_names_same_repository_and_selects_exact_receipt_facts() {
+        let document = operation().document();
+        for required in [
+            "repositoryId: \"REPO_NODE_ID\"",
+            "headRepositoryId: \"REPO_NODE_ID\"",
+            "headRefName: \"Gone\"",
+            "baseRefName: \"gherrit-bases/Gone\"",
+            "clientMutationId",
+            "number, id, state",
+            "headRefOid",
+            "headRepository { id }",
+            "baseRefOid",
+            "baseRepository { id }",
         ] {
-            let mut plan = receipt_plan(&["A", "B"], initial(Vec::new()));
-            plan.record(vec![(id("A"), PullRequestIdentity::new(1, "PR_1".to_owned()).unwrap())])
-                .unwrap();
-            assert!(plan.record(vec![(id("B"), second)]).is_err());
+            assert!(document.contains(required), "{document}");
         }
+    }
 
-        let mut incomplete = receipt_plan(&["A", "B"], initial(Vec::new()));
-        incomplete
-            .record(vec![(id("A"), PullRequestIdentity::new(1, "PR_1".to_owned()).unwrap())])
-            .unwrap();
-        assert!(incomplete.finish().is_err());
+    #[test]
+    fn create_receipt_is_bound_to_every_planned_effect_fact() {
+        let decode = |response| create_batch(&[operation()]).unwrap().decode(response);
+        let receipt = decode(acknowledgement()).unwrap();
+        assert_eq!(receipt[0].0.as_str(), "Gone");
+        assert_eq!(receipt[0].1.number().get(), 7);
 
-        let mut complete = receipt_plan(&["A", "B"], initial(Vec::new()));
-        complete
-            .record(vec![
-                (id("A"), PullRequestIdentity::new(1, "PR_1".to_owned()).unwrap()),
-                (id("B"), PullRequestIdentity::new(2, "PR_2".to_owned()).unwrap()),
-            ])
-            .unwrap();
-        let complete = complete.finish().unwrap();
-        assert_eq!(complete.len(), 2);
-        assert_eq!(complete.identity(&id("B")).unwrap().number().get(), 2);
+        let cases = [
+            ("/data/op0/clientMutationId", json!("wrong")),
+            ("/data/op0/pullRequest", Value::Null),
+            ("/data/op0/pullRequest/number", json!(0)),
+            ("/data/op0/pullRequest/id", json!("")),
+            ("/data/op0/pullRequest/state", json!("CLOSED")),
+            ("/data/op0/pullRequest/headRefName", json!("Other")),
+            ("/data/op0/pullRequest/headRefOid", json!(oid(3).to_string())),
+            ("/data/op0/pullRequest/headRepository", Value::Null),
+            ("/data/op0/pullRequest/headRepository/id", json!("OTHER")),
+            ("/data/op0/pullRequest/baseRefName", json!("main")),
+            ("/data/op0/pullRequest/baseRefOid", json!(oid(3).to_string())),
+            ("/data/op0/pullRequest/baseRepository", Value::Null),
+            ("/data/op0/pullRequest/baseRepository/id", json!("OTHER")),
+        ];
+        for (pointer, replacement) in cases {
+            let mut response = acknowledgement();
+            *response.pointer_mut(pointer).unwrap() = replacement;
+            assert!(decode(response).is_err(), "accepted mismatch at {pointer}");
+        }
+    }
 
-        let mut ordered = receipt_plan(&["A", "B"], initial(Vec::new()));
-        ordered
-            .record(vec![
-                (id("A"), PullRequestIdentity::new(1, "PR_1".to_owned()).unwrap()),
-                (id("B"), PullRequestIdentity::new(2, "PR_2".to_owned()).unwrap()),
-            ])
-            .unwrap();
-        assert!(ordered.finish().unwrap().into_exact(&[id("B"), id("A")]).is_err());
+    #[test]
+    fn create_receipts_are_complete_unique_and_alias_exact() {
+        let operations = vec![
+            operation(),
+            CreatePullRequest::new(
+                id("Gtwo"),
+                "REPO_NODE_ID".to_owned(),
+                "gherrit-bases/Gtwo".to_owned(),
+                "Title two".to_owned(),
+                "Body two".to_owned(),
+                oid(3),
+                oid(4),
+            ),
+        ];
+        let prepared = PreparedCreates::from_exact(operations, identities([])).unwrap();
+        assert!(prepared.complete_for_test(Vec::new()).is_err());
 
-        let mut ordered = receipt_plan(&["A", "B"], initial(Vec::new()));
-        ordered
-            .record(vec![
-                (id("B"), PullRequestIdentity::new(2, "PR_2".to_owned()).unwrap()),
-                (id("A"), PullRequestIdentity::new(1, "PR_1".to_owned()).unwrap()),
-            ])
-            .unwrap();
-        let exact = ordered.finish().unwrap().into_exact(&[id("A"), id("B")]).unwrap();
-        assert_eq!(
-            exact
-                .iter()
-                .map(|(id, identity)| (id.as_str(), identity.number().get()))
-                .collect::<Vec<_>>(),
-            [("A", 1), ("B", 2)]
+        let duplicate = PullRequestIdentity::new(7, "PR_7".to_owned()).unwrap();
+        let mut prepared = PreparedCreates::from_exact(vec![operation()], identities([])).unwrap();
+        assert!(
+            prepared
+                .receipts
+                .record(vec![(id("Gone"), duplicate.clone()), (id("Gone"), duplicate),])
+                .is_err()
         );
+
+        let mut extra = acknowledgement();
+        extra["data"]["extra"] = Value::Null;
+        assert!(create_batch(&[operation()]).unwrap().decode(extra).is_err());
+
+        for observed in [identities([(7, "OTHER")]), identities([(8, "PR_7")])] {
+            let prepared = PreparedCreates::from_exact(vec![operation()], observed).unwrap();
+            assert!(
+                prepared
+                    .complete_for_test(vec![(
+                        id("Gone"),
+                        PullRequestIdentity::new(7, "PR_7".to_owned()).unwrap(),
+                    )])
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -2165,54 +1140,105 @@ mod mutation_tests {
             .is_err()
         );
 
-        for (client_id, number, node_id) in [
-            ("wrong", 1, "PR_1"),
-            ("gherrit:update:PR_1", 2, "PR_1"),
-            ("gherrit:update:PR_1", 1, "PR_2"),
+        let decode = |response| update_batch(&[update(1, "PR_1")]).unwrap().decode(response);
+        decode(update_acknowledgement("gherrit:update:PR_1", 1, "PR_1")).unwrap();
+        for response in [
+            update_acknowledgement("wrong", 1, "PR_1"),
+            update_acknowledgement("gherrit:update:PR_1", 2, "PR_1"),
+            update_acknowledgement("gherrit:update:PR_1", 1, "PR_2"),
+            json!({ "data": { "op0": null } }),
+            json!({
+                "data": {
+                    "op0": {
+                        "clientMutationId": "gherrit:update:PR_1",
+                        "pullRequest": null
+                    }
+                }
+            }),
         ] {
-            let update = UpdatePullRequest::new(
-                PullRequestIdentity::new(1, "PR_1".to_owned()).unwrap(),
-                Some("Title".to_owned()),
-                None,
-                None,
-            )
-            .unwrap();
-            let batch =
-                PreparedUpdates::new(vec![update]).unwrap().batches.into_vec().pop().unwrap();
-            assert!(
-                batch
-                    .decode(json!({
-                        "data": {
-                            "op0": {
-                                "clientMutationId": client_id,
-                                "pullRequest": { "number": number, "id": node_id },
-                            }
-                        }
-                    }))
-                    .is_err()
-            );
+            assert!(decode(response).is_err());
         }
     }
 
     #[test]
-    fn update_preparation_rejects_each_duplicate_identity_namespace() {
-        let update = |number, node_id: &str| {
-            UpdatePullRequest::new(
-                PullRequestIdentity::new(number, node_id.to_owned()).unwrap(),
-                Some("Title".to_owned()),
-                None,
-                None,
-            )
-            .unwrap()
-        };
-
+    fn update_preparation_rejects_each_independent_identity_collision() {
         assert!(PreparedUpdates::new(vec![update(1, "PR_1"), update(1, "PR_2")]).is_err());
         assert!(PreparedUpdates::new(vec![update(1, "PR_1"), update(2, "PR_1")]).is_err());
     }
 
     #[test]
-    fn concrete_prepared_mutation_actions_must_be_nonempty() {
-        assert!(PreparedCreates::new(initial(Vec::new()), HashSet::new(), Vec::new()).is_err());
+    fn mutation_batches_use_the_exact_serialized_one_mibibyte_boundary() {
+        let create_fixed = create_batch(&[raw_create(0)]).unwrap().serialized_bytes;
+        let create_body_len = MAX_MUTATION_REQUEST_BYTES - create_fixed;
+        assert_eq!(
+            create_batch(&[raw_create(create_body_len)]).unwrap().serialized_bytes,
+            MAX_MUTATION_REQUEST_BYTES
+        );
+        assert!(prepare_create_batches(&[raw_create(create_body_len)]).is_ok());
+        assert!(prepare_create_batches(&[raw_create(create_body_len + 1)]).is_err());
+
+        let update_fixed = update_batch(&[raw_update(0)]).unwrap().serialized_bytes;
+        let update_body_len = MAX_MUTATION_REQUEST_BYTES - update_fixed;
+        assert_eq!(
+            update_batch(&[raw_update(update_body_len)]).unwrap().serialized_bytes,
+            MAX_MUTATION_REQUEST_BYTES
+        );
+        assert!(prepare_update_batches(&[raw_update(update_body_len)]).is_ok());
+        assert!(prepare_update_batches(&[raw_update(update_body_len + 1)]).is_err());
+
+        let mut creates = (0..MAX_MUTATION_ALIASES)
+            .map(|index| {
+                CreatePullRequest::new(
+                    id(&format!("G{index}")),
+                    "REPO_NODE_ID".to_owned(),
+                    format!("gherrit-bases/G{index}"),
+                    "small".to_owned(),
+                    String::new(),
+                    oid(1),
+                    oid(2),
+                )
+            })
+            .collect::<Vec<_>>();
+        creates.push(raw_create(create_body_len + 1));
+        assert!(prepare_create_batches(&creates).is_err());
+
+        let mut updates = (0..MAX_MUTATION_ALIASES)
+            .map(|index| update(u64::try_from(index + 1).unwrap(), &format!("PR_{index}")))
+            .collect::<Vec<_>>();
+        updates.push(raw_update(update_body_len + 1));
+        assert!(prepare_update_batches(&updates).is_err());
+    }
+
+    #[test]
+    fn response_derived_mutation_diagnostics_are_single_line_and_bounded() {
+        let returned = format!("{}\nnot-disclosed", "x".repeat(1_000));
+        let create_error = create_batch(&[operation()])
+            .unwrap()
+            .decode({
+                let mut response = acknowledgement();
+                response["data"]["op0"]["clientMutationId"] = json!(returned);
+                response
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(!create_error.contains('\n'));
+        assert!(!create_error.contains("not-disclosed"));
+        assert!(create_error.len() < 500);
+
+        let update_error = update_batch(&[update(1, "PR_1")])
+            .unwrap()
+            .decode(update_acknowledgement("gherrit:update:PR_1", 1, &returned))
+            .unwrap_err()
+            .to_string();
+        assert!(!update_error.contains('\n'));
+        assert!(!update_error.contains("not-disclosed"));
+        assert!(update_error.len() < 800);
+    }
+
+    #[test]
+    fn concrete_mutation_actions_must_be_nonempty() {
+        assert!(PreparedCreates::from_exact(Vec::new(), identities([])).is_err());
         assert!(PreparedUpdates::new(Vec::new()).is_err());
     }
 }

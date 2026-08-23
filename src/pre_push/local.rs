@@ -19,7 +19,6 @@ use crate::{
 };
 
 const MAX_TITLE_SCALARS: usize = 256;
-const METADATA_PREFIX: &str = "<!-- gherrit-meta:";
 
 /// A nonempty title of at most 256 Unicode scalar values.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,23 +33,6 @@ impl PullRequestTitle {
             bail!(
                 "A pull request title must contain at most {MAX_TITLE_SCALARS} Unicode scalar values"
             );
-        }
-        Ok(Self(value))
-    }
-
-    pub(super) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// User commit-body text which cannot claim GHerrit's reserved metadata.
-#[derive(Debug, Eq, PartialEq)]
-pub(super) struct CommitBody(String);
-
-impl CommitBody {
-    fn new(value: String) -> Result<Self> {
-        if value.contains(METADATA_PREFIX) {
-            bail!("Commit body contains the reserved GHerrit metadata marker");
         }
         Ok(Self(value))
     }
@@ -110,7 +92,7 @@ pub(super) struct LocalChange {
     head: ObjectId,
     first_parent: ObjectId,
     title: PullRequestTitle,
-    body: CommitBody,
+    body: String,
 }
 
 impl LocalChange {
@@ -140,9 +122,7 @@ impl LocalChange {
             .detach();
         let title = PullRequestTitle::new(title)
             .wrap_err_with(|| format!("Commit {} has an invalid pull request title", commit.id))?;
-        let body = validated_commit_body(body, id.as_str()).wrap_err_with(|| {
-            format!("Commit {} has an invalid pull request message body", commit.id)
-        })?;
+        let body = strip_gherrit_id(body, id.as_str());
 
         Ok(Self { id, head: commit.id, first_parent, title, body })
     }
@@ -159,20 +139,11 @@ impl LocalChange {
         self.first_parent
     }
 
-    pub(super) fn title(&self) -> &str {
-        self.title.as_str()
-    }
-
-    #[allow(dead_code)] // Consumed by the pending owned-base planner.
-    pub(super) fn pull_request_title(&self) -> &PullRequestTitle {
-        &self.title
-    }
-
     pub(super) fn body(&self) -> &str {
-        self.body.as_str()
+        &self.body
     }
 
-    pub(super) fn into_body_parts(self) -> (GherritPrId, PullRequestTitle, CommitBody) {
+    pub(super) fn into_body_parts(self) -> (GherritPrId, PullRequestTitle, String) {
         (self.id, self.title, self.body)
     }
 }
@@ -223,7 +194,7 @@ impl LocalStack {
                     head,
                     first_parent,
                     title: PullRequestTitle::new(title)?,
-                    body: CommitBody::new(body)?,
+                    body,
                 });
                 first_parent = head;
                 change
@@ -492,10 +463,6 @@ fn strip_gherrit_id(body: &str, id: &str) -> String {
     body
 }
 
-fn validated_commit_body(body: &str, id: &str) -> Result<CommitBody> {
-    CommitBody::new(strip_gherrit_id(body, id))
-}
-
 fn gherrit_pr_id_re() -> &'static regex::Regex {
     re!(r"(?m)^gherrit-pr-id[=:][ \t]*([a-zA-Z0-9]+)[ \t]*\r?$")
 }
@@ -518,7 +485,7 @@ mod tests {
             head: object_id(head),
             first_parent: object_id(first_parent),
             title: PullRequestTitle::new("Test change".to_owned()).unwrap(),
-            body: CommitBody::new(String::new()).unwrap(),
+            body: String::new(),
         }
     }
 
@@ -672,22 +639,13 @@ mod tests {
     }
 
     #[test]
-    fn reserved_metadata_is_rejected_after_the_trailer_is_removed() {
-        let marker = "<!-- gherrit-meta:";
-        for body in [
-            format!("{marker} forged -->\n\ngherrit-pr-id: Greal\n"),
-            format!("user text {marker} forged --> tail\n\ngherrit-pr-id: Greal\n"),
-            format!("user text\n{marker}\n\ngherrit-pr-id: Greal\n"),
-        ] {
-            let error = validated_commit_body(&body, "Greal").unwrap_err();
-            assert!(error.to_string().contains("reserved GHerrit metadata marker"));
-        }
+    fn former_metadata_prefix_is_ordinary_commit_text() {
+        let body = "Keep <!-- gherrit-meta: arbitrary text --> exactly.\n\n\
+                    gherrit-pr-id: Greal\n";
 
-        let body = validated_commit_body("user text\n\ngherrit-pr-id: Greal\n", "Greal")
-            .expect("the ordinary trailer is removed before validation");
-        assert!(!body.as_str().contains("gherrit-pr-id: Greal"));
-
-        let marker_free = "Keep ordinary markdown and <!-- unrelated comments -->.";
-        assert_eq!(CommitBody::new(marker_free.to_owned()).unwrap().as_str(), marker_free);
+        assert_eq!(
+            strip_gherrit_id(body, "Greal"),
+            "Keep <!-- gherrit-meta: arbitrary text --> exactly.\n\n\n"
+        );
     }
 }

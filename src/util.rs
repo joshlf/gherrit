@@ -412,17 +412,7 @@ impl Repo {
 
     // Check whether the branch is managed by GHerrit.
     pub fn is_managed(&self, branch_name: &str) -> Result<bool> {
-        match State::read_from(self, branch_name)? {
-            Some(State::Unmanaged) => Ok(false),
-            Some(State::Private | State::Public) => Ok(true),
-            None => {
-                bail!(
-                    "It is unclear whether branch '{branch_name}' should be managed by GHerrit.\n\
-                    Run 'gherrit manage' to sync it as a GHerrit stack.\n\
-                    Run 'gherrit unmanage' to push it as a standard Git branch."
-                );
-            }
-        }
+        Ok(State::read_required_from(self, branch_name)? != State::Unmanaged)
     }
 
     pub fn read_current_branch_and_state(&self) -> Result<(String, Option<State>)> {

@@ -1,8 +1,7 @@
-//! Pure publication-state normalization and ref-update planning.
+//! Owned-base and pull-request-marker publication.
 //!
-//! Observed remote heads and active histories are authoritative. Local tags
-//! are deliberately not inputs: a fresh clone must derive the same next
-//! version as the repository which originally published the change.
+//! Every push is fully planned, destination-bound, atomically tupled, and
+//! receipt-checked before a later publication stage can be released.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -16,10 +15,8 @@ use gix::ObjectId;
 use super::{
     destination::PushDestination,
     history::ValidatedChangeHistory,
-    local::{GherritPrId, LocalChange},
-    remote::{ObservedChange, ObservedStack},
+    plan::{AuthorizedMarkerPushes, AuthorizedTuplePushes, MarkerTarget},
     subprocess,
-    version::Version,
 };
 
 const FIXED_PUSH_OPTIONS: [&str; 7] = [
@@ -149,29 +146,14 @@ struct BudgetedOwnedPushTuple {
 }
 
 /// Plans exact, tuple-indivisible owned-base publication from validated history.
-pub(super) fn plan_owned_base_pushes<'destination>(
+pub(super) fn preflight_tuple_pushes<'destination>(
     destination: &'destination PushDestination,
     histories: &[&ValidatedChangeHistory],
-) -> Result<Option<PreparedPushes<'destination>>> {
+) -> Result<Option<TuplePushPreflight<'destination>>> {
     let requests =
         plan_owned_base_requests_with_budget(histories, PUSH_VARIABLE_ARGV_BUDGET_BYTES)?;
-    PreparedPushes::new(destination, requests)
-}
-
-/// One required missing marker, derived only from validated local history.
-#[derive(Clone, Debug)]
-pub(super) struct MissingPullRequestMarker {
-    id: GherritPrId,
-    target: ObjectId,
-}
-
-impl MissingPullRequestMarker {
-    pub(super) fn from_history(history: &ValidatedChangeHistory) -> Option<Self> {
-        history.pull_request_marker().is_none().then(|| Self {
-            id: history.id().clone(),
-            target: history.projected_current().revision().head(),
-        })
-    }
+    PushSequence::new(destination, requests)
+        .map(|pushes| pushes.map(|sequence| TuplePushPreflight { sequence }))
 }
 
 struct MarkerPushArguments {
@@ -183,9 +165,9 @@ struct MarkerPushArguments {
 }
 
 impl MarkerPushArguments {
-    fn new(marker: &MissingPullRequestMarker) -> Self {
-        let destination = format!("refs/tags/gherrit/{}/pr", marker.id.as_str());
-        let source = marker.target.to_string();
+    fn new(marker: &MarkerTarget) -> Self {
+        let destination = format!("refs/tags/gherrit/{}/pr", marker.id().as_str());
+        let source = marker.target().to_string();
         Self {
             option: format!("--force-with-lease={destination}:"),
             refspec: format!("{source}:{destination}"),
@@ -195,8 +177,8 @@ impl MarkerPushArguments {
             ),
             #[cfg(test)]
             effect: super::test_effect::MarkerEffect {
-                id: marker.id.clone(),
-                target: marker.target,
+                id: marker.id().clone(),
+                target: marker.target(),
             },
         }
     }
@@ -207,16 +189,19 @@ impl MarkerPushArguments {
 }
 
 /// Plans one absent-leased durable marker per unmarked local pull request.
-pub(super) fn plan_marker_pushes<'destination>(
+pub(super) fn preflight_marker_pushes<'destination>(
     destination: &'destination PushDestination,
-    markers: &[MissingPullRequestMarker],
-) -> Result<Option<PreparedPushes<'destination>>> {
+    markers: &[MarkerTarget],
+) -> Result<Option<MarkerPushPreflight<'destination>>> {
     let requests = plan_marker_requests_with_budget(markers, PUSH_VARIABLE_ARGV_BUDGET_BYTES)?;
-    PreparedPushes::new(destination, requests)
+    let target_keys =
+        markers.iter().map(|marker| (marker.id().clone(), marker.target())).collect::<Box<[_]>>();
+    PushSequence::new(destination, requests)
+        .map(|pushes| pushes.map(|sequence| MarkerPushPreflight { sequence, target_keys }))
 }
 
 fn plan_marker_requests_with_budget(
-    markers: &[MissingPullRequestMarker],
+    markers: &[MarkerTarget],
     budget: usize,
 ) -> Result<Box<[PushRequest]>> {
     let arguments = markers.iter().map(MarkerPushArguments::new).collect::<Vec<_>>();
@@ -337,124 +322,6 @@ fn plan_owned_base_requests_with_budget(
 #[cfg(test)]
 fn plan_owned_base_requests(histories: &[&ValidatedChangeHistory]) -> Result<Box<[PushRequest]>> {
     plan_owned_base_requests_with_budget(histories, PUSH_VARIABLE_ARGV_BUDGET_BYTES)
-}
-
-#[derive(Clone, Debug)]
-enum PushTarget {
-    First {
-        id: GherritPrId,
-        desired_head: ObjectId,
-    },
-    Advance {
-        id: GherritPrId,
-        desired_head: ObjectId,
-        expected_head: ObjectId,
-        next_version: Version,
-    },
-}
-
-impl PushTarget {
-    fn first(id: GherritPrId, desired_head: ObjectId) -> Self {
-        Self::First { id, desired_head }
-    }
-
-    fn advance(
-        id: GherritPrId,
-        desired_head: ObjectId,
-        expected_head: ObjectId,
-        latest_version: Version,
-    ) -> Result<Self> {
-        let next_version = latest_version
-            .next()
-            .ok_or_else(|| eyre!("Remote GHerrit change '{}' has no next version", id.as_str()))?;
-        Ok(Self::Advance { id, desired_head, expected_head, next_version })
-    }
-
-    fn id(&self) -> &GherritPrId {
-        match self {
-            Self::First { id, .. } | Self::Advance { id, .. } => id,
-        }
-    }
-
-    fn desired_head(&self) -> ObjectId {
-        match self {
-            Self::First { desired_head, .. } | Self::Advance { desired_head, .. } => *desired_head,
-        }
-    }
-
-    fn version(&self) -> Version {
-        match self {
-            Self::First { .. } => Version::FIRST,
-            Self::Advance { next_version, .. } => *next_version,
-        }
-    }
-
-    fn expected_head(&self) -> Option<ObjectId> {
-        match self {
-            Self::First { .. } => None,
-            Self::Advance { expected_head, .. } => Some(*expected_head),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct PushPlan {
-    first: BudgetedPushTuple,
-    rest: Vec<BudgetedPushTuple>,
-}
-
-impl PushPlan {
-    fn new(first: BudgetedPushTuple) -> Self {
-        Self { first, rest: Vec::new() }
-    }
-
-    fn push(&mut self, tuple: BudgetedPushTuple) {
-        self.rest.push(tuple);
-    }
-
-    #[cfg(test)]
-    fn tuples(&self) -> impl Iterator<Item = &BudgetedPushTuple> {
-        std::iter::once(&self.first).chain(&self.rest)
-    }
-
-    #[cfg(test)]
-    fn arguments(&self) -> (Vec<String>, Vec<String>) {
-        let tuple_count = self.tuples().count();
-        let mut options = FIXED_PUSH_OPTIONS.map(str::to_owned).to_vec();
-        let mut refspecs = Vec::with_capacity(tuple_count * 2);
-        options.reserve(tuple_count * 2);
-        for tuple in self.tuples() {
-            options.extend(tuple.arguments.options.iter().cloned());
-            refspecs.extend(tuple.arguments.refspecs.iter().cloned());
-        }
-        (options, refspecs)
-    }
-
-    fn into_request(self) -> Result<PushRequest> {
-        let tuple_count = 1 + self.rest.len();
-        let mut options = FIXED_PUSH_OPTIONS.map(str::to_owned).to_vec();
-        let mut refspecs = Vec::with_capacity(tuple_count * 2);
-        let mut expected_receipts = Vec::with_capacity(tuple_count * 2);
-        options.reserve(tuple_count * 2);
-        for tuple in std::iter::once(self.first).chain(self.rest) {
-            options.extend(tuple.arguments.options);
-            refspecs.extend(tuple.arguments.refspecs);
-            expected_receipts.extend(tuple.arguments.expected_receipts);
-        }
-        Ok(PushRequest {
-            options,
-            refspecs,
-            expected: ExpectedReceipts::new(expected_receipts)?,
-            #[cfg(test)]
-            effects: Vec::new(),
-        })
-    }
-
-    #[cfg(test)]
-    fn into_arguments(self) -> (Vec<String>, Vec<String>) {
-        let request = self.into_request().expect("a planned request has unique destinations");
-        (request.options, request.refspecs)
-    }
 }
 
 /// The immutable boundary between publication planning and a `git push`
@@ -626,25 +493,21 @@ fn parse_push_receipts(
 /// One nonempty sequence of fully preflighted pushes bound to the destination
 /// which supplied its publication evidence.
 ///
-/// Both publication planners use this boundary. In particular, the active
-/// legacy path now deliberately has the same finite remote-command deadline as
-/// the dormant owned-base path instead of waiting forever for a hung push.
-pub(super) struct PreparedPushes<'destination> {
+/// Both owned-tuple and marker publication use the same finite remote-command
+/// deadline and exact receipt policy.
+struct PushSequence<'destination> {
     destination: &'destination PushDestination,
     first: PushRequest,
     rest: Box<[PushRequest]>,
 }
 
-impl fmt::Debug for PreparedPushes<'_> {
+impl fmt::Debug for PushSequence<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PreparedPushes")
-            .field("batch_count", &(1 + self.rest.len()))
-            .finish()
+        formatter.debug_struct("PushSequence").field("batch_count", &(1 + self.rest.len())).finish()
     }
 }
 
-impl<'destination> PreparedPushes<'destination> {
+impl<'destination> PushSequence<'destination> {
     fn new(
         destination: &'destination PushDestination,
         requests: impl IntoIterator<Item = PushRequest>,
@@ -727,345 +590,104 @@ impl<'destination> PreparedPushes<'destination> {
     }
 }
 
-/// Every Git publication decision and ready push batch for one local stack.
-#[derive(Debug)]
-pub(super) struct GitPublicationPlan<'stack, 'destination> {
-    pushes: Option<PreparedPushes<'destination>>,
-    changes: PlannedChanges<'stack>,
+/// Completely validated tuple wire data which is not executable on its own.
+///
+/// Only the planner can turn this value into [`AuthorizedTuplePushes`]. This
+/// keeps request construction and its local failure modes before the first
+/// write without treating validated bytes as publication authority.
+pub(super) struct TuplePushPreflight<'destination> {
+    sequence: PushSequence<'destination>,
 }
 
-impl<'stack> GitPublicationPlan<'stack, '_> {
-    /// Releases planned changes only after every required push is acknowledged.
-    pub(super) async fn publish(self) -> Result<PlannedChanges<'stack>> {
-        if let Some(pushes) = self.pushes {
-            pushes.publish().await?;
-        }
-        Ok(self.changes)
-    }
+/// Completely validated marker wire data which is not executable on its own.
+///
+/// A missing marker is not sufficient authority to publish it. The planner
+/// converts this value into an executable stage only by consuming authority
+/// from an already-validated OPEN pull request or exact create receipts.
+pub(super) struct MarkerPushPreflight<'destination> {
+    sequence: PushSequence<'destination>,
+    target_keys: Box<[(super::local::GherritPrId, ObjectId)]>,
+}
 
-    #[cfg(test)]
-    async fn publish_with_timeout_for_test(
-        self,
-        timeout: std::time::Duration,
-    ) -> Result<PlannedChanges<'stack>> {
-        if let Some(pushes) = self.pushes {
-            pushes.publish_with_timeout_for_test(timeout).await?;
-        }
-        Ok(self.changes)
+impl fmt::Debug for TuplePushPreflight<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.sequence.fmt(formatter)
     }
 }
 
-/// One publication outcome for every local change, in local stack order.
-#[derive(Debug)]
-pub(super) struct PlannedChanges<'stack>(Vec<VersionedChange<'stack>>);
-
-impl<'stack> IntoIterator for PlannedChanges<'stack> {
-    type Item = VersionedChange<'stack>;
-    type IntoIter = std::vec::IntoIter<Self::Item>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
+impl fmt::Debug for MarkerPushPreflight<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MarkerPushPreflight")
+            .field("pushes", &self.sequence)
+            .field("target_count", &self.target_keys.len())
+            .finish()
     }
 }
 
-impl PlannedChanges<'_> {
-    #[cfg(test)]
-    fn version(&self, id: &str) -> Option<Version> {
-        self.0
+impl MarkerPushPreflight<'_> {
+    /// Checks the exact ordered evidence set whose wire data was preflighted.
+    pub(super) fn matches_targets(&self, targets: &[MarkerTarget]) -> bool {
+        self.target_keys
             .iter()
-            .find(|change| change.change().id().as_str() == id)
-            .map(|change| change.version())
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
+            .map(|(id, target)| (id, *target))
+            .eq(targets.iter().map(|target| (target.id(), target.target())))
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct VersionedChange<'a> {
-    change: &'a LocalChange,
-    version: Version,
-}
-
-impl<'a> VersionedChange<'a> {
-    pub(super) fn change(self) -> &'a LocalChange {
-        self.change
-    }
-
-    pub(super) fn version(self) -> Version {
-        self.version
+#[cfg(test)]
+impl TuplePushPreflight<'_> {
+    pub(super) fn effect_batches_for_test(
+        &self,
+    ) -> super::test_effect::EffectBatches<super::test_effect::GitEffect> {
+        self.sequence.effect_batches_for_test()
     }
 }
 
-pub(super) fn plan_git_publication<'stack, 'destination>(
-    observed: &ObservedStack<'stack, 'destination>,
-) -> Result<GitPublicationPlan<'stack, 'destination>> {
-    // Collect every result before constructing the plan. In particular, an
-    // invalid change late in a large stack cannot be discovered after an
-    // earlier push batch has already committed.
-    let planned = observed
-        .iter()
-        .map(|observed| plan_change(observed).map(|publication| (observed.change(), publication)))
-        .collect::<Result<Vec<_>>>()?;
-    let requests =
-        plan_push_batches(planned.iter().filter_map(|(_, publication)| publication.target()))?
-            .into_iter()
-            .map(PushPlan::into_request)
-            .collect::<Result<Vec<_>>>()?;
-    let pushes = PreparedPushes::new(observed.destination(), requests)?;
-    let changes = planned
-        .into_iter()
-        .map(|(change, publication)| VersionedChange { change, version: publication.version() })
-        .collect();
-    Ok(GitPublicationPlan { pushes, changes: PlannedChanges(changes) })
-}
-
-#[derive(Debug)]
-enum PlannedChange {
-    Current(Version),
-    Publish(PushTarget),
-}
-
-impl PlannedChange {
-    fn version(&self) -> Version {
-        match self {
-            Self::Current(version) => *version,
-            Self::Publish(target) => target.version(),
-        }
+#[cfg(test)]
+impl MarkerPushPreflight<'_> {
+    pub(super) fn arguments_for_test(&self) -> Vec<(Vec<String>, Vec<String>)> {
+        self.sequence.arguments_for_test()
     }
 
-    fn target(&self) -> Option<&PushTarget> {
-        match self {
-            Self::Current(_) => None,
-            Self::Publish(target) => Some(target),
-        }
+    pub(super) fn effect_batches_for_test(
+        &self,
+    ) -> super::test_effect::EffectBatches<super::test_effect::GitEffect> {
+        self.sequence.effect_batches_for_test()
+    }
+
+    async fn publish_with_timeout_for_test(self, timeout: std::time::Duration) -> Result<()> {
+        self.sequence.publish_with_timeout_for_test(timeout).await
     }
 }
 
-fn plan_change(observed: &ObservedChange<'_>) -> Result<PlannedChange> {
-    let change = observed.change();
-    let id = change.id();
-    let desired_head = change.head();
-    match normalize_remote_publication(
-        id,
-        observed.head(),
-        observed.owned_base(),
-        observed.versions(),
-    )? {
-        RemotePublication::Absent => {
-            Ok(PlannedChange::Publish(PushTarget::first(id.clone(), desired_head)))
-        }
-        RemotePublication::Published { current_head, latest_version } => {
-            if current_head == desired_head {
-                // This is a true no-op, not a concurrency guard. Git elides
-                // an up-to-date refspec without sending an update, so adding
-                // an exact lease would not make it a compare-and-swap. A
-                // later read would only narrow, not close, the race before
-                // unconditioned GitHub mutations. The publication protocol
-                // therefore assumes one publisher at a time.
-                Ok(PlannedChange::Current(latest_version))
-            } else {
-                Ok(PlannedChange::Publish(PushTarget::advance(
-                    id.clone(),
-                    desired_head,
-                    current_head,
-                    latest_version,
-                )?))
-            }
-        }
-    }
+/// Executes tuple wire data only after the planner has authorized the complete
+/// publication plan.
+pub(super) async fn publish_tuples(pushes: AuthorizedTuplePushes<'_>) -> Result<()> {
+    pushes.into_preflight().sequence.publish().await
 }
 
-#[derive(Debug)]
-enum RemotePublication {
-    Absent,
-    Published { current_head: ObjectId, latest_version: Version },
-}
-
-fn normalize_remote_publication(
-    id: &GherritPrId,
-    head: Option<ObjectId>,
-    owned_base: Option<ObjectId>,
-    tags: &std::collections::BTreeMap<Version, ObjectId>,
-) -> Result<RemotePublication> {
-    if owned_base.is_some() {
-        bail!(
-            "Remote GHerrit change '{}' has an owned base from the new publication representation; this client cannot publish mixed representations",
-            id.as_str()
-        );
-    }
-    match (head, tags.is_empty()) {
-        (None, true) => return Ok(RemotePublication::Absent),
-        (Some(_), true) => {
-            bail!("Remote GHerrit change '{}' has a managed head but no version tags", id.as_str())
-        }
-        (None, false) => {
-            bail!("Remote GHerrit change '{}' has version tags but no managed head", id.as_str())
-        }
-        (Some(_), false) => {}
-    }
-
-    tags.iter().enumerate().try_for_each(|(index, (actual, _))| {
-        let expected = Version::from_history_index(index)
-            .ok_or_else(|| {
-                eyre!("Remote GHerrit change '{}' has too many versions", id.as_str())
-            })?;
-        if *actual != expected {
-            bail!(
-                "Remote GHerrit change '{}' has noncontiguous version tags: expected v{expected}, observed v{actual}",
-                id.as_str()
-            );
-        }
-        Ok(())
-    })?;
-    let (&latest_version, &current_head) = tags
-        .last_key_value()
-        .ok_or_else(|| eyre!("Remote GHerrit change '{}' has no version records", id.as_str()))?;
-    if head != Some(current_head) {
-        bail!("Remote GHerrit change '{}' head does not match its latest version tag", id.as_str());
-    }
-    Ok(RemotePublication::Published { current_head, latest_version })
-}
-
-#[derive(Debug)]
-struct PushTupleArguments {
-    options: [String; 2],
-    refspecs: [String; 2],
-    expected_receipts: [(String, ExpectedRefReceipt); 2],
-}
-
-/// One exact rendered change tuple which has passed the variable-argument
-/// budget used to construct its push batch.
-#[derive(Debug)]
-struct BudgetedPushTuple {
-    arguments: PushTupleArguments,
-    encoded_argv_bytes: usize,
-}
-
-impl BudgetedPushTuple {
-    fn new(target_index: usize, target: &PushTarget, budget: usize) -> Result<Self> {
-        let arguments = PushTupleArguments::new(target);
-        let encoded_argv_bytes = arguments.encoded_argv_bytes();
-        if encoded_argv_bytes > budget {
-            bail!(
-                "Git publication target {target_index} has a {}-byte change ID and requires {encoded_argv_bytes} bytes of variable push arguments, which exceeds the {budget}-byte variable-argument budget",
-                target.id().as_str().len()
-            );
-        }
-        Ok(Self { arguments, encoded_argv_bytes })
-    }
-}
-
-impl PushTupleArguments {
-    fn new(target: &PushTarget) -> Self {
-        let branch = format!("refs/heads/{}", target.id().as_str());
-        let tag = format!("refs/tags/gherrit/{}/v{}", target.id().as_str(), target.version());
-        let expected = target.expected_head().map(|object| object.to_string()).unwrap_or_default();
-        // Branch updates are leased against the observed remote value. A tag
-        // lease with an empty expected value requires that the version tag not
-        // exist, making it a lock rather than an overwrite.
-        let options = [
-            format!("--force-with-lease={branch}:{expected}"),
-            format!("--force-with-lease={tag}:"),
-        ];
-        let desired_head = target.desired_head();
-        let refspecs = [format!("{desired_head}:{branch}"), format!("{desired_head}:{tag}")];
-        let branch_transition = if target.expected_head().is_some() {
-            ExpectedRefTransition::UpdateOrAlreadyDesired
-        } else {
-            ExpectedRefTransition::CreateOrAlreadyDesired
-        };
-        let expected_receipts = [
-            (branch, ExpectedRefReceipt::new(desired_head.to_string(), branch_transition)),
-            (
-                tag,
-                ExpectedRefReceipt::new(
-                    desired_head.to_string(),
-                    ExpectedRefTransition::CreateOrAlreadyDesired,
-                ),
-            ),
-        ];
-        Self { options, refspecs, expected_receipts }
-    }
-
-    fn encoded_argv_bytes(&self) -> usize {
-        self.options.iter().chain(&self.refspecs).map(|argument| argument.len() + 1).sum()
-    }
-}
-
-fn plan_push_batches<'a>(
-    targets: impl IntoIterator<Item = &'a PushTarget>,
-) -> Result<Vec<PushPlan>> {
-    plan_push_batches_with_budget(targets, PUSH_VARIABLE_ARGV_BUDGET_BYTES)
-}
-
-fn plan_push_batches_with_budget<'a>(
-    targets: impl IntoIterator<Item = &'a PushTarget>,
-    budget: usize,
-) -> Result<Vec<PushPlan>> {
-    // Render and size every per-change tuple before constructing the first
-    // batch. A late oversized target therefore rejects the complete
-    // publication plan; no prefix can escape to the push adapter.
-    let tuples = targets
-        .into_iter()
-        .enumerate()
-        .map(|(index, target)| BudgetedPushTuple::new(index, target, budget))
-        .collect::<Result<Vec<_>>>()?;
-    // Validate destinations across the complete plan before constructing its
-    // first executable batch. A repeated destination in different batches is
-    // just as invalid as a repeat within one atomic push.
-    ExpectedReceipts::new(
-        tuples.iter().flat_map(|tuple| tuple.arguments.expected_receipts.iter().cloned()),
-    )?;
-
-    let mut batches = Vec::new();
-    let mut current = None::<PushPlan>;
-    let mut current_bytes = 0;
-    for tuple in tuples {
-        let tuple_bytes = tuple.encoded_argv_bytes;
-        if current.is_some() && current_bytes > budget - tuple_bytes {
-            batches.push(current.take().expect("a full push batch exists"));
-            current_bytes = 0;
-        }
-        current_bytes += tuple_bytes;
-        match &mut current {
-            Some(batch) => batch.push(tuple),
-            None => current = Some(PushPlan::new(tuple)),
-        }
-    }
-    if let Some(current) = current {
-        batches.push(current);
-    }
-
-    Ok(batches)
+/// Executes marker wire data only after the planner has authorized every
+/// marker in the complete stage.
+pub(super) async fn publish_markers(pushes: AuthorizedMarkerPushes<'_>) -> Result<()> {
+    pushes.into_preflight().sequence.publish().await
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fmt::Write as _};
+    use std::fmt::Write as _;
     #[cfg(unix)]
-    use std::{
-        fs,
-        os::unix::fs::PermissionsExt as _,
-        path::PathBuf,
-        time::{Duration, Instant},
-    };
+    use std::{fs, os::unix::fs::PermissionsExt as _, path::PathBuf, time::Duration};
 
     use tempfile::TempDir;
 
     use super::*;
     use crate::{
         pre_push::{
+            destination::DefaultBranch,
             history::{CommitGraphEvidence, NormalizedPublishedHistory, ValidatedChangeHistory},
-            local::LocalStack,
-            remote::{self, ObservedStack},
+            local::{GherritPrId, LocalStack},
+            remote,
         },
         util,
     };
@@ -1074,65 +696,8 @@ mod tests {
         ObjectId::from_bytes_or_panic(&[byte; 20])
     }
 
-    fn version(value: u64) -> Version {
-        Version::new(value).expect("test version must be nonzero")
-    }
-
     fn change_id(value: &str) -> GherritPrId {
         GherritPrId::from_ref_component(value.as_bytes()).expect("valid test change ID")
-    }
-
-    fn versions(values: &[(u64, u8)]) -> BTreeMap<Version, ObjectId> {
-        values.iter().map(|(value, byte)| (version(*value), object_id(*byte))).collect()
-    }
-
-    fn stack(changes: impl IntoIterator<Item = (GherritPrId, ObjectId)>) -> LocalStack {
-        LocalStack::for_test(object_id(0xff), changes)
-    }
-
-    fn observed<'stack>(
-        stack: &'stack LocalStack,
-        heads: &[(&str, u8)],
-        tags: &[(&str, &[(u64, u8)])],
-    ) -> ObservedStack<'stack, 'static> {
-        ObservedStack::for_test(
-            stack,
-            stack.iter().map(|change| {
-                let id = change.id().as_str();
-                let head = heads
-                    .iter()
-                    .find_map(|(candidate, byte)| (*candidate == id).then(|| object_id(*byte)));
-                let history = tags
-                    .iter()
-                    .find_map(|(candidate, values)| (*candidate == id).then(|| versions(values)))
-                    .unwrap_or_default();
-                (head, None, history)
-            }),
-        )
-    }
-
-    #[cfg(unix)]
-    fn observed_at<'stack, 'destination>(
-        destination: &'destination PushDestination,
-        stack: &'stack LocalStack,
-        heads: &[(&str, u8)],
-        tags: &[(&str, &[(u64, u8)])],
-    ) -> ObservedStack<'stack, 'destination> {
-        ObservedStack::for_test_at(
-            destination,
-            stack,
-            stack.iter().map(|change| {
-                let id = change.id().as_str();
-                let head = heads
-                    .iter()
-                    .find_map(|(candidate, byte)| (*candidate == id).then(|| object_id(*byte)));
-                let history = tags
-                    .iter()
-                    .find_map(|(candidate, values)| (*candidate == id).then(|| versions(values)))
-                    .unwrap_or_default();
-                (head, None, history)
-            }),
-        )
     }
 
     #[cfg(unix)]
@@ -1158,29 +723,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    const SUCCESSFUL_PUSH: &str = r#"#!/bin/sh
-: > "$GHERRIT_TEST_ARGV"
-for argument in "$@"; do
-    printf '%s\n' "$argument" >> "$GHERRIT_TEST_ARGV"
-done
-printf 'To private-destination\n'
-for argument in "$@"; do
-    case "$argument" in
-        *:refs/heads/*|*:refs/tags/*)
-            printf '*\t%s\t[new reference]\n' "$argument"
-            ;;
-    esac
-done
-printf 'Done\n'
-"#;
-
-    #[cfg(unix)]
-    const HANGING_PUSH: &str = r#"#!/bin/sh
-: > "$GHERRIT_TEST_ARGV"
-/bin/sleep 10
-"#;
-
-    #[cfg(unix)]
     const ACKNOWLEDGED_PREFIX: &str = r#"#!/bin/sh
 count=0
 if test -f "$GHERRIT_TEST_ARGV"; then
@@ -1200,28 +742,6 @@ if test "$count" -eq 1; then
 fi
 printf 'Done\n'
 "#;
-
-    fn push_target(
-        id: &str,
-        object_id: ObjectId,
-        version: Version,
-        expected_remote: Option<ObjectId>,
-    ) -> PushTarget {
-        match expected_remote {
-            None => {
-                assert_eq!(version, Version::FIRST);
-                PushTarget::first(change_id(id), object_id)
-            }
-            Some(expected_head) => {
-                let previous = Version::new(version.get() - 1).expect("advanced test version");
-                PushTarget::advance(change_id(id), object_id, expected_head, previous).unwrap()
-            }
-        }
-    }
-
-    fn batch_tuple_count(batch: &PushPlan) -> usize {
-        batch.tuples().count()
-    }
 
     struct HistoryRepository {
         directory: TempDir,
@@ -1291,17 +811,18 @@ printf 'Done\n'
         );
         let id = change_id(id);
         let default = published_revision.map_or(proposed.1, |(_, base)| base);
-        let mut heads =
-            format!("ref: refs/heads/main\tHEAD\n{default}\tHEAD\n{default}\trefs/heads/main\n");
-        let mut tags = String::new();
+        let mut local = format!("{default}\trefs/heads/main\n");
         if let Some((head, base)) = published_revision {
-            writeln!(heads, "{head}\trefs/heads/{}", id.as_str()).unwrap();
-            writeln!(heads, "{base}\trefs/heads/gherrit-bases/{}", id.as_str()).unwrap();
-            writeln!(tags, "{head}\trefs/tags/gherrit/{}/v1", id.as_str()).unwrap();
+            writeln!(local, "{head}\trefs/heads/{}", id.as_str()).unwrap();
+            writeln!(local, "{base}\trefs/heads/gherrit-bases/{}", id.as_str()).unwrap();
+            writeln!(local, "{head}\trefs/tags/gherrit/{}/v1", id.as_str()).unwrap();
         }
-        let observed =
-            remote::parse_active_change_for_test(id.clone(), heads.as_bytes(), tags.as_bytes())
-                .unwrap();
+        let observed = remote::parse_active_change_for_test(
+            id.clone(),
+            DefaultBranch::new("main".to_owned(), default).unwrap(),
+            local.as_bytes(),
+        )
+        .unwrap();
         let normalized = NormalizedPublishedHistory::from_observation(observed, &graph).unwrap();
         let stack = LocalStack::for_test(proposed.1, [(id, proposed.0)]);
         let history = normalized
@@ -1360,8 +881,8 @@ printf 'Done\n'
 
     #[test]
     fn marker_publication_uses_exact_absent_leases_and_indivisible_byte_batches() {
-        let first = MissingPullRequestMarker { id: change_id("Gone"), target: object_id(0x11) };
-        let second = MissingPullRequestMarker { id: change_id("Gtwo"), target: object_id(0x22) };
+        let first = MarkerTarget::for_test(change_id("Gone"), object_id(0x11));
+        let second = MarkerTarget::for_test(change_id("Gtwo"), object_id(0x22));
         let encoded = MarkerPushArguments::new(&first).encoded_argv_bytes();
 
         let exact =
@@ -1397,7 +918,7 @@ printf 'Done\n'
 
     #[test]
     fn marker_receipts_require_exact_source_destination_coverage_and_create_transition() {
-        let marker = MissingPullRequestMarker { id: change_id("Gone"), target: object_id(0x11) };
+        let marker = MarkerTarget::for_test(change_id("Gone"), object_id(0x11));
         let mut requests =
             plan_marker_requests_with_budget(&[marker], usize::MAX).unwrap().into_vec();
         let request = requests.pop().unwrap();
@@ -1465,7 +986,7 @@ printf 'Done\n'
             Vec::new(),
         )
         .unwrap();
-        assert!(plan_owned_base_pushes(&destination, &[&fixture.history]).unwrap().is_none());
+        assert!(preflight_tuple_pushes(&destination, &[&fixture.history]).unwrap().is_none());
     }
 
     #[test]
@@ -1511,208 +1032,26 @@ printf 'Done\n'
         assert!(split.iter().all(|request| request.refspecs.len() == 3));
     }
 
-    #[test]
-    fn normalizes_only_absent_or_complete_contiguous_publications() {
-        assert!(matches!(
-            normalize_remote_publication(&change_id("Gone"), None, None, &versions(&[])).unwrap(),
-            RemotePublication::Absent
-        ));
-
-        let repeated = versions(&[(1, 2), (2, 2), (3, 3)]);
-        let RemotePublication::Published { current_head, latest_version } =
-            normalize_remote_publication(&change_id("Gone"), Some(object_id(3)), None, &repeated)
-                .unwrap()
-        else {
-            panic!("complete history must be published");
-        };
-        assert_eq!(current_head, object_id(3));
-        assert_eq!(latest_version, version(3));
-
-        for (head, tags, message) in [
-            (Some(object_id(2)), versions(&[]), "head but no version tags"),
-            (None, versions(&[(1, 2)]), "version tags but no managed head"),
-            (Some(object_id(3)), versions(&[(1, 2), (3, 3)]), "noncontiguous version tags"),
-            (
-                Some(object_id(3)),
-                versions(&[(1, 2), (2, 2)]),
-                "does not match its latest version tag",
-            ),
-        ] {
-            let error =
-                normalize_remote_publication(&change_id("Gone"), head, None, &tags).unwrap_err();
-            assert!(error.to_string().contains(message), "error={error:?}");
-        }
-    }
-
-    #[test]
-    fn rejects_an_owned_base_before_planning_any_push() {
-        let stack = stack([(change_id("Gone"), object_id(2))]);
-        let observed =
-            ObservedStack::for_test(&stack, [(None, Some(object_id(1)), BTreeMap::new())]);
-
-        let error = plan_git_publication(&observed).unwrap_err();
-        assert!(error.to_string().contains("mixed representations"), "error={error:?}");
-    }
-
-    #[test]
-    fn unchanged_heads_are_no_ops_and_changed_heads_advance_remote_history() {
-        let stack = stack([
-            (change_id("Gone"), object_id(3)),
-            (change_id("Gtwo"), object_id(6)),
-            (change_id("Gnew"), object_id(7)),
-        ]);
-        let observed = observed(
-            &stack,
-            &[("Gone", 3), ("Gtwo", 5)],
-            &[("Gone", &[(1, 2), (2, 3)]), ("Gtwo", &[(1, 5)])],
-        );
-        let plan = plan_git_publication(&observed).unwrap();
-
-        assert_eq!(plan.changes.version("Gone"), Some(version(2)));
-        assert_eq!(plan.changes.version("Gtwo"), Some(version(2)));
-        assert_eq!(plan.changes.version("Gnew"), Some(Version::FIRST));
-        let batches = plan.pushes.as_ref().unwrap().arguments_for_test();
-        assert_eq!(batches.len(), 1);
-        let (options, refspecs) = &batches[0];
-        assert_eq!(refspecs.len() / 2, 2);
-        assert!(options.iter().all(|argument| !argument.contains("Gone")));
-        assert!(refspecs.iter().all(|argument| !argument.contains("Gone")));
-        assert!(options.contains(&format!("--force-with-lease=refs/heads/Gtwo:{}", object_id(5))));
-        assert!(refspecs.contains(&format!("{}:refs/tags/gherrit/Gnew/v1", object_id(7))));
-    }
-
-    #[test]
-    fn stacks_larger_than_the_removed_query_batch_are_planned_together() {
-        let ids = (0..251).map(|index| change_id(&format!("G{index}"))).collect::<Vec<_>>();
-        let stack = stack(ids.iter().cloned().map(|id| (id, object_id(2))));
-        let observed = observed(&stack, &[], &[]);
-        let plan = plan_git_publication(&observed).unwrap();
-
-        assert_eq!(plan.changes.len(), 251);
-        let batches = plan.pushes.as_ref().unwrap().arguments_for_test();
-        assert_eq!(batches.iter().map(|(_, refspecs)| refspecs.len() / 2).sum::<usize>(), 251);
-        assert!(
-            batches
-                .iter()
-                .flat_map(|(_, refspecs)| refspecs)
-                .filter(|refspec| refspec.contains("refs/tags/gherrit/"))
-                .all(|refspec| refspec.ends_with("/v1"))
-        );
-    }
-
-    #[test]
-    fn every_local_change_is_validated_before_a_plan_exists() {
-        let stack = stack([(change_id("Gvalid"), object_id(2)), (change_id("Gbad"), object_id(4))]);
-        let observed = observed(&stack, &[("Gbad", 4)], &[("Gbad", &[(1, 3)])]);
-        let error = plan_git_publication(&observed).unwrap_err();
-
-        assert!(error.to_string().contains("latest version tag"), "error={error:?}");
-    }
-
-    #[test]
-    fn an_empty_publication_has_no_push_batches() {
-        let stack = stack(std::iter::empty());
-        let observed = observed(&stack, &[], &[]);
-        let plan = plan_git_publication(&observed).unwrap();
-
-        assert!(plan.pushes.is_none());
-        assert!(plan.changes.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_no_op_has_no_executable_action_and_releases_changes() {
-        let (_directory, destination, argument_log) = fake_git_destination(SUCCESSFUL_PUSH);
-        let stack = stack([(change_id("Gone"), object_id(3))]);
-        let observed = observed_at(&destination, &stack, &[("Gone", 3)], &[("Gone", &[(1, 3)])]);
-        let plan = plan_git_publication(&observed).unwrap();
-
-        assert!(plan.pushes.is_none());
-        let changes = plan.publish_with_timeout_for_test(Duration::from_millis(100)).await.unwrap();
-
-        assert_eq!(changes.version("Gone"), Some(Version::FIRST));
-        assert!(!argument_log.exists(), "a no-op plan must not start Git");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_plan_executes_only_its_observed_destination_and_releases_exact_receipts() {
-        let (_directory, destination, argument_log) = fake_git_destination(SUCCESSFUL_PUSH);
-        let stack = stack([(change_id("Gone"), object_id(7))]);
-        let observed = observed_at(&destination, &stack, &[], &[]);
-        let plan = plan_git_publication(&observed).unwrap();
-        let expected = plan.pushes.as_ref().unwrap().arguments_for_test();
-        assert_eq!(expected.len(), 1);
-        let expected_options = expected[0].0.clone();
-        let expected_refspecs = expected[0].1.clone();
-
-        let changes = plan.publish_with_timeout_for_test(Duration::from_secs(10)).await.unwrap();
-
-        assert_eq!(changes.version("Gone"), Some(Version::FIRST));
-        let arguments = fs::read_to_string(argument_log)
-            .unwrap()
-            .lines()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let push = arguments.iter().position(|argument| argument == "push").unwrap();
-        let separator = arguments[push + 1..]
-            .iter()
-            .position(|argument| argument == "--")
-            .map(|offset| push + 1 + offset)
-            .unwrap();
-        assert_eq!(&arguments[push + 1..separator], expected_options);
-        assert_eq!(arguments[separator + 1], "gherrit-publication");
-        assert_eq!(&arguments[separator + 2..], expected_refspecs);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_hung_push_uses_the_bounded_executor_and_releases_nothing() {
-        let (_directory, destination, argument_log) = fake_git_destination(HANGING_PUSH);
-        let stack = stack([(change_id("Gone"), object_id(7))]);
-        let observed = observed_at(&destination, &stack, &[], &[]);
-        let plan = plan_git_publication(&observed).unwrap();
-
-        let started = Instant::now();
-        let error = plan.publish_with_timeout_for_test(Duration::from_secs(5)).await.unwrap_err();
-
-        assert!(error.to_string().contains("timed out"), "error={error:?}");
-        assert!(argument_log.exists(), "the hanging fake Git process must have started");
-        assert!(started.elapsed() < Duration::from_secs(12));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn acknowledged_legacy_prefix_then_indeterminate_batch_releases_nothing() {
-        let (_directory, destination, invocation_count) = fake_git_destination(ACKNOWLEDGED_PREFIX);
-        let first = change_id(&format!("G{}", "a".repeat(2_000)));
-        let second = change_id(&format!("G{}", "b".repeat(2_000)));
-        let stack = stack([(first, object_id(2)), (second, object_id(3))]);
-        let observed = observed_at(&destination, &stack, &[], &[]);
-        let plan = plan_git_publication(&observed).unwrap();
-        assert_eq!(plan.pushes.as_ref().unwrap().arguments_for_test().len(), 2);
-
-        let error = plan.publish_with_timeout_for_test(Duration::from_secs(10)).await.unwrap_err();
-
-        assert!(error.to_string().contains("Could not acknowledge `git push`"), "error={error:?}");
-        assert_eq!(fs::read_to_string(invocation_count).unwrap().trim(), "2");
-    }
-
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn acknowledged_marker_prefix_then_indeterminate_batch_is_not_success() {
         let (_directory, destination, invocation_count) = fake_git_destination(ACKNOWLEDGED_PREFIX);
         let markers = [
-            MissingPullRequestMarker {
-                id: change_id(&format!("G{}", "a".repeat(5_000))),
-                target: object_id(2),
-            },
-            MissingPullRequestMarker {
-                id: change_id(&format!("G{}", "b".repeat(5_000))),
-                target: object_id(3),
-            },
+            MarkerTarget::for_test(change_id("Gone"), object_id(2)),
+            MarkerTarget::for_test(change_id("Gtwo"), object_id(3)),
         ];
-        let pushes = plan_marker_pushes(&destination, &markers).unwrap().unwrap();
+        let argument_bytes = markers
+            .iter()
+            .map(MarkerPushArguments::new)
+            .map(|arguments| arguments.encoded_argv_bytes())
+            .collect::<Vec<_>>();
+        let requests =
+            plan_marker_requests_with_budget(&markers, argument_bytes.iter().sum::<usize>() - 1)
+                .unwrap();
+        let sequence = PushSequence::new(&destination, requests).unwrap().unwrap();
+        let target_keys =
+            markers.iter().map(|marker| (marker.id().clone(), marker.target())).collect();
+        let pushes = MarkerPushPreflight { sequence, target_keys };
         assert_eq!(pushes.arguments_for_test().len(), 2);
 
         let error =
@@ -1720,157 +1059,6 @@ printf 'Done\n'
 
         assert!(error.to_string().contains("Could not acknowledge `git push`"));
         assert_eq!(fs::read_to_string(invocation_count).unwrap().trim(), "2");
-    }
-
-    #[test]
-    fn push_batch_planning_accepts_the_exact_encoded_argv_boundary() {
-        let target = push_target("Gone", object_id(2), version(2), Some(object_id(1)));
-        let exact_bytes = PushTupleArguments::new(&target).encoded_argv_bytes();
-
-        let exact = plan_push_batches_with_budget([&target], exact_bytes).unwrap();
-        assert_eq!(exact.len(), 1);
-        assert_eq!(batch_tuple_count(&exact[0]), 1);
-
-        let error = plan_push_batches_with_budget([&target], exact_bytes - 1).unwrap_err();
-        assert!(error.to_string().contains(&format!("requires {exact_bytes} bytes")));
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("{}-byte variable-argument budget", exact_bytes - 1))
-        );
-    }
-
-    #[test]
-    fn push_batch_planning_splits_just_before_the_byte_boundary() {
-        let first = push_target("Gone", object_id(2), version(2), Some(object_id(1)));
-        let second = push_target("Gtwo", object_id(3), Version::FIRST, None);
-        let first_bytes = PushTupleArguments::new(&first).encoded_argv_bytes();
-        let second_bytes = PushTupleArguments::new(&second).encoded_argv_bytes();
-        let combined_bytes = first_bytes + second_bytes;
-
-        assert_eq!(
-            plan_push_batches_with_budget([&first, &second], combined_bytes)
-                .unwrap()
-                .iter()
-                .map(batch_tuple_count)
-                .collect::<Vec<_>>(),
-            [2]
-        );
-        assert_eq!(
-            plan_push_batches_with_budget([&first, &second], combined_bytes - 1)
-                .unwrap()
-                .iter()
-                .map(batch_tuple_count)
-                .collect::<Vec<_>>(),
-            [1, 1]
-        );
-    }
-
-    #[test]
-    fn a_late_oversized_target_rejects_the_complete_push_plan() {
-        let first = push_target("Gone", object_id(2), Version::FIRST, None);
-        let oversized =
-            push_target(&format!("G{}", "x".repeat(100)), object_id(3), Version::FIRST, None);
-        let budget = PushTupleArguments::new(&first).encoded_argv_bytes();
-
-        let error = plan_push_batches_with_budget([&first, &oversized], budget)
-            .expect_err("a later oversized tuple must reject rather than return a prefix");
-        assert!(error.to_string().contains("target 1"), "error={error:?}");
-    }
-
-    #[test]
-    fn long_ids_split_by_rendered_bytes_instead_of_target_count() {
-        let first_id = format!("G{}", "a".repeat(2_000));
-        let second_id = format!("G{}", "b".repeat(2_000));
-        let first = push_target(&first_id, object_id(2), Version::FIRST, None);
-        let second = push_target(&second_id, object_id(3), version(2), Some(object_id(2)));
-        let batches = plan_push_batches([&first, &second]).unwrap();
-
-        assert_eq!(batches.iter().map(batch_tuple_count).collect::<Vec<_>>(), [1, 1]);
-        assert!(batches.iter().all(|batch| {
-            let (options, refspecs) = batch.arguments();
-            options
-                .iter()
-                .skip(FIXED_PUSH_OPTIONS.len())
-                .chain(&refspecs)
-                .map(|argument| argument.len() + 1)
-                .sum::<usize>()
-                <= PUSH_VARIABLE_ARGV_BUDGET_BYTES
-        }));
-    }
-
-    #[test]
-    fn branch_and_tag_arguments_are_never_split_between_batches() {
-        let ids = [
-            format!("G{}", "a".repeat(2_000)),
-            format!("G{}", "b".repeat(2_000)),
-            "Gshort".to_owned(),
-        ];
-        let targets = ids
-            .iter()
-            .enumerate()
-            .map(|(index, id)| push_target(id, object_id(index as u8 + 2), Version::FIRST, None))
-            .collect::<Vec<_>>();
-        let batches = plan_push_batches(&targets).unwrap();
-
-        for target in &targets {
-            let tuple = PushTupleArguments::new(target);
-            let memberships = batches
-                .iter()
-                .map(|batch| {
-                    let (options, refspecs) = batch.arguments();
-                    let option_count =
-                        tuple.options.iter().filter(|item| options.contains(item)).count();
-                    let refspec_count =
-                        tuple.refspecs.iter().filter(|item| refspecs.contains(item)).count();
-                    assert!(
-                        (option_count == 0 && refspec_count == 0)
-                            || (option_count == 2 && refspec_count == 2),
-                        "a change tuple was split across push batches"
-                    );
-                    usize::from(option_count == 2)
-                })
-                .sum::<usize>();
-            assert_eq!(memberships, 1, "each change tuple must appear in exactly one batch");
-        }
-    }
-
-    #[test]
-    fn plans_atomic_branch_and_tag_leases() {
-        let targets = [
-            push_target("Gone", object_id(0x11), version(2), Some(object_id(0x33))),
-            push_target("Gtwo", object_id(0x22), Version::FIRST, None),
-        ];
-        let mut plans = plan_push_batches(&targets).unwrap();
-        assert_eq!(plans.len(), 1);
-        let plan = plans.pop().unwrap();
-        let (options, refspecs) = plan.into_arguments();
-
-        assert_eq!(
-            options,
-            [
-                "--porcelain".to_string(),
-                "--atomic".to_string(),
-                "--no-verify".to_string(),
-                "--no-follow-tags".to_string(),
-                "--recurse-submodules=no".to_string(),
-                "--no-signed".to_string(),
-                "--no-force-if-includes".to_string(),
-                format!("--force-with-lease=refs/heads/Gone:{}", object_id(0x33)),
-                "--force-with-lease=refs/tags/gherrit/Gone/v2:".to_string(),
-                "--force-with-lease=refs/heads/Gtwo:".to_string(),
-                "--force-with-lease=refs/tags/gherrit/Gtwo/v1:".to_string(),
-            ]
-        );
-        assert_eq!(
-            refspecs,
-            [
-                format!("{}:refs/heads/Gone", object_id(0x11)),
-                format!("{}:refs/tags/gherrit/Gone/v2", object_id(0x11)),
-                format!("{}:refs/heads/Gtwo", object_id(0x22)),
-                format!("{}:refs/tags/gherrit/Gtwo/v1", object_id(0x22)),
-            ]
-        );
     }
 
     fn expected_receipts(receipts: &[(&str, ExpectedRefTransition)]) -> ExpectedReceipts {
@@ -1960,13 +1148,14 @@ printf 'Done\n'
     #[test]
     fn only_a_zero_exit_status_can_acknowledge_on_unix() {
         use std::os::unix::process::ExitStatusExt as _;
-        let target = push_target("Gone", object_id(2), Version::FIRST, None);
-        let request = plan_push_batches([&target]).unwrap().pop().unwrap().into_request().unwrap();
-        let receipt = format!(
-            "To private\n*\t{}:refs/heads/Gone\t[new branch]\n*\t{}:refs/tags/gherrit/Gone/v1\t[new tag]\nDone\n",
-            object_id(2),
-            object_id(2)
-        );
+        let marker = MarkerTarget::for_test(change_id("Gone"), object_id(2));
+        let request = plan_marker_requests_with_budget(&[marker], usize::MAX)
+            .unwrap()
+            .into_vec()
+            .pop()
+            .unwrap();
+        let receipt =
+            format!("To private\n*\t{}:refs/tags/gherrit/Gone/pr\t[new tag]\nDone\n", object_id(2));
         assert_eq!(
             request.outcome(&std::process::ExitStatus::from_raw(0), receipt.as_bytes()),
             PushOutcome::AcknowledgedSuccess
@@ -1982,26 +1171,26 @@ printf 'Done\n'
     }
 
     #[test]
-    fn duplicate_planned_destinations_are_rejected_before_batching() {
-        let target = push_target("Gone", object_id(2), Version::FIRST, None);
-        let error = plan_push_batches([&target, &target]).unwrap_err();
-        assert!(error.to_string().contains("refs/heads/Gone"));
-    }
-
-    #[test]
-    fn prepared_pushes_revalidate_duplicate_destinations_across_batches() {
+    fn push_sequences_revalidate_duplicate_destinations_across_batches() {
         let destination = PushDestination::for_test(
             "origin",
             "https://github.com/owner/repository.git",
             Vec::new(),
         )
         .unwrap();
-        let target = push_target("Gone", object_id(2), Version::FIRST, None);
-        let first = plan_push_batches([&target]).unwrap().pop().unwrap().into_request().unwrap();
-        let second = plan_push_batches([&target]).unwrap().pop().unwrap().into_request().unwrap();
+        let request = || {
+            let marker = MarkerTarget::for_test(change_id("Gone"), object_id(2));
+            plan_marker_requests_with_budget(&[marker], usize::MAX)
+                .unwrap()
+                .into_vec()
+                .pop()
+                .unwrap()
+        };
+        let first = request();
+        let second = request();
 
-        let error = PreparedPushes::new(&destination, [first, second]).unwrap_err();
+        let error = PushSequence::new(&destination, [first, second]).unwrap_err();
 
-        assert!(error.to_string().contains("refs/heads/Gone"));
+        assert!(error.to_string().contains("refs/tags/gherrit/Gone/pr"));
     }
 }

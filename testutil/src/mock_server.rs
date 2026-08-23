@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::{
-    git_interceptor, FailureKind, GraphQlExchange, GraphQlOperation, MutationExchange,
-    PullRequestConnectionExchange, RedirectStatus, RetryableHttpStatus, TestEnvironment,
+    git_interceptor, ExternalEvent, FailureKind, GraphQlExchange, GraphQlOperation,
+    MutationExchange, PullRequestConnectionExchange, RedirectStatus, ResponseGateKind,
+    ResponseGateRegistry, RetryableHttpStatus, TestEnvironment,
 };
 
 const MAX_PULL_REQUEST_CANDIDATES: usize = 100;
@@ -32,12 +33,26 @@ static GITHUB_SCHEMA: LazyLock<Valid<apollo_compiler::Schema>> = LazyLock::new(|
     .expect("Failed to parse and validate embedded GitHub schema")
 });
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalVisibilityPhase {
+    Pending,
+    Active { saw_pull_request: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LocalVisibilityExpectation {
+    number: usize,
+    head: String,
+    phase: LocalVisibilityPhase,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MockState {
     pub prs: Vec<PrEntry>,
     pub(super) cross_repository_prs: HashSet<usize>,
     pub(super) git: git_interceptor::State,
     pub graphql_requests: Vec<Vec<GraphQlOperation>>,
+    pub(super) external_events: Vec<ExternalEvent>,
     pub semantic_graphql_transcript: Option<VecDeque<GraphQlExchange>>,
     pub semantic_graphql_error: Option<String>,
     pub graphql_redirect_trap_requests: usize,
@@ -49,6 +64,8 @@ pub struct MockState {
     pub repo_name: String,
     pub github_default_branch: Option<(String, String)>,
     pub faults: VecDeque<FailureKind>,
+    pub(super) response_gates: ResponseGateRegistry,
+    pub(super) local_visibility: Option<LocalVisibilityExpectation>,
 }
 
 impl MockState {
@@ -59,6 +76,79 @@ impl MockState {
     pub fn add_pr(&mut self, pr: PrEntry) {
         self.prs.push(pr);
     }
+
+    pub(super) fn suppress_from_next_local_observation(&mut self, number: usize) {
+        assert!(
+            self.local_visibility.is_none(),
+            "an exact-local visibility expectation is already installed"
+        );
+        let pull_request = self
+            .prs
+            .iter()
+            .find(|pull_request| pull_request.number == number)
+            .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
+        assert_eq!(pull_request.state, "OPEN", "pull request #{number} is not OPEN");
+        assert!(
+            !self.cross_repository_prs.contains(&number),
+            "pull request #{number} is not in the repository under test"
+        );
+        self.local_visibility = Some(LocalVisibilityExpectation {
+            number,
+            head: pull_request.head.ref_field.clone(),
+            phase: LocalVisibilityPhase::Pending,
+        });
+    }
+
+    fn suppression_for_local_connection(
+        &self,
+        head: &str,
+        after: Option<&str>,
+    ) -> Option<LocalSuppression> {
+        let expectation = self.local_visibility.as_ref()?;
+        if expectation.head != head {
+            return None;
+        }
+        match (expectation.phase, after.is_none()) {
+            (LocalVisibilityPhase::Pending, true)
+            | (LocalVisibilityPhase::Active { .. }, true)
+            | (LocalVisibilityPhase::Active { .. }, false) => {
+                Some(LocalSuppression { number: expectation.number, initial: after.is_none() })
+            }
+            _ => None,
+        }
+    }
+
+    fn record_suppressed_local_page(
+        &mut self,
+        suppression: LocalSuppression,
+        saw_pull_request: bool,
+        has_next_page: bool,
+    ) {
+        let expectation = self
+            .local_visibility
+            .as_mut()
+            .expect("suppressed exact-local page requires an active expectation");
+        assert_eq!(
+            expectation.number, suppression.number,
+            "exact-local suppression identity changed"
+        );
+        let previously_saw_pull_request = match (expectation.phase, suppression.initial) {
+            (LocalVisibilityPhase::Pending | LocalVisibilityPhase::Active { .. }, true) => false,
+            (LocalVisibilityPhase::Active { saw_pull_request }, false) => saw_pull_request,
+            _ => panic!("successful page does not continue the expected exact-local connection"),
+        };
+        let saw_pull_request = previously_saw_pull_request || saw_pull_request;
+        expectation.phase = LocalVisibilityPhase::Active { saw_pull_request };
+        if !has_next_page && saw_pull_request {
+            self.local_visibility = None;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalSuppression {
+    number: usize,
+    initial: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -81,6 +171,8 @@ pub struct PrEntry {
     pub head: RefInfo,
     #[serde(rename = "base")]
     pub base: RefInfo,
+    pub auto_merge: bool,
+    pub in_merge_queue: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -136,6 +228,8 @@ impl PrEntry {
             body: Some(body),
             head: RefInfo { ref_field: head, sha: "2".repeat(40) },
             base: RefInfo { ref_field: base, sha: "1".repeat(40) },
+            auto_merge: false,
+            in_merge_queue: false,
             created_at: "2023-01-01T00:00:00Z".to_string(),
             updated_at: "2023-01-01T00:00:00Z".to_string(),
         }
@@ -273,6 +367,26 @@ fn graphql_operations(document: &ExecutableDocument) -> Vec<GraphQlOperation> {
             }
         })
         .collect()
+}
+
+fn local_query_response_kind(exchange: &GraphQlExchange) -> Option<ResponseGateKind> {
+    let GraphQlExchange::Repository { selected_fields, connections, .. } = exchange else {
+        return None;
+    };
+    if connections.is_empty()
+        || connections.iter().any(|connection| {
+            connection.head.is_none()
+                || connection.states.as_slice() != ["CLOSED", "MERGED", "OPEN"]
+        })
+    {
+        return None;
+    }
+    Some(if connections.iter().any(|connection| connection.after.is_some()) {
+        ResponseGateKind::LocalPagination
+    } else {
+        let _ = selected_fields;
+        ResponseGateKind::LocalObservation
+    })
 }
 
 fn selected_semantic_fields(
@@ -584,17 +698,10 @@ fn resolve_string_argument(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PullRequestQueryKind {
-    FirstOpen,
-    NextOpen,
-    Terminal,
-}
-
 fn validate_pull_requests_field(
     field: &executable::Field,
     variables: &GraphQlVariables,
-) -> Result<PullRequestQueryKind, String> {
+) -> Result<(), String> {
     const PATH: &str = "repository.pullRequests";
     validate_argument_names(field, PATH, &["headRefName", "first", "after", "states"])?;
 
@@ -631,54 +738,19 @@ fn validate_pull_requests_field(
             _ => None,
         })
         .collect();
-    let is_open = state_count == 1 && states == HashSet::from(["OPEN"]);
-    let is_historical = state_count == 2 && states == HashSet::from(["CLOSED", "MERGED"]);
-    let kind = if is_open && argument(field, "after").is_some() {
-        PullRequestQueryKind::NextOpen
-    } else if is_open {
-        PullRequestQueryKind::FirstOpen
-    } else if is_historical {
-        PullRequestQueryKind::Terminal
-    } else {
-        return Err(format!(
-            "The mock GitHub API only supports `{PATH}(states: [OPEN])` or `{PATH}(states: [CLOSED, MERGED])`"
-        ));
-    };
-
-    match (kind, argument(field, "headRefName")) {
-        (PullRequestQueryKind::FirstOpen | PullRequestQueryKind::NextOpen, Some(_)) => {
-            return Err(format!(
-                "The mock GitHub API requires the OPEN `{PATH}` connection to be repository-wide"
-            ));
-        }
-        (PullRequestQueryKind::Terminal, None) => {
-            return Err(format!(
-                "The mock GitHub API requires terminal `{PATH}` connections to select one headRefName"
-            ));
-        }
-        _ => {}
+    let is_local = state_count == 3 && states == HashSet::from(["OPEN", "CLOSED", "MERGED"]);
+    if !is_local {
+        return Err("The mock GitHub API requires exact local all-state connections".to_string());
     }
-    match kind {
-        PullRequestQueryKind::FirstOpen | PullRequestQueryKind::NextOpen => {
-            if field.alias.is_some() {
-                return Err(format!(
-                    "The mock GitHub API requires the OPEN `{PATH}` connection to be unaliased"
-                ));
-            }
-        }
-        PullRequestQueryKind::Terminal => {
-            if field.alias.is_none() {
-                return Err(format!(
-                    "The mock GitHub API requires every terminal `{PATH}` connection to be aliased"
-                ));
-            }
-            let head = resolve_string_argument(field, "headRefName", PATH, variables)?;
-            if head.is_empty() {
-                return Err(
-                    "The mock GitHub API requires a nonempty terminal headRefName".to_string()
-                );
-            }
-        }
+
+    if field.alias.is_none() {
+        return Err(format!(
+            "The mock GitHub API requires every exact `{PATH}` connection to be aliased"
+        ));
+    }
+    let head = resolve_string_argument(field, "headRefName", PATH, variables)?;
+    if head.is_empty() {
+        return Err("The mock GitHub API requires a nonempty local headRefName".to_string());
     }
     if argument(field, "after").is_some() {
         let cursor = resolve_string_argument(field, "after", PATH, variables)?;
@@ -690,8 +762,10 @@ fn validate_pull_requests_field(
     for field in validate_exact_fields(&field.selection_set, PATH, &["nodes", "pageInfo"])? {
         match field.name.as_str() {
             "nodes" => {
-                let required = match kind {
-                    PullRequestQueryKind::FirstOpen | PullRequestQueryKind::NextOpen => &[
+                let fields = validate_exact_fields(
+                    &field.selection_set,
+                    "repository.pullRequests.nodes",
+                    &[
                         "number",
                         "id",
                         "title",
@@ -704,28 +778,17 @@ fn validate_pull_requests_field(
                         "isCrossRepository",
                         "autoMergeRequest",
                         "isInMergeQueue",
-                    ][..],
-                    PullRequestQueryKind::Terminal => {
-                        &["number", "id", "headRefName", "state", "isCrossRepository"][..]
-                    }
-                };
-                let fields = validate_exact_fields(
-                    &field.selection_set,
-                    "repository.pullRequests.nodes",
-                    required,
+                    ],
                 )?;
-                if matches!(kind, PullRequestQueryKind::FirstOpen | PullRequestQueryKind::NextOpen)
-                {
-                    let auto_merge = fields
-                        .into_iter()
-                        .find(|field| field.name == "autoMergeRequest")
-                        .expect("the exact OPEN field set contains autoMergeRequest");
-                    validate_exact_fields(
-                        &auto_merge.selection_set,
-                        "repository.pullRequests.nodes.autoMergeRequest",
-                        &["enabledAt"],
-                    )?;
-                }
+                let auto_merge = fields
+                    .into_iter()
+                    .find(|field| field.name == "autoMergeRequest")
+                    .expect("the exact local field set contains autoMergeRequest");
+                validate_exact_fields(
+                    &auto_merge.selection_set,
+                    "repository.pullRequests.nodes.autoMergeRequest",
+                    &["enabledAt"],
+                )?;
             }
             "pageInfo" => {
                 validate_exact_fields(
@@ -737,7 +800,7 @@ fn validate_pull_requests_field(
             _ => unreachable!("the exact connection field set was checked"),
         }
     }
-    Ok(kind)
+    Ok(())
 }
 
 fn validate_default_branch_ref_field(field: &executable::Field) -> Result<(), String> {
@@ -791,8 +854,8 @@ fn validate_repository_field(
                 validate_default_branch_ref_field(selected)?;
             }
             "pullRequests" => {
-                pull_request_queries
-                    .push((*selected, validate_pull_requests_field(selected, variables)?));
+                validate_pull_requests_field(selected, variables)?;
+                pull_request_queries.push(*selected);
             }
             _ => {
                 return Err(format!(
@@ -803,36 +866,36 @@ fn validate_repository_field(
         }
     }
 
-    if pull_request_queries.len() == 1
-        && pull_request_queries[0].1 == PullRequestQueryKind::FirstOpen
-    {
-        validate_exact_fields(
-            &field.selection_set,
-            PATH,
-            &["id", "defaultBranchRef", "pullRequests"],
-        )?;
-    } else if pull_request_queries.len() == 1
-        && pull_request_queries[0].1 == PullRequestQueryKind::NextOpen
-    {
-        validate_exact_fields(&field.selection_set, PATH, &["pullRequests"])?;
-    } else if !pull_request_queries.is_empty()
+    if !pull_request_queries.is_empty()
         && pull_request_queries.len() <= 64
-        && pull_request_queries.len() == fields.len()
-        && pull_request_queries.iter().all(|(_, kind)| *kind == PullRequestQueryKind::Terminal)
+        && (fields.len() == pull_request_queries.len()
+            || fields.len() == pull_request_queries.len() + 2)
     {
-        for (index, (query, _)) in pull_request_queries.iter().enumerate() {
+        let repository_facts = fields.len() == pull_request_queries.len() + 2;
+        if repository_facts != fields.iter().any(|field| field.name == "id")
+            || repository_facts != fields.iter().any(|field| field.name == "defaultBranchRef")
+        {
+            return Err("The mock GitHub API requires both repository facts or neither".to_string());
+        }
+        let mut heads = HashSet::with_capacity(pull_request_queries.len());
+        for (index, query) in pull_request_queries.iter().enumerate() {
             let expected_alias = format!("op{index}");
             if query.alias.as_ref().map(Name::as_str) != Some(expected_alias.as_str()) {
                 return Err(format!(
-                    "The mock GitHub API requires terminal pull request aliases op0 through op{} in order",
+                    "The mock GitHub API requires local pull request aliases op0 through op{} in order",
                     pull_request_queries.len() - 1
+                ));
+            }
+            let head = resolve_string_argument(query, "headRefName", PATH, variables)?;
+            if !heads.insert(head.clone()) {
+                return Err(format!(
+                    "The mock GitHub API requires one exact connection per local head; repeated '{head}'"
                 ));
             }
         }
     } else {
         return Err(
-            "The mock GitHub API requires exactly one first-page OPEN query with repository facts, one later-page OPEN query without them, or 1..=64 terminal aliases"
-                .to_string(),
+            "The mock GitHub API requires one exact local pull request observation".to_string()
         );
     }
     Ok(())
@@ -845,20 +908,62 @@ fn validate_create_field(field: &executable::Field) -> Result<(), String> {
     validate_input_fields(
         input,
         PATH,
-        &["repositoryId", "baseRefName", "headRefName", "title", "body", "clientMutationId"],
+        &[
+            "repositoryId",
+            "headRepositoryId",
+            "baseRefName",
+            "headRefName",
+            "title",
+            "body",
+            "clientMutationId",
+        ],
     )?;
-    for required in ["repositoryId", "baseRefName", "headRefName", "title", "clientMutationId"] {
+    for required in [
+        "repositoryId",
+        "headRepositoryId",
+        "baseRefName",
+        "headRefName",
+        "title",
+        "clientMutationId",
+    ] {
         required_string_field(input, required, PATH)?;
     }
 
     for field in selected_fields(&field.selection_set, PATH)? {
         match field.name.as_str() {
             "clientMutationId" => {}
-            "pullRequest" => validate_scalar_fields(
-                &field.selection_set,
-                "createPullRequest.pullRequest",
-                &["number", "url", "id", "headRefName"],
-            )?,
+            "pullRequest" => {
+                for selected in validate_exact_fields(
+                    &field.selection_set,
+                    "createPullRequest.pullRequest",
+                    &[
+                        "number",
+                        "id",
+                        "state",
+                        "headRefName",
+                        "headRefOid",
+                        "headRepository",
+                        "baseRefName",
+                        "baseRefOid",
+                        "baseRepository",
+                    ],
+                )? {
+                    match selected.name.as_str() {
+                        "headRepository" | "baseRepository" => {
+                            validate_scalar_fields(
+                                &selected.selection_set,
+                                "createPullRequest.pullRequest.repository",
+                                &["id"],
+                            )?;
+                        }
+                        _ => validate_scalar_fields(
+                            &selected.selection_set,
+                            "createPullRequest.pullRequest.scalar",
+                            &[],
+                        )?,
+                    }
+                }
+            }
             _ => {
                 return Err(format!(
                     "The mock GitHub API does not support field `{PATH}.{}`",
@@ -970,22 +1075,43 @@ async fn graphql(
     };
 
     let operations = graphql_operations(&document);
-    let mut mock_state = app_state.state.write().unwrap();
-    if let Err(message) = consume_semantic_exchange(&mut mock_state, &exchange) {
-        mock_state.semantic_graphql_error = Some(message.clone());
-        return graphql_http_error(&message);
+    let response_gate_kind = local_query_response_kind(&exchange);
+    let (exceeds_query_limit, exceeds_page_limit, failure, response_gate) = {
+        let mut mock_state = app_state.state.write().unwrap();
+        mock_state.external_events.push(ExternalEvent::GraphQl(exchange.clone()));
+        if let Err(message) = consume_semantic_exchange(&mut mock_state, &exchange) {
+            mock_state.semantic_graphql_error = Some(message.clone());
+            return graphql_http_error(&message);
+        }
+        mock_state.graphql_requests.push(operations.clone());
+        let create_request_number = mock_state
+            .graphql_requests
+            .iter()
+            .filter(|request| request.contains(&GraphQlOperation::CreatePr))
+            .count();
+        let exceeds_query_limit =
+            operations.iter().all(|operation| *operation == GraphQlOperation::Query)
+                && mock_state
+                    .max_graphql_query_operations_per_request
+                    .is_some_and(|limit| operations.len() > limit);
+        let exceeds_page_limit = match &exchange {
+            GraphQlExchange::Repository { connections, .. } => mock_state
+                .max_graphql_connection_page_size
+                .is_some_and(|limit| connections.iter().any(|connection| connection.first > limit)),
+            GraphQlExchange::Mutation { .. } => false,
+        };
+        let failure =
+            check_and_apply_graphql_failure(&mut mock_state, &operations, create_request_number);
+        let response_gate =
+            response_gate_kind.and_then(|kind| mock_state.response_gates.take(kind));
+        (exceeds_query_limit, exceeds_page_limit, failure, response_gate)
+    };
+    if let Some(response_gate) = response_gate {
+        response_gate.wait().await;
     }
-    mock_state.graphql_requests.push(operations.clone());
-    let create_request_number = mock_state
-        .graphql_requests
-        .iter()
-        .filter(|request| request.contains(&GraphQlOperation::CreatePr))
-        .count();
-    if operations.iter().all(|operation| *operation == GraphQlOperation::Query)
-        && mock_state
-            .max_graphql_query_operations_per_request
-            .is_some_and(|limit| operations.len() > limit)
-    {
+
+    let mut mock_state = app_state.state.write().unwrap();
+    if exceeds_query_limit {
         return graphql_response(
             StatusCode::OK,
             serde_json::json!({
@@ -996,12 +1122,6 @@ async fn graphql(
             }),
         );
     }
-    let exceeds_page_limit = match &exchange {
-        GraphQlExchange::Repository { connections, .. } => mock_state
-            .max_graphql_connection_page_size
-            .is_some_and(|limit| connections.iter().any(|connection| connection.first > limit)),
-        GraphQlExchange::Mutation { .. } => false,
-    };
     if exceeds_page_limit {
         return graphql_response(
             StatusCode::OK,
@@ -1013,9 +1133,7 @@ async fn graphql(
             }),
         );
     }
-    if let Some(failure) =
-        check_and_apply_graphql_failure(&mut mock_state, &operations, create_request_number)
-    {
+    if let Some(failure) = failure {
         if let FailureKind::ApplyMutationIdsThenDisconnect(client_mutation_ids) = failure {
             return apply_mutation_ids_then_disconnect(
                 &mut mock_state,
@@ -1030,6 +1148,7 @@ async fn graphql(
     let mut response_data = serde_json::Map::new();
 
     let mut errors = Vec::new();
+    let github_default_branch = mock_state.github_default_branch.clone();
 
     for operation in document.operations.iter() {
         for selection in operation.selection_set.selections.iter() {
@@ -1044,8 +1163,8 @@ async fn graphql(
                         remote_branch_oid(&app_state, branch)
                     }),
                     "repository" => {
-                        handle_repository_query(&mock_state, field, &variables, &|| {
-                            repository_default_branch(&app_state, &mock_state)
+                        handle_repository_query(&mut mock_state, field, &variables, &|| {
+                            repository_default_branch(&app_state, github_default_branch.as_ref())
                         })
                     }
                     _ => unreachable!("request was checked by validate_supported_document"),
@@ -1259,9 +1378,9 @@ fn remote_branch_oid(app_state: &AppState, branch: &str) -> Result<Option<String
 
 fn repository_default_branch(
     app_state: &AppState,
-    mock_state: &MockState,
+    github_default_branch: Option<&(String, String)>,
 ) -> Result<(String, String), String> {
-    if let Some(default_branch) = &mock_state.github_default_branch {
+    if let Some(default_branch) = github_default_branch {
         return Ok(default_branch.clone());
     }
 
@@ -1395,6 +1514,7 @@ fn handle_create_pr(
     const PATH: &str = "createPullRequest";
     let input = input_object(field, PATH)?;
     let repository_id = required_string_field(input, "repositoryId", PATH)?;
+    let head_repository_id = required_string_field(input, "headRepositoryId", PATH)?;
     let base = required_string_field(input, "baseRefName", PATH)?;
     let head = required_string_field(input, "headRefName", PATH)?;
     let title = required_string_field(input, "title", PATH)?;
@@ -1403,6 +1523,9 @@ fn handle_create_pr(
 
     if repository_id != "REPO_NODE_ID" {
         return Err(format!("Repository node `{repository_id}` does not exist"));
+    }
+    if head_repository_id != repository_id {
+        return Err(format!("Head repository node `{head_repository_id}` does not exist"));
     }
     if base == head {
         return Err("Pull request head and base branches must differ".to_string());
@@ -1430,14 +1553,13 @@ fn handle_create_pr(
         title,
         body,
         head: head.clone(),
-        base,
+        base: base.clone(),
         repo_owner: &owner,
         repo_name: &repo,
     });
-    entry.head.sha = head_oid;
-    entry.base.sha = base_oid;
+    entry.head.sha = head_oid.clone();
+    entry.base.sha = base_oid.clone();
     let node_id = entry.node_id.clone();
-    let html_url = entry.html_url.clone();
     mock_state.prs.push(entry);
 
     let mut response = serde_json::Map::new();
@@ -1452,9 +1574,15 @@ fn handle_create_pr(
                 {
                     let value = match field.name.as_str() {
                         "number" => serde_json::json!(number),
-                        "url" => serde_json::json!(html_url),
                         "id" => serde_json::json!(node_id),
+                        "state" => serde_json::json!("OPEN"),
                         "headRefName" => serde_json::json!(head),
+                        "headRefOid" => serde_json::json!(head_oid),
+                        "headRepository" | "baseRepository" => {
+                            serde_json::json!({ "id": repository_id })
+                        }
+                        "baseRefName" => serde_json::json!(base),
+                        "baseRefOid" => serde_json::json!(base_oid),
                         _ => unreachable!("request was checked by validate_create_field"),
                     };
                     pull_request.insert(response_key(field), value);
@@ -1468,7 +1596,7 @@ fn handle_create_pr(
 }
 
 fn handle_repository_query(
-    mock_state: &MockState,
+    mock_state: &mut MockState,
     field: &executable::Field,
     variables: &GraphQlVariables,
     default_branch: &dyn Fn() -> Result<(String, String), String>,
@@ -1482,7 +1610,6 @@ fn handle_repository_query(
     }
 
     let mut repo_data = serde_json::Map::new();
-
     for field in selected_fields(&field.selection_set, PATH)? {
         match field.name.as_str() {
             "defaultBranchRef" => {
@@ -1517,16 +1644,12 @@ fn handle_repository_query(
                 repo_data.insert(response_key(field), serde_json::Value::Object(default_branch));
             }
             "pullRequests" => {
-                let head = argument(field, "headRefName")
-                    .map(|_| {
-                        resolve_string_argument(
-                            field,
-                            "headRefName",
-                            "repository.pullRequests",
-                            variables,
-                        )
-                    })
-                    .transpose()?;
+                let head = resolve_string_argument(
+                    field,
+                    "headRefName",
+                    "repository.pullRequests",
+                    variables,
+                )?;
                 let after = argument(field, "after")
                     .map(|_| {
                         resolve_string_argument(
@@ -1550,12 +1673,22 @@ fn handle_repository_query(
                         _ => unreachable!("request was checked by validate_pull_requests_field"),
                     })
                     .collect::<HashSet<_>>();
+                let suppression =
+                    mock_state.suppression_for_local_connection(&head, after.as_deref());
+                let saw_suppressed_pull_request = suppression.is_some_and(|suppression| {
+                    mock_state.prs.iter().any(|pr| {
+                        pr.number == suppression.number
+                            && pr.head.ref_field == head
+                            && states.contains(pr.state.as_str())
+                    })
+                });
                 let matching_prs = mock_state
                     .prs
                     .iter()
                     .filter(|pr| {
-                        head.as_ref().is_none_or(|head| pr.head.ref_field == *head)
+                        pr.head.ref_field == head
                             && states.contains(pr.state.as_str())
+                            && Some(pr.number) != suppression.map(|value| value.number)
                     })
                     .collect::<Vec<_>>();
                 let offset = after
@@ -1623,6 +1756,15 @@ fn handle_repository_query(
                         _ => unreachable!("request was checked by validate_pull_requests_field"),
                     }
                 }
+                drop(page);
+                drop(matching_prs);
+                if let Some(suppression) = suppression {
+                    mock_state.record_suppressed_local_page(
+                        suppression,
+                        saw_suppressed_pull_request,
+                        has_next_page,
+                    );
+                }
                 repo_data.insert(response_key(field), serde_json::Value::Object(connection));
             }
             "id" => {
@@ -1656,8 +1798,14 @@ fn project_pr_node(
             "headRefOid" => serde_json::json!(pr.head.sha),
             "state" => serde_json::json!(pr.state),
             "isCrossRepository" => serde_json::json!(is_cross_repository),
-            "autoMergeRequest" => serde_json::Value::Null,
-            "isInMergeQueue" => serde_json::Value::Bool(false),
+            "autoMergeRequest" => {
+                if pr.auto_merge {
+                    serde_json::json!({ "enabledAt": "2026-01-01T00:00:00Z" })
+                } else {
+                    serde_json::Value::Null
+                }
+            }
+            "isInMergeQueue" => serde_json::Value::Bool(pr.in_merge_queue),
             _ => unreachable!("request was checked by validate_pull_requests_field"),
         };
         node.insert(response_key(field), value);
@@ -1683,21 +1831,19 @@ mod tests {
         field
     }
 
-    fn open_pull_requests_field(after: Option<&str>) -> String {
+    fn local_pull_requests_field(
+        alias: &str,
+        head: &str,
+        after: Option<&str>,
+        first: usize,
+    ) -> String {
         let after = after.map(|cursor| format!(", after: \"{cursor}\"")).unwrap_or_default();
         format!(
-            "pullRequests(first: 100{after}, states: [OPEN]) {{ nodes {{ number, id, \
+            "{alias}: pullRequests(headRefName: \"{head}\", first: {first}{after}, \
+             states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, \
              title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, \
              isCrossRepository, autoMergeRequest {{ enabledAt }}, isInMergeQueue }} \
              pageInfo {{ hasNextPage, endCursor }} }}"
-        )
-    }
-
-    fn terminal_pull_requests_field(alias: &str, head: &str) -> String {
-        format!(
-            "{alias}: pullRequests(headRefName: \"{head}\", first: 100, \
-             states: [CLOSED, MERGED]) {{ nodes {{ number, id, headRefName, state, \
-             isCrossRepository }} pageInfo {{ hasNextPage, endCursor }} }}"
         )
     }
 
@@ -1791,29 +1937,32 @@ mod tests {
 
     #[test]
     fn accepts_the_production_request_shapes() {
-        let open = repository_query(
+        let initial = repository_query(
             "owner",
             "repo",
             &format!(
-                "id, defaultBranchRef {{ name, target {{ oid }} }} {}",
-                open_pull_requests_field(None)
+                "id, defaultBranchRef {{ name, target {{ oid }} }} {} {}",
+                local_pull_requests_field("op0", "Gone", None, 100),
+                local_pull_requests_field("op1", "Gtwo", None, 100),
             ),
         );
-        validate_supported_document(&open, &None).unwrap();
+        validate_supported_document(&initial, &None).unwrap();
 
-        let next = repository_query("owner", "repo", &open_pull_requests_field(Some("cursor-1")));
+        let next = repository_query(
+            "owner",
+            "repo",
+            &local_pull_requests_field("op0", "Gone", Some("cursor:1"), 25),
+        );
         validate_supported_document(&next, &None).unwrap();
-
-        let terminal =
-            repository_query("owner", "repo", &terminal_pull_requests_field("op0", "Ghead"));
-        validate_supported_document(&terminal, &None).unwrap();
 
         let create = parse_document(
             "mutation { op0: createPullRequest(input: { repositoryId: \
-             \"REPO_NODE_ID\", baseRefName: \"main\", headRefName: \"Ghead\", \
+             \"REPO_NODE_ID\", headRepositoryId: \"REPO_NODE_ID\", \
+             baseRefName: \"main\", headRefName: \"Ghead\", \
              title: \"Title\", body: \"Body\", clientMutationId: \
              \"gherrit:create:Ghead\" }) { clientMutationId, pullRequest { \
-             number, url, id, headRefName } } }",
+             number, id, state, headRefName, headRefOid, headRepository { id }, \
+             baseRefName, baseRefOid, baseRepository { id } } } }",
         );
         validate_supported_document(&create, &None).unwrap();
 
@@ -1827,20 +1976,25 @@ mod tests {
 
     #[test]
     fn rejects_non_production_observation_topologies() {
-        let open_first = open_pull_requests_field(None);
-        let open_next = open_pull_requests_field(Some("cursor-1"));
-        let terminal = terminal_pull_requests_field("op0", "Ghead");
+        let exact = local_pull_requests_field("op0", "Ghead", None, 100);
+        let duplicate_head = local_pull_requests_field("op1", "Ghead", None, 100);
+        let open = exact.replace("[OPEN, CLOSED, MERGED]", "[OPEN]");
+        let terminal = exact.replace("[OPEN, CLOSED, MERGED]", "[CLOSED, MERGED]");
+        let unaliased = exact.replacen("op0: ", "", 1);
+        let wrong_alias = exact.replacen("op0: ", "op1: ", 1);
         let invalid_fields = [
-            open_first.clone(),
-            format!("id, defaultBranchRef {{ name, target {{ oid }} }} {open_next}"),
-            format!("id, defaultBranchRef {{ name, target {{ oid }} }} {open_first} {terminal}"),
-            format!("id, defaultBranchRef {{ name, target {{ oid }} }} {terminal}"),
+            open,
+            terminal,
+            unaliased,
+            wrong_alias,
+            format!("id {exact}"),
+            format!("defaultBranchRef {{ name, target {{ oid }} }} {exact}"),
+            format!("{exact} {duplicate_head}"),
         ];
 
         for fields in invalid_fields {
             let document = repository_query("owner", "repo", &fields);
-            let error = validate_supported_document(&document, &None).unwrap_err();
-            assert!(error.contains("requires exactly"), "{error}");
+            assert!(validate_supported_document(&document, &None).is_err(), "accepted {fields}");
         }
     }
 
@@ -1873,10 +2027,12 @@ mod tests {
 
         let duplicate_mutation = parse_document(
             "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
+             headRepositoryId: \"REPO_NODE_ID\", \
              baseRefName: \"main\", headRefName: \"Ghead\", title: \"Title\", \
              clientMutationId: \"first\" }) { \
              pullRequest { number } } createPullRequest(input: { repositoryId: \
-             \"REPO_NODE_ID\", baseRefName: \"main\", headRefName: \"Ghead\", \
+             \"REPO_NODE_ID\", headRepositoryId: \"REPO_NODE_ID\", \
+             baseRefName: \"main\", headRefName: \"Ghead\", \
              title: \"Title\", clientMutationId: \"first\" }) { \
              pullRequest { number } } }",
         );
@@ -1891,7 +2047,7 @@ mod tests {
         );
         assert!(validate_supported_document(&duplicate_states, &None)
             .unwrap_err()
-            .contains("only supports `repository.pullRequests(states:"));
+            .contains("exact local all-state connections"));
     }
 
     #[test]
@@ -1913,11 +2069,10 @@ mod tests {
 
     #[test]
     fn repository_response_contains_only_selected_fields() {
-        let document = parse_document(
-            "query { repository(owner: \"owner\", name: \"repo\") { \
-             op0: pullRequests(headRefName: \"Ghead\", first: 100, \
-             states: [CLOSED, MERGED]) { nodes { number, id, headRefName, state, \
-             isCrossRepository } pageInfo { hasNextPage, endCursor } } } }",
+        let document = repository_query(
+            "owner",
+            "repo",
+            &local_pull_requests_field("op0", "Ghead", None, 100),
         );
         validate_supported_document(&document, &None).unwrap();
 
@@ -1932,9 +2087,11 @@ mod tests {
             repo_name: "repo",
         });
         pull_request.state = "CLOSED".to_string();
+        pull_request.head.sha = "2".repeat(40);
+        pull_request.base.sha = "1".repeat(40);
         state.add_pr(pull_request);
         state.cross_repository_prs.insert(1);
-        let response = handle_repository_query(&state, root_field(&document), &None, &|| {
+        let response = handle_repository_query(&mut state, root_field(&document), &None, &|| {
             Ok(("main".to_string(), "1".repeat(40)))
         })
         .unwrap();
@@ -1945,9 +2102,16 @@ mod tests {
                     "nodes": [{
                         "number": 1,
                         "id": "PR_1",
+                        "title": "Title",
+                        "body": "Body",
+                        "baseRefName": "main",
+                        "baseRefOid": "1111111111111111111111111111111111111111",
                         "headRefName": "Ghead",
+                        "headRefOid": "2222222222222222222222222222222222222222",
                         "state": "CLOSED",
                         "isCrossRepository": true,
+                        "autoMergeRequest": null,
+                        "isInMergeQueue": false,
                     }],
                     "pageInfo": { "hasNextPage": false, "endCursor": null }
                 }
@@ -1957,10 +2121,10 @@ mod tests {
 
     #[test]
     fn repository_response_rejects_another_repository() {
-        let state = MockState::new("owner".to_string(), "repo".to_string());
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
         let fields = format!(
             "id, defaultBranchRef {{ name, target {{ oid }} }} {}",
-            open_pull_requests_field(None)
+            local_pull_requests_field("op0", "Ghead", None, 100)
         );
 
         for (owner, repository) in [("other", "repo"), ("owner", "other")] {
@@ -1968,10 +2132,10 @@ mod tests {
             validate_supported_document(&document, &None).unwrap();
 
             assert_eq!(
-                handle_repository_query(&state, root_field(&document), &None, &|| Ok((
+                handle_repository_query(&mut state, root_field(&document), &None, &|| Ok((
                     "main".to_string(),
                     "1".repeat(40)
-                )),)
+                )))
                 .unwrap(),
                 serde_json::Value::Null,
                 "repository: {owner}/{repository}"
@@ -1980,9 +2144,144 @@ mod tests {
     }
 
     #[test]
+    fn exact_local_visibility_suppression_spans_one_complete_connection_only() {
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
+        for id in 1..=3 {
+            state.add_pr(PrEntry::mock(MockPrArgs {
+                id,
+                title: format!("PR {id}"),
+                body: String::new(),
+                head: "Ghidden".to_string(),
+                base: "gherrit-bases/Ghidden".to_string(),
+                repo_owner: "owner",
+                repo_name: "repo",
+            }));
+        }
+        state.suppress_from_next_local_observation(2);
+
+        let first = repository_query(
+            "owner",
+            "repo",
+            &format!(
+                "id, defaultBranchRef {{ name, target {{ oid }} }} {}",
+                local_pull_requests_field("op0", "Ghidden", None, 1)
+            ),
+        );
+        assert_eq!(
+            state.suppression_for_local_connection("Ghidden", None),
+            Some(LocalSuppression { number: 2, initial: true }),
+            "selecting a suppressed first page must not start the scan"
+        );
+        assert_eq!(
+            state.local_visibility.as_ref().unwrap().phase,
+            LocalVisibilityPhase::Pending,
+            "only successful page materialization starts the scan"
+        );
+        let response = handle_repository_query(&mut state, root_field(&first), &None, &|| {
+            Ok(("main".to_string(), "1".repeat(40)))
+        })
+        .unwrap();
+        assert_eq!(response.pointer("/op0/nodes/0/number"), Some(&serde_json::json!(1)));
+        assert_eq!(response.pointer("/op0/pageInfo/hasNextPage"), Some(&true.into()));
+        assert!(state.local_visibility.is_some(), "the incomplete scan retains its expectation");
+
+        let repeated_first = repository_query(
+            "owner",
+            "repo",
+            &local_pull_requests_field("op0", "Ghidden", None, 1),
+        );
+        let response =
+            handle_repository_query(&mut state, root_field(&repeated_first), &None, &|| {
+                unreachable!("a repeated page omits initial repository facts")
+            })
+            .unwrap();
+        assert_eq!(response.pointer("/op0/nodes/0/number"), Some(&serde_json::json!(1)));
+        assert!(state.local_visibility.is_some(), "a restarted scan retains its expectation");
+
+        let later = repository_query(
+            "owner",
+            "repo",
+            &local_pull_requests_field("op0", "Ghidden", Some("cursor:1"), 1),
+        );
+        assert_eq!(
+            state.suppression_for_local_connection("Ghidden", Some("cursor:1")),
+            Some(LocalSuppression { number: 2, initial: false }),
+            "selecting a suppressed later page must not advance the scan"
+        );
+        let response = handle_repository_query(&mut state, root_field(&later), &None, &|| {
+            unreachable!("later exact-local pages do not request default-branch facts")
+        })
+        .unwrap();
+        assert_eq!(response.pointer("/op0/nodes/0/number"), Some(&serde_json::json!(3)));
+        assert_eq!(response.pointer("/op0/pageInfo/hasNextPage"), Some(&false.into()));
+        assert!(state.local_visibility.is_none(), "the complete scan consumes its expectation");
+        assert_eq!(state.prs.len(), 3, "suppression must not remove fake state");
+
+        let create = parse_document(
+            "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
+             headRepositoryId: \"REPO_NODE_ID\", \
+             baseRefName: \"gherrit-bases/Ghidden\", headRefName: \"Ghidden\", \
+             title: \"Duplicate\", clientMutationId: \"create\" }) { \
+             pullRequest { number } } }",
+        );
+        let error =
+            handle_create_pr(&mut state, root_field(&create), &|_| Ok(Some("1".repeat(40))))
+                .unwrap_err();
+        assert!(error.contains("already exists"));
+    }
+
+    #[test]
+    fn exact_local_suppression_tracks_its_alias_in_every_batch_position() {
+        for target_position in 0..3 {
+            let mut state = MockState::new("owner".to_string(), "repo".to_string());
+            for (number, head) in [(1, "Gtarget"), (2, "Gleft"), (3, "Gright")] {
+                state.add_pr(PrEntry::mock(MockPrArgs {
+                    id: number,
+                    title: format!("PR {number}"),
+                    body: String::new(),
+                    head: head.to_owned(),
+                    base: "main".to_owned(),
+                    repo_owner: "owner",
+                    repo_name: "repo",
+                }));
+            }
+            state.suppress_from_next_local_observation(1);
+            let mut heads = ["Gleft", "Gright"].into_iter().collect::<Vec<_>>();
+            heads.insert(target_position, "Gtarget");
+            let fields = heads
+                .iter()
+                .enumerate()
+                .map(|(index, head)| {
+                    local_pull_requests_field(&format!("op{index}"), head, None, 100)
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let document = repository_query("owner", "repo", &fields);
+            validate_supported_document(&document, &None).unwrap();
+            let response =
+                handle_repository_query(&mut state, root_field(&document), &None, &|| {
+                    unreachable!("this response does not select repository facts")
+                })
+                .unwrap();
+
+            assert_eq!(
+                response
+                    .pointer(&format!("/op{target_position}/nodes"))
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                0
+            );
+            assert!(state.local_visibility.is_none(), "target_position={target_position}");
+        }
+    }
+
+    #[test]
     fn create_validates_same_repository_refs_uniqueness_and_numbering() {
         let document = parse_document(
             "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
+             headRepositoryId: \"REPO_NODE_ID\", \
              baseRefName: \"main\", headRefName: \"Gnew\", title: \"Title\", \
              clientMutationId: \"create\" }) { \
              pullRequest { number } } }",
@@ -2025,6 +2324,7 @@ mod tests {
     fn create_duplicate_rule_is_exact_over_repository_lifecycle_head_and_base() {
         let document = parse_document(
             "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
+             headRepositoryId: \"REPO_NODE_ID\", \
              baseRefName: \"main\", headRefName: \"Gnew\", title: \"Title\", \
              clientMutationId: \"create\" }) { pullRequest { number } } }",
         );
@@ -2079,10 +2379,12 @@ mod tests {
     fn mutation_fields_are_not_modeled_as_an_atomic_transaction() {
         let document = parse_document(
             "mutation { first: createPullRequest(input: { repositoryId: \
-             \"REPO_NODE_ID\", baseRefName: \"main\", headRefName: \"Gnew\", \
+             \"REPO_NODE_ID\", headRepositoryId: \"REPO_NODE_ID\", \
+             baseRefName: \"main\", headRefName: \"Gnew\", \
              title: \"First\", clientMutationId: \"first\" }) { \
              clientMutationId } second: createPullRequest(input: { \
              repositoryId: \"REPO_NODE_ID\", baseRefName: \"main\", \
+             headRepositoryId: \"REPO_NODE_ID\", \
              headRefName: \"Gnew\", title: \"Second\", clientMutationId: \
              \"second\" }) { clientMutationId } }",
         );
@@ -2104,6 +2406,7 @@ mod tests {
     fn mutations_reject_unknown_repository_and_pull_request_ids() {
         let create = parse_document(
             "mutation { createPullRequest(input: { repositoryId: \"WRONG\", \
+             headRepositoryId: \"WRONG\", \
              baseRefName: \"main\", headRefName: \"Ghead\", title: \"Title\", \
              clientMutationId: \"create\" }) { \
              pullRequest { number } } }",

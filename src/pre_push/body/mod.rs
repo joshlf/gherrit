@@ -1,10 +1,7 @@
-//! Pull-request body rendering during the owned-base activation transition.
+//! Bounded pull-request body rendering for owned-base publication.
 
-mod legacy;
 mod recipe;
 
-pub(super) use legacy::PrBody;
-#[allow(unused_imports)]
 pub(super) use recipe::{
     BodyLinkContext, BodyRecipeInput, FinalBodyRecipes, GeneratedBody, RenderedBody,
     StackBodyRecipes,

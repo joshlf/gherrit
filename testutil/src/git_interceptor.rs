@@ -7,7 +7,10 @@ use std::{
 use axum::{extract::State as AxumState, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::{mock_server::MockState, FailureKind, GitOperation, TestEnvironment};
+use crate::{
+    mock_server::MockState, ExternalEvent, FailureKind, GitOperation, PushRecord, ResponseGateKind,
+    TestEnvironment,
+};
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct State {
@@ -62,7 +65,7 @@ impl State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RemoteRefTransactionTrigger {
     BeforePush,
-    BeforeActiveManagedTagObservation,
+    BeforeLocalRemoteObservation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,10 +174,10 @@ impl GitOperation {
                 let Some((remote, arguments)) = private_remote_ls_remote(args) else {
                     return Some(Self::LsRemoteOther);
                 };
-                if is_global_head_query(remote, arguments) {
-                    Some(Self::LsRemoteHeads)
-                } else if is_active_managed_tag_query(remote, arguments) {
-                    Some(Self::LsRemoteActiveManagedTags)
+                if is_remote_default_query(remote, arguments) {
+                    Some(Self::LsRemoteDefault)
+                } else if is_local_remote_query(remote, arguments) {
+                    Some(Self::LsRemoteLocal)
                 } else {
                     Some(Self::LsRemoteOther)
                 }
@@ -189,8 +192,8 @@ impl GitOperation {
             Self::InterpretTrailers => "interpret-trailers",
             Self::HttpRedirectPolicy => "config --get-urlmatch",
             Self::LsRemoteUrl
-            | Self::LsRemoteHeads
-            | Self::LsRemoteActiveManagedTags
+            | Self::LsRemoteDefault
+            | Self::LsRemoteLocal
             | Self::LsRemoteOther => "ls-remote",
             Self::Push => "push",
         }
@@ -200,8 +203,8 @@ impl GitOperation {
 /// Recognizes only the suffix emitted by `PushDestination::remote_command`.
 ///
 /// This deliberately does not implement Git's general `ls-remote` grammar.
-fn is_global_head_query(remote: &str, arguments: &[String]) -> bool {
-    let [quiet, symref, separator, operand, head, heads, managed_tag_root] = arguments else {
+fn is_remote_default_query(remote: &str, arguments: &[String]) -> bool {
+    let [quiet, symref, separator, operand, head] = arguments else {
         return false;
     };
 
@@ -210,34 +213,39 @@ fn is_global_head_query(remote: &str, arguments: &[String]) -> bool {
         && separator == "--"
         && operand == remote
         && head == "HEAD"
-        && heads == "refs/heads/*"
-        && managed_tag_root == "refs/tags/gherrit"
 }
 
-fn is_active_managed_tag_query(remote: &str, arguments: &[String]) -> bool {
+fn is_local_remote_query(remote: &str, arguments: &[String]) -> bool {
     let [quiet, separator, operand, patterns @ ..] = arguments else {
         return false;
     };
-    if quiet != "--quiet"
-        || separator != "--"
-        || operand != remote
-        || patterns.is_empty()
-        || !patterns.len().is_multiple_of(2)
-    {
+    if quiet != "--quiet" || separator != "--" || operand != remote || patterns.is_empty() {
         return false;
     }
 
-    let mut ids = HashSet::with_capacity(patterns.len() / 2);
-    patterns.chunks_exact(2).all(|pair| {
-        let [root, wildcard] = pair else {
-            unreachable!("chunks_exact(2) always yields pairs");
+    let patterns = match patterns.len() % 4 {
+        0 => patterns,
+        1 if patterns[0].strip_prefix("refs/heads/").is_some_and(|name| !name.is_empty()) => {
+            &patterns[1..]
+        }
+        _ => return false,
+    };
+    if patterns.is_empty() {
+        return false;
+    }
+    let mut ids = HashSet::with_capacity(patterns.len() / 4);
+    patterns.chunks(4).all(|group| {
+        let [candidate, owned_base, tag_root, tag_wildcard] = group else {
+            unreachable!("the pattern count makes every local namespace a four-ref group");
         };
-        let Some(id) = root.strip_prefix("refs/tags/gherrit/") else {
+        let Some(id) = candidate.strip_prefix("refs/heads/") else {
             return false;
         };
         !id.is_empty()
             && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            && wildcard.strip_suffix("/*") == Some(root.as_str())
+            && owned_base == &format!("refs/heads/gherrit-bases/{id}")
+            && tag_root == &format!("refs/tags/gherrit/{id}")
+            && tag_wildcard == &format!("refs/tags/gherrit/{id}/*")
             && ids.insert(id)
     })
 }
@@ -341,14 +349,27 @@ async fn handle_git(
     let is_production =
         request.args.get(1).is_some_and(|argument| argument == "--no-replace-objects");
     let operation = GitOperation::from_args(&request.args);
-    if is_production {
-        if let Some(operation) = operation {
-            handler.shared.write().unwrap().git.record_invocation(operation, request.args.clone());
+    let (failure, response_gate) = {
+        let mut state = handler.shared.write().unwrap();
+        if is_production {
+            if let Some(operation) = operation {
+                state.git.record_invocation(operation, request.args.clone());
+            }
         }
+        let failure =
+            operation.and_then(|operation| check_and_apply_failure(&mut state, operation));
+        let response_gate = operation
+            .and_then(|operation| match operation {
+                GitOperation::LsRemoteDefault => Some(ResponseGateKind::RemoteDefault),
+                GitOperation::LsRemoteLocal => Some(ResponseGateKind::LocalRemote),
+                _ => None,
+            })
+            .and_then(|kind| state.response_gates.take(kind));
+        (failure, response_gate)
+    };
+    if let Some(response_gate) = response_gate {
+        response_gate.wait().await;
     }
-    let failure = operation.and_then(|operation| {
-        check_and_apply_failure(&mut handler.shared.write().unwrap(), operation)
-    });
     let push_stdout = match failure {
         Some(FailureKind::Git(operation)) => {
             return Json(GitResponse {
@@ -376,10 +397,10 @@ async fn handle_git(
         None => None,
     };
 
-    if operation == Some(GitOperation::LsRemoteActiveManagedTags) {
+    if operation == Some(GitOperation::LsRemoteLocal) {
         apply_remote_ref_transaction(
             &handler,
-            RemoteRefTransactionTrigger::BeforeActiveManagedTagObservation,
+            RemoteRefTransactionTrigger::BeforeLocalRemoteObservation,
         );
     }
 
@@ -453,7 +474,47 @@ async fn complete_git(
 
 fn record_push(shared: &RwLock<MockState>, args: Vec<String>, exit_code: i32) {
     assert_eq!(subcommand(&args), Some("push"), "record_push requires a Git push");
-    shared.write().unwrap().git.record_push(args, exit_code);
+    let branch_updates = (exit_code == 0).then(|| pushed_branch_updates(&args));
+    let mut shared = shared.write().unwrap();
+    shared
+        .external_events
+        .push(ExternalEvent::GitPush(PushRecord { arguments: args.clone(), exit_code }));
+    shared.git.record_push(args, exit_code);
+    if let Some(branch_updates) = branch_updates {
+        let cross_repository_prs = shared.cross_repository_prs.clone();
+        for (branch, oid) in branch_updates {
+            for pull_request in &mut shared.prs {
+                if pull_request.base.ref_field == branch {
+                    pull_request.base.sha.clone_from(&oid);
+                }
+                if !cross_repository_prs.contains(&pull_request.number)
+                    && pull_request.head.ref_field == branch
+                {
+                    pull_request.head.sha.clone_from(&oid);
+                }
+            }
+        }
+    }
+}
+
+/// Extracts the literal same-repository branch movements emitted by GHerrit.
+///
+/// Production publishes object IDs, not symbolic sources. Ignoring every
+/// other Git refspec shape keeps this fixture helper narrower than Git's
+/// general refspec grammar while making subsequent OPEN observations follow
+/// the refs a successful push moved.
+fn pushed_branch_updates(args: &[String]) -> Vec<(String, String)> {
+    args.iter()
+        .filter_map(|argument| {
+            let (source, destination) = argument.split_once(':')?;
+            let source = source.strip_prefix('+').unwrap_or(source);
+            let branch = destination.strip_prefix("refs/heads/")?;
+            ((source.len() == 40 || source.len() == 64)
+                && source.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !branch.is_empty())
+            .then(|| (branch.to_owned(), source.to_owned()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -461,6 +522,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+    use crate::mock_server::{MockPrArgs, PrEntry};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -601,7 +663,7 @@ mod tests {
         assert!(
             !matches!(
                 GitOperation::from_args(arguments),
-                Some(GitOperation::LsRemoteHeads | GitOperation::LsRemoteActiveManagedTags)
+                Some(GitOperation::LsRemoteDefault | GitOperation::LsRemoteLocal)
             ),
             "arguments={arguments:?}"
         );
@@ -609,17 +671,9 @@ mod tests {
 
     #[test]
     fn remote_observation_requires_the_exact_private_adapter_prefix() {
-        let tail = [
-            "--quiet",
-            "--symref",
-            "--",
-            "gherrit-publication-2",
-            "HEAD",
-            "refs/heads/*",
-            "refs/tags/gherrit",
-        ];
+        let tail = ["--quiet", "--symref", "--", "gherrit-publication-2", "HEAD"];
         let canonical = production_ls_remote("gherrit-publication-2", &tail);
-        assert_eq!(GitOperation::from_args(&canonical), Some(GitOperation::LsRemoteHeads));
+        assert_eq!(GitOperation::from_args(&canonical), Some(GitOperation::LsRemoteDefault));
 
         for index in 0..7 {
             let mut missing = canonical.clone();
@@ -658,19 +712,11 @@ mod tests {
     }
 
     #[test]
-    fn global_head_operation_requires_the_complete_ordered_production_tail() {
-        let canonical = [
-            "--quiet",
-            "--symref",
-            "--",
-            "gherrit-publication-2",
-            "HEAD",
-            "refs/heads/*",
-            "refs/tags/gherrit",
-        ];
+    fn remote_default_operation_requires_the_complete_ordered_production_tail() {
+        let canonical = ["--quiet", "--symref", "--", "gherrit-publication-2", "HEAD"];
         assert_eq!(
             GitOperation::from_args(&production_ls_remote("gherrit-publication-2", &canonical)),
-            Some(GitOperation::LsRemoteHeads)
+            Some(GitOperation::LsRemoteDefault)
         );
 
         for index in 0..canonical.len() {
@@ -698,7 +744,7 @@ mod tests {
             query[3] = remote;
             assert_eq!(
                 GitOperation::from_args(&production_ls_remote(remote, &query)),
-                Some(GitOperation::LsRemoteHeads)
+                Some(GitOperation::LsRemoteDefault)
             );
         }
         for remote in [
@@ -717,25 +763,18 @@ mod tests {
         assert_ls_remote_other("gherrit-publication", &["--symref", "HEAD"]);
         assert_ls_remote_other(
             "gherrit-publication",
-            &[
-                "--quiet",
-                "--symref",
-                "--",
-                "gherrit-publication",
-                "HEAD",
-                "refs/heads/*",
-                "refs/tags/gherrit/Gone",
-                "refs/tags/gherrit/Gone/*",
-            ],
+            &["--quiet", "--symref", "--", "gherrit-publication", "HEAD", "refs/heads/main"],
         );
     }
 
     #[test]
-    fn active_managed_tag_operation_requires_complete_unique_root_wildcard_pairs() {
+    fn local_remote_operation_requires_complete_unique_four_ref_namespaces() {
         let one = [
             "--quiet",
             "--",
             "gherrit-publication",
+            "refs/heads/Gone",
+            "refs/heads/gherrit-bases/Gone",
             "refs/tags/gherrit/Gone",
             "refs/tags/gherrit/Gone/*",
         ];
@@ -743,21 +782,36 @@ mod tests {
             "--quiet",
             "--",
             "gherrit-publication-12",
+            "refs/heads/main",
+            "refs/heads/Gone",
+            "refs/heads/gherrit-bases/Gone",
             "refs/tags/gherrit/Gone",
             "refs/tags/gherrit/Gone/*",
+            "refs/heads/G2",
+            "refs/heads/gherrit-bases/G2",
             "refs/tags/gherrit/G2",
             "refs/tags/gherrit/G2/*",
         ];
         assert_eq!(
             GitOperation::from_args(&production_ls_remote("gherrit-publication", &one)),
-            Some(GitOperation::LsRemoteActiveManagedTags)
+            Some(GitOperation::LsRemoteLocal)
         );
         assert_eq!(
             GitOperation::from_args(&production_ls_remote("gherrit-publication-12", &two)),
-            Some(GitOperation::LsRemoteActiveManagedTags)
+            Some(GitOperation::LsRemoteLocal)
         );
 
-        for index in 0..two.len() {
+        let mut without_default = two.to_vec();
+        without_default.remove(3);
+        assert_eq!(
+            GitOperation::from_args(&production_ls_remote(
+                "gherrit-publication-12",
+                &without_default
+            )),
+            Some(GitOperation::LsRemoteLocal)
+        );
+
+        for index in (0..3).chain(4..two.len()) {
             let mut missing = two.to_vec();
             missing.remove(index);
             assert_ls_remote_other("gherrit-publication-12", &missing);
@@ -778,62 +832,35 @@ mod tests {
         }
 
         for malformed in [
+            &["--quiet", "--", "gherrit-publication", "refs/heads/Gone"][..],
             &[
                 "--quiet",
                 "--",
                 "gherrit-publication",
+                "refs/heads/Gone",
+                "refs/heads/gherrit-bases/Gtwo",
                 "refs/tags/gherrit/Gone",
                 "refs/tags/gherrit/Gone/*",
-                "refs/tags/gherrit/Gone",
-                "refs/tags/gherrit/Gone/*",
-            ][..],
-            &["--quiet", "--", "gherrit-publication", "refs/tags/gherrit/Gone"][..],
-            &[
-                "--quiet",
-                "--",
-                "gherrit-publication",
-                "refs/tags/gherrit/Gone/*",
-                "refs/tags/gherrit/Gone",
             ][..],
             &[
                 "--quiet",
                 "--",
                 "gherrit-publication",
-                "refs/tags/gherrit/Gone",
-                "refs/tags/gherrit/Gtwo/*",
-            ][..],
-            &[
-                "--quiet",
-                "--",
-                "gherrit-publication",
+                "refs/heads/G-one",
+                "refs/heads/gherrit-bases/G-one",
                 "refs/tags/gherrit/G-one",
                 "refs/tags/gherrit/G-one/*",
-            ][..],
-            &["--quiet", "--", "gherrit-publication", "refs/tags/gherrit/", "refs/tags/gherrit//*"]
-                [..],
-            &[
-                "--quiet",
-                "--",
-                "gherrit-publication",
-                "refs/tags/gherrit/G/one",
-                "refs/tags/gherrit/G/one/*",
-            ][..],
-            &[
-                "--quiet",
-                "--",
-                "gherrit-publication",
-                "refs/tags/gherrit/G雪",
-                "refs/tags/gherrit/G雪/*",
             ][..],
             &[
                 "--quiet",
                 "--symref",
                 "--",
                 "gherrit-publication",
+                "refs/heads/Gone",
+                "refs/heads/gherrit-bases/Gone",
                 "refs/tags/gherrit/Gone",
                 "refs/tags/gherrit/Gone/*",
             ][..],
-            &["--quiet", "--", "gherrit-publication", "HEAD", "refs/heads/*"][..],
         ] {
             assert_ls_remote_other("gherrit-publication", malformed);
         }
@@ -843,19 +870,19 @@ mod tests {
     fn git_faults_match_in_script_order() {
         let expected = VecDeque::from([
             FailureKind::Git(GitOperation::Var),
-            FailureKind::Git(GitOperation::LsRemoteHeads),
+            FailureKind::Git(GitOperation::LsRemoteDefault),
         ]);
         let mut state = MockState { faults: expected.clone(), ..Default::default() };
 
-        assert_eq!(check_and_apply_failure(&mut state, GitOperation::LsRemoteHeads), None);
+        assert_eq!(check_and_apply_failure(&mut state, GitOperation::LsRemoteDefault), None);
         assert_eq!(state.faults, expected);
         assert_eq!(
             check_and_apply_failure(&mut state, GitOperation::Var),
             Some(FailureKind::Git(GitOperation::Var))
         );
         assert_eq!(
-            check_and_apply_failure(&mut state, GitOperation::LsRemoteHeads),
-            Some(FailureKind::Git(GitOperation::LsRemoteHeads))
+            check_and_apply_failure(&mut state, GitOperation::LsRemoteDefault),
+            Some(FailureKind::Git(GitOperation::LsRemoteDefault))
         );
         assert!(state.faults.is_empty());
 
@@ -878,6 +905,7 @@ mod tests {
         assert!(response.passthrough);
         assert!(response.report_exit_status);
         assert!(handler.shared.read().unwrap().git.pushes.is_empty());
+        assert!(handler.shared.read().unwrap().external_events.is_empty());
 
         let status = complete_git(
             AxumState(handler.clone()),
@@ -887,8 +915,96 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(
             handler.shared.read().unwrap().git.pushes,
-            [Push { args: invocation, exit_code: 0 }]
+            [Push { args: invocation.clone(), exit_code: 0 }]
         );
+        assert_eq!(
+            handler.shared.read().unwrap().external_events,
+            [ExternalEvent::GitPush(PushRecord { arguments: invocation, exit_code: 0 })]
+        );
+    }
+
+    #[test]
+    fn successful_push_refreshes_only_target_repository_pull_request_refs() {
+        let handler = handler_state();
+        {
+            let mut state = handler.shared.write().unwrap();
+            state.add_pr(PrEntry::mock(MockPrArgs {
+                id: 1,
+                title: "Same repository".to_owned(),
+                body: String::new(),
+                head: "Gsame".to_owned(),
+                base: "gherrit-bases/Gsame".to_owned(),
+                repo_owner: "owner",
+                repo_name: "repo",
+            }));
+            state.add_pr(PrEntry::mock(MockPrArgs {
+                id: 2,
+                title: "Fork".to_owned(),
+                body: String::new(),
+                head: "Gsame".to_owned(),
+                base: "main".to_owned(),
+                repo_owner: "owner",
+                repo_name: "repo",
+            }));
+            state.cross_repository_prs.insert(2);
+        }
+        let head = "a".repeat(40);
+        let base = "b".repeat(40);
+        let main = "c".repeat(40);
+        record_push(
+            &handler.shared,
+            args(&[
+                "git",
+                "push",
+                "origin",
+                &format!("{head}:refs/heads/Gsame"),
+                &format!("{base}:refs/heads/gherrit-bases/Gsame"),
+                &format!("{main}:refs/heads/main"),
+            ]),
+            0,
+        );
+
+        let state = handler.shared.read().unwrap();
+        assert_eq!(state.prs[0].head.sha, head);
+        assert_eq!(state.prs[0].base.sha, base);
+        assert_ne!(state.prs[1].head.sha, head, "a fork head belongs to another repository");
+        assert_eq!(state.prs[1].base.sha, main);
+    }
+
+    #[test]
+    fn failed_push_does_not_refresh_pull_request_refs() {
+        let handler = handler_state();
+        let original = {
+            let mut state = handler.shared.write().unwrap();
+            state.add_pr(PrEntry::mock(MockPrArgs {
+                id: 1,
+                title: "Same repository".to_owned(),
+                body: String::new(),
+                head: "Gsame".to_owned(),
+                base: "gherrit-bases/Gsame".to_owned(),
+                repo_owner: "owner",
+                repo_name: "repo",
+            }));
+            (state.prs[0].head.sha.clone(), state.prs[0].base.sha.clone())
+        };
+        let head = "a".repeat(40);
+        let base = "b".repeat(40);
+        record_push(
+            &handler.shared,
+            args(&[
+                "git",
+                "push",
+                "origin",
+                &format!("{head}:refs/heads/Gsame"),
+                &format!("{base}:refs/heads/gherrit-bases/Gsame"),
+            ]),
+            1,
+        );
+
+        let state = handler.shared.read().unwrap();
+        assert_eq!((state.prs[0].head.sha.clone(), state.prs[0].base.sha.clone()), original);
+        assert_eq!(state.git.pushes.len(), 1);
+        assert_eq!(state.git.pushes[0].exit_code, 1);
     }
 
     #[tokio::test]
