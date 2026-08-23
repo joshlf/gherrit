@@ -28,6 +28,8 @@ pub(super) struct CreateEffect {
     pub(super) base_branch: String,
     pub(super) title: String,
     pub(super) body: String,
+    pub(super) head_oid: ObjectId,
+    pub(super) base_oid: ObjectId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

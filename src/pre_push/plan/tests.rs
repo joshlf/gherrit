@@ -1,2004 +1,492 @@
-use std::fmt::Write as _;
+//! Focused tables for the planner's exact-local policy and typed gates.
+//!
+//! These fixtures start after Git and GitHub adapters have produced their
+//! validated domain values. Adapter encoding, terminal classification, and
+//! unrelated repository state belong to their own test modules.
 
 use gix::ObjectId;
-use serde::Deserialize as _;
-use serde_json::{Value, json};
-use tempfile::TempDir;
 
 use super::*;
-use crate::{
-    pre_push::{
-        destination::PushDestination,
-        github::{
-            OpenObservation, TerminalPullRequest, TerminalPullRequestEvidence,
-            TerminalPullRequestPage, TerminalPullRequestState,
-        },
-        pull_request::{PullRequestIdentity, TerminalExhaustionAccumulator, TerminalHistories},
-        remote::{
-            RemoteHeads, parse_remote_heads_for_destination_for_test, parse_remote_heads_for_test,
-        },
-    },
-    util,
+use crate::pre_push::{
+    github::CorrelatedRepository,
+    pull_request::{AbsentPullRequest, LocalPullRequestObservation},
+    remote::{ActiveRemoteChanges, ObservedChangeHistory},
+    test_effect::{EffectBatches, Stage},
 };
 
-struct TestRepository {
-    directory: TempDir,
-    writer: gix::Repository,
-}
-
-impl TestRepository {
-    fn new() -> Self {
-        let directory = tempfile::tempdir().unwrap();
-        let writer = gix::init_bare(directory.path()).unwrap();
-        Self { directory, writer }
-    }
-
-    fn commit(&self, subject: &str, parents: &[ObjectId], id: Option<&str>) -> ObjectId {
-        let message = match id {
-            Some(id) => format!("{subject}\n\ngherrit-pr-id: {id}\n"),
-            None => subject.to_owned(),
-        };
-        let signature = gix::actor::Signature {
-            name: "GHerrit test".into(),
-            email: "test@example.com".into(),
-            time: gix::actor::date::Time::new(0, 0),
-        };
-        self.writer
-            .write_object(&gix::objs::Commit {
-                tree: ObjectId::empty_tree(self.writer.object_hash()),
-                parents: parents.iter().copied().collect(),
-                author: signature.clone(),
-                committer: signature,
-                encoding: None,
-                message: message.into(),
-                extra_headers: Vec::new(),
-            })
-            .unwrap()
-            .detach()
-    }
-
-    fn graph(&self, roots: impl IntoIterator<Item = ObjectId>) -> CommitGraphEvidence {
-        let repository = util::Repo::open(self.directory.path().to_str().unwrap()).unwrap();
-        CommitGraphEvidence::load(&repository, roots).unwrap()
-    }
+/// Flattens typed transport batches only in planner-policy assertions which
+/// neither execute nor model interruption. The restart oracle retains every
+/// batch boundary.
+fn flatten_batches<T: Clone>(batches: &EffectBatches<T>) -> Box<[T]> {
+    batches.iter().flat_map(|batch| batch.iter().cloned()).collect()
 }
 
 fn id(value: &str) -> GherritPrId {
-    GherritPrId::from_ref_component(value.as_bytes()).unwrap()
+    GherritPrId::from_ref_component(value.as_bytes()).expect("valid test change ID")
 }
 
-fn head_advertisement(default: ObjectId, managed: &[(&str, ObjectId, ObjectId)]) -> String {
-    let mut output =
-        format!("ref: refs/heads/main\tHEAD\n{default}\tHEAD\n{default}\trefs/heads/main\n");
-    for (id, head, base) in managed {
-        writeln!(output, "{head}\trefs/heads/{id}").unwrap();
-        writeln!(output, "{base}\trefs/heads/gherrit-bases/{id}").unwrap();
-    }
-    output
+fn oid(byte: u8) -> ObjectId {
+    ObjectId::from_bytes_or_panic(&[byte; 20])
 }
 
-fn heads(default: ObjectId, managed: &[(&str, ObjectId, ObjectId)]) -> RemoteHeads<'static> {
-    parse_remote_heads_for_test(head_advertisement(default, managed).as_bytes()).unwrap()
+fn identity(number: u64) -> PullRequestIdentity {
+    PullRequestIdentity::new(number, format!("PR_{number}")).expect("valid test identity")
 }
 
-fn heads_for<'destination>(
-    destination: &'destination PushDestination,
-    default: ObjectId,
-    managed: &[(&str, ObjectId, ObjectId)],
-) -> RemoteHeads<'destination> {
-    parse_remote_heads_for_destination_for_test(
-        destination,
-        head_advertisement(default, managed).as_bytes(),
+fn destination() -> super::super::destination::PushDestination {
+    super::super::destination::PushDestination::for_test(
+        "origin",
+        "https://github.com/owner/repository.git",
+        Vec::new(),
     )
-    .unwrap()
+    .expect("valid test destination")
 }
 
-fn versions(entries: &[(&str, u64, ObjectId)]) -> String {
-    entries
-        .iter()
-        .map(|(id, version, oid)| format!("{oid}\trefs/tags/gherrit/{id}/v{version}\n"))
-        .collect()
-}
-
-fn marked_history(entries: &[(&str, u64, ObjectId)], markers: &[(&str, ObjectId)]) -> String {
-    let mut output = versions(entries);
-    for (index, (id, target)) in markers.iter().enumerate() {
-        assert!(
-            entries.iter().any(|(entry_id, _, head)| entry_id == id && head == target),
-            "marker target must be an explicitly supplied version head"
-        );
-        assert!(
-            !markers[..index].iter().any(|(previous, _)| previous == id),
-            "marked-history fixture must contain at most one marker per ID"
-        );
-        writeln!(output, "{target}\trefs/tags/gherrit/{id}/pr").unwrap();
-    }
-    output
-}
-
-fn open_node(
-    number: u64,
-    id: &str,
-    base: &str,
-    base_oid: ObjectId,
-    head_oid: ObjectId,
-    landing: bool,
-) -> Value {
-    json!({
-        "number": number,
-        "id": format!("PR_{number}"),
-        "title": "Title",
-        "body": "Observed body",
-        "baseRefName": base,
-        "baseRefOid": base_oid.to_string(),
-        "headRefName": id,
-        "headRefOid": head_oid.to_string(),
-        "state": "OPEN",
-        "isCrossRepository": false,
-        "autoMergeRequest": if landing { json!({ "enabledAt": "now" }) } else { Value::Null },
-        "isInMergeQueue": false,
-    })
-}
-
-fn open_response(default: ObjectId, nodes: Vec<Value>) -> Value {
-    json!({
-        "data": {
-            "repository": {
-                "id": "R_repository",
-                "defaultBranchRef": {
-                    "name": "main",
-                    "target": { "oid": default.to_string() },
-                },
-                "pullRequests": {
-                    "nodes": nodes,
-                    "pageInfo": { "hasNextPage": false, "endCursor": null },
-                },
-            },
-        },
-    })
-}
-
-fn exact_terminal_histories(ids: &[GherritPrId]) -> TerminalHistories {
-    let mut accumulator = TerminalExhaustionAccumulator::new(ids.iter().cloned()).unwrap();
-    for id in ids {
-        accumulator = accumulator
-            .record_page(TerminalPullRequestEvidence::for_test(
-                id.clone(),
-                None,
-                TerminalPullRequestPage { pull_requests: Vec::new(), next_cursor: None },
-            ))
-            .unwrap();
-    }
-    accumulator.into_terminal_histories().unwrap()
-}
-
-fn empty_terminal_histories(
-    active: &ActiveRemoteChanges<'_>,
-    ids: &[GherritPrId],
-) -> RepositoryTerminalHistories {
-    RepositoryTerminalHistories::for_test(active.destination(), exact_terminal_histories(ids))
-}
-
-fn retired_terminal_history(
-    active: &ActiveRemoteChanges<'_>,
+#[allow(clippy::too_many_arguments)]
+fn open(
     id: GherritPrId,
-    state: TerminalPullRequestState,
-) -> RepositoryTerminalHistories {
-    let histories = TerminalExhaustionAccumulator::new([id.clone()])
-        .unwrap()
-        .record_page(TerminalPullRequestEvidence::for_test(
-            id,
-            None,
-            TerminalPullRequestPage {
-                pull_requests: vec![TerminalPullRequest {
-                    number: 17,
-                    node_id: "PR_17".to_owned(),
-                    state,
-                }],
-                next_cursor: None,
-            },
-        ))
-        .unwrap()
-        .into_terminal_histories()
-        .unwrap();
-    RepositoryTerminalHistories::for_test(active.destination(), histories)
-}
-
-fn retirement_message(number: u64, state: TerminalPullRequestState) -> String {
-    let state = match state {
-        TerminalPullRequestState::Closed => "closed",
-        TerminalPullRequestState::Merged => "merged",
-    };
-    format!(
-        "Cannot push to {state} PR #{number}. Please open a new PR or reopen the existing one.\n\
-         You may want to rebase on the latest changes before pushing."
+    number: u64,
+    head: ObjectId,
+    base: BaseKind,
+    base_oid: ObjectId,
+    title: &str,
+    body: &str,
+    landing: bool,
+) -> ManagedOpenPullRequest {
+    ManagedOpenPullRequest::from_typed_for_test(
+        id,
+        identity(number),
+        head,
+        base,
+        base_oid,
+        title.to_owned(),
+        body.to_owned(),
     )
+    .with_landing_automation_for_test(landing)
 }
 
-fn correlate_and_activate<'destination>(
-    remote_heads: RemoteHeads<'destination>,
-    stack: &LocalStack,
-    response: Value,
-    managed_tag_output: &str,
-) -> (CorrelatedRepository<'destination>, ActiveRemoteChanges<'destination>) {
-    let ids = stack.iter().map(|change| change.id().clone()).collect::<Vec<_>>();
-    let open =
-        OpenObservation::from_complete_response_for_test("owner", "repository", response).unwrap();
-    let correlated = open.correlate(ids.iter(), &remote_heads).unwrap();
-    let active =
-        remote_heads.into_active_for_test(&ids, &[], managed_tag_output.as_bytes()).unwrap();
-    (correlated, active)
+#[test]
+fn open_marker_base_position_and_landing_policy_is_exact() {
+    let change = id("Gone");
+    let default = DefaultBranch::new("main".to_owned(), oid(1)).unwrap();
+
+    for desired in [BaseKind::Default, BaseKind::Owned] {
+        for observed in [BaseKind::Default, BaseKind::Owned] {
+            for marked in [false, true] {
+                for landing in [false, true] {
+                    let base_oid = match observed {
+                        BaseKind::Default => default.tip(),
+                        BaseKind::Owned => oid(2),
+                    };
+                    let pull_request = open(
+                        change.clone(),
+                        7,
+                        oid(3),
+                        observed,
+                        base_oid,
+                        "Title",
+                        "Body",
+                        landing,
+                    );
+                    let result = validate_pull_request(
+                        &change,
+                        &pull_request,
+                        true,
+                        true,
+                        marked,
+                        Some(desired),
+                        &default,
+                    );
+                    let expected = (marked || observed == BaseKind::Owned)
+                        && !(landing
+                            && (observed == BaseKind::Owned || desired == BaseKind::Owned));
+
+                    assert_eq!(
+                        result.is_ok(),
+                        expected,
+                        "desired={desired:?}, observed={observed:?}, marked={marked}, landing={landing}, error={:?}",
+                        result.err()
+                    );
+                }
+            }
+        }
+    }
 }
 
-fn correlate_and_activate_with_nonlocal<'destination>(
-    remote_heads: RemoteHeads<'destination>,
-    stack: &LocalStack,
-    nonlocal_ids: &[GherritPrId],
-    response: Value,
-    managed_tag_output: &str,
-) -> (CorrelatedRepository<'destination>, ActiveRemoteChanges<'destination>) {
-    let local_ids = stack.iter().map(|change| change.id().clone()).collect::<Vec<_>>();
-    let open =
-        OpenObservation::from_complete_response_for_test("owner", "repository", response).unwrap();
-    let correlated = open.correlate(local_ids.iter(), &remote_heads).unwrap();
-    let active = remote_heads
-        .into_active_for_test(&local_ids, nonlocal_ids, managed_tag_output.as_bytes())
-        .unwrap();
-    (correlated, active)
+#[derive(Clone, Copy)]
+enum OneChangeObservation {
+    Absent,
+    Open { head: ObjectId, base: BaseKind, base_oid: ObjectId },
 }
 
-fn first_publication_plan<'destination>(
-    repository: &TestRepository,
-    destination: &'destination PushDestination,
-) -> PublicationPlan<'destination> {
-    let default = repository.commit("root", &[], None);
-    let proposed = repository.commit("change", &[default], Some("Gone"));
+fn one_change_plan(
+    published: &[(ObjectId, ObjectId)],
+    marker: Option<ObjectId>,
+    observation: OneChangeObservation,
+) -> Result<Stage> {
+    let change = id("Gone");
+    let default_tip = oid(1);
+    let proposal = oid(12);
+    let graph = CommitGraphEvidence::from_literal_commits_for_test([
+        (default_tip, Vec::new(), Vec::new()),
+        (oid(2), Vec::new(), Vec::new()),
+        (oid(3), Vec::new(), Vec::new()),
+        (oid(10), vec![oid(2)], vec![change.clone()]),
+        (oid(11), vec![oid(3)], vec![change.clone()]),
+        (proposal, vec![default_tip], vec![change.clone()]),
+        (oid(20), vec![default_tip], vec![id("Other")]),
+    ])?;
+    let default = DefaultBranch::new("main".to_owned(), default_tip)?;
     let stack = LocalStack::for_test_with_content(
-        default,
-        [(id("Gone"), proposed, "Title".to_owned(), "Commit body".to_owned())],
-    )
-    .unwrap();
-    let remote_heads = heads_for(destination, default, &[]);
-    let (correlated, active) =
-        correlate_and_activate(remote_heads, &stack, open_response(default, Vec::new()), "");
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[id("Gone")]),
-        active,
-        &repository.graph([proposed]),
-    )
-    .unwrap()
-}
-
-fn missing_root_plan(repository: &TestRepository, value: &str) -> PublicationPlan<'static> {
-    let default = repository.commit("root", &[], None);
-    let proposed = repository.commit("change", &[default], Some(value));
-    let stack = LocalStack::for_test_with_content(
-        default,
-        [(id(value), proposed, "Title".to_owned(), "Commit body".to_owned())],
-    )
-    .unwrap();
-    let remote_heads = heads(default, &[]);
-    let (correlated, active) =
-        correlate_and_activate(remote_heads, &stack, open_response(default, Vec::new()), "");
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[id(value)]),
-        active,
-        &repository.graph([proposed]),
-    )
-    .unwrap()
-}
-
-fn missing_nonroot_plan(repository: &TestRepository, value: &str) -> PublicationPlan<'static> {
-    let default = repository.commit("root", &[], None);
-    let parent = repository.commit("parent", &[default], Some("Gparent"));
-    let proposed = repository.commit("change", &[parent], Some(value));
-    let stack = LocalStack::for_test_with_content(
-        default,
-        [
-            (id("Gparent"), parent, "Parent title".to_owned(), String::new()),
-            (id(value), proposed, "Title".to_owned(), "Commit body".to_owned()),
-        ],
-    )
-    .unwrap();
-    let remote_heads = heads(default, &[("Gparent", parent, default)]);
-    let response =
-        open_response(default, vec![open_node(7, "Gparent", "main", default, parent, false)]);
-    let (correlated, active) = correlate_and_activate(
-        remote_heads,
-        &stack,
-        response,
-        &marked_history(&[("Gparent", 1, parent)], &[("Gparent", parent)]),
+        default_tip,
+        [(change.clone(), proposal, "Title".to_owned(), "Commit body".to_owned())],
+    )?;
+    let destination = destination();
+    let remote = ActiveRemoteChanges::from_typed_for_test(
+        &destination,
+        default.clone(),
+        vec![ObservedChangeHistory::from_typed_for_test(change.clone(), published, marker)?],
     );
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[id(value)]),
-        active,
-        &repository.graph([proposed]),
-    )
-    .unwrap()
-}
-
-fn requests_for_test(plan: &PublicationPlan<'_>) -> Vec<(Vec<String>, Vec<String>)> {
-    plan.push_arguments_for_test()
-}
-
-fn into_projection_for_test(plan: PublicationPlan<'_>) -> ReadyProjection<'_> {
-    plan.projection
-}
-
-fn only_query(request_text: String) -> String {
-    assert_eq!(request_text.lines().count(), 1, "expected exactly one mutation request");
-    serde_json::from_str::<Value>(&request_text).unwrap()["query"].as_str().unwrap().to_owned()
-}
-
-fn serialized_create_key(query: &str) -> &str {
-    let start = query.find("repositoryId:").expect("create request has a repository ID");
-    let end = start
-        + query[start..]
-            .find(", title:")
-            .expect("create request has a title after its repository/head/base key");
-    &query[start..end]
-}
-
-fn graphql_bodies(request_text: String) -> Vec<String> {
-    let query = only_query(request_text);
-    query
-        .split("body: ")
-        .skip(1)
-        .map(|tail| {
-            let mut deserializer = serde_json::Deserializer::from_str(tail);
-            String::deserialize(&mut deserializer).unwrap()
-        })
-        .collect()
-}
-
-#[cfg(unix)]
-fn fake_git_destination(script: &str) -> (TempDir, PushDestination, std::path::PathBuf) {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let directory = tempfile::tempdir().unwrap();
-    let executable = directory.path().join("git");
-    let argument_log = directory.path().join("arguments");
-    std::fs::write(&executable, script).unwrap();
-    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(&executable, permissions).unwrap();
-    let environment = vec![
-        (std::ffi::OsString::from("PATH"), directory.path().as_os_str().to_owned()),
-        (std::ffi::OsString::from("GHERRIT_TEST_ARGV"), argument_log.as_os_str().to_owned()),
-    ];
-    let destination =
-        PushDestination::for_test("origin", "https://github.com/owner/repository.git", environment)
-            .unwrap();
-    (directory, destination, argument_log)
-}
-
-#[cfg(unix)]
-const SUCCESSFUL_PUSH: &str = r#"#!/bin/sh
-: > "$GHERRIT_TEST_ARGV"
-for argument in "$@"; do
-    printf '%s\n' "$argument" >> "$GHERRIT_TEST_ARGV"
-done
-printf 'To private-destination\n'
-for argument in "$@"; do
-    case "$argument" in
-        *:refs/heads/*|*:refs/tags/*)
-            printf '*\t%s\t[new reference]\n' "$argument"
-            ;;
-    esac
-done
-printf 'Done\n'
-"#;
-
-#[cfg(unix)]
-const INDETERMINATE_PUSH: &str = r#"#!/bin/sh
-: > "$GHERRIT_TEST_ARGV"
-printf 'To private-destination\nDone\n'
-"#;
-
-#[cfg(unix)]
-const TUPLE_THEN_INDETERMINATE_MARKER: &str = r#"#!/bin/sh
-count=0
-if test -f "$GHERRIT_TEST_ARGV"; then
-    read -r count < "$GHERRIT_TEST_ARGV"
-fi
-count=$((count + 1))
-printf '%s\n' "$count" > "$GHERRIT_TEST_ARGV"
-printf 'To private-destination\n'
-if test "$count" -eq 1; then
-    for argument in "$@"; do
-        case "$argument" in
-            *:refs/heads/*|*:refs/tags/*)
-                printf '*\t%s\t[new reference]\n' "$argument"
-                ;;
-        esac
-    done
-fi
-printf 'Done\n'
-"#;
-
-#[test]
-fn first_publication_hides_create_and_update_work_behind_git_publication() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let proposed = repository.commit("change", &[default], Some("Gone"));
-    let stack = LocalStack::for_test_with_content(
+    let observation = match observation {
+        OneChangeObservation::Absent => {
+            LocalPullRequestObservation::Absent(AbsentPullRequest::for_test(change.clone()))
+        }
+        OneChangeObservation::Open { head, base, base_oid } => LocalPullRequestObservation::Open(
+            open(change.clone(), 7, head, base, base_oid, "Title", "stale body", false),
+        ),
+    };
+    let correlated = CorrelatedRepository::from_typed_for_test(
+        &destination,
+        "R_repository".to_owned(),
         default,
-        [(id("Gone"), proposed, "Title".to_owned(), "Commit body".to_owned())],
-    )
-    .unwrap();
-    let remote_heads = heads(default, &[]);
-    let (correlated, active) =
-        correlate_and_activate(remote_heads, &stack, open_response(default, Vec::new()), "");
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    let plan = plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[id("Gone")]),
-        active,
-        &repository.graph([proposed]),
-    )
-    .unwrap();
+        vec![observation],
+    )?;
+    let context = BodyLinkContext::from_destination(&destination, None)?;
 
-    let git = plan;
-    let requests = requests_for_test(&git);
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].1.len(), 3);
-    let ReadyProjection::Creates { creates, projection } = into_projection_for_test(git) else {
-        panic!("first publication must create its pull request");
-    };
-    assert_eq!(creates.operation_count(), 1);
-    let receipts = creates
-        .complete_for_test(vec![(
-            id("Gone"),
-            PullRequestIdentity::new(42, "PR_42".to_owned()).unwrap(),
-        )])
-        .unwrap();
-    let updates = projection.complete(receipts).unwrap();
-    let marker_arguments = updates.arguments_for_test();
-    assert_eq!(marker_arguments.len(), 1);
-    assert_eq!(marker_arguments[0].1.len(), 1);
-    assert!(marker_arguments[0].1[0].ends_with(":refs/tags/gherrit/Gone/pr"));
-    assert_eq!(updates.operation_count(), 1);
-    assert!(updates.request_text().contains("updatePullRequest"));
+    plan_local_publication(context, stack, correlated, remote, &graph)
+        .map(|plan| plan.first_stage_for_test())
 }
 
 #[test]
-fn new_root_uses_owned_create_key_then_moves_to_the_default_base() {
-    let repository = TestRepository::new();
-    let plan = missing_root_plan(&repository, "Gone");
-    let ReadyProjection::Creates { creates, projection } = into_projection_for_test(plan) else {
-        panic!("the missing root must be created");
-    };
-
-    let create = only_query(creates.request_text());
-    assert!(create.contains("headRefName: \"Gone\""));
-    assert!(create.contains("baseRefName: \"gherrit-bases/Gone\""));
-    assert!(!create.contains("baseRefName: \"main\""));
-
-    let receipts = creates
-        .complete_for_test(vec![(
-            id("Gone"),
-            PullRequestIdentity::new(42, "PR_42".to_owned()).unwrap(),
-        )])
-        .unwrap();
-    let markers = projection.complete(receipts).unwrap();
-    assert_eq!(markers.arguments_for_test()[0].1.len(), 1);
-    assert!(markers.arguments_for_test()[0].1[0].ends_with(":refs/tags/gherrit/Gone/pr"));
-    let update = only_query(markers.request_text());
-    assert!(update.contains("body:"));
-    assert!(update.contains("#42"));
-    assert!(update.contains("baseRefName: \"main\""));
-    assert!(!update.contains("baseRefName: \"gherrit-bases/Gone\""));
-}
-
-#[test]
-fn new_nonroot_uses_owned_create_key_without_a_redundant_base_update() {
-    let repository = TestRepository::new();
-    let plan = missing_nonroot_plan(&repository, "Gone");
-    let ReadyProjection::Creates { creates, projection } = into_projection_for_test(plan) else {
-        panic!("the missing nonroot must be created");
-    };
-
-    let create = only_query(creates.request_text());
-    assert!(create.contains("headRefName: \"Gone\""));
-    assert!(create.contains("baseRefName: \"gherrit-bases/Gone\""));
-    assert!(!create.contains("baseRefName: \"main\""));
-
-    let receipts = creates
-        .complete_for_test(vec![(
-            id("Gone"),
-            PullRequestIdentity::new(42, "PR_42".to_owned()).unwrap(),
-        )])
-        .unwrap();
-    let update = only_query(projection.complete(receipts).unwrap().request_text());
-    assert!(update.contains("body:"));
-    assert!(update.contains("#42"));
-    assert!(!update.contains("baseRefName:"));
-}
-
-#[test]
-fn root_status_does_not_change_the_create_repository_head_base_key() {
-    let root_repository = TestRepository::new();
-    let root = missing_root_plan(&root_repository, "Gone");
-    let ReadyProjection::Creates { creates: root, .. } = into_projection_for_test(root) else {
-        panic!("the missing root must be created");
-    };
-    let root = only_query(root.request_text());
-
-    let nonroot_repository = TestRepository::new();
-    let nonroot = missing_nonroot_plan(&nonroot_repository, "Gone");
-    let ReadyProjection::Creates { creates: nonroot, .. } = into_projection_for_test(nonroot)
+fn absence_and_marker_are_the_exact_creation_authority() {
+    let current = (oid(12), oid(1));
+    let Stage::Creates(creates) =
+        one_change_plan(&[current], None, OneChangeObservation::Absent).unwrap()
     else {
-        panic!("the missing nonroot must be created");
+        panic!("published markerless absence must create")
     };
-    let nonroot = only_query(nonroot.request_text());
+    assert_eq!(creates.len(), 1, "the one-operation fixture has one request");
+    let creates = flatten_batches(&creates);
+    assert_eq!(creates.len(), 1);
+    assert_eq!(creates[0].id.as_str(), "Gone");
+    assert_eq!(creates[0].base_branch, "gherrit-bases/Gone");
+    assert_eq!(creates[0].head_oid, oid(12));
+    assert_eq!(creates[0].base_oid, oid(1));
 
-    assert_eq!(serialized_create_key(&root), serialized_create_key(&nonroot));
-    assert_eq!(
-        serialized_create_key(&root),
-        "repositoryId: \"R_repository\", baseRefName: \"gherrit-bases/Gone\", headRefName: \"Gone\""
-    );
+    let error =
+        one_change_plan(&[current], Some(current.0), OneChangeObservation::Absent).unwrap_err();
+    assert!(error.to_string().contains("marker but no same-repository pull request"));
 }
 
 #[test]
-fn create_and_response_derived_update_preflight_at_their_typed_boundaries() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let proposed = repository.commit("change", &[default], Some("Gone"));
-    let stack = LocalStack::for_test_with_content(
-        default,
-        [(id("Gone"), proposed, "Title".to_owned(), String::new())],
-    )
-    .unwrap();
-    let remote_heads = heads(default, &[]);
-    let mut response = open_response(default, Vec::new());
-    response["data"]["repository"]["id"] = json!("R".repeat(1_100_000));
-    let (correlated, active) = correlate_and_activate(remote_heads, &stack, response, "");
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    let error = match plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[id("Gone")]),
-        active,
-        &repository.graph([proposed]),
-    ) {
-        Ok(_) => panic!("an oversized exact create request must not escape planning"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("GraphQL create mutation"));
-    assert!(error.to_string().contains("exceeds the 1048576-byte request limit"));
+fn open_head_and_base_oids_must_belong_to_published_history() {
+    let published = [(oid(10), oid(2)), (oid(11), oid(3))];
 
-    let repository = TestRepository::new();
-    let plan = missing_root_plan(&repository, "Gone");
-    let ReadyProjection::Creates { creates, projection } = into_projection_for_test(plan) else {
-        panic!("the missing root must be created");
-    };
-    let receipts = creates
-        .complete_for_test(vec![(
-            id("Gone"),
-            PullRequestIdentity::new(42, "N".repeat(1_100_000)).unwrap(),
-        )])
-        .unwrap();
-    let error = projection.complete(receipts).unwrap_err();
-    assert!(error.to_string().contains("GraphQL update mutation"));
-    assert!(error.to_string().contains("exceeds the 1048576-byte request limit"));
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "current_thread")]
-async fn pending_publication_executes_the_exact_request_before_releasing_projection() {
-    let (_directory, destination, argument_log) = fake_git_destination(SUCCESSFUL_PUSH);
-    let repository = TestRepository::new();
-    let plan = first_publication_plan(&repository, &destination);
-    let requests = requests_for_test(&plan);
-    assert_eq!(requests.len(), 1);
-    let expected_options = requests[0].0.clone();
-    let expected_refspecs = requests[0].1.clone();
-
-    assert!(matches!(plan.publish().await.unwrap(), ReadyProjection::Creates { .. }));
-
-    let arguments = std::fs::read_to_string(argument_log)
-        .unwrap()
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let push = arguments.iter().position(|argument| argument == "push").unwrap();
-    let separator = arguments[push + 1..]
-        .iter()
-        .position(|argument| argument == "--")
-        .map(|offset| push + 1 + offset)
-        .unwrap();
-    assert_eq!(&arguments[push + 1..separator], expected_options);
-    assert_eq!(arguments[separator + 1], "gherrit-publication");
-    assert_eq!(&arguments[separator + 2..], expected_refspecs);
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "current_thread")]
-async fn pending_publication_does_not_release_projection_for_indeterminate_receipts() {
-    let (_directory, destination, _argument_log) = fake_git_destination(INDETERMINATE_PUSH);
-    let repository = TestRepository::new();
-    let plan = first_publication_plan(&repository, &destination);
-
-    let error = plan.publish().await.unwrap_err();
-
-    assert!(
-        error.to_string().contains("Could not acknowledge `git push` for GHerrit remote 'origin'")
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "current_thread")]
-async fn indeterminate_marker_receipt_withholds_the_prepared_final_projection() {
-    let (_directory, destination, invocation_count) =
-        fake_git_destination(TUPLE_THEN_INDETERMINATE_MARKER);
-    let repository = TestRepository::new();
-    let plan = first_publication_plan(&repository, &destination);
-    let ReadyProjection::Creates { creates, projection } = plan.publish().await.unwrap() else {
-        panic!("the acknowledged first tuple must release create work");
-    };
-    let receipts = creates
-        .complete_for_test(vec![(
-            id("Gone"),
-            PullRequestIdentity::new(42, "PR_42".to_owned()).unwrap(),
-        )])
-        .unwrap();
-    let markers = projection.complete(receipts).unwrap();
-    assert_eq!(markers.operation_count(), 1);
-
-    let error = markers.publish().await.unwrap_err();
-
-    assert!(error.to_string().contains("Could not acknowledge `git push`"));
-    assert_eq!(std::fs::read_to_string(invocation_count).unwrap().trim(), "2");
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "current_thread")]
-async fn exact_marker_receipt_releases_the_prepared_final_projection() {
-    let (_directory, destination, _argument_log) = fake_git_destination(SUCCESSFUL_PUSH);
-    let repository = TestRepository::new();
-    let plan = first_publication_plan(&repository, &destination);
-    let ReadyProjection::Creates { creates, projection } = plan.publish().await.unwrap() else {
-        panic!("the acknowledged first tuple must release create work");
-    };
-    let receipts = creates
-        .complete_for_test(vec![(
-            id("Gone"),
-            PullRequestIdentity::new(42, "PR_42".to_owned()).unwrap(),
-        )])
-        .unwrap();
-    let markers = projection.complete(receipts).unwrap();
-
-    let FinalProjection::Updates(updates) = markers.publish().await.unwrap() else {
-        panic!("a completed create must release a nonempty update projection");
-    };
-    assert_eq!(updates.operation_count(), 1);
-    assert!(updates.request_text().contains("#42"));
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn published_without_open_pr_is_create_recovery_with_a_ready_no_op() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let published = repository.commit("change", &[default], Some("Gone"));
-    let stack = LocalStack::for_test_with_content(
-        default,
-        [(id("Gone"), published, "Title".to_owned(), String::new())],
-    )
-    .unwrap();
-    let remote_heads = heads(default, &[("Gone", published, default)]);
-    let history = versions(&[("Gone", 1, published)]);
-    let (correlated, active) =
-        correlate_and_activate(remote_heads, &stack, open_response(default, Vec::new()), &history);
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    let plan = plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[id("Gone")]),
-        active,
-        &repository.graph([published]),
-    )
-    .unwrap();
-
-    assert!(requests_for_test(&plan).is_empty());
-    assert!(matches!(plan.publish().await.unwrap(), ReadyProjection::Creates { .. }));
-}
-
-#[test]
-fn marked_history_without_an_open_pull_request_rejects_before_git_planning() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let published = repository.commit("change", &[default], Some("Gone"));
-    let stack = LocalStack::for_test(default, [(id("Gone"), published)]);
-    let remote_heads = heads(default, &[("Gone", published, default)]);
-    let history = marked_history(&[("Gone", 1, published)], &[("Gone", published)]);
-    let (correlated, active) =
-        correlate_and_activate(remote_heads, &stack, open_response(default, Vec::new()), &history);
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-
-    let error = match plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[id("Gone")]),
-        active,
-        &repository.graph([published]),
-    ) {
-        Ok(_) => panic!("a hidden marked OPEN pull request must fail closed"),
-        Err(error) => error,
-    };
-
-    assert!(error.to_string().contains("marker but no OPEN"));
-}
-
-#[test]
-fn missing_open_terminal_history_table_is_exact() {
-    for terminal in
-        [None, Some(TerminalPullRequestState::Closed), Some(TerminalPullRequestState::Merged)]
-    {
-        let repository = TestRepository::new();
-        let default = repository.commit("root", &[], None);
-        let published = repository.commit("change", &[default], Some("Gone"));
-        let stack = LocalStack::for_test(default, [(id("Gone"), published)]);
-        let remote_heads = heads(default, &[("Gone", published, default)]);
-        let history = versions(&[("Gone", 1, published)]);
-        let (correlated, active) = correlate_and_activate(
-            remote_heads,
-            &stack,
-            open_response(default, Vec::new()),
-            &history,
-        );
-        let terminal_histories = terminal.map_or_else(
-            || empty_terminal_histories(&active, &[id("Gone")]),
-            |state| retired_terminal_history(&active, id("Gone"), state),
-        );
-        let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-        let result = plan_publication(
-            context,
-            stack,
-            correlated,
-            terminal_histories,
-            active,
-            &repository.graph([published]),
-        );
-
-        match (terminal, result) {
-            (None, Ok(plan)) => {
-                assert!(matches!(into_projection_for_test(plan), ReadyProjection::Creates { .. }));
-            }
-            (Some(state), Err(error)) => {
-                assert_eq!(error.to_string(), retirement_message(17, state));
-            }
-            (None, Err(error)) => panic!("empty terminal history rejected creation: {error}"),
-            (Some(state), Ok(_)) => panic!("{state:?} terminal history authorized creation"),
-        }
-    }
-}
-
-#[test]
-fn planner_aggregates_retired_histories_in_requested_order() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let empty = repository.commit("empty", &[default], Some("Gempty"));
-    let closed = repository.commit("closed", &[empty], Some("Gclosed"));
-    let merged = repository.commit("merged", &[closed], Some("Gmerged"));
-    let ids = [id("Gempty"), id("Gclosed"), id("Gmerged")];
-    let stack = LocalStack::for_test(
-        default,
-        [(ids[0].clone(), empty), (ids[1].clone(), closed), (ids[2].clone(), merged)],
-    );
-    let remote_heads = heads(default, &[]);
-    let (correlated, active) =
-        correlate_and_activate(remote_heads, &stack, open_response(default, Vec::new()), "");
-    let terminal_histories = TerminalExhaustionAccumulator::new(ids.iter().cloned())
-        .unwrap()
-        .record_page(TerminalPullRequestEvidence::for_test(
-            ids[2].clone(),
-            None,
-            TerminalPullRequestPage {
-                pull_requests: vec![TerminalPullRequest {
-                    number: 22,
-                    node_id: "PR_22".to_owned(),
-                    state: TerminalPullRequestState::Merged,
-                }],
-                next_cursor: None,
-            },
-        ))
-        .unwrap()
-        .record_page(TerminalPullRequestEvidence::for_test(
-            ids[0].clone(),
-            None,
-            TerminalPullRequestPage { pull_requests: Vec::new(), next_cursor: None },
-        ))
-        .unwrap()
-        .record_page(TerminalPullRequestEvidence::for_test(
-            ids[1].clone(),
-            None,
-            TerminalPullRequestPage {
-                pull_requests: vec![TerminalPullRequest {
-                    number: 11,
-                    node_id: "PR_11".to_owned(),
-                    state: TerminalPullRequestState::Closed,
-                }],
-                next_cursor: None,
-            },
-        ))
-        .unwrap()
-        .into_terminal_histories()
-        .unwrap();
-    let terminal_histories =
-        RepositoryTerminalHistories::for_test(active.destination(), terminal_histories);
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-
-    let error = match plan_publication(
-        context,
-        stack,
-        correlated,
-        terminal_histories,
-        active,
-        &repository.graph([merged]),
-    ) {
-        Ok(_) => panic!("retired histories must reject before publication planning"),
-        Err(error) => error,
-    };
-
-    assert_eq!(
-        error.to_string(),
-        "Cannot push to closed PR #11. Please open a new PR or reopen the existing one.\n\
-         Cannot push to merged PR #22. Please open a new PR or reopen the existing one.\n\
-         You may want to rebase on the latest changes before pushing."
-    );
-}
-
-#[test]
-fn missing_open_marker_and_terminal_history_table_is_exhaustive() {
-    for marked in [false, true] {
-        for terminal in
-            [None, Some(TerminalPullRequestState::Closed), Some(TerminalPullRequestState::Merged)]
-        {
-            let repository = TestRepository::new();
-            let default = repository.commit("root", &[], None);
-            let published = repository.commit("change", &[default], Some("Gone"));
-            let stack = LocalStack::for_test(default, [(id("Gone"), published)]);
-            let remote_heads = heads(default, &[("Gone", published, default)]);
-            let entries = [("Gone", 1, published)];
-            let history = if marked {
-                marked_history(&entries, &[("Gone", published)])
-            } else {
-                versions(&entries)
-            };
-            let (correlated, active) = correlate_and_activate(
-                remote_heads,
-                &stack,
-                open_response(default, Vec::new()),
-                &history,
-            );
-            let terminal_histories = terminal.map_or_else(
-                || empty_terminal_histories(&active, &[id("Gone")]),
-                |state| retired_terminal_history(&active, id("Gone"), state),
-            );
-            let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-            let result = plan_publication(
-                context,
-                stack,
-                correlated,
-                terminal_histories,
-                active,
-                &repository.graph([published]),
-            );
-            match (marked, terminal, result) {
-                (false, None, Ok(plan)) => {
-                    assert!(matches!(
-                        into_projection_for_test(plan),
-                        ReadyProjection::Creates { .. }
-                    ));
-                }
-                (true, None, Err(error)) => assert_eq!(
-                    error.to_string(),
-                    "GHerrit change 'Gone' has a pull-request marker but no OPEN pull request"
-                ),
-                (_, Some(state), Err(error)) => {
-                    assert_eq!(error.to_string(), retirement_message(17, state));
-                }
-                (marked, terminal, Ok(_)) => {
-                    panic!("marked={marked}, terminal={terminal:?} unexpectedly planned")
-                }
-                (marked, terminal, Err(error)) => panic!(
-                    "marked={marked}, terminal={terminal:?} returned unexpected error: {error}"
-                ),
-            }
-        }
-    }
-}
-
-#[test]
-fn open_pull_request_marker_and_base_table_is_exact() {
-    for marked in [false, true] {
-        for owned in [false, true] {
-            let repository = TestRepository::new();
-            let default = repository.commit("root", &[], None);
-            let published = repository.commit("change", &[default], Some("Gone"));
-            let stack = LocalStack::for_test_with_content(
-                default,
-                [(id("Gone"), published, "Title".to_owned(), String::new())],
+    for head in [oid(10), oid(11)] {
+        for base_oid in [oid(2), oid(3)] {
+            one_change_plan(
+                &published,
+                Some(oid(10)),
+                OneChangeObservation::Open { head, base: BaseKind::Owned, base_oid },
             )
-            .unwrap();
-            let remote_heads = heads(default, &[("Gone", published, default)]);
-            let entries = [("Gone", 1, published)];
-            let history = if marked {
-                marked_history(&entries, &[("Gone", published)])
-            } else {
-                versions(&entries)
-            };
-            let response = open_response(
-                default,
-                vec![open_node(
-                    7,
-                    "Gone",
-                    if owned { "gherrit-bases/Gone" } else { "main" },
-                    default,
-                    published,
-                    false,
-                )],
-            );
-            let (correlated, active) =
-                correlate_and_activate(remote_heads, &stack, response, &history);
-            let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-            let result = plan_publication(
-                context,
-                stack,
-                correlated,
-                empty_terminal_histories(&active, &[]),
-                active,
-                &repository.graph([published]),
-            );
-
-            assert_eq!(result.is_ok(), marked || owned, "marked={marked}, owned={owned}");
-            if let Ok(plan) = result {
-                match into_projection_for_test(plan) {
-                    ReadyProjection::Markers(markers) => {
-                        assert!(!marked);
-                        assert_eq!(markers.arguments_for_test()[0].1.len(), 1);
-                    }
-                    ReadyProjection::Final(_) => assert!(marked),
-                    ReadyProjection::Creates { .. } => panic!("an OPEN row cannot be created"),
-                }
-            }
+            .unwrap_or_else(|error| {
+                panic!("published head={head} and base={base_oid} must be independent: {error:?}")
+            });
         }
     }
-}
 
-#[test]
-fn an_unmarked_already_converged_open_pr_has_a_marker_only_no_action_gate() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let parent = repository.commit("parent", &[default], Some("Gone"));
-    let child = repository.commit("child", &[parent], Some("Gtwo"));
-
-    let plan_with_bodies = |history: String, parent_body: &str, child_body: &str| {
-        let stack = LocalStack::for_test_with_content(
-            default,
-            [
-                (id("Gone"), parent, "Title".to_owned(), String::new()),
-                (id("Gtwo"), child, "Title".to_owned(), String::new()),
-            ],
-        )
-        .unwrap();
-        let remote_heads = heads(default, &[("Gone", parent, default), ("Gtwo", child, parent)]);
-        let mut parent_node = open_node(7, "Gone", "main", default, parent, false);
-        parent_node["body"] = json!(parent_body);
-        let mut child_node = open_node(8, "Gtwo", "gherrit-bases/Gtwo", parent, child, false);
-        child_node["body"] = json!(child_body);
-        let (correlated, active) = correlate_and_activate(
-            remote_heads,
-            &stack,
-            open_response(default, vec![parent_node, child_node]),
-            &history,
-        );
-        let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-        plan_publication(
-            context,
-            stack,
-            correlated,
-            empty_terminal_histories(&active, &[]),
-            active,
-            &repository.graph([child]),
-        )
-        .unwrap()
-    };
-
-    let baseline = plan_with_bodies(
-        marked_history(
-            &[("Gone", 1, parent), ("Gtwo", 1, child)],
-            &[("Gone", parent), ("Gtwo", child)],
-        ),
-        "stale parent",
-        "stale child",
-    );
-    let ReadyProjection::Final(FinalProjection::Updates(updates)) =
-        into_projection_for_test(baseline)
-    else {
-        panic!("the baseline must reveal both desired bodies");
-    };
-    let bodies = graphql_bodies(updates.request_text());
-    assert_eq!(bodies.len(), 2);
-
-    let mut mixed_history = marked_history(&[("Gone", 1, parent)], &[("Gone", parent)]);
-    mixed_history.push_str(&versions(&[("Gtwo", 1, child)]));
-    let converged = plan_with_bodies(mixed_history, &bodies[0], &bodies[1]);
-    let ReadyProjection::Markers(markers) = into_projection_for_test(converged) else {
-        panic!("an unmarked converged PR must expose only its marker gate");
-    };
-    assert_eq!(markers.operation_count(), 0);
-    let arguments = markers.arguments_for_test();
-    assert_eq!(arguments.len(), 1);
-    assert_eq!(arguments[0].1.len(), 1);
-    assert!(arguments[0].1[0].ends_with(":refs/tags/gherrit/Gtwo/pr"));
-}
-
-#[test]
-fn correlation_and_active_evidence_require_the_same_destination_capability() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let proposed = repository.commit("change", &[default], Some("Gone"));
-    let stack = LocalStack::for_test(default, [(id("Gone"), proposed)]);
-    let correlation_heads = heads(default, &[]);
-    let active_heads = heads(default, &[]);
-    let ids = [id("Gone")];
-    let open = OpenObservation::from_complete_response_for_test(
-        "owner",
-        "repository",
-        open_response(default, Vec::new()),
+    one_change_plan(
+        &published,
+        Some(oid(10)),
+        OneChangeObservation::Open { head: oid(10), base: BaseKind::Default, base_oid: oid(1) },
     )
-    .unwrap();
-    let correlated = open.correlate(ids.iter(), &correlation_heads).unwrap();
-    let active = active_heads.into_active_for_test(&ids, &[], b"").unwrap();
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    let error = match plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &ids),
-        active,
-        &repository.graph([proposed]),
-    ) {
-        Ok(_) => panic!("different push-destination capabilities must not be joined"),
-        Err(error) => error,
-    };
+    .expect("the exact default object ID is valid");
 
-    assert!(error.to_string().contains("different push-destination capabilities"));
-}
-
-#[test]
-fn terminal_history_for_another_repository_cannot_enter_planning() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let proposed = repository.commit("change", &[default], Some("Gone"));
-    let stack = LocalStack::for_test(default, [(id("Gone"), proposed)]);
-    let remote_heads = heads(default, &[]);
-    let (correlated, active) =
-        correlate_and_activate(remote_heads, &stack, open_response(default, Vec::new()), "");
-    let other_destination =
-        PushDestination::for_test("other", "https://github.com/another/repository.git", Vec::new())
-            .unwrap();
-    let terminal_histories = RepositoryTerminalHistories::for_test(
-        &other_destination,
-        exact_terminal_histories(&[id("Gone")]),
-    );
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    let error = match plan_publication(
-        context,
-        stack,
-        correlated,
-        terminal_histories,
-        active,
-        &repository.graph([proposed]),
-    ) {
-        Ok(_) => panic!("another repository's terminal evidence must not enter planning"),
-        Err(error) => error,
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("terminal pull request evidence came from a different GitHub repository")
-    );
-}
-
-#[test]
-fn retained_stack_default_must_match_the_agreed_publication_default() {
-    let repository = TestRepository::new();
-    let remote_default = repository.commit("remote root", &[], None);
-    let local_default = repository.commit("local root", &[], None);
-
-    for (label, stack_default, parent, diagnostic) in [
+    for (label, observation, diagnostic) in [
         (
-            "name",
-            DefaultBranch::new("trunk".to_owned(), remote_default).unwrap(),
-            remote_default,
-            "different default branch names",
+            "proposal head",
+            OneChangeObservation::Open { head: oid(12), base: BaseKind::Owned, base_oid: oid(2) },
+            "head not present in published history",
         ),
         (
-            "tip",
-            DefaultBranch::new("main".to_owned(), local_default).unwrap(),
-            local_default,
-            "different default branch tips",
+            "unrelated head",
+            OneChangeObservation::Open { head: oid(20), base: BaseKind::Owned, base_oid: oid(2) },
+            "head not present in published history",
+        ),
+        (
+            "wrong default",
+            OneChangeObservation::Open { head: oid(10), base: BaseKind::Default, base_oid: oid(2) },
+            "wrong default-branch object ID",
+        ),
+        (
+            "proposal parent",
+            OneChangeObservation::Open { head: oid(10), base: BaseKind::Owned, base_oid: oid(1) },
+            "owned-base object ID not present in published history",
+        ),
+        (
+            "unrelated base",
+            OneChangeObservation::Open { head: oid(10), base: BaseKind::Owned, base_oid: oid(20) },
+            "owned-base object ID not present in published history",
+        ),
+        (
+            "published head used as base",
+            OneChangeObservation::Open { head: oid(10), base: BaseKind::Owned, base_oid: oid(11) },
+            "owned-base object ID not present in published history",
         ),
     ] {
-        let proposed = repository.commit("change", &[parent], Some("Gone"));
-        let stack = LocalStack::for_test_with_default(
-            stack_default,
-            [(id("Gone"), proposed, "Title".to_owned(), String::new())],
-        )
-        .unwrap();
-        let remote_heads = heads(remote_default, &[]);
-        let (correlated, active) = correlate_and_activate(
-            remote_heads,
-            &stack,
-            open_response(remote_default, Vec::new()),
-            "",
-        );
-        let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-        let error = match plan_publication(
-            context,
-            stack,
-            correlated,
-            empty_terminal_histories(&active, &[id("Gone")]),
-            active,
-            &repository.graph([proposed]),
-        ) {
-            Ok(_) => panic!("retained stack default mismatch must fail for {label}"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains(diagnostic), "case={label}: {error}");
+        let error = one_change_plan(&published, Some(oid(10)), observation).unwrap_err();
+        assert!(error.to_string().contains(diagnostic), "case={label}: {error:?}");
     }
-}
 
-#[test]
-fn old_marker_target_is_not_republished_after_published_and_projected_heads_move() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let marker_target = repository.commit("first", &[default], Some("Gone"));
-    let published_current = repository.commit("current", &[default], Some("Gone"));
-    let proposed = repository.commit("amended", &[default], Some("Gone"));
-    let stack = LocalStack::for_test_with_content(
-        default,
-        [(id("Gone"), proposed, "Title".to_owned(), String::new())],
+    let error = one_change_plan(
+        &[],
+        None,
+        OneChangeObservation::Open { head: oid(12), base: BaseKind::Default, base_oid: oid(1) },
     )
-    .unwrap();
-    let remote_heads = heads(default, &[("Gone", published_current, default)]);
-    let history = marked_history(
-        &[("Gone", 1, marker_target), ("Gone", 2, published_current)],
-        &[("Gone", marker_target)],
-    );
-    assert!(history.contains(&format!("{marker_target}\trefs/tags/gherrit/Gone/pr\n")));
-    assert!(!history.contains(&format!("{published_current}\trefs/tags/gherrit/Gone/pr\n")));
-    assert!(!history.contains(&format!("{proposed}\trefs/tags/gherrit/Gone/pr\n")));
-    let response =
-        open_response(default, vec![open_node(7, "Gone", "main", default, marker_target, true)]);
-    let (correlated, active) = correlate_and_activate(remote_heads, &stack, response, &history);
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    let plan = plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[]),
-        active,
-        &repository.graph([proposed, published_current, marker_target]),
-    )
-    .unwrap();
-
-    let git = plan;
-    let initial_requests = requests_for_test(&git);
-    assert_eq!(initial_requests.len(), 1, "the amendment still requires its initial tuple");
-    assert!(
-        initial_requests
-            .iter()
-            .flat_map(|(_, refspecs)| refspecs)
-            .all(|refspec| { !refspec.contains("refs/tags/gherrit/Gone/pr") })
-    );
-    assert!(
-        initial_requests[0]
-            .1
-            .iter()
-            .any(|refspec| refspec == &format!("{proposed}:refs/heads/Gone"))
-    );
-    let ReadyProjection::Final(FinalProjection::Updates(updates)) = into_projection_for_test(git)
-    else {
-        panic!("an existing old marker must bypass marker publication");
-    };
-    assert_eq!(updates.operation_count(), 1);
-    let request = updates.request_text();
-    assert!(request.contains("body:"));
-    assert!(!request.contains("baseRefName:"));
-    assert!(!request.contains("title:"));
-}
-
-#[test]
-fn owned_pr_head_and_base_may_be_independent_published_versions() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let parent_first = repository.commit("parent first", &[default], Some("Gone"));
-    let parent_current = repository.commit("parent current", &[default], Some("Gone"));
-    let child_first = repository.commit("child first", &[parent_first], Some("Gtwo"));
-    let child_current = repository.commit("child current", &[parent_current], Some("Gtwo"));
-    let stack = LocalStack::for_test_with_content(
-        default,
-        [
-            (id("Gone"), parent_current, "Title".to_owned(), String::new()),
-            (id("Gtwo"), child_current, "Title".to_owned(), String::new()),
-        ],
-    )
-    .unwrap();
-    let remote_heads = heads(
-        default,
-        &[("Gone", parent_current, default), ("Gtwo", child_current, parent_current)],
-    );
-    let history = marked_history(
-        &[
-            ("Gone", 1, parent_first),
-            ("Gone", 2, parent_current),
-            ("Gtwo", 1, child_first),
-            ("Gtwo", 2, child_current),
-        ],
-        &[("Gone", parent_first), ("Gtwo", child_first)],
-    );
-    let response = open_response(
-        default,
-        vec![
-            open_node(7, "Gone", "main", default, parent_first, false),
-            open_node(8, "Gtwo", "gherrit-bases/Gtwo", parent_first, child_first, false),
-        ],
-    );
-    let (correlated, active) = correlate_and_activate(remote_heads, &stack, response, &history);
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    let plan = plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[]),
-        active,
-        &repository.graph([child_first, child_current]),
-    )
-    .unwrap();
-
-    assert!(requests_for_test(&plan).is_empty());
-    assert!(matches!(
-        into_projection_for_test(plan),
-        ReadyProjection::Final(FinalProjection::Updates(_))
-    ));
-}
-
-#[test]
-fn every_marked_and_unmarked_cross_version_owned_head_base_pair_is_accepted() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let parent_first = repository.commit("parent first", &[default], Some("Gone"));
-    let parent_current = repository.commit("parent current", &[default], Some("Gone"));
-    let child_first = repository.commit("child first", &[parent_first], Some("Gtwo"));
-    let child_current = repository.commit("child current", &[parent_current], Some("Gtwo"));
-
-    for child_marked in [false, true] {
-        for observed_head in [child_first, child_current] {
-            for observed_base in [parent_first, parent_current] {
-                let stack = LocalStack::for_test_with_content(
-                    default,
-                    [
-                        (id("Gone"), parent_current, "Title".to_owned(), String::new()),
-                        (id("Gtwo"), child_current, "Title".to_owned(), String::new()),
-                    ],
-                )
-                .unwrap();
-                let remote_heads = heads(
-                    default,
-                    &[("Gone", parent_current, default), ("Gtwo", child_current, parent_current)],
-                );
-                let entries = [
-                    ("Gone", 1, parent_first),
-                    ("Gone", 2, parent_current),
-                    ("Gtwo", 1, child_first),
-                    ("Gtwo", 2, child_current),
-                ];
-                let markers = if child_marked {
-                    vec![("Gone", parent_first), ("Gtwo", child_first)]
-                } else {
-                    vec![("Gone", parent_first)]
-                };
-                let history = marked_history(&entries, &markers);
-                let response = open_response(
-                    default,
-                    vec![
-                        open_node(7, "Gone", "main", default, parent_first, false),
-                        open_node(
-                            8,
-                            "Gtwo",
-                            "gherrit-bases/Gtwo",
-                            observed_base,
-                            observed_head,
-                            false,
-                        ),
-                    ],
-                );
-                let (correlated, active) =
-                    correlate_and_activate(remote_heads, &stack, response, &history);
-                let context =
-                    BodyLinkContext::from_destination(active.destination(), None).unwrap();
-                let plan = plan_publication(
-                    context,
-                    stack,
-                    correlated,
-                    empty_terminal_histories(&active, &[]),
-                    active,
-                    &repository.graph([child_first, child_current]),
-                )
-                .unwrap();
-
-                assert!(requests_for_test(&plan).is_empty());
-                match into_projection_for_test(plan) {
-                    ReadyProjection::Final(_) => assert!(child_marked),
-                    ReadyProjection::Markers(markers) => {
-                        assert!(!child_marked);
-                        let refspecs = markers
-                            .arguments_for_test()
-                            .into_iter()
-                            .flat_map(|(_, refspecs)| refspecs)
-                            .collect::<Vec<_>>();
-                        assert_eq!(
-                            refspecs,
-                            [format!("{child_current}:refs/tags/gherrit/Gtwo/pr")]
-                        );
-                    }
-                    ReadyProjection::Creates { .. } => {
-                        panic!("a visible cross-version pull request cannot require creation")
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn all_nine_three_version_owned_head_base_pairs_are_accepted() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let parents = [
-        repository.commit("parent one", &[default], Some("Gone")),
-        repository.commit("parent two", &[default], Some("Gone")),
-        repository.commit("parent three", &[default], Some("Gone")),
-    ];
-    let children = [
-        repository.commit("child one", &[parents[0]], Some("Gtwo")),
-        repository.commit("child two", &[parents[1]], Some("Gtwo")),
-        repository.commit("child three", &[parents[2]], Some("Gtwo")),
-    ];
-
-    for observed_head in children {
-        for observed_base in parents {
-            let stack = LocalStack::for_test_with_content(
-                default,
-                [
-                    (id("Gone"), parents[2], "Title".to_owned(), String::new()),
-                    (id("Gtwo"), children[2], "Title".to_owned(), String::new()),
-                ],
-            )
-            .unwrap();
-            let remote_heads =
-                heads(default, &[("Gone", parents[2], default), ("Gtwo", children[2], parents[2])]);
-            let history = marked_history(
-                &[
-                    ("Gone", 1, parents[0]),
-                    ("Gone", 2, parents[1]),
-                    ("Gone", 3, parents[2]),
-                    ("Gtwo", 1, children[0]),
-                    ("Gtwo", 2, children[1]),
-                    ("Gtwo", 3, children[2]),
-                ],
-                &[("Gone", parents[0]), ("Gtwo", children[0])],
-            );
-            let response = open_response(
-                default,
-                vec![
-                    open_node(7, "Gone", "main", default, parents[0], false),
-                    open_node(8, "Gtwo", "gherrit-bases/Gtwo", observed_base, observed_head, false),
-                ],
-            );
-            let (correlated, active) =
-                correlate_and_activate(remote_heads, &stack, response, &history);
-            let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-            let plan = plan_publication(
-                context,
-                stack,
-                correlated,
-                empty_terminal_histories(&active, &[]),
-                active,
-                &repository.graph(children),
-            )
-            .unwrap();
-
-            assert!(requests_for_test(&plan).is_empty());
-        }
-    }
-}
-
-#[test]
-fn mixed_existing_create_projection_renders_final_navigation_for_both() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let parent = repository.commit("parent", &[default], Some("Gone"));
-    let child = repository.commit("child", &[parent], Some("Gtwo"));
-    let stack = LocalStack::for_test_with_content(
-        default,
-        [
-            (id("Gone"), parent, "Title".to_owned(), String::new()),
-            (id("Gtwo"), child, "Title".to_owned(), String::new()),
-        ],
-    )
-    .unwrap();
-    let remote_heads = heads(default, &[("Gone", parent, default)]);
-    let history = marked_history(&[("Gone", 1, parent)], &[("Gone", parent)]);
-    let response =
-        open_response(default, vec![open_node(7, "Gone", "main", default, parent, false)]);
-    let (correlated, active) = correlate_and_activate(remote_heads, &stack, response, &history);
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    let plan = plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[id("Gtwo")]),
-        active,
-        &repository.graph([child]),
-    )
-    .unwrap();
-    assert_eq!(requests_for_test(&plan).len(), 1);
-    let ReadyProjection::Creates { creates, projection } = into_projection_for_test(plan) else {
-        panic!("the mixed stack must create its missing child");
-    };
-    let receipts = creates
-        .complete_for_test(vec![(
-            id("Gtwo"),
-            PullRequestIdentity::new(42, "PR_42".to_owned()).unwrap(),
-        )])
-        .unwrap();
-    let updates = projection.complete(receipts).unwrap();
-    assert_eq!(updates.operation_count(), 2);
-    let request = updates.request_text();
-    assert!(request.contains("#7"));
-    assert!(request.contains("#42"));
-}
-
-#[test]
-fn created_observed_unmarked_and_marked_rows_share_one_global_marker_gate() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let parent = repository.commit("parent", &[default], Some("Gone"));
-    let middle = repository.commit("middle", &[parent], Some("Gtwo"));
-    let child = repository.commit("child", &[middle], Some("Gthree"));
-    let stack = LocalStack::for_test_with_content(
-        default,
-        [
-            (id("Gone"), parent, "Title".to_owned(), String::new()),
-            (id("Gtwo"), middle, "Title".to_owned(), String::new()),
-            (id("Gthree"), child, "Title".to_owned(), String::new()),
-        ],
-    )
-    .unwrap();
-    let remote_heads = heads(default, &[("Gone", parent, default), ("Gtwo", middle, parent)]);
-    let mut history = marked_history(&[("Gone", 1, parent)], &[("Gone", parent)]);
-    history.push_str(&versions(&[("Gtwo", 1, middle)]));
-    let response = open_response(
-        default,
-        vec![
-            open_node(7, "Gone", "main", default, parent, false),
-            open_node(8, "Gtwo", "gherrit-bases/Gtwo", parent, middle, false),
-        ],
-    );
-    let (correlated, active) = correlate_and_activate(remote_heads, &stack, response, &history);
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    let plan = plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[id("Gthree")]),
-        active,
-        &repository.graph([child]),
-    )
-    .unwrap();
-    assert_eq!(requests_for_test(&plan).len(), 1);
-    let ReadyProjection::Creates { creates, projection } = into_projection_for_test(plan) else {
-        panic!("the missing child must be created before the mixed marker gate");
-    };
-    let receipts = creates
-        .complete_for_test(vec![(
-            id("Gthree"),
-            PullRequestIdentity::new(42, "PR_42".to_owned()).unwrap(),
-        )])
-        .unwrap();
-    let markers = projection.complete(receipts).unwrap();
-
-    let destinations = markers
-        .arguments_for_test()
-        .into_iter()
-        .flat_map(|(_, refspecs)| refspecs)
-        .map(|refspec| refspec.split_once(':').unwrap().1.to_owned())
-        .collect::<Vec<_>>();
-    assert_eq!(destinations, ["refs/tags/gherrit/Gtwo/pr", "refs/tags/gherrit/Gthree/pr"]);
-    assert_eq!(markers.operation_count(), 3);
-    let request = markers.request_text();
-    assert!(request.contains("PR_7"));
-    assert!(request.contains("PR_8"));
-    assert!(request.contains("PR_42"));
-}
-
-#[test]
-fn an_open_pr_without_published_history_is_not_a_create_recovery() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let proposed = repository.commit("proposed", &[default], Some("Gone"));
-    let stack = LocalStack::for_test_with_content(
-        default,
-        [(id("Gone"), proposed, "Title".to_owned(), String::new())],
-    )
-    .unwrap();
-    let remote_heads = heads(default, &[]);
-    let mut node = open_node(7, "Gone", "main", default, proposed, false);
-    node["body"] = json!("<!-- gherrit-meta: {\"id\":\"Gone\",\"parent\":null,\"child\":null} -->");
-    let (correlated, active) =
-        correlate_and_activate(remote_heads, &stack, open_response(default, vec![node]), "");
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    let error = match plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[]),
-        active,
-        &repository.graph([proposed]),
-    ) {
-        Ok(_) => panic!("OPEN without published history must be rejected"),
-        Err(error) => error,
-    };
-
+    .unwrap_err();
     assert!(error.to_string().contains("OPEN pull request but no published history"));
 }
 
 #[test]
-fn landing_automation_is_rejected_for_an_owned_base() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let parent = repository.commit("parent", &[default], Some("Gone"));
-    let child = repository.commit("child", &[parent], Some("Gtwo"));
-    let stack = LocalStack::for_test_with_content(
-        default,
-        [
-            (id("Gone"), parent, "Title".to_owned(), String::new()),
-            (id("Gtwo"), child, "Title".to_owned(), String::new()),
-        ],
-    )
-    .unwrap();
-    let remote_heads = heads(default, &[("Gone", parent, default), ("Gtwo", child, parent)]);
-    let history = marked_history(
-        &[("Gone", 1, parent), ("Gtwo", 1, child)],
-        &[("Gone", parent), ("Gtwo", child)],
-    );
-    let response = open_response(
-        default,
-        vec![
-            open_node(7, "Gone", "main", default, parent, false),
-            open_node(8, "Gtwo", "gherrit-bases/Gtwo", parent, child, true),
-        ],
-    );
-    let (correlated, active) = correlate_and_activate(remote_heads, &stack, response, &history);
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    let error = match plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[]),
-        active,
-        &repository.graph([child]),
-    ) {
-        Ok(_) => panic!("landing automation on an owned base must be rejected"),
-        Err(error) => error,
-    };
-
-    assert!(error.to_string().contains("landing automation with an owned base"));
-}
-
-#[test]
-fn observed_desired_base_and_landing_automation_truth_table_is_exact() {
-    for desired_owned in [false, true] {
-        for observed_owned in [false, true] {
-            for landing in 0..3 {
-                let repository = TestRepository::new();
-                let default = repository.commit("root", &[], None);
-                let parent = repository.commit("parent", &[default], Some("Gone"));
-                let child = repository.commit("child", &[parent], Some("Gtwo"));
-                let (stack, managed, history, mut nodes, target_id, graph_roots) = if desired_owned
-                {
-                    (
-                        LocalStack::for_test_with_content(
-                            default,
-                            [
-                                (id("Gone"), parent, "Title".to_owned(), String::new()),
-                                (id("Gtwo"), child, "Title".to_owned(), String::new()),
-                            ],
-                        )
-                        .unwrap(),
-                        vec![("Gone", parent, default), ("Gtwo", child, parent)],
-                        marked_history(
-                            &[("Gone", 1, parent), ("Gtwo", 1, child)],
-                            &[("Gone", parent), ("Gtwo", child)],
-                        ),
-                        vec![open_node(7, "Gone", "main", default, parent, false)],
-                        "Gtwo",
-                        vec![child],
-                    )
-                } else {
-                    (
-                        LocalStack::for_test_with_content(
-                            default,
-                            [(id("Gone"), parent, "Title".to_owned(), String::new())],
-                        )
-                        .unwrap(),
-                        vec![("Gone", parent, default)],
-                        marked_history(&[("Gone", 1, parent)], &[("Gone", parent)]),
-                        Vec::new(),
-                        "Gone",
-                        vec![parent],
-                    )
-                };
-                let target_head = if desired_owned { child } else { parent };
-                let owned_base = if desired_owned { parent } else { default };
-                let mut target = open_node(
-                    8,
-                    target_id,
-                    if observed_owned {
-                        if desired_owned { "gherrit-bases/Gtwo" } else { "gherrit-bases/Gone" }
-                    } else {
-                        "main"
-                    },
-                    if observed_owned { owned_base } else { default },
-                    target_head,
-                    landing == 1,
-                );
-                target["isInMergeQueue"] = json!(landing == 2);
-                nodes.push(target);
-                let remote_heads = heads(default, &managed);
-                let response = open_response(default, nodes);
-                let (correlated, active) =
-                    correlate_and_activate(remote_heads, &stack, response, &history);
-                let context =
-                    BodyLinkContext::from_destination(active.destination(), None).unwrap();
-                let result = plan_publication(
-                    context,
-                    stack,
-                    correlated,
-                    empty_terminal_histories(&active, &[]),
-                    active,
-                    &repository.graph(graph_roots),
-                );
-                let must_reject = landing != 0 && (observed_owned || desired_owned);
-                assert_eq!(
-                    result.is_err(),
-                    must_reject,
-                    "desired_owned={desired_owned}, observed_owned={observed_owned}, landing={landing}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn nonlocal_rows_are_validation_only_and_fail_closed() {
-    for mode in 0..4 {
-        let repository = TestRepository::new();
-        let default = repository.commit("root", &[], None);
-        let local = repository.commit("local", &[default], Some("Gone"));
-        let nonlocal = repository.commit("nonlocal", &[default], Some("Gextra"));
-        let stack = LocalStack::for_test_with_content(
-            default,
-            [(id("Gone"), local, "Title".to_owned(), String::new())],
-        )
-        .unwrap();
-        let absent_history = mode == 3;
-        let observed_owned = mode == 1 || mode == 2;
-        let landing = mode == 2;
-        let mut managed = vec![("Gone", local, default)];
-        if !absent_history {
-            managed.push(("Gextra", nonlocal, default));
-        }
-        let history = if absent_history {
-            marked_history(&[("Gone", 1, local)], &[("Gone", local)])
-        } else {
-            marked_history(
-                &[("Gone", 1, local), ("Gextra", 1, nonlocal)],
-                &[("Gone", local), ("Gextra", nonlocal)],
-            )
-        };
-        let mut nonlocal_node = open_node(
-            8,
-            "Gextra",
-            if observed_owned { "gherrit-bases/Gextra" } else { "main" },
-            default,
-            nonlocal,
-            landing,
-        );
-        if absent_history {
-            nonlocal_node["body"] =
-                json!("<!-- gherrit-meta: {\"id\":\"Gextra\",\"parent\":null,\"child\":null} -->");
-        }
-        let response = open_response(
-            default,
-            vec![open_node(7, "Gone", "main", default, local, false), nonlocal_node],
-        );
-        let remote_heads = heads(default, &managed);
-        let (correlated, active) = correlate_and_activate_with_nonlocal(
-            remote_heads,
-            &stack,
-            &[id("Gextra")],
-            response,
-            &history,
-        );
-        let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-        let result = plan_publication(
-            context,
-            stack,
-            correlated,
-            empty_terminal_histories(&active, &[]),
-            active,
-            &repository.graph([local, nonlocal]),
-        );
-
-        assert_eq!(result.is_err(), landing || absent_history, "mode={mode}");
-        if let Ok(plan) = result {
-            assert!(requests_for_test(&plan).is_empty(), "nonlocal state cannot emit Git work");
-        }
-    }
-}
-
-#[test]
-fn nonlocal_unmarked_open_rows_are_owned_base_only_and_never_emit_markers() {
-    for marked in [false, true] {
-        for owned in [false, true] {
-            let repository = TestRepository::new();
-            let default = repository.commit("root", &[], None);
-            let local = repository.commit("local", &[default], Some("Gone"));
-            let nonlocal = repository.commit("nonlocal", &[default], Some("Gextra"));
-            let stack = LocalStack::for_test_with_content(
-                default,
-                [(id("Gone"), local, "Title".to_owned(), String::new())],
-            )
-            .unwrap();
-            let remote_heads =
-                heads(default, &[("Gone", local, default), ("Gextra", nonlocal, default)]);
-            let entries = [("Gone", 1, local), ("Gextra", 1, nonlocal)];
-            let markers = if marked {
-                vec![("Gone", local), ("Gextra", nonlocal)]
-            } else {
-                vec![("Gone", local)]
-            };
-            let history = marked_history(&entries, &markers);
-            let response = open_response(
-                default,
-                vec![
-                    open_node(7, "Gone", "main", default, local, false),
-                    open_node(
-                        8,
-                        "Gextra",
-                        if owned { "gherrit-bases/Gextra" } else { "main" },
-                        default,
-                        nonlocal,
-                        false,
-                    ),
-                ],
-            );
-            let (correlated, active) = correlate_and_activate_with_nonlocal(
-                remote_heads,
-                &stack,
-                &[id("Gextra")],
-                response,
-                &history,
-            );
-            let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-            let result = plan_publication(
-                context,
-                stack,
-                correlated,
-                empty_terminal_histories(&active, &[]),
-                active,
-                &repository.graph([local, nonlocal]),
-            );
-
-            assert_eq!(result.is_ok(), marked || owned, "marked={marked}, owned={owned}");
-            if let Ok(plan) = result {
-                assert!(requests_for_test(&plan).is_empty());
-                assert!(matches!(into_projection_for_test(plan), ReadyProjection::Final(_)));
-            }
-        }
-    }
-}
-
-#[test]
-fn empty_local_stack_is_outside_the_planner_contract() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let stack = LocalStack::for_test(default, std::iter::empty());
-    let remote_heads = heads(default, &[]);
-    let (correlated, active) =
-        correlate_and_activate(remote_heads, &stack, open_response(default, Vec::new()), "");
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    let error = match plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[]),
-        active,
-        &repository.graph([default]),
-    ) {
-        Ok(_) => panic!("empty planning should be unreachable"),
-        Err(error) => error,
-    };
-
-    assert!(error.to_string().contains("nonempty local stack"));
-}
-
-#[test]
-fn body_equality_normalizes_only_crlf_pairs() {
-    let cases = [
-        ("empty", "", "", true),
-        ("exact text", "body", "body", true),
-        ("exact LF", "a\nb", "a\nb", true),
-        ("observed CRLF", "a\r\nb", "a\nb", true),
-        ("desired CRLF", "a\nb", "a\r\nb", true),
-        ("both CRLF", "a\r\nb", "a\r\nb", true),
-        ("mixed spellings", "a\r\nb\nc\r\n", "a\nb\r\nc\n", true),
-        ("terminal line-ending spelling", "body\r\n", "body\n", true),
-        ("identical outer spaces", " body ", " body ", true),
-        ("leading ASCII space added", " body", "body", false),
-        ("trailing ASCII space added", "body ", "body", false),
-        ("leading tab added", "\tbody", "body", false),
-        ("trailing tab added", "body\t", "body", false),
-        ("leading blank line added", "\nbody", "body", false),
-        ("terminal LF added", "body\n", "body", false),
-        ("second terminal blank line added", "body\n\n", "body\n", false),
-        ("nonbreaking space added", "\u{00a0}body", "body", false),
-        ("em space added", "body\u{2003}", "body", false),
-        ("lone CR changed to LF", "a\rb", "a\nb", false),
-        ("CR before a CRLF pair", "a\r\r\nb", "a\nb", false),
-        ("internal blank line removed", "a\n\nb", "a\nb", false),
-        ("content changed", "a\nx", "a\ny", false),
-    ];
-
-    for (case, observed, desired, expected) in cases {
-        assert_eq!(bodies_equal(observed, desired), expected, "{case}");
-    }
-}
-
-#[test]
-fn existing_projection_emits_each_exact_title_body_base_difference_mask() {
+fn existing_projection_emits_every_exact_field_difference_mask() {
     for mask in 0_u8..8 {
         let projection = ExistingProjection {
             id: id("Gone"),
-            identity: PullRequestIdentity::new(7, "PR_7".to_owned()).unwrap(),
+            identity: identity(7),
             observed_body: if mask & 2 == 0 { "new body" } else { "old body" }.into(),
             title_update: (mask & 1 != 0).then(|| "new title".to_owned()),
             base_update: (mask & 4 != 0).then(|| "gherrit-bases/Gone".to_owned()),
         };
         let update = projection.into_update(GeneratedBody::for_test("new body")).unwrap();
+
         if mask == 0 {
-            assert!(update.is_none());
+            assert!(update.is_none(), "mask={mask:03b}");
             continue;
         }
-        let request = PreparedUpdates::new(vec![update.unwrap()]).unwrap().request_text();
-        assert_eq!(request.contains("title:"), mask & 1 != 0, "mask={mask:03b}");
-        assert_eq!(request.contains("body:"), mask & 2 != 0, "mask={mask:03b}");
-        assert_eq!(request.contains("baseRefName:"), mask & 4 != 0, "mask={mask:03b}");
+        let (actual_identity, title, body, base) = update.unwrap().into_parts();
+        assert_eq!(actual_identity, identity(7), "mask={mask:03b}");
+        assert_eq!(title.as_deref(), (mask & 1 != 0).then_some("new title"), "mask={mask:03b}");
+        assert_eq!(body.as_deref(), (mask & 2 != 0).then_some("new body"), "mask={mask:03b}");
+        assert_eq!(
+            base.as_deref(),
+            (mask & 4 != 0).then_some("gherrit-bases/Gone"),
+            "mask={mask:03b}"
+        );
     }
 }
 
 #[test]
-fn an_open_pr_head_cannot_be_just_the_unpublished_proposal() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let published = repository.commit("published", &[default], Some("Gone"));
-    let proposed = repository.commit("proposed", &[default], Some("Gone"));
+fn body_comparison_normalizes_only_crlf_pairs() {
+    for (label, observed, desired, equal) in [
+        ("empty", "", "", true),
+        ("exact", "a\nb", "a\nb", true),
+        ("observed CRLF", "a\r\nb", "a\nb", true),
+        ("desired CRLF", "a\nb", "a\r\nb", true),
+        ("mixed line endings", "a\r\nb\nc\r\n", "a\nb\r\nc\n", true),
+        ("leading space", " body", "body", false),
+        ("trailing space", "body ", "body", false),
+        ("terminal newline", "body\n", "body", false),
+        ("lone CR", "a\rb", "a\nb", false),
+        ("extra blank line", "a\n\nb", "a\nb", false),
+        ("changed content", "a\nx", "a\ny", false),
+    ] {
+        assert_eq!(bodies_equal(observed, desired), equal, "case={label}");
+    }
+}
+
+#[test]
+fn create_stage_requires_one_exact_nonempty_ordered_join() {
+    let one = id("Gone");
+    let two = id("Gtwo");
+    let three = id("Gthree");
+    assert!(
+        validate_create_stage_ids(
+            &[one.clone(), two.clone()],
+            &[one.clone(), two.clone()],
+            &[one.clone(), two.clone()],
+        )
+        .is_ok()
+    );
+
+    for (label, planned, projected, pending) in [
+        ("empty", Vec::new(), Vec::new(), Vec::new()),
+        (
+            "short projection",
+            vec![one.clone(), two.clone()],
+            vec![one.clone()],
+            vec![one.clone(), two.clone()],
+        ),
+        (
+            "long projection",
+            vec![one.clone(), two.clone()],
+            vec![one.clone(), two.clone(), three.clone()],
+            vec![one.clone(), two.clone()],
+        ),
+        (
+            "duplicate",
+            vec![one.clone(), one.clone()],
+            vec![one.clone(), one.clone()],
+            vec![one.clone(), one.clone()],
+        ),
+        (
+            "reordered projection",
+            vec![one.clone(), two.clone()],
+            vec![two.clone(), one.clone()],
+            vec![one.clone(), two.clone()],
+        ),
+        (
+            "short marker evidence",
+            vec![one.clone(), two.clone()],
+            vec![one.clone(), two.clone()],
+            vec![one.clone()],
+        ),
+        (
+            "long marker evidence",
+            vec![one.clone(), two.clone()],
+            vec![one.clone(), two.clone()],
+            vec![one.clone(), two.clone(), three.clone()],
+        ),
+    ] {
+        assert!(validate_create_stage_ids(&planned, &projected, &pending).is_err(), "case={label}");
+    }
+}
+
+#[test]
+fn mixed_create_receipt_releases_one_ordered_marker_gate_and_final_projection() {
+    let default_tip = oid(1);
+    let created_id = id("Gcreated");
+    let marked_id = id("Gmarked");
+    let unmarked_id = id("Gunmarked");
+    let created_head = oid(10);
+    let marked_head = oid(11);
+    let unmarked_head = oid(12);
+    let graph = CommitGraphEvidence::from_literal_commits_for_test([
+        (default_tip, Vec::new(), Vec::new()),
+        (created_head, vec![default_tip], vec![created_id.clone()]),
+        (marked_head, vec![created_head], vec![marked_id.clone()]),
+        (unmarked_head, vec![marked_head], vec![unmarked_id.clone()]),
+    ])
+    .unwrap();
+    let default = DefaultBranch::new("main".to_owned(), default_tip).unwrap();
     let stack = LocalStack::for_test_with_content(
-        default,
-        [(id("Gone"), proposed, "Title".to_owned(), String::new())],
+        default_tip,
+        [
+            (
+                created_id.clone(),
+                created_head,
+                "Created root".to_owned(),
+                "Created body".to_owned(),
+            ),
+            (marked_id.clone(), marked_head, "Marked child".to_owned(), "Marked body".to_owned()),
+            (
+                unmarked_id.clone(),
+                unmarked_head,
+                "Unmarked child".to_owned(),
+                "Unmarked body".to_owned(),
+            ),
+        ],
     )
     .unwrap();
-    let remote_heads = heads(default, &[("Gone", published, default)]);
-    let history = marked_history(&[("Gone", 1, published)], &[("Gone", published)]);
-    let response =
-        open_response(default, vec![open_node(7, "Gone", "main", default, proposed, false)]);
-    let (correlated, active) = correlate_and_activate(remote_heads, &stack, response, &history);
-    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-    let error = match plan_publication(
-        context,
-        stack,
-        correlated,
-        empty_terminal_histories(&active, &[]),
-        active,
-        &repository.graph([proposed, published]),
-    ) {
-        Ok(_) => panic!("proposal-only GitHub head must be rejected"),
-        Err(error) => error,
+    let destination = destination();
+    let remote = ActiveRemoteChanges::from_typed_for_test(
+        &destination,
+        default.clone(),
+        vec![
+            ObservedChangeHistory::from_typed_for_test(
+                created_id.clone(),
+                &[(created_head, default_tip)],
+                None,
+            )
+            .unwrap(),
+            ObservedChangeHistory::from_typed_for_test(
+                marked_id.clone(),
+                &[(marked_head, created_head)],
+                Some(marked_head),
+            )
+            .unwrap(),
+            ObservedChangeHistory::from_typed_for_test(
+                unmarked_id.clone(),
+                &[(unmarked_head, marked_head)],
+                None,
+            )
+            .unwrap(),
+        ],
+    );
+    let correlated = CorrelatedRepository::from_typed_for_test(
+        &destination,
+        "R_repository".to_owned(),
+        default,
+        vec![
+            LocalPullRequestObservation::Absent(AbsentPullRequest::for_test(created_id.clone())),
+            LocalPullRequestObservation::Open(open(
+                marked_id.clone(),
+                101,
+                marked_head,
+                BaseKind::Owned,
+                created_head,
+                "Marked child",
+                "stale marked body",
+                false,
+            )),
+            LocalPullRequestObservation::Open(open(
+                unmarked_id.clone(),
+                102,
+                unmarked_head,
+                BaseKind::Owned,
+                marked_head,
+                "Unmarked child",
+                "stale unmarked body",
+                false,
+            )),
+        ],
+    )
+    .unwrap();
+    let context = BodyLinkContext::from_destination(&destination, None).unwrap();
+    let plan = plan_local_publication(context, stack, correlated, remote, &graph).unwrap();
+    let (creates, projection) = plan.into_create_stage_for_test();
+    let create_batches = creates.effect_batches_for_test();
+    assert_eq!(create_batches.len(), 1, "the one-operation fixture has one request");
+    let create_effects = flatten_batches(&create_batches);
+    assert_eq!(create_effects.len(), 1);
+    assert_eq!(create_effects[0].id, created_id);
+    assert_eq!(create_effects[0].base_branch, "gherrit-bases/Gcreated");
+    assert_eq!(create_effects[0].head_oid, created_head);
+    assert_eq!(create_effects[0].base_oid, default_tip);
+
+    let receipts = creates.complete_for_test(vec![(created_id.clone(), identity(103))]).unwrap();
+    let markers = projection.complete(receipts).unwrap();
+    assert_eq!(
+        flatten_batches(&markers.effect_batches_for_test())
+            .iter()
+            .map(|effect| (effect.id.as_str(), effect.target))
+            .collect::<Vec<_>>(),
+        [("Gcreated", created_head), ("Gunmarked", unmarked_head)]
+    );
+
+    let Stage::Updates(updates) = markers.final_projection.stage_for_test() else {
+        panic!("the marker gate must retain one complete final projection")
     };
-
-    assert!(error.to_string().contains("head not present in published history"));
-}
-
-#[test]
-fn initial_pr_oid_evidence_accepts_only_published_or_exact_default_values() {
-    let repository = TestRepository::new();
-    let default = repository.commit("root", &[], None);
-    let parent_published = repository.commit("parent published", &[default], Some("Gone"));
-    let parent_proposed = repository.commit("parent proposed", &[default], Some("Gone"));
-    let child_published = repository.commit("child published", &[parent_published], Some("Gtwo"));
-    let child_proposed = repository.commit("child proposed", &[parent_proposed], Some("Gtwo"));
-    let unrelated = repository.commit("unrelated", &[default], Some("Gother"));
-    let graph = repository.graph([child_proposed, child_published, unrelated]);
-
-    for (label, head, base_name, base_oid, should_succeed) in [
-        ("published-owned", child_published, "gherrit-bases/Gtwo", parent_published, true),
-        ("exact-default", child_published, "main", default, true),
-        ("wrong-default-tip", child_published, "main", parent_published, false),
-        ("proposal-head", child_proposed, "gherrit-bases/Gtwo", parent_published, false),
-        ("unrelated-head", unrelated, "gherrit-bases/Gtwo", parent_published, false),
-        ("wrong-change-head", parent_published, "gherrit-bases/Gtwo", parent_published, false),
-        ("proposal-base", child_published, "gherrit-bases/Gtwo", parent_proposed, false),
-        ("unrelated-base", child_published, "gherrit-bases/Gtwo", unrelated, false),
-        ("wrong-change-base", child_published, "gherrit-bases/Gtwo", child_published, false),
-    ] {
-        let stack = LocalStack::for_test_with_content(
-            default,
-            [
-                (id("Gone"), parent_proposed, "Title".to_owned(), String::new()),
-                (id("Gtwo"), child_proposed, "Title".to_owned(), String::new()),
-            ],
-        )
-        .unwrap();
-        let remote_heads = heads(
-            default,
-            &[("Gone", parent_published, default), ("Gtwo", child_published, parent_published)],
-        );
-        let history = marked_history(
-            &[("Gone", 1, parent_published), ("Gtwo", 1, child_published)],
-            &[("Gone", parent_published), ("Gtwo", child_published)],
-        );
-        let response = open_response(
-            default,
-            vec![
-                open_node(7, "Gone", "main", default, parent_published, false),
-                open_node(8, "Gtwo", base_name, base_oid, head, false),
-            ],
-        );
-        let (correlated, active) = correlate_and_activate(remote_heads, &stack, response, &history);
-        let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
-        let result = plan_publication(
-            context,
-            stack,
-            correlated,
-            empty_terminal_histories(&active, &[]),
-            active,
-            &graph,
-        );
-
-        assert_eq!(result.is_ok(), should_succeed, "case={label}");
-    }
+    let updates = flatten_batches(&updates);
+    assert_eq!(
+        updates
+            .iter()
+            .map(|update| (
+                update.identity.number().get(),
+                update.title.is_some(),
+                update.body.is_some(),
+                update.base_branch.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        [(103, false, true, Some("main")), (101, false, true, None), (102, false, true, None),]
+    );
 }

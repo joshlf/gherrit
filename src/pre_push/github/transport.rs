@@ -13,26 +13,25 @@ use octocrab::Octocrab;
 use serde_json::Value;
 
 use super::{
-    CompleteCreateReceipts, CompleteOpenRows, CorrelatedRepository, FirstOpenPullRequests,
-    FirstOpenPullRequestsPage, NextOpenPullRequests, OpenPullRequest, PreparedCreates,
-    PreparedUpdates, Repository, RepositoryTerminalHistories, TerminalPullRequestQuery,
-    TerminalPullRequests, graphql_error_detail,
+    CompleteCreateReceipts, CorrelatedRepository, PreparedCreates, PreparedUpdates, Repository,
+    graphql_error_detail,
+    observation::{
+        CompleteLocalPullRequests, LocalPullRequestPageEvidence, LocalPullRequestQuery,
+        LocalPullRequests,
+    },
 };
 use crate::pre_push::{
     bounded_diagnostic_detail,
-    destination::{PushDestination, RepositoryCoordinates},
+    destination::{DefaultBranch, PushDestination, RepositoryCoordinates},
     local::GherritPrId,
-    pull_request::{
-        InitialPullRequestIdentities, TerminalExhaustionAccumulator, TerminalHistories,
-        correlate_complete,
-    },
-    remote::RemoteHeads,
+    pull_request::correlate_local,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const TOTAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
+const TOTAL_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 const QUERY_RETRY_DELAYS: [Duration; 3] =
     [Duration::from_millis(100), Duration::from_millis(200), Duration::from_millis(400)];
@@ -41,9 +40,9 @@ const MAX_GRAPHQL_QUERY_BYTES: usize = 256 * 1024;
 const MAX_HTTP_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 /// A read-only GraphQL JSON response may occupy at most 64 MiB locally.
 ///
-/// Overflow is a deterministic query-planning signal: OPEN observation halves
-/// its page size, and terminal observation halves aliases then page size,
-/// without spending retry budget or advancing a cursor.
+/// Overflow is a deterministic query-planning signal: exact-local observation
+/// halves aliases and then page size without spending retry budget or
+/// advancing a cursor.
 const MAX_GRAPHQL_QUERY_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_GRAPHQL_MUTATION_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const INDETERMINATE_GRAPHQL_MUTATION: &str = "GraphQL mutation acknowledgement is indeterminate; stop this publication attempt and retry the push to reobserve GitHub state";
@@ -115,6 +114,7 @@ struct Timeouts {
     read: Duration,
     write: Duration,
     attempt: Duration,
+    observation: Duration,
 }
 
 impl Timeouts {
@@ -123,6 +123,7 @@ impl Timeouts {
         read: READ_TIMEOUT,
         write: WRITE_TIMEOUT,
         attempt: TOTAL_ATTEMPT_TIMEOUT,
+        observation: TOTAL_OBSERVATION_TIMEOUT,
     };
 }
 
@@ -133,114 +134,137 @@ pub(in crate::pre_push) struct Github {
     timeouts: Timeouts,
 }
 
-/// One complete repository-wide OPEN observation.
-///
-/// The rows and initial identity namespaces remain opaque. Correlation or the
-/// temporary legacy adapter must consume this value directly; no API exposes a
-/// detachable list which can be truncated and relabelled as complete.
+/// Complete all-state pull request observation for the exact local ID set.
 #[derive(Debug)]
-pub(in crate::pre_push) struct OpenObservation {
+pub(in crate::pre_push) struct LocalPullRequestObservationSet {
     repository: Repository,
-    rows: CompleteOpenRows,
+    rows: CompleteLocalPullRequests,
 }
 
-impl OpenObservation {
-    #[cfg(test)]
-    pub(in crate::pre_push) fn from_complete_response_for_test(
-        owner: &str,
-        repository: &str,
-        response: Value,
-    ) -> Result<Self> {
-        let page = FirstOpenPullRequests::new(owner.to_owned(), repository.to_owned(), 100)
-            .decode(response)?;
-        if page.next_cursor.is_some() {
-            bail!("a complete test OPEN response cannot advertise another page");
-        }
-        Ok(Self { repository: page.repository, rows: CompleteOpenRows::new(page.pull_requests)? })
-    }
-
-    #[allow(dead_code)] // Consumed by the pending owned-base activation path.
-    pub(in crate::pre_push) fn correlate<'a, 'destination>(
+impl LocalPullRequestObservationSet {
+    pub(in crate::pre_push) fn correlate(
         self,
-        local_ids: impl IntoIterator<Item = &'a GherritPrId>,
-        heads: &RemoteHeads<'destination>,
-    ) -> Result<CorrelatedRepository<'destination>> {
-        let correlated = correlate_complete(local_ids, heads, self.rows)?;
-        Ok(CorrelatedRepository::new(heads.destination(), self.repository, correlated))
-    }
-
-    fn into_legacy_selection(self, local_ids: &[GherritPrId]) -> Result<LegacyOpenSelection> {
-        let (pull_requests, initial_identities) = self.rows.into_values();
-        let local_id_set = local_ids.iter().collect::<HashSet<_>>();
-        let mut candidates = HashMap::<GherritPrId, Vec<OpenPullRequest>>::new();
-
-        for pull_request in pull_requests.into_vec() {
-            if pull_request.is_cross_repository {
-                continue;
-            }
-            let Ok(id) = GherritPrId::from_ref_component(pull_request.head_branch.as_bytes())
-            else {
-                continue;
-            };
-            if local_id_set.contains(&id) {
-                candidates.entry(id).or_default().push(pull_request);
-            }
-        }
-
-        let mut selected = Vec::with_capacity(local_ids.len());
-        let mut missing = Vec::new();
-        for id in local_ids {
-            match candidates.remove(id) {
-                None => {
-                    missing.push(id.clone());
-                    selected.push(None);
-                }
-                Some(mut candidates) if candidates.len() == 1 => {
-                    selected.push(Some(candidates.pop().expect("one candidate is present")));
-                }
-                Some(candidates) => {
-                    let id = bounded_diagnostic_detail(id.as_str());
-                    let mut numbers = candidates
-                        .iter()
-                        .map(|pull_request| pull_request.number)
-                        .collect::<Vec<_>>();
-                    numbers.sort_unstable();
-                    let numbers = numbers
-                        .into_iter()
-                        .map(|number| format!("#{number}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    bail!(
-                        "Found multiple open pull requests for GHerrit ID '{}': {numbers}. GHerrit cannot safely choose one.",
-                        id
-                    );
-                }
-            }
-        }
-
-        Ok(LegacyOpenSelection {
-            repository: self.repository,
-            local_pull_requests: selected,
-            initial_identities,
-            missing: missing.into_boxed_slice(),
-        })
+        default_branch: &DefaultBranch,
+    ) -> Result<CorrelatedRepository> {
+        let correlated = correlate_local(default_branch, self.rows)?;
+        Ok(CorrelatedRepository::new(self.repository, correlated))
     }
 }
 
 #[derive(Debug)]
-struct LegacyOpenSelection {
-    repository: Repository,
-    local_pull_requests: Vec<Option<OpenPullRequest>>,
-    initial_identities: InitialPullRequestIdentities,
-    missing: Box<[GherritPrId]>,
+enum LocalPullRequestProgress {
+    Initial,
+    Next { cursor: String, seen: HashSet<String> },
+    Exhausted,
 }
 
-/// Complete compatibility observation consumed by the pre-activation caller.
-pub(in crate::pre_push) struct LegacyGithubObservation {
-    pub(in crate::pre_push) repository: Repository,
-    pub(in crate::pre_push) local_pull_requests: Vec<Option<OpenPullRequest>>,
-    pub(in crate::pre_push) initial_identities: InitialPullRequestIdentities,
-    pub(in crate::pre_push) terminal_histories: TerminalHistories,
+impl LocalPullRequestProgress {
+    fn expects(&self, after: Option<&str>) -> bool {
+        match self {
+            Self::Initial => after.is_none(),
+            Self::Next { cursor, .. } => after == Some(cursor),
+            Self::Exhausted => false,
+        }
+    }
+
+    fn advance(self, id: &GherritPrId, next_cursor: Option<String>) -> Result<Self> {
+        let Some(next_cursor) = next_cursor else {
+            return Ok(Self::Exhausted);
+        };
+        if next_cursor.is_empty() {
+            bail!(
+                "local pull request observation returned an empty pagination cursor for '{}'",
+                id.as_str()
+            );
+        }
+        let mut seen = match self {
+            Self::Initial => HashSet::new(),
+            Self::Next { seen, .. } => seen,
+            Self::Exhausted => bail!(
+                "local pull request observation returned another page after exhausting '{}'",
+                id.as_str()
+            ),
+        };
+        if !seen.insert(next_cursor.clone()) {
+            bail!(
+                "local pull request observation repeated a pagination cursor for '{}'",
+                id.as_str()
+            );
+        }
+        Ok(Self::Next { cursor: next_cursor, seen })
+    }
+}
+
+#[derive(Debug)]
+struct LocalPullRequestAccumulator {
+    order: Box<[GherritPrId]>,
+    progress: HashMap<GherritPrId, LocalPullRequestProgress>,
+    rows: HashMap<GherritPrId, Vec<super::ObservedPullRequest>>,
+}
+
+impl LocalPullRequestAccumulator {
+    fn new(ids: impl IntoIterator<Item = GherritPrId>) -> Result<Self> {
+        let mut order = Vec::new();
+        let mut progress = HashMap::new();
+        for id in ids {
+            if progress.insert(id.clone(), LocalPullRequestProgress::Initial).is_some() {
+                bail!(
+                    "local pull request observation requested change '{}' more than once",
+                    id.as_str()
+                );
+            }
+            order.push(id);
+        }
+        if order.is_empty() {
+            bail!("local pull request observation requires at least one change");
+        }
+        Ok(Self { order: order.into_boxed_slice(), progress, rows: HashMap::new() })
+    }
+
+    fn record_page(&mut self, evidence: LocalPullRequestPageEvidence) -> Result<()> {
+        let (id, after, page_rows, next_cursor) = evidence.into_parts();
+        let progress = self.progress.remove(&id).ok_or_else(|| {
+            eyre!("local pull request observation returned unrequested change '{}'", id.as_str())
+        })?;
+        if !progress.expects(after.as_deref()) {
+            bail!(
+                "local pull request observation returned an unexpected page cursor for '{}'",
+                id.as_str()
+            );
+        }
+        self.rows.entry(id.clone()).or_default().extend(page_rows);
+        let progress = progress.advance(&id, next_cursor)?;
+        assert!(self.progress.insert(id, progress).is_none());
+        Ok(())
+    }
+
+    fn finish(self) -> Result<CompleteLocalPullRequests> {
+        let mut incomplete = self
+            .progress
+            .iter()
+            .filter(|(_, progress)| !matches!(progress, LocalPullRequestProgress::Exhausted))
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>();
+        incomplete.sort_unstable();
+        if !incomplete.is_empty() {
+            bail!(
+                "local pull request observation did not exhaust change ID(s): {}",
+                incomplete.join(", ")
+            );
+        }
+        let mut rows = self.rows;
+        let entries = self
+            .order
+            .into_vec()
+            .into_iter()
+            .map(|id| {
+                let pull_requests = rows.remove(&id).unwrap_or_default();
+                (id, pull_requests)
+            })
+            .collect();
+        debug_assert!(rows.is_empty());
+        CompleteLocalPullRequests::new(entries)
+    }
 }
 
 /// A mutation either has a complete acknowledgement or is indeterminate.
@@ -290,87 +314,39 @@ impl Github {
         Ok(Self { http: builder.build()?, coordinates, timeouts })
     }
 
-    /// Observes every page of the repository-wide OPEN connection.
-    pub(in crate::pre_push) async fn observe_open_pull_requests(&self) -> Result<OpenObservation> {
-        let mut page_len = 100;
-        let first_page = loop {
-            let operation =
-                FirstOpenPullRequests::for_repository(self.coordinates.clone(), page_len);
-            let Some(response) = self.run_observation_query(&operation.document()).await? else {
-                if page_len == 1 {
-                    bail!(
-                        "The repository-wide open pull request query exceeds GitHub resource limits"
-                    );
-                }
-                let retry_page_len = page_len / 2;
-                log::warn!(
-                    "Backing off the repository-wide open pull request page size from {page_len} to {retry_page_len}."
-                );
-                page_len = retry_page_len;
-                continue;
-            };
-            break operation.decode(response)?;
-        };
-        let FirstOpenPullRequestsPage {
-            repository,
-            pull_requests: first_pull_requests,
-            next_cursor,
-        } = first_page;
-        let mut seen_cursors = next_cursor.iter().cloned().collect::<HashSet<_>>();
-        let mut pull_requests = first_pull_requests;
-        let mut cursor = next_cursor;
-
-        while let Some(current_cursor) = cursor {
-            let operation = NextOpenPullRequests::for_repository(
-                self.coordinates.clone(),
-                current_cursor.clone(),
-                page_len,
-            );
-            let Some(response) = self.run_observation_query(&operation.document()).await? else {
-                if page_len == 1 {
-                    bail!(
-                        "The repository-wide open pull request query exceeds GitHub resource limits"
-                    );
-                }
-                let retry_page_len = page_len / 2;
-                log::warn!(
-                    "Backing off the repository-wide open pull request page size from {page_len} to {retry_page_len}."
-                );
-                page_len = retry_page_len;
-                cursor = Some(current_cursor);
-                continue;
-            };
-            let page = operation.decode(response)?;
-            pull_requests.extend(page.pull_requests);
-            if let Some(next_cursor) = &page.next_cursor
-                && !seen_cursors.insert(next_cursor.clone())
-            {
-                bail!("GitHub repeated an open pull request pagination cursor");
-            }
-            cursor = page.next_cursor;
-        }
-
-        Ok(OpenObservation { repository, rows: CompleteOpenRows::new(pull_requests)? })
+    /// Renders the browser URL for a PR in the repository bound to this client.
+    pub(in crate::pre_push) fn pull_request_url(&self, number: u32) -> String {
+        format!("https://github.com{}/pull/{number}", self.coordinates.relative_url())
     }
 
-    /// Returns complete ordered terminal history for the exact requested set.
-    pub(in crate::pre_push) async fn observe_terminal_pull_requests(
+    /// Observes every lifecycle state for each exact local change ID.
+    pub(in crate::pre_push) async fn observe_local_pull_requests(
         &self,
         ids: Box<[GherritPrId]>,
-    ) -> Result<RepositoryTerminalHistories> {
+    ) -> Result<LocalPullRequestObservationSet> {
+        tokio::time::timeout(self.timeouts.observation, self.observe_local_pull_requests_inner(ids))
+            .await
+            .map_err(|_| eyre!("GitHub exact-local observation exceeded its total deadline"))?
+    }
+
+    async fn observe_local_pull_requests_inner(
+        &self,
+        ids: Box<[GherritPrId]>,
+    ) -> Result<LocalPullRequestObservationSet> {
         #[derive(Debug)]
         struct Pending {
             id: GherritPrId,
             cursor: Option<String>,
         }
 
-        let mut accumulator = TerminalExhaustionAccumulator::new(ids.iter().cloned())?;
+        let mut accumulator = LocalPullRequestAccumulator::new(ids.iter().cloned())?;
         let mut pending = ids
             .into_vec()
             .into_iter()
             .map(|id| Pending { id, cursor: None })
             .collect::<VecDeque<_>>();
-        let mut batch_len = TerminalPullRequests::MAX_ALIASES;
+        let mut repository = None;
+        let mut batch_len = LocalPullRequests::MAX_ALIASES;
         let mut page_len = 100;
 
         while !pending.is_empty() {
@@ -379,33 +355,26 @@ impl Github {
             let queries = batch
                 .iter()
                 .map(|pending| {
-                    TerminalPullRequestQuery::new(
-                        pending.id.clone(),
-                        pending.cursor.clone(),
-                        page_len,
-                    )
+                    LocalPullRequestQuery::new(pending.id.clone(), pending.cursor.clone(), page_len)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let operation = TerminalPullRequests::new(
-                self.coordinates.owner().to_owned(),
-                self.coordinates.repository().to_owned(),
-                queries,
-            )?;
+            let operation =
+                LocalPullRequests::new(self.coordinates.clone(), queries, repository.is_none())?;
             let response = self.run_observation_query(&operation.document()).await?;
             let Some(response) = response else {
                 if batch.len() == 1 {
                     if page_len == 1 {
                         bail!(
-                            "GitHub terminal pull request query for '{}' exceeds resource limits",
+                            "GitHub local pull request query for '{}' exceeds resource limits",
                             batch[0].id.as_str()
                         );
                     }
                     let retry_page_len = page_len / 2;
                     log::warn!(
-                        "Backing off terminal pull request page size from {page_len} to {retry_page_len}."
+                        "Backing off local pull request page size from {page_len} to {retry_page_len}."
                     );
                     page_len = retry_page_len;
-                    pending.push_front(batch.into_iter().next().expect("one terminal query"));
+                    pending.push_front(batch.into_iter().next().expect("one local query"));
                     continue;
                 }
                 let retry_batch_len = batch.len() / 2;
@@ -420,41 +389,25 @@ impl Github {
                 }
                 continue;
             };
-            let data =
-                response.get("data").and_then(|data| data.get("repository")).cloned().ok_or_else(
-                    || eyre!("GitHub terminal pull request response is missing repository data"),
-                )?;
-            for evidence in operation.decode(data)? {
+            let decoded = operation.decode(response)?;
+            match (repository.is_none(), decoded.repository) {
+                (true, Some(observed)) => repository = Some(observed),
+                (false, None) => {}
+                (true, None) => bail!("GitHub omitted initial repository facts"),
+                (false, Some(_)) => bail!("GitHub repeated repository facts"),
+            }
+            for evidence in decoded.pages {
                 let next_cursor = evidence.next_cursor().map(ToOwned::to_owned);
                 let id = evidence.id().clone();
-                accumulator = accumulator.record_page(evidence)?;
+                accumulator.record_page(evidence)?;
                 if let Some(cursor) = next_cursor {
                     pending.push_back(Pending { id, cursor: Some(cursor) });
                 }
             }
         }
-        Ok(RepositoryTerminalHistories::from_transport(
-            self.coordinates.clone(),
-            accumulator.into_terminal_histories()?,
-        ))
-    }
 
-    /// Temporary adapter for the legacy orchestration retained until activation.
-    pub(in crate::pre_push) async fn observe_legacy_pull_requests(
-        &self,
-        ids: &[GherritPrId],
-    ) -> Result<LegacyGithubObservation> {
-        let selection = self.observe_open_pull_requests().await?.into_legacy_selection(ids)?;
-        let terminal_histories = self.observe_terminal_pull_requests(selection.missing).await?;
-        let terminal_histories = terminal_histories
-            .into_legacy_for(&selection.repository.coordinates)
-            .wrap_err("terminal pull request evidence does not match the legacy OPEN repository")?;
-        Ok(LegacyGithubObservation {
-            repository: selection.repository,
-            local_pull_requests: selection.local_pull_requests,
-            initial_identities: selection.initial_identities,
-            terminal_histories,
-        })
+        let repository = repository.ok_or_else(|| eyre!("GitHub omitted repository facts"))?;
+        Ok(LocalPullRequestObservationSet { repository, rows: accumulator.finish()? })
     }
 
     pub(in crate::pre_push) async fn create_pull_requests(
@@ -701,6 +654,40 @@ mod tests {
 
     use super::*;
 
+    fn id(value: &str) -> GherritPrId {
+        GherritPrId::from_ref_component(value.as_bytes()).unwrap()
+    }
+
+    fn observed(number: u64, node_id: &str, head: &str) -> super::super::ObservedPullRequest {
+        super::super::ObservedPullRequest {
+            identity: super::super::PullRequestIdentity::new(number, node_id.to_owned()).unwrap(),
+            title: format!("title {number}"),
+            body: format!("body {number}"),
+            base_branch: "main".to_owned(),
+            head_branch: head.to_owned(),
+            base_oid: gix::ObjectId::from_bytes_or_panic(&[2; 20]),
+            head_oid: gix::ObjectId::from_bytes_or_panic(&[3; 20]),
+            state: super::super::PullRequestState::Open,
+            is_cross_repository: false,
+            has_auto_merge_request: false,
+            is_in_merge_queue: false,
+        }
+    }
+
+    fn page(
+        id_value: &str,
+        after: Option<&str>,
+        rows: Vec<super::super::ObservedPullRequest>,
+        next_cursor: Option<&str>,
+    ) -> LocalPullRequestPageEvidence {
+        LocalPullRequestPageEvidence::for_test(
+            id(id_value),
+            after.map(str::to_owned),
+            rows,
+            next_cursor.map(str::to_owned),
+        )
+    }
+
     async fn read_request_head(stream: &mut TcpStream) {
         let mut request = Vec::new();
         let mut buffer = [0_u8; 4096];
@@ -763,101 +750,101 @@ mod tests {
         .unwrap()
     }
 
-    fn observation_fields(open: bool) -> Vec<String> {
-        let mut fields = if open {
-            vec![
-                "nodes.autoMergeRequest.enabledAt",
-                "nodes.baseRefName",
-                "nodes.baseRefOid",
-                "nodes.body",
-                "nodes.headRefName",
-                "nodes.headRefOid",
-                "nodes.id",
-                "nodes.isCrossRepository",
-                "nodes.isInMergeQueue",
-                "nodes.number",
-                "nodes.state",
-                "nodes.title",
-            ]
-        } else {
-            vec![
-                "nodes.headRefName",
-                "nodes.id",
-                "nodes.isCrossRepository",
-                "nodes.number",
-                "nodes.state",
-            ]
-        };
-        fields.extend(["pageInfo.endCursor", "pageInfo.hasNextPage"]);
-        fields.into_iter().map(str::to_owned).collect()
-    }
-
-    fn connection(
-        alias: Option<&str>,
-        head: Option<&str>,
-        after: Option<&str>,
-        open: bool,
-    ) -> testutil::PullRequestConnectionExchange {
-        connection_with_first(alias, head, after, open, 100)
-    }
-
-    fn connection_with_first(
-        alias: Option<&str>,
-        head: Option<&str>,
-        after: Option<&str>,
-        open: bool,
-        first: usize,
-    ) -> testutil::PullRequestConnectionExchange {
-        testutil::PullRequestConnectionExchange {
-            alias: alias.map(str::to_owned),
-            head: head.map(str::to_owned),
-            first,
-            after: after.map(str::to_owned),
-            states: if open {
-                vec!["OPEN".to_owned()]
-            } else {
-                vec!["CLOSED".to_owned(), "MERGED".to_owned()]
-            },
-            selected_fields: observation_fields(open),
-        }
-    }
-
-    fn mock_github_context() -> testutil::TestContext {
-        testutil::TestContextBuilder::new(std::env::current_exe().unwrap())
-            .with_remote()
-            .with_initial_commit()
-            .with_mock_github()
-            .build()
-    }
-
-    fn seed_pull_request(
-        context: &testutil::TestContext,
-        number: usize,
-        head: String,
-        state: testutil::PullRequestState,
-    ) {
-        context.github().seed_pull_request(testutil::PullRequestSeed {
-            number,
-            title: format!("Title {number}"),
-            body: String::new(),
-            head,
-            head_oid: "2".repeat(40),
-            base: "main".to_owned(),
-            base_oid: "1".repeat(40),
-        });
-        context.github().set_pull_request_state(number, state);
-    }
-
     #[test]
     fn production_transport_limits_are_fixed_and_finite() {
         assert_eq!(Timeouts::PRODUCTION.connect, Duration::from_secs(10));
         assert_eq!(Timeouts::PRODUCTION.read, Duration::from_secs(30));
         assert_eq!(Timeouts::PRODUCTION.write, Duration::from_secs(30));
         assert_eq!(Timeouts::PRODUCTION.attempt, Duration::from_secs(60));
+        assert_eq!(Timeouts::PRODUCTION.observation, Duration::from_secs(10 * 60));
         assert_eq!(QUERY_RETRY_DELAYS.map(|delay| delay.as_millis()), [100, 200, 400]);
         assert_eq!(MAX_HTTP_ERROR_RESPONSE_BYTES, 64 * 1024);
         assert_eq!(MAX_GRAPHQL_QUERY_RESPONSE_BYTES, 64 * 1024 * 1024);
         assert_eq!(MAX_GRAPHQL_MUTATION_RESPONSE_BYTES, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn local_accumulator_advances_connections_independently_and_preserves_id_order() {
+        let mut accumulator = LocalPullRequestAccumulator::new([id("A"), id("B")]).unwrap();
+        accumulator.record_page(page("B", None, vec![observed(2, "PR_B", "B")], None)).unwrap();
+        accumulator
+            .record_page(page("A", None, vec![observed(1, "PR_A_1", "A")], Some("A_NEXT")))
+            .unwrap();
+        accumulator
+            .record_page(page("A", Some("A_NEXT"), vec![observed(3, "PR_A_2", "A")], None))
+            .unwrap();
+
+        let (entries, _) = accumulator.finish().unwrap().into_parts();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(id, rows)| {
+                    (
+                        id.as_str(),
+                        rows.iter().map(|row| row.identity.number().get()).collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [("A", vec![1, 3]), ("B", vec![2])]
+        );
+    }
+
+    #[test]
+    fn local_accumulator_rejects_invalid_progress_transitions() {
+        let mut wrong_input = LocalPullRequestAccumulator::new([id("A")]).unwrap();
+        assert!(
+            wrong_input
+                .record_page(page("A", Some("unexpected"), Vec::new(), None))
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected page cursor")
+        );
+
+        let mut repeated_output = LocalPullRequestAccumulator::new([id("A")]).unwrap();
+        repeated_output.record_page(page("A", None, Vec::new(), Some("same"))).unwrap();
+        assert!(
+            repeated_output
+                .record_page(page("A", Some("same"), Vec::new(), Some("same")))
+                .unwrap_err()
+                .to_string()
+                .contains("repeated a pagination cursor")
+        );
+
+        let mut exhausted = LocalPullRequestAccumulator::new([id("A")]).unwrap();
+        exhausted.record_page(page("A", None, Vec::new(), None)).unwrap();
+        assert!(
+            exhausted
+                .record_page(page("A", None, Vec::new(), None))
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected page cursor")
+        );
+
+        let mut unrequested = LocalPullRequestAccumulator::new([id("A")]).unwrap();
+        assert!(
+            unrequested
+                .record_page(page("B", None, Vec::new(), None))
+                .unwrap_err()
+                .to_string()
+                .contains("unrequested change 'B'")
+        );
+    }
+
+    #[test]
+    fn local_accumulator_requires_exhaustion_and_rejects_cross_page_identity_reuse() {
+        let incomplete = LocalPullRequestAccumulator::new([id("B"), id("A")]).unwrap();
+        assert!(incomplete.finish().unwrap_err().to_string().contains("change ID(s): A, B"));
+
+        let mut duplicate = LocalPullRequestAccumulator::new([id("A")]).unwrap();
+        duplicate
+            .record_page(page("A", None, vec![observed(1, "PR_ONE", "A")], Some("next")))
+            .unwrap();
+        duplicate
+            .record_page(page("A", Some("next"), vec![observed(1, "PR_ONE", "A")], None))
+            .unwrap();
+        assert!(
+            duplicate.finish().unwrap_err().to_string().contains("repeated pull request number 1")
+        );
     }
 
     #[tokio::test]
@@ -882,6 +869,7 @@ mod tests {
                 read: Duration::from_secs(1),
                 write: Duration::from_secs(1),
                 attempt: Duration::from_secs(2),
+                observation: Duration::from_secs(10),
             },
         );
 
@@ -911,6 +899,7 @@ mod tests {
                 read: Duration::from_secs(1),
                 write: Duration::from_secs(1),
                 attempt: Duration::from_millis(40),
+                observation: Duration::from_secs(10),
             },
         );
 
@@ -928,135 +917,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn facade_exhausts_every_open_page_before_exposing_observation() {
-        let context = mock_github_context();
-        for number in 1..=101 {
-            seed_pull_request(
-                &context,
-                number,
-                format!("G{}", number - 1),
-                testutil::PullRequestState::Open,
-            );
-        }
-        context.github().expect_graphql_transcript([
-            testutil::GraphQlExchange::Repository {
-                owner: testutil::DEFAULT_OWNER.to_owned(),
-                repository: testutil::DEFAULT_REPO.to_owned(),
-                selected_fields: vec![
-                    "defaultBranchRef.name".to_owned(),
-                    "defaultBranchRef.target.oid".to_owned(),
-                    "id".to_owned(),
-                ],
-                connections: vec![connection(None, None, None, true)],
+    async fn exact_local_observation_has_one_deadline_across_all_attempts_and_pages() {
+        let (api_url, server) = hanging_server().await;
+        let github = test_github(
+            &api_url,
+            Timeouts {
+                connect: Duration::from_secs(1),
+                read: Duration::from_secs(1),
+                write: Duration::from_secs(1),
+                attempt: Duration::from_secs(1),
+                observation: Duration::from_millis(40),
             },
-            testutil::GraphQlExchange::Repository {
-                owner: testutil::DEFAULT_OWNER.to_owned(),
-                repository: testutil::DEFAULT_REPO.to_owned(),
-                selected_fields: Vec::new(),
-                connections: vec![connection(None, None, Some("cursor:100"), true)],
-            },
-        ]);
-        let github = test_github(context.mock_server_url(), Timeouts::PRODUCTION);
-
-        let ids = [
-            GherritPrId::from_ref_component(b"G0").unwrap(),
-            GherritPrId::from_ref_component(b"G100").unwrap(),
-        ];
-        let selection =
-            github.observe_open_pull_requests().await.unwrap().into_legacy_selection(&ids).unwrap();
-
-        context.github().assert_graphql_transcript_consumed();
-        assert!(selection.local_pull_requests.iter().all(Option::is_some));
-        assert_eq!(selection.initial_identities.len(), 101);
-        assert_eq!(
-            selection
-                .local_pull_requests
-                .iter()
-                .map(|pull_request| pull_request.as_ref().unwrap().number)
-                .collect::<Vec<_>>(),
-            [1, 101]
         );
-    }
 
-    #[tokio::test]
-    async fn open_resource_planning_reduces_pages_without_cursor_drift_or_retry() {
-        let context = mock_github_context();
-        for number in 1..=51 {
-            seed_pull_request(
-                &context,
-                number,
-                format!("G{}", number - 1),
-                testutil::PullRequestState::Open,
-            );
-        }
-        context.limit_graphql_connection_page_size(25);
-        let exchange = |first, after: Option<&str>| testutil::GraphQlExchange::Repository {
-            owner: testutil::DEFAULT_OWNER.to_owned(),
-            repository: testutil::DEFAULT_REPO.to_owned(),
-            selected_fields: if after.is_none() {
-                vec![
-                    "defaultBranchRef.name".to_owned(),
-                    "defaultBranchRef.target.oid".to_owned(),
-                    "id".to_owned(),
-                ]
-            } else {
-                Vec::new()
-            },
-            connections: vec![connection_with_first(None, None, after, true, first)],
-        };
-        context.github().expect_graphql_transcript([
-            exchange(100, None),
-            exchange(50, None),
-            exchange(25, None),
-            exchange(25, Some("cursor:25")),
-            exchange(25, Some("cursor:50")),
-        ]);
-        let github = test_github(context.mock_server_url(), Timeouts::PRODUCTION);
-        let ids = [
-            GherritPrId::from_ref_component(b"G0").unwrap(),
-            GherritPrId::from_ref_component(b"G50").unwrap(),
-        ];
+        let started = Instant::now();
+        let error =
+            github.observe_local_pull_requests(vec![id("A")].into_boxed_slice()).await.unwrap_err();
+        let elapsed = started.elapsed();
+        server.abort();
 
-        let selection =
-            github.observe_open_pull_requests().await.unwrap().into_legacy_selection(&ids).unwrap();
-
-        context.github().assert_graphql_transcript_consumed();
-        assert_eq!(context.github().requests().len(), 5);
-        assert_eq!(selection.initial_identities.len(), 51);
-        assert!(selection.local_pull_requests.iter().all(Option::is_some));
-    }
-
-    #[tokio::test]
-    async fn terminal_facade_paginates_ids_independently_and_preserves_cursors() {
-        let context = mock_github_context();
-        for number in 1..=101 {
-            seed_pull_request(&context, number, "A".to_owned(), testutil::PullRequestState::Closed);
-            context.github().mark_pull_request_cross_repository(number);
-        }
-        context.github().expect_graphql_transcript([
-            testutil::GraphQlExchange::Repository {
-                owner: testutil::DEFAULT_OWNER.to_owned(),
-                repository: testutil::DEFAULT_REPO.to_owned(),
-                selected_fields: Vec::new(),
-                connections: vec![
-                    connection(Some("op0"), Some("A"), None, false),
-                    connection(Some("op1"), Some("B"), None, false),
-                ],
-            },
-            testutil::GraphQlExchange::Repository {
-                owner: testutil::DEFAULT_OWNER.to_owned(),
-                repository: testutil::DEFAULT_REPO.to_owned(),
-                selected_fields: Vec::new(),
-                connections: vec![connection(Some("op0"), Some("A"), Some("cursor:100"), false)],
-            },
-        ]);
-        let github = test_github(context.mock_server_url(), Timeouts::PRODUCTION);
-        let ids =
-            ["A", "B"].map(|id| GherritPrId::from_ref_component(id.as_bytes()).unwrap()).into();
-
-        let _histories = github.observe_terminal_pull_requests(ids).await.unwrap();
-
-        context.github().assert_graphql_transcript_consumed();
+        assert!(error.to_string().contains("exact-local observation exceeded its total deadline"));
+        assert!(elapsed >= Duration::from_millis(30));
+        assert!(elapsed < Duration::from_millis(500));
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::{fmt, num::NonZeroU64};
 pub(super) struct Version(NonZeroU64);
 
 impl Version {
+    #[cfg(test)]
     pub(super) const FIRST: Self = Self(NonZeroU64::MIN);
 
     pub(super) fn new(value: u64) -> Option<Self> {
@@ -20,6 +21,7 @@ impl Version {
         u64::try_from(index).ok()?.checked_add(1).and_then(Self::new)
     }
 
+    #[cfg(test)]
     pub(super) fn next(self) -> Option<Self> {
         self.get().checked_add(1).and_then(Self::new)
     }

@@ -35,6 +35,18 @@ impl State {
         }
     }
 
+    /// Reads the branch's checked management intent or reports how to choose it.
+    pub fn read_required_from(repo: &util::Repo, branch_name: &str) -> Result<State> {
+        let Some(state) = Self::read_from(repo, branch_name)? else {
+            bail!(
+                "It is unclear whether branch '{branch_name}' should be managed by GHerrit.\n\
+                Run 'gherrit manage' to sync it as a GHerrit stack.\n\
+                Run 'gherrit unmanage' to push it as a standard Git branch."
+            );
+        };
+        Ok(state)
+    }
+
     fn config_value(self) -> &'static str {
         match self {
             State::Unmanaged => State::UNMANAGED,

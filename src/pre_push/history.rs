@@ -2,10 +2,9 @@
 //!
 //! Raw remote refs can be absent, incomplete, or contradictory. This module
 //! turns only an absent representation or one complete published history into
-//! a domain value. A local value must then be coupled to one literal proposal;
-//! an existing nonlocal value must be nonempty. Either path consumes the whole
-//! value during validation before planning can inspect any revision. A
-//! revision always comes from an actual commit and therefore cannot pair an
+//! a domain value. Each value is then coupled to one literal local proposal and
+//! consumed whole during validation before planning can inspect any revision.
+//! A revision always comes from an actual commit and therefore cannot pair an
 //! arbitrary head with an arbitrary first parent.
 
 use std::{
@@ -71,6 +70,7 @@ pub(super) struct PullRequestMarker {
 }
 
 impl PullRequestMarker {
+    #[cfg(test)]
     pub(super) fn target(self) -> ObjectId {
         self.target
     }
@@ -261,63 +261,6 @@ impl NormalizedPublishedHistory {
             proposed,
             pull_request_marker: self.pull_request_marker,
         })
-    }
-
-    /// Consumes and validates all history for an existing nonlocal change.
-    pub(super) fn validate_existing(
-        self,
-        graph: &CommitGraphEvidence,
-        default_tip: Option<ObjectId>,
-    ) -> Result<ValidatedPublishedHistory> {
-        let published = self.published.ok_or_else(|| {
-            eyre!("Existing GHerrit change '{}' has no published history", self.id.as_str())
-        })?;
-        graph.validate_complete_revisions(&self.id, published.iter(), default_tip)?;
-        Ok(ValidatedPublishedHistory {
-            id: self.id,
-            published,
-            pull_request_marker: self.pull_request_marker,
-        })
-    }
-}
-
-/// Complete published-only evidence for an existing nonlocal change.
-#[derive(Debug)]
-pub(super) struct ValidatedPublishedHistory {
-    id: GherritPrId,
-    published: PublishedHistory,
-    pull_request_marker: Option<PullRequestMarker>,
-}
-
-impl ValidatedPublishedHistory {
-    pub(super) fn id(&self) -> &GherritPrId {
-        &self.id
-    }
-
-    pub(super) fn published_len(&self) -> usize {
-        self.published.len()
-    }
-
-    pub(super) fn published_versions(
-        &self,
-    ) -> impl ExactSizeIterator<Item = (Version, Revision)> + '_ {
-        self.published.versioned()
-    }
-
-    pub(super) fn published_current(&self) -> CurrentVersion {
-        self.published.current()
-    }
-
-    pub(super) fn pull_request_marker(&self) -> Option<PullRequestMarker> {
-        self.pull_request_marker
-    }
-
-    pub(super) fn contains_published_head(&self, head: ObjectId) -> bool {
-        self.published.iter().any(|revision| revision.head() == head)
-    }
-
-    pub(super) fn contains_published_first_parent(&self, first_parent: ObjectId) -> bool {
-        self.published.iter().any(|revision| revision.first_parent() == first_parent)
     }
 }
 
@@ -869,7 +812,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::pre_push::{local::LocalStack, remote};
+    use crate::pre_push::{destination::DefaultBranch, local::LocalStack, remote};
 
     fn change_id(value: &str) -> GherritPrId {
         GherritPrId::from_ref_component(value.as_bytes()).expect("valid test change ID")
@@ -959,13 +902,12 @@ mod tests {
         marker: Option<ObjectId>,
     ) -> remote::ObservedChangeHistory {
         let default = ObjectId::from_bytes_or_panic(&[1; 20]);
-        let mut heads =
-            format!("ref: refs/heads/main\tHEAD\n{default}\tHEAD\n{default}\trefs/heads/main\n");
+        let mut local = format!("{default}\trefs/heads/main\n");
         if let Some(head) = head {
-            writeln!(heads, "{head}\trefs/heads/{}", id.as_str()).unwrap();
+            writeln!(local, "{head}\trefs/heads/{}", id.as_str()).unwrap();
         }
         if let Some(owned_base) = owned_base {
-            writeln!(heads, "{owned_base}\trefs/heads/gherrit-bases/{}", id.as_str()).unwrap();
+            writeln!(local, "{owned_base}\trefs/heads/gherrit-bases/{}", id.as_str()).unwrap();
         }
         let mut managed_tags = tags
             .iter()
@@ -974,8 +916,13 @@ mod tests {
         if let Some(marker) = marker {
             writeln!(managed_tags, "{marker}\trefs/tags/gherrit/{}/pr", id.as_str()).unwrap();
         }
-        remote::parse_active_change_for_test(id.clone(), heads.as_bytes(), managed_tags.as_bytes())
-            .expect("complete test observation")
+        local.push_str(&managed_tags);
+        remote::parse_active_change_for_test(
+            id.clone(),
+            DefaultBranch::new("main".to_owned(), default).unwrap(),
+            local.as_bytes(),
+        )
+        .expect("complete test observation")
     }
 
     fn normalize(
@@ -1248,59 +1195,6 @@ mod tests {
             .validate(&graph, None)
             .expect_err("the sole validation path must include the unsafe middle revision");
         assert!(error.to_string().contains(&unsafe_middle.to_string()), "{error:?}");
-    }
-
-    #[test]
-    fn existing_nonlocal_validation_rejects_absence_and_checks_full_history() {
-        let repository = TestRepository::new();
-        let root = repository.commit("root", &[], &[]);
-        let a = repository.commit("A", &[root], &["Gone"]);
-        let b = repository.commit("B", &[root], &["Gone"]);
-        let unsafe_middle = repository.commit("unsafe middle", &[root], &["Gother"]);
-        let current = repository.commit("current", &[root], &["Gone"]);
-        let graph = load(&repository, [a, b, unsafe_middle, current]);
-        let id = change_id("Gone");
-
-        let absent =
-            normalize(&id, None, None, &BTreeMap::new(), &graph).expect("genuinely absent history");
-        let absent_error = absent
-            .validate_existing(&graph, None)
-            .expect_err("an existing nonlocal change must have published history");
-        assert!(absent_error.to_string().contains("no published history"));
-
-        let unsafe_history = normalize(
-            &id,
-            Some(current),
-            Some(root),
-            &tags([(1, a), (2, unsafe_middle), (3, current)]),
-            &graph,
-        )
-        .expect("structurally complete nonlocal history");
-        let unsafe_error = unsafe_history
-            .validate_existing(&graph, None)
-            .expect_err("full nonlocal validation must retain the unsafe middle revision");
-        assert!(unsafe_error.to_string().contains(&unsafe_middle.to_string()));
-
-        let validated =
-            normalize(&id, Some(a), Some(root), &tags([(1, a), (2, b), (3, a)]), &graph)
-                .expect("complete nonlocal history")
-                .validate_existing(&graph, Some(root))
-                .expect("entire nonlocal history and exact root tip are safe");
-        assert_eq!(validated.id(), &id);
-        assert_eq!(validated.published_len(), 3);
-        assert_eq!(
-            validated
-                .published_versions()
-                .map(|(number, revision)| (number.get(), revision.head()))
-                .collect::<Vec<_>>(),
-            [(1, a), (2, b), (3, a)]
-        );
-        assert_eq!(validated.published_current().number(), version(3));
-        assert_eq!(validated.published_current().revision().head(), a);
-        assert!(validated.contains_published_head(a));
-        assert!(validated.contains_published_head(b));
-        assert!(!validated.contains_published_head(current));
-        assert!(validated.contains_published_first_parent(root));
     }
 
     #[test]

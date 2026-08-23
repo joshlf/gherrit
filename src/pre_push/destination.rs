@@ -386,17 +386,6 @@ impl PushDestination {
             repository: self.resolved.repository.clone(),
         }
     }
-
-    pub(super) fn pr_url(&self, pr_number: u64) -> String {
-        format!(
-            "https://github.com/{}/{}/pull/{pr_number}",
-            self.resolved.owner, self.resolved.repository
-        )
-    }
-
-    pub(super) fn repo_url_relative(&self) -> String {
-        format!("/{}/{}", self.resolved.owner, self.resolved.repository)
-    }
 }
 
 impl ResolvedDestination {
@@ -662,9 +651,9 @@ impl DefaultBranch {
     /// Establishes the default branch used by all write planning and intent.
     ///
     /// The local stack may be rejected before this GitHub read is necessary.
-    /// A stack retained for publication was derived from the exact Git value;
-    /// returning that same value after comparison proves that both systems
-    /// agree before any write.
+    /// A stack retained for publication was derived from the exact Git value.
+    /// Returning that value after comparison proves only that the retained,
+    /// non-atomic Git and GitHub observations agree.
     pub(super) fn agree(git: Self, github: Self) -> Result<Self> {
         if git.name != github.name {
             let git_name = bounded_diagnostic_detail(&git.name);
