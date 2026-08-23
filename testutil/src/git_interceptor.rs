@@ -62,7 +62,7 @@ impl State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RemoteRefTransactionTrigger {
     BeforePush,
-    BeforeActiveVersionObservation,
+    BeforeActiveManagedTagObservation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,8 +173,8 @@ impl GitOperation {
                 };
                 if is_global_head_query(remote, arguments) {
                     Some(Self::LsRemoteHeads)
-                } else if is_active_version_query(remote, arguments) {
-                    Some(Self::LsRemoteActiveVersions)
+                } else if is_active_managed_tag_query(remote, arguments) {
+                    Some(Self::LsRemoteActiveManagedTags)
                 } else {
                     Some(Self::LsRemoteOther)
                 }
@@ -190,7 +190,7 @@ impl GitOperation {
             Self::HttpRedirectPolicy => "config --get-urlmatch",
             Self::LsRemoteUrl
             | Self::LsRemoteHeads
-            | Self::LsRemoteActiveVersions
+            | Self::LsRemoteActiveManagedTags
             | Self::LsRemoteOther => "ls-remote",
             Self::Push => "push",
         }
@@ -201,7 +201,7 @@ impl GitOperation {
 ///
 /// This deliberately does not implement Git's general `ls-remote` grammar.
 fn is_global_head_query(remote: &str, arguments: &[String]) -> bool {
-    let [quiet, symref, separator, operand, head, heads, version_root] = arguments else {
+    let [quiet, symref, separator, operand, head, heads, managed_tag_root] = arguments else {
         return false;
     };
 
@@ -211,10 +211,10 @@ fn is_global_head_query(remote: &str, arguments: &[String]) -> bool {
         && operand == remote
         && head == "HEAD"
         && heads == "refs/heads/*"
-        && version_root == "refs/tags/gherrit"
+        && managed_tag_root == "refs/tags/gherrit"
 }
 
-fn is_active_version_query(remote: &str, arguments: &[String]) -> bool {
+fn is_active_managed_tag_query(remote: &str, arguments: &[String]) -> bool {
     let [quiet, separator, operand, patterns @ ..] = arguments else {
         return false;
     };
@@ -376,10 +376,10 @@ async fn handle_git(
         None => None,
     };
 
-    if operation == Some(GitOperation::LsRemoteActiveVersions) {
+    if operation == Some(GitOperation::LsRemoteActiveManagedTags) {
         apply_remote_ref_transaction(
             &handler,
-            RemoteRefTransactionTrigger::BeforeActiveVersionObservation,
+            RemoteRefTransactionTrigger::BeforeActiveManagedTagObservation,
         );
     }
 
@@ -601,7 +601,7 @@ mod tests {
         assert!(
             !matches!(
                 GitOperation::from_args(arguments),
-                Some(GitOperation::LsRemoteHeads | GitOperation::LsRemoteActiveVersions)
+                Some(GitOperation::LsRemoteHeads | GitOperation::LsRemoteActiveManagedTags)
             ),
             "arguments={arguments:?}"
         );
@@ -731,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn active_version_operation_requires_complete_unique_root_wildcard_pairs() {
+    fn active_managed_tag_operation_requires_complete_unique_root_wildcard_pairs() {
         let one = [
             "--quiet",
             "--",
@@ -750,11 +750,11 @@ mod tests {
         ];
         assert_eq!(
             GitOperation::from_args(&production_ls_remote("gherrit-publication", &one)),
-            Some(GitOperation::LsRemoteActiveVersions)
+            Some(GitOperation::LsRemoteActiveManagedTags)
         );
         assert_eq!(
             GitOperation::from_args(&production_ls_remote("gherrit-publication-12", &two)),
-            Some(GitOperation::LsRemoteActiveVersions)
+            Some(GitOperation::LsRemoteActiveManagedTags)
         );
 
         for index in 0..two.len() {

@@ -459,7 +459,7 @@ pub enum GitOperation {
     HttpRedirectPolicy,
     LsRemoteUrl,
     LsRemoteHeads,
-    LsRemoteActiveVersions,
+    LsRemoteActiveManagedTags,
     LsRemoteOther,
     Push,
 }
@@ -1091,8 +1091,8 @@ impl TestContext {
     }
 
     /// Atomically changes remote refs after the global head observation and
-    /// immediately before the next active-version observation.
-    pub fn update_remote_refs_before_active_version_observation<I, R, T>(&self, updates: I)
+    /// immediately before the next active managed-tag observation.
+    pub fn update_remote_refs_before_active_managed_tag_observation<I, R, T>(&self, updates: I)
     where
         I: IntoIterator<Item = (R, T)>,
         R: Into<String>,
@@ -1111,7 +1111,7 @@ impl TestContext {
         self.mock_state().write().unwrap().git.schedule_remote_ref_transaction(
             git_interceptor::ScheduledRemoteRefTransaction {
                 trigger:
-                    git_interceptor::RemoteRefTransactionTrigger::BeforeActiveVersionObservation,
+                    git_interceptor::RemoteRefTransactionTrigger::BeforeActiveManagedTagObservation,
                 updates,
             },
         );

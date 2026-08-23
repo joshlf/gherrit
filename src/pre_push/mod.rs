@@ -62,7 +62,7 @@ use local::{GherritPrId, LocalStack};
 use publication::{PlannedChanges, plan_git_publication};
 use pull_request::{InitialPullRequestIdentities, PullRequestIdentity, TerminalHistories};
 use reconcile::{CurrentPr, DesiredPr, PrUpdate, link_stack, plan_update};
-use remote::{ObservedStack, observe_active_version_tags, observe_remote_heads};
+use remote::{ObservedStack, observe_active_managed_tags, observe_remote_heads};
 
 #[derive(Eq, PartialEq)]
 pub(crate) enum GithubEndpoint {
@@ -129,12 +129,13 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     }
 
     // Missing heads are meaningful because the global observation covered the
-    // complete namespace. Missing version histories remain an error because
-    // only these active IDs were queried. Couple both domains before planning
-    // so the complete stack is validated before any write can be exposed.
-    let versions =
-        observe_active_version_tags(&destination, commits.iter().map(|change| change.id())).await?;
-    let observed = ObservedStack::couple(&commits, &remote_heads, versions)?;
+    // complete namespace. Missing managed-tag namespaces remain an error
+    // because only these active IDs were queried. Couple both domains before
+    // planning so the complete stack is validated before any write can be
+    // exposed.
+    let managed_tags =
+        observe_active_managed_tags(&destination, commits.iter().map(|change| change.id())).await?;
+    let observed = ObservedStack::couple(&commits, &remote_heads, managed_tags)?;
     let publication = plan_git_publication(&observed)?;
 
     // A custom endpoint is an explicit dependency supplied by the caller. The
