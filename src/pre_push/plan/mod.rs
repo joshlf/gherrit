@@ -16,8 +16,8 @@ use super::{
     destination::DefaultBranch,
     github::{
         CompleteCreateReceipts, CorrelatedRepository, CreatePullRequest, PreparedCreates,
-        PreparedUpdates, RepositoryCreateAuthorizations, UpdatePreflight, UpdatePullRequest,
-        preflight_updates,
+        PreparedUpdates, RepositoryTerminalHistories, TerminalPullRequestState, UpdatePreflight,
+        UpdatePullRequest, preflight_updates,
     },
     history::{
         CommitGraphEvidence, NormalizedPublishedHistory, ValidatedChangeHistory,
@@ -26,8 +26,8 @@ use super::{
     local::{GherritPrId, LocalStack},
     publication::{PreparedPushes, plan_owned_base_pushes},
     pull_request::{
-        BaseKind, CreateAuthorization, LocalPullRequestObservation, ManagedOpenParts,
-        ManagedOpenPullRequest, PullRequestIdentity,
+        BaseKind, LocalPullRequestObservation, ManagedOpenParts, ManagedOpenPullRequest,
+        PullRequestIdentity, TerminalHistory,
     },
     remote::{ActiveRemoteChanges, ObservedChangeHistory},
 };
@@ -134,13 +134,13 @@ impl ProjectionSeed {
 #[derive(Debug)]
 enum LocalReality {
     Existing { history: ValidatedChangeHistory, pull_request: ManagedOpenPullRequest },
-    Create { history: ValidatedChangeHistory, authorization: CreateAuthorization },
+    Create { history: ValidatedChangeHistory },
 }
 
 impl LocalReality {
     fn history(&self) -> &ValidatedChangeHistory {
         match self {
-            Self::Existing { history, .. } | Self::Create { history, .. } => history,
+            Self::Existing { history, .. } | Self::Create { history } => history,
         }
     }
 
@@ -154,9 +154,9 @@ impl LocalReality {
                     ProjectionDraft::Existing(pull_request.into_validated_parts()),
                 ))
             }
-            Self::Create { history, authorization } => {
+            Self::Create { history } => {
                 let id = history.id().clone();
-                Ok((BodyRecipeInput::missing(id, history)?, ProjectionDraft::Create(authorization)))
+                Ok((BodyRecipeInput::missing(id, history)?, ProjectionDraft::Create))
             }
         }
     }
@@ -164,7 +164,7 @@ impl LocalReality {
 
 enum ProjectionDraft {
     Existing(ManagedOpenParts),
-    Create(CreateAuthorization),
+    Create,
 }
 
 #[derive(Debug)]
@@ -211,7 +211,7 @@ pub(super) fn plan_publication<'destination>(
     body_context: BodyLinkContext,
     stack: LocalStack,
     correlated: CorrelatedRepository<'destination>,
-    authorizations: RepositoryCreateAuthorizations,
+    terminal_histories: RepositoryTerminalHistories,
     remote: ActiveRemoteChanges<'destination>,
     graph: &CommitGraphEvidence,
 ) -> Result<PublicationPlan<'destination>> {
@@ -222,8 +222,8 @@ pub(super) fn plan_publication<'destination>(
     if !body_context.agrees_with(destination) {
         bail!("pull request body context came from a different push repository");
     }
-    let (repository, correlated, authorizations) =
-        correlated.into_authorized_parts_for(destination, authorizations)?;
+    let (repository, correlated, terminal_histories) =
+        correlated.into_planning_parts_for(destination, terminal_histories)?;
     let (repository_id, github_default_branch) = repository.into_parts();
     let default_branch = DefaultBranch::agree(default_branch, github_default_branch)?;
     validate_stack_default(stack.default_branch(), &default_branch)?;
@@ -251,7 +251,11 @@ pub(super) fn plan_publication<'destination>(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    let mut exact_authorizations = authorizations.into_exact(&missing_ids)?.into_vec().into_iter();
+    let exact_terminal_histories = terminal_histories.into_exact(&missing_ids)?;
+    if let Some(error) = retired_histories_error(&exact_terminal_histories) {
+        return Err(error);
+    }
+    let mut exact_terminal_histories = exact_terminal_histories.into_vec().into_iter();
 
     let realities = stack
         .iter()
@@ -293,26 +297,25 @@ pub(super) fn plan_publication<'destination>(
                     Ok(LocalReality::Existing { history, pull_request })
                 }
                 LocalPullRequestObservation::NeedsTerminalProof(_) => {
-                    let authorization = exact_authorizations.next().ok_or_else(|| {
+                    let terminal_history = exact_terminal_histories.next().ok_or_else(|| {
                         color_eyre::eyre::eyre!(
-                            "terminal authorization order ended before local change '{}'",
+                            "terminal-history order ended before local change '{}'",
                             change.id().as_str()
                         )
                     })?;
-                    if authorization.id() != change.id() {
-                        bail!(
-                            "terminal authorization identifies '{}', expected '{}'",
-                            authorization.id().as_str(),
-                            change.id().as_str()
-                        );
+                    match terminal_history {
+                        TerminalHistory::Empty => {}
+                        TerminalHistory::Retired { identity, state } => {
+                            return Err(retired_history_error(&identity, state));
+                        }
                     }
-                    Ok(LocalReality::Create { history, authorization })
+                    Ok(LocalReality::Create { history })
                 }
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    if exact_authorizations.next().is_some() {
-        bail!("terminal authorization order extends beyond the local stack");
+    if exact_terminal_histories.next().is_some() {
+        bail!("terminal-history order extends beyond the local stack");
     }
 
     validate_nonlocal(
@@ -455,6 +458,42 @@ fn validate_pull_request(
     Ok(())
 }
 
+fn retired_histories_error(histories: &[TerminalHistory]) -> Option<color_eyre::Report> {
+    let mut message = histories
+        .iter()
+        .filter_map(|history| match history {
+            TerminalHistory::Empty => None,
+            TerminalHistory::Retired { identity, state } => Some((identity, state)),
+        })
+        .map(|(identity, state)| retired_history_line(identity, *state))
+        .collect::<String>();
+    if message.is_empty() {
+        return None;
+    }
+    message.push_str("You may want to rebase on the latest changes before pushing.");
+    Some(color_eyre::eyre::eyre!(message))
+}
+
+fn retired_history_error(
+    identity: &PullRequestIdentity,
+    state: TerminalPullRequestState,
+) -> color_eyre::Report {
+    let mut message = retired_history_line(identity, state);
+    message.push_str("You may want to rebase on the latest changes before pushing.");
+    color_eyre::eyre::eyre!(message)
+}
+
+fn retired_history_line(identity: &PullRequestIdentity, state: TerminalPullRequestState) -> String {
+    let state = match state {
+        TerminalPullRequestState::Closed => "closed",
+        TerminalPullRequestState::Merged => "merged",
+    };
+    format!(
+        "Cannot push to {state} PR #{}. Please open a new PR or reopen the existing one.\n",
+        identity.number().get()
+    )
+}
+
 fn prepare_projection(
     repository_id: String,
     default_branch: &DefaultBranch,
@@ -493,10 +532,7 @@ fn prepare_projection(
                     base_update,
                 }));
             }
-            ProjectionDraft::Create(authorization) => {
-                if authorization.id() != title_id {
-                    bail!("title recipe at stack position {index} does not match create authority");
-                }
+            ProjectionDraft::Create => {
                 let rendered = provisional.next().ok_or_else(|| {
                     color_eyre::eyre::eyre!(
                         "body recipe omitted provisional change '{}'",
@@ -514,8 +550,8 @@ fn prepare_projection(
                 let id = title_id.clone();
                 let base_update = (desired_base(index) == BaseKind::Default)
                     .then(|| BaseKind::Default.branch_name(default_branch.name(), &id));
-                create_operations.push(CreatePullRequest::new(
-                    authorization,
+                create_operations.push(CreatePullRequest::from_planner(
+                    id.clone(),
                     repository_id.clone(),
                     BaseKind::Owned.branch_name(default_branch.name(), &id),
                     title.as_str().to_owned(),

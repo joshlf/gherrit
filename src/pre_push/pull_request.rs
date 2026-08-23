@@ -584,8 +584,8 @@ impl TerminalProgress {
 /// Accumulates independently paginated terminal histories for an exact ID set.
 ///
 /// Construction fixes the covered IDs. A page must match the cursor currently
-/// expected for that ID, and no authorization is exposed until every
-/// connection is exhausted without a same-repository CLOSED or MERGED result.
+/// expected for that ID. Neutral `Empty` or `Retired` evidence is exposed in
+/// requested order only after every connection is exhausted.
 #[derive(Debug)]
 pub(super) struct TerminalExhaustionAccumulator {
     order: Box<[GherritPrId]>,
@@ -643,7 +643,7 @@ impl TerminalExhaustionAccumulator {
         Ok(self)
     }
 
-    pub(super) fn into_authorizations(self) -> Result<CreateAuthorizations> {
+    pub(super) fn into_terminal_histories(self) -> Result<TerminalHistories> {
         let mut incomplete = self
             .by_id
             .iter()
@@ -654,11 +654,74 @@ impl TerminalExhaustionAccumulator {
         if !incomplete.is_empty() {
             bail!("terminal observation did not exhaust change ID(s): {}", incomplete.join(", "));
         }
-        if !self.retired.is_empty() {
+        let mut retired = self.retired;
+        let entries = self
+            .order
+            .into_vec()
+            .into_iter()
+            .map(|id| {
+                let history =
+                    retired.remove(&id).map_or(TerminalHistory::Empty, |(identity, state)| {
+                        TerminalHistory::Retired { identity, state }
+                    });
+                (id, history)
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        debug_assert!(retired.is_empty());
+        Ok(TerminalHistories { entries })
+    }
+
+    /// FIXME(#264): Delete this conversion with the pre-activation publisher.
+    pub(super) fn into_legacy_authorizations(self) -> Result<CreateAuthorizations> {
+        self.into_terminal_histories()?.into_legacy_authorizations()
+    }
+}
+
+/// Exact neutral terminal history for one missing OPEN pull request.
+#[derive(Debug)]
+pub(super) enum TerminalHistory {
+    Empty,
+    Retired { identity: PullRequestIdentity, state: TerminalPullRequestState },
+}
+
+/// Complete terminal histories in the caller's original requested order.
+#[derive(Debug)]
+pub(super) struct TerminalHistories {
+    entries: Box<[(GherritPrId, TerminalHistory)]>,
+}
+
+impl TerminalHistories {
+    pub(super) fn into_exact(
+        self,
+        expected_in_stack_order: &[GherritPrId],
+    ) -> Result<Box<[TerminalHistory]>> {
+        if !self.entries.iter().map(|(id, _)| id).eq(expected_in_stack_order) {
+            bail!("terminal-history join does not match the exact requested change order");
+        }
+        Ok(self
+            .entries
+            .into_vec()
+            .into_iter()
+            .map(|(_, history)| history)
+            .collect::<Vec<_>>()
+            .into_boxed_slice())
+    }
+
+    /// FIXME(#264): Delete this conversion with the pre-activation publisher.
+    pub(super) fn into_legacy_authorizations(self) -> Result<CreateAuthorizations> {
+        if self
+            .entries
+            .iter()
+            .any(|(_, history)| matches!(history, TerminalHistory::Retired { .. }))
+        {
             let mut message = self
-                .order
+                .entries
                 .iter()
-                .filter_map(|id| self.retired.get(id))
+                .filter_map(|(_, history)| match history {
+                    TerminalHistory::Retired { identity, state } => Some((identity, state)),
+                    TerminalHistory::Empty => None,
+                })
                 .map(|(identity, state)| {
                     let state = match state {
                         TerminalPullRequestState::Closed => "closed",
@@ -674,7 +737,8 @@ impl TerminalExhaustionAccumulator {
             bail!(message);
         }
 
-        let expected = self.by_id.into_keys().collect::<HashSet<_>>();
+        let expected =
+            self.entries.into_vec().into_iter().map(|(id, _)| id).collect::<HashSet<_>>();
         let by_id =
             expected.iter().cloned().map(|id| (id.clone(), CreateAuthorization { id })).collect();
         Ok(CreateAuthorizations { by_id, expected })
@@ -829,7 +893,7 @@ mod tests {
         remote::parse_remote_heads_for_test(advertisement.as_bytes()).unwrap()
     }
 
-    fn authorizations(values: &[&str]) -> CreateAuthorizations {
+    fn terminal_histories(values: &[&str]) -> TerminalHistories {
         let ids = values.iter().map(|value| id(value)).collect::<Vec<_>>();
         let mut accumulator = TerminalExhaustionAccumulator::new(ids.iter().cloned()).unwrap();
         for id in ids {
@@ -841,18 +905,22 @@ mod tests {
                 ))
                 .unwrap();
         }
-        accumulator.into_authorizations().unwrap()
+        accumulator.into_terminal_histories().unwrap()
+    }
+
+    fn legacy_authorizations(values: &[&str]) -> CreateAuthorizations {
+        terminal_histories(values).into_legacy_authorizations().unwrap()
     }
 
     #[test]
     fn exact_authorization_join_rejects_every_set_and_order_contradiction() {
-        assert!(authorizations(&["A", "B"]).into_exact(&[id("A")]).is_err());
-        assert!(authorizations(&["A"]).into_exact(&[id("A"), id("B")]).is_err());
-        assert!(authorizations(&["A"]).into_exact(&[id("A"), id("A")]).is_err());
-        let missing = authorizations(&[]).into_exact(&[id("B"), id("A")]).unwrap_err();
+        assert!(legacy_authorizations(&["A", "B"]).into_exact(&[id("A")]).is_err());
+        assert!(legacy_authorizations(&["A"]).into_exact(&[id("A"), id("B")]).is_err());
+        assert!(legacy_authorizations(&["A"]).into_exact(&[id("A"), id("A")]).is_err());
+        let missing = legacy_authorizations(&[]).into_exact(&[id("B"), id("A")]).unwrap_err();
         assert!(missing.to_string().contains("'B'"));
 
-        let exact = authorizations(&["A", "B"]).into_exact(&[id("B"), id("A")]).unwrap();
+        let exact = legacy_authorizations(&["A", "B"]).into_exact(&[id("B"), id("A")]).unwrap();
         assert_eq!(
             exact.iter().map(|authorization| authorization.id().as_str()).collect::<Vec<_>>(),
             ["B", "A"]
@@ -1266,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_terminal_exhaustion_yields_exact_consumable_authorizations() {
+    fn complete_terminal_exhaustion_supports_the_exact_legacy_adapter() {
         let a = id("A");
         let b = id("B");
         let accumulator = TerminalExhaustionAccumulator::new([a.clone(), b.clone()]).unwrap();
@@ -1276,13 +1344,50 @@ mod tests {
         let accumulator =
             accumulator.record_page(evidence(&a, Some("a-1"), terminal_page(None))).unwrap();
 
-        let mut authorizations = accumulator.into_authorizations().unwrap();
+        let mut authorizations = accumulator.into_legacy_authorizations().unwrap();
         assert_eq!(authorizations.len(), 2);
         assert_eq!(authorizations.take(&b).unwrap().id(), &b);
         assert_eq!(authorizations.take(&a).unwrap().id(), &a);
         assert!(authorizations.is_empty());
         assert!(authorizations.take(&a).is_err());
         assert!(authorizations.take(&id("C")).is_err());
+    }
+
+    #[test]
+    fn terminal_histories_preserve_requested_order_and_neutral_states() {
+        let empty = id("Gempty");
+        let retired = id("Gretired");
+        let accumulator = TerminalExhaustionAccumulator::new([empty.clone(), retired.clone()])
+            .unwrap()
+            .record_page(evidence(
+                &retired,
+                None,
+                retired_page(17, "terminal-17", TerminalPullRequestState::Merged),
+            ))
+            .unwrap()
+            .record_page(evidence(&empty, None, terminal_page(None)))
+            .unwrap();
+
+        let exact = accumulator
+            .into_terminal_histories()
+            .unwrap()
+            .into_exact(&[empty.clone(), retired.clone()])
+            .unwrap();
+        assert!(matches!(exact[0], TerminalHistory::Empty));
+        let TerminalHistory::Retired { identity, state } = &exact[1] else {
+            panic!("the second requested ID must retain its retired history");
+        };
+        assert_eq!(identity.number().get(), 17);
+        assert_eq!(*state, TerminalPullRequestState::Merged);
+    }
+
+    #[test]
+    fn terminal_history_join_rejects_every_length_set_duplicate_and_order_mismatch() {
+        assert!(terminal_histories(&["A", "B"]).into_exact(&[id("A")]).is_err());
+        assert!(terminal_histories(&["A"]).into_exact(&[id("A"), id("B")]).is_err());
+        assert!(terminal_histories(&["A", "B"]).into_exact(&[id("A"), id("C")]).is_err());
+        assert!(terminal_histories(&["A", "B"]).into_exact(&[id("A"), id("A")]).is_err());
+        assert!(terminal_histories(&["A", "B"]).into_exact(&[id("B"), id("A")]).is_err());
     }
 
     #[test]
@@ -1295,9 +1400,10 @@ mod tests {
         assert!(accumulator.record_page(evidence(&b, None, terminal_page(None))).is_err());
 
         let accumulator = TerminalExhaustionAccumulator::new([a]).unwrap();
-        assert!(accumulator.into_authorizations().is_err());
+        assert!(accumulator.into_legacy_authorizations().is_err());
 
-        let empty = TerminalExhaustionAccumulator::new([]).unwrap().into_authorizations().unwrap();
+        let empty =
+            TerminalExhaustionAccumulator::new([]).unwrap().into_legacy_authorizations().unwrap();
         assert_eq!(empty.len(), 0);
     }
 
@@ -1342,7 +1448,7 @@ mod tests {
             let error = accumulator
                 .record_page(evidence(&g, None, retired_page(7, "terminal", state)))
                 .unwrap()
-                .into_authorizations()
+                .into_legacy_authorizations()
                 .unwrap_err();
             assert!(error.to_string().contains("Cannot push to"));
         }
@@ -1367,7 +1473,7 @@ mod tests {
                 retired_page(11, "terminal-11", TerminalPullRequestState::Merged),
             ))
             .unwrap()
-            .into_authorizations()
+            .into_legacy_authorizations()
             .unwrap_err();
 
         assert_eq!(

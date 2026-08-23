@@ -10,7 +10,7 @@ use super::{
     local::GherritPrId,
     pull_request::{
         CreateAuthorization, CreateAuthorizations, InitialPullRequestIdentities,
-        PullRequestIdentity, PullRequestNodeId, PullRequestNumber,
+        PullRequestIdentity, PullRequestNodeId, PullRequestNumber, TerminalHistories,
     },
 };
 
@@ -154,13 +154,13 @@ pub(super) struct CorrelatedRepository<'destination> {
 }
 
 /// Complete terminal-exhaustion evidence bound to one GitHub repository.
-pub(super) struct RepositoryCreateAuthorizations {
+pub(super) struct RepositoryTerminalHistories {
     coordinates: RepositoryCoordinates,
-    exact: CreateAuthorizations,
+    exact: TerminalHistories,
 }
 
-impl RepositoryCreateAuthorizations {
-    fn from_transport(coordinates: RepositoryCoordinates, exact: CreateAuthorizations) -> Self {
+impl RepositoryTerminalHistories {
+    fn from_transport(coordinates: RepositoryCoordinates, exact: TerminalHistories) -> Self {
         Self { coordinates, exact }
     }
 
@@ -170,17 +170,12 @@ impl RepositoryCreateAuthorizations {
         if &self.coordinates != expected {
             bail!("terminal pull request evidence came from a different GitHub repository");
         }
-        Ok(self.exact)
+        self.exact.into_legacy_authorizations()
     }
 
     #[cfg(test)]
-    pub(super) fn for_test(destination: &PushDestination, exact: CreateAuthorizations) -> Self {
+    pub(super) fn for_test(destination: &PushDestination, exact: TerminalHistories) -> Self {
         Self::from_transport(destination.repository_coordinates(), exact)
-    }
-
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.exact.len()
     }
 }
 
@@ -193,12 +188,11 @@ impl<'destination> CorrelatedRepository<'destination> {
         Self { destination, repository, pull_requests }
     }
 
-    pub(super) fn into_authorized_parts_for(
+    pub(super) fn into_planning_parts_for(
         self,
         destination: &PushDestination,
-        authorizations: RepositoryCreateAuthorizations,
-    ) -> Result<(Repository, super::pull_request::CorrelatedPullRequests, CreateAuthorizations)>
-    {
+        terminal_histories: RepositoryTerminalHistories,
+    ) -> Result<(Repository, super::pull_request::CorrelatedPullRequests, TerminalHistories)> {
         if !std::ptr::eq(self.destination, destination) {
             bail!("Git and GitHub evidence came from different push-destination capabilities");
         }
@@ -206,10 +200,10 @@ impl<'destination> CorrelatedRepository<'destination> {
         if self.repository.coordinates != destination_coordinates {
             bail!("Git and GitHub planning evidence identify different repositories");
         }
-        if authorizations.coordinates != destination_coordinates {
+        if terminal_histories.coordinates != destination_coordinates {
             bail!("terminal pull request evidence came from a different GitHub repository");
         }
-        Ok((self.repository, self.pull_requests, authorizations.exact))
+        Ok((self.repository, self.pull_requests, terminal_histories.exact))
     }
 }
 
@@ -735,8 +729,10 @@ impl TerminalPullRequestQuery {
 
 /// A request to create one pull request.
 ///
-/// Construction consumes the terminal-exhaustion proof for the exact change;
-/// the head name and response correlation ID derive from that proof.
+/// The active legacy path consumes its private authorization token. The
+/// dormant planner path is reachable only after its exact neutral terminal
+/// join selected `Empty`. Both paths derive the head and response correlation
+/// ID from the selected change ID.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct CreatePullRequest {
     id: GherritPrId,
@@ -755,7 +751,28 @@ impl CreatePullRequest {
         title: String,
         body: String,
     ) -> Self {
-        let id = authorization.into_id();
+        Self::from_id(authorization.into_id(), repository_id, base_branch, title, body)
+    }
+
+    /// Constructs an operation only after the dormant planner's exact neutral
+    /// terminal-history join selected an empty history.
+    pub(super) fn from_planner(
+        id: GherritPrId,
+        repository_id: String,
+        base_branch: String,
+        title: String,
+        body: String,
+    ) -> Self {
+        Self::from_id(id, repository_id, base_branch, title, body)
+    }
+
+    fn from_id(
+        id: GherritPrId,
+        repository_id: String,
+        base_branch: String,
+        title: String,
+        body: String,
+    ) -> Self {
         let client_mutation_id = format!("gherrit:create:{}", id.as_str());
         Self { id, repository_id, base_branch, title, body, client_mutation_id }
     }
@@ -1796,7 +1813,7 @@ mod mutation_tests {
         InitialPullRequestIdentities::from_open(&pull_requests).unwrap()
     }
 
-    fn authorizations(ids: &[&str]) -> CreateAuthorizations {
+    fn legacy_authorizations(ids: &[&str]) -> CreateAuthorizations {
         let ids = ids.iter().map(|value| id(value)).collect::<Vec<_>>();
         let mut accumulator = TerminalExhaustionAccumulator::new(ids.iter().cloned()).unwrap();
         for id in ids {
@@ -1808,11 +1825,11 @@ mod mutation_tests {
                 ))
                 .unwrap();
         }
-        accumulator.into_authorizations().unwrap()
+        accumulator.into_legacy_authorizations().unwrap()
     }
 
     fn creates(ids: &[&str], initial: InitialPullRequestIdentities) -> PreparedCreates {
-        let mut authorizations = authorizations(ids);
+        let mut authorizations = legacy_authorizations(ids);
         let operations = ids
             .iter()
             .map(|value| {
@@ -1876,7 +1893,7 @@ mod mutation_tests {
 
     #[test]
     fn create_preparation_consumes_the_exact_authorization_set() {
-        let mut authorization_set = authorizations(&["A", "B"]);
+        let mut authorization_set = legacy_authorizations(&["A", "B"]);
         let a = id("A");
         let operation = CreatePullRequest::new(
             authorization_set.take(&a).unwrap(),
@@ -1889,7 +1906,7 @@ mod mutation_tests {
             PreparedCreates::new(initial(Vec::new()), authorization_set, vec![operation]).is_err()
         );
 
-        let mut authorization_set = authorizations(&["A", "B"]);
+        let mut authorization_set = legacy_authorizations(&["A", "B"]);
         let operations = ["A", "B"]
             .map(|value| {
                 let value = id(value);
@@ -2145,7 +2162,8 @@ mod mutation_tests {
     #[test]
     fn concrete_prepared_mutation_actions_must_be_nonempty() {
         assert!(
-            PreparedCreates::new(initial(Vec::new()), authorizations(&[]), Vec::new()).is_err()
+            PreparedCreates::new(initial(Vec::new()), legacy_authorizations(&[]), Vec::new())
+                .is_err()
         );
         assert!(PreparedUpdates::new(Vec::new()).is_err());
     }

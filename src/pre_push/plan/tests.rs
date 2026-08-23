@@ -8,8 +8,11 @@ use super::*;
 use crate::{
     pre_push::{
         destination::PushDestination,
-        github::{OpenObservation, TerminalPullRequestEvidence, TerminalPullRequestPage},
-        pull_request::{CreateAuthorizations, PullRequestIdentity, TerminalExhaustionAccumulator},
+        github::{
+            OpenObservation, TerminalPullRequest, TerminalPullRequestEvidence,
+            TerminalPullRequestPage, TerminalPullRequestState,
+        },
+        pull_request::{PullRequestIdentity, TerminalExhaustionAccumulator, TerminalHistories},
         remote::{
             RemoteHeads, parse_remote_heads_for_destination_for_test, parse_remote_heads_for_test,
         },
@@ -138,7 +141,7 @@ fn open_response(default: ObjectId, nodes: Vec<Value>) -> Value {
     })
 }
 
-fn exact_authorizations(ids: &[GherritPrId]) -> CreateAuthorizations {
+fn exact_terminal_histories(ids: &[GherritPrId]) -> TerminalHistories {
     let mut accumulator = TerminalExhaustionAccumulator::new(ids.iter().cloned()).unwrap();
     for id in ids {
         accumulator = accumulator
@@ -149,14 +152,40 @@ fn exact_authorizations(ids: &[GherritPrId]) -> CreateAuthorizations {
             ))
             .unwrap();
     }
-    accumulator.into_authorizations().unwrap()
+    accumulator.into_terminal_histories().unwrap()
 }
 
-fn authorizations(
+fn empty_terminal_histories(
     active: &ActiveRemoteChanges<'_>,
     ids: &[GherritPrId],
-) -> RepositoryCreateAuthorizations {
-    RepositoryCreateAuthorizations::for_test(active.destination(), exact_authorizations(ids))
+) -> RepositoryTerminalHistories {
+    RepositoryTerminalHistories::for_test(active.destination(), exact_terminal_histories(ids))
+}
+
+fn retired_terminal_history(
+    active: &ActiveRemoteChanges<'_>,
+    id: GherritPrId,
+    state: TerminalPullRequestState,
+) -> RepositoryTerminalHistories {
+    let accumulator = TerminalExhaustionAccumulator::new([id.clone()])
+        .unwrap()
+        .record_page(TerminalPullRequestEvidence::for_test(
+            id,
+            None,
+            TerminalPullRequestPage {
+                pull_requests: vec![TerminalPullRequest {
+                    number: 17,
+                    node_id: "PR_17".to_owned(),
+                    state,
+                }],
+                next_cursor: None,
+            },
+        ))
+        .unwrap();
+    RepositoryTerminalHistories::for_test(
+        active.destination(),
+        accumulator.into_terminal_histories().unwrap(),
+    )
 }
 
 fn correlate_and_activate<'destination>(
@@ -209,7 +238,7 @@ fn first_publication_plan<'destination>(
         context,
         stack,
         correlated,
-        authorizations(&active, &[id("Gone")]),
+        empty_terminal_histories(&active, &[id("Gone")]),
         active,
         &repository.graph([proposed]),
     )
@@ -232,7 +261,7 @@ fn missing_root_plan(repository: &TestRepository, value: &str) -> PublicationPla
         context,
         stack,
         correlated,
-        authorizations(&active, &[id(value)]),
+        empty_terminal_histories(&active, &[id(value)]),
         active,
         &repository.graph([proposed]),
     )
@@ -265,7 +294,7 @@ fn missing_nonroot_plan(repository: &TestRepository, value: &str) -> Publication
         context,
         stack,
         correlated,
-        authorizations(&active, &[id(value)]),
+        empty_terminal_histories(&active, &[id(value)]),
         active,
         &repository.graph([proposed]),
     )
@@ -356,7 +385,7 @@ fn first_publication_hides_create_and_update_work_behind_git_publication() {
         context,
         stack,
         correlated,
-        authorizations(&active, &[id("Gone")]),
+        empty_terminal_histories(&active, &[id("Gone")]),
         active,
         &repository.graph([proposed]),
     )
@@ -475,7 +504,7 @@ fn create_and_response_derived_update_preflight_at_their_typed_boundaries() {
         context,
         stack,
         correlated,
-        authorizations(&active, &[id("Gone")]),
+        empty_terminal_histories(&active, &[id("Gone")]),
         active,
         &repository.graph([proposed]),
     ) {
@@ -563,7 +592,7 @@ async fn published_without_open_pr_is_create_recovery_with_a_ready_no_op() {
         context,
         stack,
         correlated,
-        authorizations(&active, &[id("Gone")]),
+        empty_terminal_histories(&active, &[id("Gone")]),
         active,
         &repository.graph([published]),
     )
@@ -571,6 +600,122 @@ async fn published_without_open_pr_is_create_recovery_with_a_ready_no_op() {
 
     assert!(requests_for_test(&plan).is_empty());
     assert!(matches!(plan.publish().await.unwrap(), ReadyProjection::Creates { .. }));
+}
+
+#[test]
+fn missing_open_terminal_history_table_is_exact() {
+    for terminal in
+        [None, Some(TerminalPullRequestState::Closed), Some(TerminalPullRequestState::Merged)]
+    {
+        let repository = TestRepository::new();
+        let default = repository.commit("root", &[], None);
+        let published = repository.commit("change", &[default], Some("Gone"));
+        let stack = LocalStack::for_test(default, [(id("Gone"), published)]);
+        let remote_heads = heads(default, &[("Gone", published, default)]);
+        let history = versions(&[("Gone", 1, published)]);
+        let (correlated, active) = correlate_and_activate(
+            remote_heads,
+            &stack,
+            open_response(default, Vec::new()),
+            &history,
+        );
+        let terminal_histories = terminal.map_or_else(
+            || empty_terminal_histories(&active, &[id("Gone")]),
+            |state| retired_terminal_history(&active, id("Gone"), state),
+        );
+        let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
+        let result = plan_publication(
+            context,
+            stack,
+            correlated,
+            terminal_histories,
+            active,
+            &repository.graph([published]),
+        );
+
+        assert_eq!(result.is_ok(), terminal.is_none(), "terminal={terminal:?}");
+        match result {
+            Ok(plan) => {
+                assert!(matches!(into_projection_for_test(plan), ReadyProjection::Creates { .. }));
+            }
+            Err(error) => assert!(error.to_string().contains("Cannot push to")),
+        }
+    }
+}
+
+#[test]
+fn planner_aggregates_retired_histories_in_requested_order() {
+    let repository = TestRepository::new();
+    let default = repository.commit("root", &[], None);
+    let empty = repository.commit("empty", &[default], Some("Gempty"));
+    let closed = repository.commit("closed", &[empty], Some("Gclosed"));
+    let merged = repository.commit("merged", &[closed], Some("Gmerged"));
+    let ids = [id("Gempty"), id("Gclosed"), id("Gmerged")];
+    let stack = LocalStack::for_test(
+        default,
+        [(ids[0].clone(), empty), (ids[1].clone(), closed), (ids[2].clone(), merged)],
+    );
+    let remote_heads = heads(default, &[]);
+    let (correlated, active) =
+        correlate_and_activate(remote_heads, &stack, open_response(default, Vec::new()), "");
+    let terminal_histories = TerminalExhaustionAccumulator::new(ids.iter().cloned())
+        .unwrap()
+        .record_page(TerminalPullRequestEvidence::for_test(
+            ids[2].clone(),
+            None,
+            TerminalPullRequestPage {
+                pull_requests: vec![TerminalPullRequest {
+                    number: 22,
+                    node_id: "PR_22".to_owned(),
+                    state: TerminalPullRequestState::Merged,
+                }],
+                next_cursor: None,
+            },
+        ))
+        .unwrap()
+        .record_page(TerminalPullRequestEvidence::for_test(
+            ids[0].clone(),
+            None,
+            TerminalPullRequestPage { pull_requests: Vec::new(), next_cursor: None },
+        ))
+        .unwrap()
+        .record_page(TerminalPullRequestEvidence::for_test(
+            ids[1].clone(),
+            None,
+            TerminalPullRequestPage {
+                pull_requests: vec![TerminalPullRequest {
+                    number: 11,
+                    node_id: "PR_11".to_owned(),
+                    state: TerminalPullRequestState::Closed,
+                }],
+                next_cursor: None,
+            },
+        ))
+        .unwrap()
+        .into_terminal_histories()
+        .unwrap();
+    let terminal_histories =
+        RepositoryTerminalHistories::for_test(active.destination(), terminal_histories);
+    let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
+
+    let error = match plan_publication(
+        context,
+        stack,
+        correlated,
+        terminal_histories,
+        active,
+        &repository.graph([merged]),
+    ) {
+        Ok(_) => panic!("retired histories must reject before publication planning"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "Cannot push to closed PR #11. Please open a new PR or reopen the existing one.\n\
+         Cannot push to merged PR #22. Please open a new PR or reopen the existing one.\n\
+         You may want to rebase on the latest changes before pushing."
+    );
 }
 
 #[test]
@@ -595,7 +740,7 @@ fn correlation_and_active_evidence_require_the_same_destination_capability() {
         context,
         stack,
         correlated,
-        authorizations(&active, &ids),
+        empty_terminal_histories(&active, &ids),
         active,
         &repository.graph([proposed]),
     ) {
@@ -607,7 +752,7 @@ fn correlation_and_active_evidence_require_the_same_destination_capability() {
 }
 
 #[test]
-fn terminal_authorization_for_another_repository_cannot_authorize_creation() {
+fn terminal_history_for_another_repository_cannot_enter_planning() {
     let repository = TestRepository::new();
     let default = repository.commit("root", &[], None);
     let proposed = repository.commit("change", &[default], Some("Gone"));
@@ -618,16 +763,16 @@ fn terminal_authorization_for_another_repository_cannot_authorize_creation() {
     let other_destination =
         PushDestination::for_test("other", "https://github.com/another/repository.git", Vec::new())
             .unwrap();
-    let authorizations = RepositoryCreateAuthorizations::for_test(
+    let terminal_histories = RepositoryTerminalHistories::for_test(
         &other_destination,
-        exact_authorizations(&[id("Gone")]),
+        exact_terminal_histories(&[id("Gone")]),
     );
     let context = BodyLinkContext::from_destination(active.destination(), None).unwrap();
     let error = match plan_publication(
         context,
         stack,
         correlated,
-        authorizations,
+        terminal_histories,
         active,
         &repository.graph([proposed]),
     ) {
@@ -680,7 +825,7 @@ fn retained_stack_default_must_match_the_agreed_publication_default() {
             context,
             stack,
             correlated,
-            authorizations(&active, &[id("Gone")]),
+            empty_terminal_histories(&active, &[id("Gone")]),
             active,
             &repository.graph([proposed]),
         ) {
@@ -712,7 +857,7 @@ fn an_open_pr_may_retain_an_older_published_head() {
         context,
         stack,
         correlated,
-        authorizations(&active, &[]),
+        empty_terminal_histories(&active, &[]),
         active,
         &repository.graph([current, first]),
     )
@@ -769,7 +914,7 @@ fn owned_pr_head_and_base_may_be_independent_published_versions() {
         context,
         stack,
         correlated,
-        authorizations(&active, &[]),
+        empty_terminal_histories(&active, &[]),
         active,
         &repository.graph([child_first, child_current]),
     )
@@ -822,7 +967,7 @@ fn every_cross_version_owned_head_base_pair_is_accepted() {
                 context,
                 stack,
                 correlated,
-                authorizations(&active, &[]),
+                empty_terminal_histories(&active, &[]),
                 active,
                 &repository.graph([child_first, child_current]),
             )
@@ -882,7 +1027,7 @@ fn all_nine_three_version_owned_head_base_pairs_are_accepted() {
                 context,
                 stack,
                 correlated,
-                authorizations(&active, &[]),
+                empty_terminal_histories(&active, &[]),
                 active,
                 &repository.graph(children),
             )
@@ -917,7 +1062,7 @@ fn mixed_existing_create_projection_renders_final_navigation_for_both() {
         context,
         stack,
         correlated,
-        authorizations(&active, &[id("Gtwo")]),
+        empty_terminal_histories(&active, &[id("Gtwo")]),
         active,
         &repository.graph([child]),
     )
@@ -959,7 +1104,7 @@ fn an_open_pr_without_published_history_is_not_a_create_recovery() {
         context,
         stack,
         correlated,
-        authorizations(&active, &[]),
+        empty_terminal_histories(&active, &[]),
         active,
         &repository.graph([proposed]),
     ) {
@@ -999,7 +1144,7 @@ fn landing_automation_is_rejected_for_an_owned_base() {
         context,
         stack,
         correlated,
-        authorizations(&active, &[]),
+        empty_terminal_histories(&active, &[]),
         active,
         &repository.graph([child]),
     ) {
@@ -1076,7 +1221,7 @@ fn observed_desired_base_and_landing_automation_truth_table_is_exact() {
                     context,
                     stack,
                     correlated,
-                    authorizations(&active, &[]),
+                    empty_terminal_histories(&active, &[]),
                     active,
                     &repository.graph(graph_roots),
                 );
@@ -1144,7 +1289,7 @@ fn nonlocal_rows_are_validation_only_and_fail_closed() {
             context,
             stack,
             correlated,
-            authorizations(&active, &[]),
+            empty_terminal_histories(&active, &[]),
             active,
             &repository.graph([local, nonlocal]),
         );
@@ -1169,7 +1314,7 @@ fn empty_local_stack_is_outside_the_planner_contract() {
         context,
         stack,
         correlated,
-        authorizations(&active, &[]),
+        empty_terminal_histories(&active, &[]),
         active,
         &repository.graph([default]),
     ) {
@@ -1255,7 +1400,7 @@ fn an_open_pr_head_cannot_be_just_the_unpublished_proposal() {
         context,
         stack,
         correlated,
-        authorizations(&active, &[]),
+        empty_terminal_histories(&active, &[]),
         active,
         &repository.graph([proposed, published]),
     ) {
@@ -1314,7 +1459,7 @@ fn initial_pr_oid_evidence_accepts_only_published_or_exact_default_values() {
             context,
             stack,
             correlated,
-            authorizations(&active, &[]),
+            empty_terminal_histories(&active, &[]),
             active,
             &graph,
         );

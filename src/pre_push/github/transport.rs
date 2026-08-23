@@ -15,7 +15,7 @@ use serde_json::Value;
 use super::{
     CompleteCreateReceipts, CompleteOpenRows, CorrelatedRepository, FirstOpenPullRequests,
     FirstOpenPullRequestsPage, NextOpenPullRequests, OpenPullRequest, PreparedCreates,
-    PreparedUpdates, Repository, RepositoryCreateAuthorizations, TerminalPullRequestQuery,
+    PreparedUpdates, Repository, RepositoryTerminalHistories, TerminalPullRequestQuery,
     TerminalPullRequests, graphql_error_detail,
 };
 use crate::pre_push::{
@@ -353,11 +353,12 @@ impl Github {
         Ok(OpenObservation { repository, rows: CompleteOpenRows::new(pull_requests)? })
     }
 
-    /// Returns complete terminal-exhaustion authority for the exact typed set.
+    /// Returns complete ordered terminal-history evidence for the exact
+    /// requested ID set.
     pub(in crate::pre_push) async fn observe_terminal_pull_requests(
         &self,
         ids: Box<[GherritPrId]>,
-    ) -> Result<RepositoryCreateAuthorizations> {
+    ) -> Result<RepositoryTerminalHistories> {
         #[derive(Debug)]
         struct Pending {
             id: GherritPrId,
@@ -433,9 +434,9 @@ impl Github {
                 }
             }
         }
-        Ok(RepositoryCreateAuthorizations::from_transport(
+        Ok(RepositoryTerminalHistories::from_transport(
             self.coordinates.clone(),
-            accumulator.into_authorizations()?,
+            accumulator.into_terminal_histories()?,
         ))
     }
 
@@ -446,9 +447,7 @@ impl Github {
     ) -> Result<LegacyGithubObservation> {
         let selection = self.observe_open_pull_requests().await?.into_legacy_selection(ids)?;
         let authorizations = self.observe_terminal_pull_requests(selection.missing).await?;
-        let authorizations = authorizations
-            .into_legacy_for(&selection.repository.coordinates)
-            .wrap_err("terminal pull request evidence does not match the legacy OPEN repository")?;
+        let authorizations = authorizations.into_legacy_for(&selection.repository.coordinates)?;
         Ok(LegacyGithubObservation {
             repository: selection.repository,
             local_pull_requests: selection.local_pull_requests,
@@ -1054,10 +1053,9 @@ mod tests {
         let ids =
             ["A", "B"].map(|id| GherritPrId::from_ref_component(id.as_bytes()).unwrap()).into();
 
-        let authorizations = github.observe_terminal_pull_requests(ids).await.unwrap();
+        let _terminal_histories = github.observe_terminal_pull_requests(ids).await.unwrap();
 
         context.github().assert_graphql_transcript_consumed();
-        assert_eq!(authorizations.len(), 2);
     }
 
     #[test]
