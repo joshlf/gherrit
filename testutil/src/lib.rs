@@ -9,7 +9,7 @@ use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError},
-        Arc, LazyLock, RwLock,
+        Arc, Condvar, LazyLock, Mutex, RwLock,
     },
     thread,
     time::Duration,
@@ -32,6 +32,150 @@ pub const MANAGED_PUBLIC: &str = "managedPublic";
 const FIRST_GIT_TIMESTAMP: u64 = 946_684_800;
 const MOCK_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MOCK_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ResponseGateKind {
+    GlobalHeads,
+    ActiveManagedTags,
+    FirstOpen,
+    LaterOpen,
+}
+
+#[derive(Debug)]
+struct ResponseGateInner {
+    description: String,
+    started: Mutex<bool>,
+    started_changed: Condvar,
+    released: tokio::sync::watch::Sender<bool>,
+}
+
+impl ResponseGateInner {
+    fn new(description: String) -> Self {
+        let (released, _) = tokio::sync::watch::channel(false);
+        Self { description, started: Mutex::new(false), started_changed: Condvar::new(), released }
+    }
+
+    fn mark_started(&self) {
+        *self.started.lock().unwrap() = true;
+        self.started_changed.notify_all();
+    }
+
+    fn has_started(&self) -> bool {
+        *self.started.lock().unwrap()
+    }
+
+    fn release(&self) {
+        self.released.send_replace(true);
+    }
+}
+
+/// Controls one deliberately held fixture response.
+///
+/// The matching server request is fully validated and recorded before
+/// `wait_started` returns. Dropping the controller releases the response.
+pub struct ResponseGate {
+    inner: Arc<ResponseGateInner>,
+}
+
+impl ResponseGate {
+    /// Waits until the matching request has reached the response gate.
+    pub fn wait_started(&self) {
+        let started = self.inner.started.lock().unwrap();
+        let (started, _) = self
+            .inner
+            .started_changed
+            .wait_timeout_while(started, MOCK_SERVER_STARTUP_TIMEOUT, |started| !*started)
+            .unwrap();
+        assert!(
+            *started,
+            "response gate {} did not start within {:?}",
+            self.inner.description, MOCK_SERVER_STARTUP_TIMEOUT
+        );
+    }
+
+    /// Reports whether the matching request has reached the response gate.
+    pub fn has_started(&self) -> bool {
+        self.inner.has_started()
+    }
+
+    /// Releases the held response. Releasing more than once is harmless.
+    pub fn release(&self) {
+        self.inner.release();
+    }
+}
+
+impl Drop for ResponseGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ResponseGateWaiter {
+    inner: Arc<ResponseGateInner>,
+}
+
+impl ResponseGateWaiter {
+    pub(crate) async fn wait(self) {
+        self.inner.mark_started();
+        let mut released = self.inner.released.subscribe();
+        while !*released.borrow_and_update() {
+            if released.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResponseGateRegistry {
+    queued: BTreeMap<ResponseGateKind, VecDeque<Arc<ResponseGateInner>>>,
+    all: Vec<Arc<ResponseGateInner>>,
+}
+
+impl ResponseGateRegistry {
+    fn install(&mut self, kind: ResponseGateKind) -> ResponseGate {
+        let occurrence =
+            self.all.iter().filter(|gate| gate.description.starts_with(kind.description())).count()
+                + 1;
+        let inner = Arc::new(ResponseGateInner::new(format!(
+            "{} occurrence {occurrence}",
+            kind.description()
+        )));
+        self.queued.entry(kind).or_default().push_back(inner.clone());
+        self.all.push(inner.clone());
+        ResponseGate { inner }
+    }
+
+    pub(crate) fn take(&mut self, kind: ResponseGateKind) -> Option<ResponseGateWaiter> {
+        let gate = self.queued.get_mut(&kind)?.pop_front()?;
+        Some(ResponseGateWaiter { inner: gate })
+    }
+
+    fn release_all(&self) {
+        for gate in &self.all {
+            gate.release();
+        }
+    }
+
+    fn pending(&self) -> Vec<String> {
+        self.queued
+            .values()
+            .flat_map(|gates| gates.iter().map(|gate| gate.description.clone()))
+            .collect()
+    }
+}
+
+impl ResponseGateKind {
+    fn description(self) -> &'static str {
+        match self {
+            Self::GlobalHeads => "global-head response",
+            Self::ActiveManagedTags => "active-managed-tag response",
+            Self::FirstOpen => "first-OPEN-page response",
+            Self::LaterOpen => "later-OPEN-page response",
+        }
+    }
+}
 
 #[macro_export]
 macro_rules! test_context {
@@ -572,6 +716,88 @@ pub struct PullRequestSeed {
     pub head_oid: String,
     pub base: String,
     pub base_oid: String,
+    pub auto_merge: bool,
+    pub in_merge_queue: bool,
+}
+
+impl PullRequestSeed {
+    /// Describes a root proposal whose reviewed base is the repository default.
+    ///
+    /// The caller supplies both the branch name and its independently observed
+    /// object ID. The fixture never derives either value from the proposal.
+    pub fn root(
+        number: usize,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        head: impl Into<String>,
+        head_oid: impl Into<String>,
+        default_branch: impl Into<String>,
+        default_oid: impl Into<String>,
+    ) -> Self {
+        Self {
+            number,
+            title: title.into(),
+            body: body.into(),
+            head: head.into(),
+            head_oid: head_oid.into(),
+            base: default_branch.into(),
+            base_oid: default_oid.into(),
+            auto_merge: false,
+            in_merge_queue: false,
+        }
+    }
+
+    /// Describes a proposal created on its permanent owned base.
+    ///
+    /// The base name is derived only from this proposal's own head identity;
+    /// the caller still supplies the independently observed literal-base ID.
+    pub fn owned_base(
+        number: usize,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        head: impl Into<String>,
+        head_oid: impl Into<String>,
+        literal_base_oid: impl Into<String>,
+    ) -> Self {
+        let head = head.into();
+        Self {
+            number,
+            title: title.into(),
+            body: body.into(),
+            base: format!("gherrit-bases/{head}"),
+            head,
+            head_oid: head_oid.into(),
+            base_oid: literal_base_oid.into(),
+            auto_merge: false,
+            in_merge_queue: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_auto_merge(mut self) -> Self {
+        self.auto_merge = true;
+        self
+    }
+
+    #[must_use]
+    pub fn with_merge_queue(mut self) -> Self {
+        self.in_merge_queue = true;
+        self
+    }
+}
+
+/// One remotely published revision and its independently optional PR marker.
+///
+/// The head, literal base, and immutable version tag form one publication
+/// tuple. `marker_oid` is deliberately independent: a marker is written only
+/// after GitHub has established the pull request identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedBaseTuple {
+    pub id: String,
+    pub version: u64,
+    pub head_oid: String,
+    pub base_oid: String,
+    pub marker_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -585,12 +811,25 @@ pub struct PullRequestSnapshot {
     pub head_oid: String,
     pub base: String,
     pub base_oid: String,
+    pub auto_merge: bool,
+    pub in_merge_queue: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushRecord {
     arguments: Vec<String>,
     pub exit_code: i32,
+}
+
+/// One event observed at the shared fake boundary, in lock-serialized order.
+///
+/// A GraphQL event records receipt of a schema-validated canonical request. A
+/// Git event records interceptor receipt of the command's completion callback.
+/// Neither timestamp claims that the production client consumed a response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalEvent {
+    GitPush(PushRecord),
+    GraphQl(GraphQlExchange),
 }
 
 impl PushRecord {
@@ -615,6 +854,8 @@ impl From<&mock_server::PrEntry> for PullRequestSnapshot {
             head_oid: pr.head.sha.clone(),
             base: pr.base.ref_field.clone(),
             base_oid: pr.base.sha.clone(),
+            auto_merge: pr.auto_merge,
+            in_merge_queue: pr.in_merge_queue,
         }
     }
 }
@@ -701,8 +942,31 @@ impl MockGithub<'_> {
             let mut pr = pr;
             pr.head.sha = seed.head_oid;
             pr.base.sha = seed.base_oid;
+            pr.auto_merge = seed.auto_merge;
+            pr.in_merge_queue = seed.in_merge_queue;
             state.add_pr(pr);
         });
+    }
+
+    /// Hides one stored same-repository PR from the next complete OPEN scan.
+    ///
+    /// The PR remains in fake state and still participates in duplicate-key
+    /// enforcement. Teardown rejects an expectation which was not consumed by
+    /// a complete paginated scan.
+    pub fn suppress_pull_request_from_next_open_scan(&self, number: usize) {
+        self.context.mutate_mock_state(|state| state.suppress_from_next_open_scan(number));
+    }
+
+    /// Holds the next validated and recorded first OPEN-page response.
+    pub fn gate_next_first_open_response(&self) -> ResponseGate {
+        self.context
+            .mutate_mock_state(|state| state.response_gates.install(ResponseGateKind::FirstOpen))
+    }
+
+    /// Holds the next validated and recorded later OPEN-page response.
+    pub fn gate_next_later_open_response(&self) -> ResponseGate {
+        self.context
+            .mutate_mock_state(|state| state.response_gates.install(ResponseGateKind::LaterOpen))
     }
 
     pub fn set_pull_request_state(&self, number: usize, new_state: PullRequestState) {
@@ -713,6 +977,30 @@ impl MockGithub<'_> {
                 .find(|pr| pr.number == number)
                 .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
             pr.state = new_state.as_str().to_string();
+        });
+    }
+
+    /// Independently changes whether a stored PR has native auto-merge.
+    pub fn set_pull_request_auto_merge(&self, number: usize, enabled: bool) {
+        self.context.mutate_mock_state(|state| {
+            let pr = state
+                .prs
+                .iter_mut()
+                .find(|pr| pr.number == number)
+                .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
+            pr.auto_merge = enabled;
+        });
+    }
+
+    /// Independently changes whether a stored PR is in the merge queue.
+    pub fn set_pull_request_in_merge_queue(&self, number: usize, enabled: bool) {
+        self.context.mutate_mock_state(|state| {
+            let pr = state
+                .prs
+                .iter_mut()
+                .find(|pr| pr.number == number)
+                .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
+            pr.in_merge_queue = enabled;
         });
     }
 
@@ -748,6 +1036,16 @@ impl MockGithub<'_> {
 
 impl Drop for TestContext {
     fn drop(&mut self) {
+        // Release held responses before asking the server to stop. This also
+        // covers controllers which outlive the context or handlers whose HTTP
+        // client was cancelled while their response was held.
+        if let Some(state) = &self.mock_server_state {
+            match state.read() {
+                Ok(state) => state.response_gates.release_all(),
+                Err(poisoned) => poisoned.into_inner().response_gates.release_all(),
+            }
+        }
+
         // Stop the server before fixture directories and state are released.
         drop(self.mock_server.take());
 
@@ -757,6 +1055,8 @@ impl Drop for TestContext {
             pending_remote_transactions,
             pending_graphql_transcript,
             graphql_transcript_error,
+            pending_response_gates,
+            pending_open_visibility,
         ) = self
             .mock_server_state
             .as_ref()
@@ -767,6 +1067,8 @@ impl Drop for TestContext {
                     state.git.pending_remote_ref_transactions().clone(),
                     state.semantic_graphql_transcript.clone(),
                     state.semantic_graphql_error.clone(),
+                    state.response_gates.pending(),
+                    state.open_visibility,
                 ),
                 Err(poisoned) => {
                     let state = poisoned.into_inner();
@@ -776,13 +1078,15 @@ impl Drop for TestContext {
                         state.git.pending_remote_ref_transactions().clone(),
                         state.semantic_graphql_transcript.clone(),
                         state.semantic_graphql_error.clone(),
+                        state.response_gates.pending(),
+                        state.open_visibility,
                     )
                 }
             })
             .unwrap_or_default();
         if state_poisoned {
             let message = format!(
-                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}; unconsumed remote ref transactions: {pending_remote_transactions:?}; unconsumed GraphQL transcript: {pending_graphql_transcript:?}; GraphQL transcript error: {graphql_transcript_error:?}"
+                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}; unconsumed remote ref transactions: {pending_remote_transactions:?}; unconsumed GraphQL transcript: {pending_graphql_transcript:?}; GraphQL transcript error: {graphql_transcript_error:?}; unused response gates: {pending_response_gates:?}; unconsumed OPEN visibility: {pending_open_visibility:?}"
             );
             if thread::panicking() {
                 eprintln!("{message}");
@@ -824,6 +1128,26 @@ impl Drop for TestContext {
             } else {
                 panic!(
                     "Test fixture has unconsumed GraphQL exchanges: {pending_graphql_transcript:?}"
+                );
+            }
+        }
+        if !pending_response_gates.is_empty() {
+            if thread::panicking() {
+                eprintln!(
+                    "Test fixture also has unused response gates: {pending_response_gates:?}"
+                );
+            } else {
+                panic!("Test fixture has unused response gates: {pending_response_gates:?}");
+            }
+        }
+        if let Some(expectation) = pending_open_visibility {
+            if thread::panicking() {
+                eprintln!(
+                    "Test fixture also has an unconsumed OPEN-visibility expectation: {expectation:?}"
+                );
+            } else {
+                panic!(
+                    "Test fixture has an unconsumed OPEN-visibility expectation: {expectation:?}"
                 );
             }
         }
@@ -933,7 +1257,7 @@ impl TestContext {
         id
     }
 
-    /// Creates a commit with a caller-supplied legacy or scenario identity.
+    /// Creates a commit with a caller-supplied scenario identity.
     pub fn commit_with_explicit_gherrit_id(&self, message: &str, id: &str) {
         assert!(
             !message.lines().any(|line| line.starts_with("gherrit-pr-id: ")),
@@ -1117,6 +1441,23 @@ impl TestContext {
         );
     }
 
+    /// Holds the next validated and recorded global-head response.
+    pub fn gate_next_global_heads_response(&self) -> ResponseGate {
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        self.mutate_mock_state(|state| state.response_gates.install(ResponseGateKind::GlobalHeads))
+    }
+
+    /// Holds the next validated and recorded active-managed-tag response.
+    ///
+    /// Repeated calls queue gates in request occurrence order, which lets a
+    /// test distinguish the local and nonlocal observation waves.
+    pub fn gate_next_active_managed_tags_response(&self) -> ResponseGate {
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        self.mutate_mock_state(|state| {
+            state.response_gates.install(ResponseGateKind::ActiveManagedTags)
+        })
+    }
+
     fn enqueue_failure(&self, kind: FailureKind) {
         self.mock_state().write().unwrap().faults.push_back(kind);
     }
@@ -1173,6 +1514,13 @@ impl TestContext {
         })
     }
 
+    /// Returns the fake's chronological cross-system observation ledger.
+    pub fn external_events(&self) -> Vec<ExternalEvent> {
+        assert!(self.has_mock_github, "missing test capability: .with_mock_github()");
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        self.inspect_mock_state(|state| state.external_events.clone())
+    }
+
     pub fn recorded_git_invocations(&self, operation: GitOperation) -> Vec<Vec<String>> {
         assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
         self.inspect_mock_state(|state| state.git.invocations(operation))
@@ -1208,6 +1556,126 @@ impl TestContext {
             .lines()
             .map(ToString::to_string)
             .collect()
+    }
+
+    /// Seeds one complete owned-base publication tuple in one ref transaction.
+    ///
+    /// A preliminary push places every requested object in the bare object
+    /// database under fixture-only refs. The visible head/base/version tuple,
+    /// optional marker, and fixture-ref cleanup then commit atomically. This
+    /// prevents tests from exposing a state production can never publish.
+    pub fn seed_owned_base_tuple(&self, tuple: &OwnedBaseTuple) {
+        assert!(self.has_remote, "missing test capability: .with_remote()");
+        assert!(tuple.version > 0, "owned-base tuple versions start at one");
+        assert!(
+            !tuple.id.is_empty() && tuple.id.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+            "owned-base tuple IDs contain only ASCII letters and numbers"
+        );
+
+        let mut object_ids = BTreeMap::<String, String>::new();
+        for oid in [&tuple.head_oid, &tuple.base_oid].into_iter().chain(tuple.marker_oid.iter()) {
+            let next = object_ids.len();
+            object_ids
+                .entry(oid.clone())
+                .or_insert_with(|| format!("refs/gherrit-fixture-objects/{}/{next}", tuple.id));
+        }
+
+        let mut seed = self.test_environment.command(&self.system_git);
+        seed.current_dir(&self.repo_path)
+            .args(["push", "--quiet", "--atomic", "--no-verify"])
+            .arg(&self.remote_path);
+        for (oid, reference) in &object_ids {
+            seed.arg(format!("{oid}:{reference}"));
+        }
+        seed.assert().success();
+
+        let head_ref = format!("refs/heads/{}", tuple.id);
+        let base_ref = format!("refs/heads/gherrit-bases/{}", tuple.id);
+        let version_ref = format!("refs/tags/gherrit/{}/v{}", tuple.id, tuple.version);
+        let marker_ref = format!("refs/tags/gherrit/{}/pr", tuple.id);
+        let mut commands = vec![
+            "start\n".to_owned(),
+            format!("update {head_ref} {}\n", tuple.head_oid),
+            format!("update {base_ref} {}\n", tuple.base_oid),
+            format!("update {version_ref} {}\n", tuple.head_oid),
+        ];
+        if let Some(marker_oid) = &tuple.marker_oid {
+            commands.push(format!("update {marker_ref} {marker_oid}\n"));
+        } else if self.remote_ref_oid(&marker_ref).is_some() {
+            commands.push(format!("delete {marker_ref}\n"));
+        }
+        commands.extend(object_ids.values().map(|reference| format!("delete {reference}\n")));
+        commands.extend(["prepare\n".to_owned(), "commit\n".to_owned()]);
+        self.remote_git_cmd()
+            .args(["update-ref", "--stdin"])
+            .input(commands.concat())
+            .assert()
+            .success();
+
+        self.assert_owned_base_tuple(tuple);
+    }
+
+    /// Asserts every independently supplied member of an owned-base tuple.
+    pub fn assert_owned_base_tuple(&self, tuple: &OwnedBaseTuple) {
+        self.assert_owned_base_tuples(std::slice::from_ref(tuple));
+    }
+
+    /// Asserts complete owned-base tuples from one remote-ref observation.
+    pub fn assert_owned_base_tuples(&self, tuples: &[OwnedBaseTuple]) {
+        let output = self
+            .remote_git_cmd()
+            .args([
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+                "refs/tags/gherrit",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let refs = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let (name, oid) = line
+                    .split_once(' ')
+                    .unwrap_or_else(|| panic!("malformed for-each-ref output {line:?}"));
+                (name.to_owned(), oid.to_owned())
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        for tuple in tuples {
+            let head_ref = format!("refs/heads/{}", tuple.id);
+            let base_ref = format!("refs/heads/gherrit-bases/{}", tuple.id);
+            let version_ref = format!("refs/tags/gherrit/{}/v{}", tuple.id, tuple.version);
+            let marker_ref = format!("refs/tags/gherrit/{}/pr", tuple.id);
+            assert_eq!(
+                refs.get(&head_ref),
+                Some(&tuple.head_oid),
+                "published head for {}",
+                tuple.id
+            );
+            assert_eq!(
+                refs.get(&base_ref),
+                Some(&tuple.base_oid),
+                "published literal base for {}",
+                tuple.id
+            );
+            assert_eq!(
+                refs.get(&version_ref),
+                Some(&tuple.head_oid),
+                "published immutable version for {}",
+                tuple.id
+            );
+            assert_eq!(
+                refs.get(&marker_ref),
+                tuple.marker_oid.as_ref(),
+                "published pull-request marker for {}",
+                tuple.id
+            );
+        }
     }
 
     pub fn init_bare_repo(&self, path: &Path) {
@@ -1625,6 +2093,31 @@ mod tests {
         assert_eq!(deterministic_gherrit_id(1), format!("G{}b", "a".repeat(31)));
         assert_eq!(deterministic_gherrit_id(31), format!("G{}7", "a".repeat(31)));
         assert_eq!(deterministic_gherrit_id(32), format!("G{}ba", "a".repeat(30)));
+    }
+
+    #[test]
+    fn response_gate_reports_start_and_drop_releases_the_waiter() {
+        let mut registry = ResponseGateRegistry::default();
+        let gate = registry.install(ResponseGateKind::FirstOpen);
+        assert!(!gate.has_started());
+        let waiter = registry.take(ResponseGateKind::FirstOpen).unwrap();
+        assert!(registry.pending().is_empty());
+
+        let server = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(waiter.wait());
+        });
+        gate.wait_started();
+        assert!(gate.has_started());
+        drop(gate);
+        server.join().unwrap();
+
+        let unused = registry.install(ResponseGateKind::LaterOpen);
+        drop(unused);
+        assert_eq!(registry.pending(), ["later-OPEN-page response occurrence 1"]);
     }
 
     #[test]

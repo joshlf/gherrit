@@ -20,7 +20,7 @@ use gix::{ObjectId, bstr::ByteSlice as _};
 use super::{
     destination::{DefaultBranch, PushDestination, git_output_records},
     history::{CommitGraphEvidence, GraphLoadError},
-    local::{GherritPrId, LocalChange, LocalStack},
+    local::GherritPrId,
     subprocess,
     version::Version,
 };
@@ -115,7 +115,6 @@ impl<'destination> RemoteHeads<'destination> {
 impl<'destination> RemoteHeads<'destination> {
     /// Consumes the complete head observation to begin cumulative history
     /// observation at the same exact destination.
-    #[allow(dead_code)]
     pub(super) async fn observe_managed_tags(
         self,
         local_ids: &[GherritPrId],
@@ -147,7 +146,6 @@ impl fmt::Debug for DestinationObservation<'_> {
 }
 
 impl<'destination> DestinationObservation<'destination> {
-    #[allow(dead_code)]
     pub(super) fn remote_heads(&self) -> &RemoteHeads<'destination> {
         &self.heads
     }
@@ -156,7 +154,6 @@ impl<'destination> DestinationObservation<'destination> {
     ///
     /// There is deliberately no destination argument. Even empty requested
     /// namespaces are retained as complete coverage evidence.
-    #[allow(dead_code)]
     pub(super) async fn observe_additional(mut self, nonlocal_ids: &[GherritPrId]) -> Result<Self> {
         unique_id_names(nonlocal_ids, "additional remote observation")?;
         if nonlocal_ids.iter().any(|id| self.histories.contains_key(id)) {
@@ -174,7 +171,6 @@ impl<'destination> DestinationObservation<'destination> {
     }
 
     /// Consumes cumulative coverage and proves the exact ordered active set.
-    #[allow(dead_code)]
     pub(super) fn into_active(
         mut self,
         local_ids: &[GherritPrId],
@@ -260,7 +256,6 @@ impl<'destination> DestinationObservation<'destination> {
 }
 
 /// Exact active remote evidence, split in caller-supplied logical order.
-#[allow(dead_code)]
 pub(super) struct ActiveRemoteChanges<'destination> {
     destination: &'destination PushDestination,
     default_branch: DefaultBranch,
@@ -353,50 +348,6 @@ fn unique_id_names<'id>(ids: &'id [GherritPrId], context: &str) -> Result<HashSe
     Ok(unique)
 }
 
-/// Legacy publisher view of separately observed immutable histories.
-///
-/// FIXME(#264): Delete this compatibility value with [`ObservedStack`] when
-/// activation switches orchestration to [`DestinationObservation`]. It cannot
-/// enter complete-history normalization.
-pub(super) struct ActiveManagedTags<'destination> {
-    destination: &'destination PushDestination,
-    histories: HashMap<GherritPrId, AdvertisedChangeNamespace>,
-}
-
-impl fmt::Debug for ActiveManagedTags<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ActiveManagedTags")
-            .field("covered_change_count", &self.histories.len())
-            .field(
-                "advertised_ref_count",
-                &self.histories.values().map(AdvertisedChangeNamespace::ref_count).sum::<usize>(),
-            )
-            .finish()
-    }
-}
-
-impl ActiveManagedTags<'_> {
-    fn take_history(&mut self, id: &GherritPrId) -> Result<Option<BTreeMap<Version, ObjectId>>> {
-        self.histories
-            .remove(id)
-            .map(|history| {
-                if history.pull_request_marker.is_some() {
-                    bail!(
-                        "legacy publication cannot safely consume the pull-request marker for '{}'",
-                        id.as_str()
-                    );
-                }
-                Ok(history
-                    .versions
-                    .into_iter()
-                    .map(|(version, advertised)| (version, advertised.object_id))
-                    .collect())
-            })
-            .transpose()
-    }
-}
-
 /// One exact lightweight version tag accepted from an advertisement.
 ///
 /// `source_ref` remains private so acquisition cannot be redirected to a raw
@@ -415,134 +366,6 @@ struct AdvertisedChangeNamespace {
 impl AdvertisedChangeNamespace {
     fn ref_count(&self) -> usize {
         self.versions.len() + usize::from(self.pull_request_marker.is_some())
-    }
-}
-
-/// Legacy remote state for each local change, in stack order.
-///
-/// FIXME(#264): Delete this compatibility seam when the active planner consumes
-/// opaque [`ObservedChangeHistory`] values.
-pub(super) struct ObservedStack<'stack, 'destination> {
-    destination: &'destination PushDestination,
-    changes: Vec<ObservedChange<'stack>>,
-}
-
-impl fmt::Debug for ObservedStack<'_, '_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("ObservedStack").field("changes", &self.changes).finish()
-    }
-}
-
-impl<'stack, 'destination> ObservedStack<'stack, 'destination> {
-    pub(super) fn couple(
-        stack: &'stack LocalStack,
-        heads: &RemoteHeads<'destination>,
-        mut managed_tags: ActiveManagedTags<'destination>,
-    ) -> Result<Self> {
-        if !std::ptr::eq(heads.destination, managed_tags.destination) {
-            bail!("legacy head and managed-tag observations came from different destinations");
-        }
-        let changes = stack
-            .iter()
-            .map(|change| {
-                let history = managed_tags.take_history(change.id())?.ok_or_else(|| {
-                    eyre!(
-                        "managed tag namespace for GHerrit change '{}' was not observed",
-                        change.id().as_str()
-                    )
-                })?;
-                Ok(ObservedChange {
-                    change,
-                    head: heads.candidate_head(change.id()),
-                    owned_base: heads.owned_base(change.id()),
-                    versions: history,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if !managed_tags.histories.is_empty() {
-            bail!("remote managed-tag observation contains a change outside the local stack");
-        }
-        Ok(Self { destination: heads.destination, changes })
-    }
-
-    pub(super) fn destination(&self) -> &'destination PushDestination {
-        self.destination
-    }
-
-    pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = &ObservedChange<'stack>> {
-        self.changes.iter()
-    }
-
-    #[cfg(test)]
-    pub(super) fn for_test_at(
-        destination: &'destination PushDestination,
-        stack: &'stack LocalStack,
-        states: impl IntoIterator<
-            Item = (Option<ObjectId>, Option<ObjectId>, BTreeMap<Version, ObjectId>),
-        >,
-    ) -> Self {
-        let states = states.into_iter().collect::<Vec<_>>();
-        assert_eq!(stack.iter().len(), states.len());
-        let changes = stack
-            .iter()
-            .zip(states)
-            .map(|(change, (head, owned_base, versions))| ObservedChange {
-                change,
-                head,
-                owned_base,
-                versions,
-            })
-            .collect();
-        Self { destination, changes }
-    }
-}
-
-impl<'stack> ObservedStack<'stack, 'static> {
-    #[cfg(test)]
-    pub(super) fn for_test(
-        stack: &'stack LocalStack,
-        states: impl IntoIterator<
-            Item = (Option<ObjectId>, Option<ObjectId>, BTreeMap<Version, ObjectId>),
-        >,
-    ) -> Self {
-        let destination = test_push_destination();
-        ObservedStack::for_test_at(destination, stack, states)
-    }
-}
-
-#[cfg(test)]
-fn test_push_destination() -> &'static PushDestination {
-    static DESTINATION: std::sync::OnceLock<PushDestination> = std::sync::OnceLock::new();
-    DESTINATION.get_or_init(|| {
-        PushDestination::for_test("origin", "https://github.com/owner/repository.git", Vec::new())
-            .expect("the test destination is valid")
-    })
-}
-
-/// One local change coupled to its complete remote publication observation.
-#[derive(Debug)]
-pub(super) struct ObservedChange<'stack> {
-    change: &'stack LocalChange,
-    head: Option<ObjectId>,
-    owned_base: Option<ObjectId>,
-    versions: BTreeMap<Version, ObjectId>,
-}
-
-impl<'stack> ObservedChange<'stack> {
-    pub(super) fn change(&self) -> &'stack LocalChange {
-        self.change
-    }
-
-    pub(super) fn head(&self) -> Option<ObjectId> {
-        self.head
-    }
-
-    pub(super) fn owned_base(&self) -> Option<ObjectId> {
-        self.owned_base
-    }
-
-    pub(super) fn versions(&self) -> &BTreeMap<Version, ObjectId> {
-        &self.versions
     }
 }
 
@@ -583,19 +406,6 @@ async fn observe_remote_heads_command(
     parse_remote_heads(output.stdout()).wrap_err_with(|| {
         format!("GHerrit remote '{configured_remote}' reported an invalid head advertisement")
     })
-}
-
-/// Legacy free-standing history observation used only by the active publisher.
-///
-/// FIXME(#264): Delete this wrapper at activation. New code must consume
-/// [`RemoteHeads::observe_managed_tags`] so head and tag provenance cannot
-/// diverge.
-pub(super) async fn observe_active_managed_tags<'destination, 'id>(
-    destination: &'destination PushDestination,
-    ids: impl IntoIterator<Item = &'id GherritPrId>,
-) -> Result<ActiveManagedTags<'destination>> {
-    let histories = observe_managed_tag_namespaces(destination, ids).await?;
-    Ok(ActiveManagedTags { destination, histories })
 }
 
 async fn observe_managed_tag_namespaces<'id>(
@@ -802,7 +612,6 @@ impl ObjectAcquisition<'_> {
 
 /// Loads one complete literal graph, with at most one ordinary acquisition and
 /// one promisor refetch using the same destination-bound exact refs.
-#[allow(dead_code)]
 pub(super) async fn complete_graph_wave(
     repo: &util::Repo,
     observed: &DestinationObservation<'_>,
@@ -1740,17 +1549,6 @@ mod tests {
         assert_eq!(fetch_history.len(), 1);
         assert_eq!(fetch_history[0].1.to_string(), fetch_oid);
 
-        let legacy_heads = observe_remote_heads(&push_destination).await.unwrap();
-        let legacy_fetch_managed_tags =
-            observe_active_managed_tags(&fetch_destination, [&requested]).await.unwrap();
-        let stack = LocalStack::for_test(
-            ObjectId::from_hex(MAIN.as_bytes()).unwrap(),
-            [(requested.clone(), ObjectId::from_hex(ONE.as_bytes()).unwrap())],
-        );
-        let error = ObservedStack::couple(&stack, &legacy_heads, legacy_fetch_managed_tags)
-            .expect_err("even the legacy seam rejects A-heads/B-tags");
-        assert!(error.to_string().contains("different destinations"), "{error:?}");
-
         let acquisition = push_observation
             .acquisition_for_changes(std::slice::from_ref(&requested))
             .unwrap()
@@ -2457,75 +2255,5 @@ mod tests {
         );
         assert_eq!(active.nonlocal()[0].id(), &c);
         assert!(active.local().iter().all(|change| change.versions().len() == 0));
-    }
-
-    #[test]
-    fn coupling_rejects_missing_active_managed_tag_coverage() {
-        let change = id("Gone");
-        let stack = LocalStack::for_test(
-            ObjectId::from_hex(MAIN.as_bytes()).unwrap(),
-            [(change, ObjectId::from_hex(ONE.as_bytes()).unwrap())],
-        );
-        let destination =
-            PushDestination::for_test("origin", "https://github.com/owner/repo.git", Vec::new())
-                .unwrap();
-        let heads = RemoteHeads {
-            destination: &destination,
-            parsed: parse_remote_heads(&head_advertisement("")).unwrap(),
-        };
-        let managed_tags =
-            ActiveManagedTags { destination: &destination, histories: HashMap::new() };
-
-        let error = ObservedStack::couple(&stack, &heads, managed_tags).unwrap_err();
-        assert!(error.to_string().contains("was not observed"), "error={error:?}");
-    }
-
-    #[test]
-    fn coupling_rejects_extra_active_managed_tag_coverage() {
-        let change = id("Gone");
-        let stack = LocalStack::for_test(
-            ObjectId::from_hex(MAIN.as_bytes()).unwrap(),
-            [(change.clone(), ObjectId::from_hex(ONE.as_bytes()).unwrap())],
-        );
-        let destination =
-            PushDestination::for_test("origin", "https://github.com/owner/repo.git", Vec::new())
-                .unwrap();
-        let heads = RemoteHeads {
-            destination: &destination,
-            parsed: parse_remote_heads(&head_advertisement("")).unwrap(),
-        };
-        let managed_tags = ActiveManagedTags {
-            destination: &destination,
-            histories: HashMap::from([
-                (change, AdvertisedChangeNamespace::default()),
-                (id("Gextra"), AdvertisedChangeNamespace::default()),
-            ]),
-        };
-
-        let error = ObservedStack::couple(&stack, &heads, managed_tags).unwrap_err();
-        assert!(error.to_string().contains("outside the local stack"), "error={error:?}");
-    }
-
-    #[test]
-    fn legacy_coupling_fails_closed_on_a_pull_request_marker() {
-        let change = id("Gone");
-        let stack = LocalStack::for_test(
-            ObjectId::from_hex(MAIN.as_bytes()).unwrap(),
-            [(change.clone(), ObjectId::from_hex(ONE.as_bytes()).unwrap())],
-        );
-        let destination =
-            PushDestination::for_test("origin", "https://github.com/owner/repo.git", Vec::new())
-                .unwrap();
-        let heads = RemoteHeads {
-            destination: &destination,
-            parsed: parse_remote_heads(&head_advertisement("")).unwrap(),
-        };
-        let ParsedManagedTags { histories } =
-            parse_managed_tags(format!("{ONE}\trefs/tags/gherrit/Gone/pr\n").as_bytes(), [&change])
-                .unwrap();
-        let managed_tags = ActiveManagedTags { destination: &destination, histories };
-
-        let error = ObservedStack::couple(&stack, &heads, managed_tags).unwrap_err();
-        assert!(error.to_string().contains("cannot safely consume the pull-request marker"));
     }
 }

@@ -32,9 +32,17 @@ represented as a chain of Pull Requests on GitHub.
 
 It achieves this by:
 1.  Intercepting `git push` via the `pre-push` hook.
-2.  Pushing unique `refs/gherrit/<id>` refs for every commit to the remote.
-3.  Using the `gh` CLI tool to create/update PRs and chain them together
-    (setting the base of one PR to the head of the previous one).
+2.  Publishing each changed revision as one atomic, point-in-time,
+    change-owned Git tuple:
+    `refs/heads/<id>` at the revision, `refs/heads/gherrit-bases/<id>` at its
+    literal first parent, and `refs/tags/gherrit/<id>/vN` at the revision.
+3.  Projecting the stack through GitHub's GraphQL API. Every pull request is
+    created on its own `gherrit-bases/<id>` branch; after the durable marker
+    barrier, a root targets the default branch and a nonroot remains on its
+    own base.
+4.  Recording established pull-request existence separately with the
+    immutable `refs/tags/gherrit/<id>/pr` marker. Exact acknowledgement of the
+    marker push gates the final GitHub projection.
 
 ### Project Structure
 

@@ -386,17 +386,6 @@ impl PushDestination {
             repository: self.resolved.repository.clone(),
         }
     }
-
-    pub(super) fn pr_url(&self, pr_number: u64) -> String {
-        format!(
-            "https://github.com/{}/{}/pull/{pr_number}",
-            self.resolved.owner, self.resolved.repository
-        )
-    }
-
-    pub(super) fn repo_url_relative(&self) -> String {
-        format!("/{}/{}", self.resolved.owner, self.resolved.repository)
-    }
 }
 
 impl ResolvedDestination {

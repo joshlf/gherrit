@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::{
-    git_interceptor, FailureKind, GraphQlExchange, GraphQlOperation, MutationExchange,
-    PullRequestConnectionExchange, RedirectStatus, RetryableHttpStatus, TestEnvironment,
+    git_interceptor, ExternalEvent, FailureKind, GraphQlExchange, GraphQlOperation,
+    MutationExchange, PullRequestConnectionExchange, RedirectStatus, ResponseGateKind,
+    ResponseGateRegistry, RetryableHttpStatus, TestEnvironment,
 };
 
 const MAX_PULL_REQUEST_CANDIDATES: usize = 100;
@@ -32,12 +33,25 @@ static GITHUB_SCHEMA: LazyLock<Valid<apollo_compiler::Schema>> = LazyLock::new(|
     .expect("Failed to parse and validate embedded GitHub schema")
 });
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenVisibilityPhase {
+    Pending,
+    Active { saw_pull_request: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OpenVisibilityExpectation {
+    number: usize,
+    phase: OpenVisibilityPhase,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MockState {
     pub prs: Vec<PrEntry>,
     pub(super) cross_repository_prs: HashSet<usize>,
     pub(super) git: git_interceptor::State,
     pub graphql_requests: Vec<Vec<GraphQlOperation>>,
+    pub(super) external_events: Vec<ExternalEvent>,
     pub semantic_graphql_transcript: Option<VecDeque<GraphQlExchange>>,
     pub semantic_graphql_error: Option<String>,
     pub graphql_redirect_trap_requests: usize,
@@ -49,6 +63,8 @@ pub struct MockState {
     pub repo_name: String,
     pub github_default_branch: Option<(String, String)>,
     pub faults: VecDeque<FailureKind>,
+    pub(super) response_gates: ResponseGateRegistry,
+    pub(super) open_visibility: Option<OpenVisibilityExpectation>,
 }
 
 impl MockState {
@@ -59,6 +75,67 @@ impl MockState {
     pub fn add_pr(&mut self, pr: PrEntry) {
         self.prs.push(pr);
     }
+
+    pub(super) fn suppress_from_next_open_scan(&mut self, number: usize) {
+        assert!(
+            self.open_visibility.is_none(),
+            "an OPEN-visibility expectation is already installed"
+        );
+        let pull_request = self
+            .prs
+            .iter()
+            .find(|pull_request| pull_request.number == number)
+            .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
+        assert_eq!(pull_request.state, "OPEN", "pull request #{number} is not OPEN");
+        assert!(
+            !self.cross_repository_prs.contains(&number),
+            "pull request #{number} is not in the repository under test"
+        );
+        self.open_visibility =
+            Some(OpenVisibilityExpectation { number, phase: OpenVisibilityPhase::Pending });
+    }
+
+    fn suppression_for_open_query(&self, kind: PullRequestQueryKind) -> Option<OpenSuppression> {
+        let expectation = self.open_visibility.as_ref()?;
+        match (expectation.phase, kind) {
+            (OpenVisibilityPhase::Pending, PullRequestQueryKind::FirstOpen)
+            | (OpenVisibilityPhase::Active { .. }, PullRequestQueryKind::NextOpen) => {
+                Some(OpenSuppression { number: expectation.number, kind })
+            }
+            _ => None,
+        }
+    }
+
+    fn record_suppressed_open_page(
+        &mut self,
+        suppression: OpenSuppression,
+        saw_pull_request: bool,
+        has_next_page: bool,
+    ) {
+        let expectation = self
+            .open_visibility
+            .as_mut()
+            .expect("suppressed OPEN page requires an active expectation");
+        assert_eq!(expectation.number, suppression.number, "OPEN suppression identity changed");
+        let previously_saw_pull_request = match (expectation.phase, suppression.kind) {
+            (OpenVisibilityPhase::Pending, PullRequestQueryKind::FirstOpen) => false,
+            (OpenVisibilityPhase::Active { saw_pull_request }, PullRequestQueryKind::NextOpen) => {
+                saw_pull_request
+            }
+            _ => panic!("successful OPEN page does not continue the expected logical scan"),
+        };
+        let saw_pull_request = previously_saw_pull_request || saw_pull_request;
+        expectation.phase = OpenVisibilityPhase::Active { saw_pull_request };
+        if !has_next_page && saw_pull_request {
+            self.open_visibility = None;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenSuppression {
+    number: usize,
+    kind: PullRequestQueryKind,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -81,6 +158,8 @@ pub struct PrEntry {
     pub head: RefInfo,
     #[serde(rename = "base")]
     pub base: RefInfo,
+    pub auto_merge: bool,
+    pub in_merge_queue: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -136,6 +215,8 @@ impl PrEntry {
             body: Some(body),
             head: RefInfo { ref_field: head, sha: "2".repeat(40) },
             base: RefInfo { ref_field: base, sha: "1".repeat(40) },
+            auto_merge: false,
+            in_merge_queue: false,
             created_at: "2023-01-01T00:00:00Z".to_string(),
             updated_at: "2023-01-01T00:00:00Z".to_string(),
         }
@@ -273,6 +354,21 @@ fn graphql_operations(document: &ExecutableDocument) -> Vec<GraphQlOperation> {
             }
         })
         .collect()
+}
+
+fn open_query_kind(exchange: &GraphQlExchange) -> Option<PullRequestQueryKind> {
+    let GraphQlExchange::Repository { connections, .. } = exchange else {
+        return None;
+    };
+    let [connection] = connections.as_slice() else { return None };
+    if connection.head.is_some() || connection.states.as_slice() != ["OPEN"] {
+        return None;
+    }
+    Some(if connection.after.is_some() {
+        PullRequestQueryKind::NextOpen
+    } else {
+        PullRequestQueryKind::FirstOpen
+    })
 }
 
 fn selected_semantic_fields(
@@ -970,22 +1066,50 @@ async fn graphql(
     };
 
     let operations = graphql_operations(&document);
-    let mut mock_state = app_state.state.write().unwrap();
-    if let Err(message) = consume_semantic_exchange(&mut mock_state, &exchange) {
-        mock_state.semantic_graphql_error = Some(message.clone());
-        return graphql_http_error(&message);
+    let query_kind = open_query_kind(&exchange);
+    let (exceeds_query_limit, exceeds_page_limit, failure, response_gate, suppressed_open_pr) = {
+        let mut mock_state = app_state.state.write().unwrap();
+        mock_state.external_events.push(ExternalEvent::GraphQl(exchange.clone()));
+        if let Err(message) = consume_semantic_exchange(&mut mock_state, &exchange) {
+            mock_state.semantic_graphql_error = Some(message.clone());
+            return graphql_http_error(&message);
+        }
+        mock_state.graphql_requests.push(operations.clone());
+        let create_request_number = mock_state
+            .graphql_requests
+            .iter()
+            .filter(|request| request.contains(&GraphQlOperation::CreatePr))
+            .count();
+        let exceeds_query_limit =
+            operations.iter().all(|operation| *operation == GraphQlOperation::Query)
+                && mock_state
+                    .max_graphql_query_operations_per_request
+                    .is_some_and(|limit| operations.len() > limit);
+        let exceeds_page_limit = match &exchange {
+            GraphQlExchange::Repository { connections, .. } => mock_state
+                .max_graphql_connection_page_size
+                .is_some_and(|limit| connections.iter().any(|connection| connection.first > limit)),
+            GraphQlExchange::Mutation { .. } => false,
+        };
+        let failure =
+            check_and_apply_graphql_failure(&mut mock_state, &operations, create_request_number);
+        let suppressed_open_pr =
+            query_kind.and_then(|kind| mock_state.suppression_for_open_query(kind));
+        let response_gate = query_kind
+            .map(|kind| match kind {
+                PullRequestQueryKind::FirstOpen => ResponseGateKind::FirstOpen,
+                PullRequestQueryKind::NextOpen => ResponseGateKind::LaterOpen,
+                PullRequestQueryKind::Terminal => unreachable!("OPEN query kind is nonterminal"),
+            })
+            .and_then(|kind| mock_state.response_gates.take(kind));
+        (exceeds_query_limit, exceeds_page_limit, failure, response_gate, suppressed_open_pr)
+    };
+    if let Some(response_gate) = response_gate {
+        response_gate.wait().await;
     }
-    mock_state.graphql_requests.push(operations.clone());
-    let create_request_number = mock_state
-        .graphql_requests
-        .iter()
-        .filter(|request| request.contains(&GraphQlOperation::CreatePr))
-        .count();
-    if operations.iter().all(|operation| *operation == GraphQlOperation::Query)
-        && mock_state
-            .max_graphql_query_operations_per_request
-            .is_some_and(|limit| operations.len() > limit)
-    {
+
+    let mut mock_state = app_state.state.write().unwrap();
+    if exceeds_query_limit {
         return graphql_response(
             StatusCode::OK,
             serde_json::json!({
@@ -996,12 +1120,6 @@ async fn graphql(
             }),
         );
     }
-    let exceeds_page_limit = match &exchange {
-        GraphQlExchange::Repository { connections, .. } => mock_state
-            .max_graphql_connection_page_size
-            .is_some_and(|limit| connections.iter().any(|connection| connection.first > limit)),
-        GraphQlExchange::Mutation { .. } => false,
-    };
     if exceeds_page_limit {
         return graphql_response(
             StatusCode::OK,
@@ -1013,9 +1131,7 @@ async fn graphql(
             }),
         );
     }
-    if let Some(failure) =
-        check_and_apply_graphql_failure(&mut mock_state, &operations, create_request_number)
-    {
+    if let Some(failure) = failure {
         if let FailureKind::ApplyMutationIdsThenDisconnect(client_mutation_ids) = failure {
             return apply_mutation_ids_then_disconnect(
                 &mut mock_state,
@@ -1030,6 +1146,7 @@ async fn graphql(
     let mut response_data = serde_json::Map::new();
 
     let mut errors = Vec::new();
+    let github_default_branch = mock_state.github_default_branch.clone();
 
     for operation in document.operations.iter() {
         for selection in operation.selection_set.selections.iter() {
@@ -1043,11 +1160,13 @@ async fn graphql(
                     "createPullRequest" => handle_create_pr(&mut mock_state, field, &|branch| {
                         remote_branch_oid(&app_state, branch)
                     }),
-                    "repository" => {
-                        handle_repository_query(&mock_state, field, &variables, &|| {
-                            repository_default_branch(&app_state, &mock_state)
-                        })
-                    }
+                    "repository" => handle_repository_query(
+                        &mut mock_state,
+                        field,
+                        &variables,
+                        &|| repository_default_branch(&app_state, github_default_branch.as_ref()),
+                        suppressed_open_pr,
+                    ),
                     _ => unreachable!("request was checked by validate_supported_document"),
                 };
                 match result {
@@ -1259,9 +1378,9 @@ fn remote_branch_oid(app_state: &AppState, branch: &str) -> Result<Option<String
 
 fn repository_default_branch(
     app_state: &AppState,
-    mock_state: &MockState,
+    github_default_branch: Option<&(String, String)>,
 ) -> Result<(String, String), String> {
-    if let Some(default_branch) = &mock_state.github_default_branch {
+    if let Some(default_branch) = github_default_branch {
         return Ok(default_branch.clone());
     }
 
@@ -1468,10 +1587,11 @@ fn handle_create_pr(
 }
 
 fn handle_repository_query(
-    mock_state: &MockState,
+    mock_state: &mut MockState,
     field: &executable::Field,
     variables: &GraphQlVariables,
     default_branch: &dyn Fn() -> Result<(String, String), String>,
+    suppressed_open_pr: Option<OpenSuppression>,
 ) -> Result<serde_json::Value, String> {
     const PATH: &str = "repository";
     let owner = resolve_string_argument(field, "owner", PATH, variables)?;
@@ -1482,6 +1602,7 @@ fn handle_repository_query(
     }
 
     let mut repo_data = serde_json::Map::new();
+    let mut completed_suppressed_page = None;
 
     for field in selected_fields(&field.selection_set, PATH)? {
         match field.name.as_str() {
@@ -1550,12 +1671,20 @@ fn handle_repository_query(
                         _ => unreachable!("request was checked by validate_pull_requests_field"),
                     })
                     .collect::<HashSet<_>>();
+                let saw_suppressed_pull_request = suppressed_open_pr.is_some_and(|suppression| {
+                    mock_state.prs.iter().any(|pr| {
+                        pr.number == suppression.number
+                            && head.as_ref().is_none_or(|head| pr.head.ref_field == *head)
+                            && states.contains(pr.state.as_str())
+                    })
+                });
                 let matching_prs = mock_state
                     .prs
                     .iter()
                     .filter(|pr| {
                         head.as_ref().is_none_or(|head| pr.head.ref_field == *head)
                             && states.contains(pr.state.as_str())
+                            && Some(pr.number) != suppressed_open_pr.map(|value| value.number)
                     })
                     .collect::<Vec<_>>();
                 let offset = after
@@ -1623,6 +1752,10 @@ fn handle_repository_query(
                         _ => unreachable!("request was checked by validate_pull_requests_field"),
                     }
                 }
+                drop(page);
+                drop(matching_prs);
+                completed_suppressed_page = suppressed_open_pr
+                    .map(|suppression| (suppression, saw_suppressed_pull_request, has_next_page));
                 repo_data.insert(response_key(field), serde_json::Value::Object(connection));
             }
             "id" => {
@@ -1633,6 +1766,10 @@ fn handle_repository_query(
             }
             _ => unreachable!("request was checked by validate_repository_field"),
         }
+    }
+
+    if let Some((suppression, saw_pull_request, has_next_page)) = completed_suppressed_page {
+        mock_state.record_suppressed_open_page(suppression, saw_pull_request, has_next_page);
     }
 
     Ok(serde_json::Value::Object(repo_data))
@@ -1656,8 +1793,14 @@ fn project_pr_node(
             "headRefOid" => serde_json::json!(pr.head.sha),
             "state" => serde_json::json!(pr.state),
             "isCrossRepository" => serde_json::json!(is_cross_repository),
-            "autoMergeRequest" => serde_json::Value::Null,
-            "isInMergeQueue" => serde_json::Value::Bool(false),
+            "autoMergeRequest" => {
+                if pr.auto_merge {
+                    serde_json::json!({ "enabledAt": "2026-01-01T00:00:00Z" })
+                } else {
+                    serde_json::Value::Null
+                }
+            }
+            "isInMergeQueue" => serde_json::Value::Bool(pr.in_merge_queue),
             _ => unreachable!("request was checked by validate_pull_requests_field"),
         };
         node.insert(response_key(field), value);
@@ -1934,9 +2077,13 @@ mod tests {
         pull_request.state = "CLOSED".to_string();
         state.add_pr(pull_request);
         state.cross_repository_prs.insert(1);
-        let response = handle_repository_query(&state, root_field(&document), &None, &|| {
-            Ok(("main".to_string(), "1".repeat(40)))
-        })
+        let response = handle_repository_query(
+            &mut state,
+            root_field(&document),
+            &None,
+            &|| Ok(("main".to_string(), "1".repeat(40))),
+            None,
+        )
         .unwrap();
         assert_eq!(
             response,
@@ -1957,7 +2104,7 @@ mod tests {
 
     #[test]
     fn repository_response_rejects_another_repository() {
-        let state = MockState::new("owner".to_string(), "repo".to_string());
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
         let fields = format!(
             "id, defaultBranchRef {{ name, target {{ oid }} }} {}",
             open_pull_requests_field(None)
@@ -1968,15 +2115,97 @@ mod tests {
             validate_supported_document(&document, &None).unwrap();
 
             assert_eq!(
-                handle_repository_query(&state, root_field(&document), &None, &|| Ok((
-                    "main".to_string(),
-                    "1".repeat(40)
-                )),)
+                handle_repository_query(
+                    &mut state,
+                    root_field(&document),
+                    &None,
+                    &|| Ok(("main".to_string(), "1".repeat(40))),
+                    None
+                )
                 .unwrap(),
                 serde_json::Value::Null,
                 "repository: {owner}/{repository}"
             );
         }
+    }
+
+    #[test]
+    fn open_visibility_suppression_spans_one_complete_scan_only() {
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
+        for (id, head) in [(1, "Ghidden"), (2, "Gvisible1"), (3, "Gvisible2")] {
+            state.add_pr(PrEntry::mock(MockPrArgs {
+                id,
+                title: format!("PR {id}"),
+                body: String::new(),
+                head: head.to_string(),
+                base: "gherrit-bases/Ghidden".to_string(),
+                repo_owner: "owner",
+                repo_name: "repo",
+            }));
+        }
+        state.suppress_from_next_open_scan(1);
+
+        let first_connection = open_pull_requests_field(None).replacen("first: 100", "first: 1", 1);
+        let first = repository_query(
+            "owner",
+            "repo",
+            &format!("id, defaultBranchRef {{ name, target {{ oid }} }} {first_connection}"),
+        );
+        let suppressed = state.suppression_for_open_query(PullRequestQueryKind::FirstOpen);
+        assert_eq!(
+            state.suppression_for_open_query(PullRequestQueryKind::FirstOpen),
+            suppressed,
+            "selecting a suppressed first page must not start the scan"
+        );
+        assert_eq!(
+            state.open_visibility.unwrap().phase,
+            OpenVisibilityPhase::Pending,
+            "only successful page materialization starts the scan"
+        );
+        let response = handle_repository_query(
+            &mut state,
+            root_field(&first),
+            &None,
+            &|| Ok(("main".to_string(), "1".repeat(40))),
+            suppressed,
+        )
+        .unwrap();
+        assert_eq!(response.pointer("/pullRequests/nodes/0/number"), Some(&serde_json::json!(2)));
+        assert_eq!(response.pointer("/pullRequests/pageInfo/hasNextPage"), Some(&true.into()));
+        assert!(state.open_visibility.is_some(), "the incomplete scan retains its expectation");
+
+        let later_connection =
+            open_pull_requests_field(Some("cursor:1")).replacen("first: 100", "first: 1", 1);
+        let later = repository_query("owner", "repo", &later_connection);
+        let suppressed = state.suppression_for_open_query(PullRequestQueryKind::NextOpen);
+        assert_eq!(
+            state.suppression_for_open_query(PullRequestQueryKind::NextOpen),
+            suppressed,
+            "selecting a suppressed later page must not advance the scan"
+        );
+        let response = handle_repository_query(
+            &mut state,
+            root_field(&later),
+            &None,
+            &|| unreachable!("later OPEN pages do not request default-branch facts"),
+            suppressed,
+        )
+        .unwrap();
+        assert_eq!(response.pointer("/pullRequests/nodes/0/number"), Some(&serde_json::json!(3)));
+        assert_eq!(response.pointer("/pullRequests/pageInfo/hasNextPage"), Some(&false.into()));
+        assert!(state.open_visibility.is_none(), "the complete scan consumes its expectation");
+        assert_eq!(state.prs.len(), 3, "suppression must not remove fake state");
+
+        let create = parse_document(
+            "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
+             baseRefName: \"gherrit-bases/Ghidden\", headRefName: \"Ghidden\", \
+             title: \"Duplicate\", clientMutationId: \"create\" }) { \
+             pullRequest { number } } }",
+        );
+        let error =
+            handle_create_pr(&mut state, root_field(&create), &|_| Ok(Some("1".repeat(40))))
+                .unwrap_err();
+        assert!(error.contains("already exists"));
     }
 
     #[test]

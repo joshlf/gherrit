@@ -6,9 +6,7 @@ values: they must show that repeated executions safely converge an external
 system, including after interruption and concurrent changes.
 
 This document defines the testing contract, the intended test architecture,
-and the criteria for choosing a test layer. It is the target architecture for
-an incremental migration; some existing tests still use a combined system-test
-harness while that migration is in progress.
+and the criteria for choosing a test layer.
 
 ## Goals
 
@@ -20,10 +18,13 @@ The suite must establish that GHerrit:
 
 - discovers the intended local stack and preserves its topology;
 - rejects unsupported or unsafe local and remote states before writing;
-- publishes the exact managed branches and immutable version tags required by
-  the local commits;
+- publishes each changed revision as an inseparable head, literal-owned-base,
+  and immutable-version tuple;
+- records established pull-request existence in a separate immutable marker
+  whose acknowledged Git publication gates final GitHub projection;
 - projects each commit into the correct pull request title, body, head, base,
-  and navigation links;
+  and navigation links, with a root on the default branch and each nonroot on
+  its own base;
 - performs no writes when the observed state already matches the desired
   state;
 - converges after interruption at every externally committed write boundary;
@@ -73,9 +74,8 @@ The suite itself must be:
 - **Understandable:** a failure identifies the violated behavior and the layer
   responsible for it.
 - **Extensible:** ordinary policy, formatting, parsing, and adapter changes add
-  focused tests. Only changes to publication stages, durable effects,
-  acknowledgement loss, visibility schedules, or restart and convergence
-  reasoning extend the semantic recovery oracle.
+  focused tests. Only changes to publication actions, durable effects,
+  visibility schedules, or restart reasoning extend the recovery oracle.
 - **Faithful:** tests use the production artifact and real external tools at the
   boundaries where their behavior is the subject of the test.
 
@@ -101,45 +101,48 @@ Organize coverage around product risks rather than source files.
 Line coverage is a useful backstop, not the organizing goal. High line coverage
 can coexist with weak evidence for convergence, atomicity, or recovery.
 
-## Target Architecture
+## Architecture
 
-The target is a functional reconciliation core surrounded by narrow Git,
-GitHub, command-line, and hook adapters.
+The publication planner is a pure core surrounded by narrow Git, GitHub,
+command-line, and hook adapters. One attempt assembles a complete
+attempt-scoped evidence set from independently timed reads and invokes that
+planner once. "Complete" means that each required namespace, history, and
+paginated connection was covered; it does not mean snapshot isolation across
+Git, GitHub, or observation waves. Safety comes from validated histories and
+markers, exact leases and acknowledgements, and fail-closed joins, not from
+cross-system snapshot isolation.
 
 ```text
- local Git observation       remote Git observation       GitHub observation
-          \                           |                           /
-           +-------------------- ObservedWorld -----------------+
-                                      |
-                              reconcile(world)
-                                      |
-       Reject | Publish | CreatePullRequests | UpdatePullRequests | Done
-                                      |
-                              production adapters
+global heads -> local stack -> local histories and graph ---------\
+complete repository-wide OPEN GraphQL observation -> correlation --+
+nonlocal histories and graph + terminal evidence ------------------+
+                                                                  |
+                                                        publication plan
+                                                                  |
+atomic head/base/version tuples -> GraphQL creates -> marker batch
+                                                    -> final GraphQL updates
 ```
 
-`ObservedWorld` contains owned, deterministic domain values. It does not retain
-repository handles, HTTP clients, locks, or syntax trees from an external
-library.
+The evidence and plan contain owned, deterministic domain values. They do not
+retain HTTP JSON, GraphQL aliases, locks, or freely recombinable authorization
+state. Destination-bound values keep Git writes, GitHub coordinates, and body
+links tied to the same selected push destination.
 
-The reconciler derives the next safe action plan. A plan may contain independent
-effects that an adapter combines into one remote request. After committing a
-prefix whose results can change the remaining plan, the caller updates or
-reobserves the affected state and reconciles again. For example, GitHub assigns
-pull request numbers during creation, and those numbers appear in projected
-pull request bodies.
+Typed transitions enforce the two Git barriers. Exact acknowledgement of all
+initial tuple pushes releases pull-request creation. Every marker request is
+fully preflighted before the first write. Validated initial OPEN evidence
+authorizes an existing pull request's marker immediately, while exact complete
+create receipts authorize the already-preflighted marker requests for newly
+created pull requests. Exact acknowledgement of all marker pushes releases the
+final body and base updates. An indeterminate write ends the attempt; the same
+attempt neither retries the write nor reobserves external state.
 
-These action boundaries make recovery explicit; they do not require one network
-round trip per commit. A new process reconstructs the same world from Git and
-GitHub and derives the next missing plan. It does not need a separate
-transaction log or an in-memory notion of what a previous process intended to
-do. Implementations must batch independent observations and effects, avoid
-reobserving state that cannot affect the remaining plan, and measure user-side
-push latency as the stack grows before accepting an architectural change.
-
-Batching is semantically transparent but operationally required for acceptable
-latency. Batch boundaries and response mapping must be tested independently,
-while semantic tests reason about structured domain actions.
+A later process reconstructs current evidence from Git and GitHub and derives
+only the remaining work. It needs no transaction log or remembered prior plan.
+Adapters batch independent observations and effects, but never split one
+change's three-ref publication tuple. Batch boundaries and receipt mapping are
+tested independently, while semantic tests reason about typed actions and
+durable prefixes.
 
 ### Domain Values
 
@@ -153,11 +156,20 @@ The core model should distinguish at least:
 - stack visibility and base branch;
 - destination-scoped observations which couple each active change to its
   managed head, owned base, and complete immutable version history;
+- optional immutable pull-request markers whose targets belong to the
+  validated published history;
 - pull requests keyed by stable GHerrit ID, including lifecycle state;
 - desired pull request specifications and minimal update patches;
-- ref updates with explicit expected and desired object IDs; and
-- rejection and ambiguity reasons represented by dedicated Rust enum variants
-  with structured fields, rather than booleans or formatted strings.
+- whole publication tuples and marker operations with explicit expected and
+  desired object IDs; and
+- outcomes which drive production branching, retry classification, or
+  authority transitions, represented by dedicated Rust structs or enums with
+  validated structured fields.
+
+Terminal validation failures on which production never branches may use a
+`color_eyre::Report`. Their contract is bounded, actionable user-facing text,
+owned by focused assertions or reviewed snapshots. Introduce a structured
+rejection taxonomy only when a production consumer needs to inspect it.
 
 Invalid combinations should be difficult to construct. Test builders may offer
 concise scenario syntax, but they should produce the same validated domain
@@ -173,7 +185,10 @@ The Git boundary should support:
 - observing the local stack and branch configuration;
 - observing the default branch and every remote head in one global request;
 - observing exact active tag namespaces in separate byte-bounded requests;
-- publishing bounded atomic batches with explicit branch and tag leases.
+- publishing bounded atomic batches of inseparable head, literal-owned-base,
+  and immutable-version tuples with exact leases; and
+- publishing separate create-only pull-request marker batches after GitHub has
+  established the corresponding pull requests.
 
 Remote immutable tags are version authority. The boundary must not consult or
 persist local version tags: tests must produce the same next version from a
@@ -183,12 +198,18 @@ plus active immutable histories, not every historical version tag.
 
 The GitHub boundary should support:
 
-- observing pull requests for a set of GHerrit IDs;
-- creating pull requests from complete specifications; and
-- applying minimal pull request updates.
+- completely paginating the repository-wide OPEN connection and correlating
+  managed identities only after local Git evidence is ready;
+- exhaustively observing terminal history only for missing local identities;
+- creating pull requests from complete specifications on the stable owned-base
+  key; and
+- applying the final minimal GraphQL projection, including default base for a
+  root and the change's own base for a nonroot.
 
-Production adapters use real Git and GitHub protocols. Application tests use
+Production adapters use real Git and GitHub protocols. Pure planner tests use
 focused domain fixtures and a dedicated finite-state semantic recovery oracle.
+Process tests compose real repositories and Git subprocesses with a strict
+schema-validating GitHub fake.
 
 ## Test Layers
 
@@ -204,30 +225,22 @@ the exhaustive recovery proof.
 They cover:
 
 - stack topology and policy;
-- pull request rendering, exact body comparison, and minimal updates;
-- parser syntax and exact text equivalence;
-- publication and version decisions;
-- reconciliation ordering and batching boundaries;
+- pull request rendering and minimal updates;
+- parsing and exact text equivalence;
+- local owned-tuple, version, and marker decisions;
+- batching boundaries;
 - action masks; and
-- bounded diagnostic formatting.
+- bounded error formatting.
 
 ### Exhaustive Semantic Recovery Proof
 
-The single named test
+The named test
 `owned_base_and_marker_publication_exhaustively_survive_restarts` compares an
 independent finite-state model with the production planner. It covers bounded
-topologies, publication stages, durable effect prefixes, acknowledgement loss,
-visibility schedules, restarts, and convergence. It is required in CI and
-before publication, but it is deliberately separate from the interactive
-focused-test loop.
-
-Ordinary policy, formatting, parsing, adapter, and feature cases remain in
-focused tests. Update the exhaustive oracle when publication stages, durable
-effects, acknowledgement loss, visibility schedules, or restart and
-convergence reasoning change. Exact body text, rendering, parser syntax, wire
-encoding, and local batching boundaries remain owned by focused tests; those
-details do not enlarge the recovery state space unless they change a durable
-action or visibility schedule.
+topologies, typed barrier ordering, durable effect prefixes, partial success,
+visibility schedules, acknowledgements, restarts, and convergence. It is
+required in CI and before publication, but it is deliberately separate from
+the interactive focused-test loop.
 
 Before adding a property-testing dependency, exhaustively enumerate bounded
 small state spaces directly. Stacks of up to three commits combined with absent,
@@ -238,16 +251,18 @@ names and failures.
 Universal invariants include:
 
 - rejection produces no mutations;
-- GitHub creates never precede exact acknowledgement of required Git
+- GitHub creates never precede exact acknowledgement of required tuple
   publication;
-- final GitHub updates never precede exact acknowledgement of required marker
+- final GraphQL updates never precede exact acknowledgement of required marker
   publication;
 - a converged world produces no action;
 - applying a successful action makes measurable progress;
 - retrying from every committed prefix eventually converges;
 - version tags never move;
 - one change's head, owned base, and new version tag are never split;
-- every created pull request uses its own published base; and
+- every created pull request uses its own published base;
+- every converged root uses the exact default base and every converged nonroot
+  uses its own base; and
 - merged state is absorbing.
 
 ### Adapter Contract Tests
@@ -256,8 +271,11 @@ These tests prove translation at a real boundary while keeping domain policy
 out of the fixture.
 
 Git contracts use temporary repositories and a real bare remote. They cover
-history discovery, ref parsing, atomic pushes, lease conflicts, tag
-immutability, configuration, and hook filesystem behavior.
+history discovery, ref parsing, atomic three-ref tuple pushes, exact head/base
+leases, version and marker immutability, separately batched marker pushes,
+lost or malformed porcelain acknowledgements, configuration, and hook
+filesystem behavior. Assertions inspect the real bare remote's object IDs;
+command snapshots alone are not evidence that tuple atomicity held.
 
 GitHub contracts use a small scripted HTTP transport. A script declares exact
 expected requests and explicit responses. Unexpected requests, request-order
@@ -275,8 +293,15 @@ System tests are reserved for claims about complete process composition:
 
 - command-line parsing and complete user-visible output;
 - hook installation, upgrading, permissions, and argument forwarding;
-- one complete successful flow through an installed pre-push hook;
-- one installed pre-push rejection that blocks the enclosing push; and
+- representative one-change, two-change, and mixed established/new
+  publication through an installed pre-push hook;
+- exact remote head, literal-owned-base, immutable-version, and optional marker
+  object IDs after real Git pushes;
+- root/default and nonroot/self-owned pull-request bases after the GraphQL
+  projection;
+- one installed pre-push rejection that blocks the enclosing push without a
+  Git or GitHub write;
+- focused recovery across lost tuple, create, and marker acknowledgements; and
 - platform-specific executable discovery and process behavior.
 
 System fixtures should create managed commits and IDs explicitly when hook
@@ -289,16 +314,21 @@ after itself, and never be part of ordinary hermetic test execution.
 
 ## Test Doubles and Faults
 
-Use two independent test implementations:
+Keep three evidence roles distinct:
 
-1. `ModelWorld` provides synchronous, in-memory Git and GitHub domain semantics
-   and a typed chronological effect trace.
-2. `ScriptedHttp` verifies exact GitHub protocol translation.
+1. The planner's synchronous semantic world applies typed Git and GitHub
+   effects and records their chronological trace. It owns exhaustive policy
+   and recovery combinations.
+2. The strict GitHub fake validates GraphQL documents and schemas, projects
+   independent stored pull-request fields, enforces duplicate creation by the
+   complete same-repository head/base key, and records ordered requests.
+3. Temporary repositories, a real bare remote, and the bounded Git interceptor
+   prove command and ref effects at the actual Git boundary.
 
-Do not combine a semantic GitHub simulator, GraphQL interpreter, Git command
-interceptor, remote repository, request recorder, and fault injector behind one
-shared mutable state object. Such a fake duplicates external behavior, permits
-impossible states, and makes policy tests depend on transport details.
+The GitHub fake must not become an alternate planner, and the semantic world
+must not parse GraphQL, Git commands, URLs, or HTTP payloads. A request log can
+prove ordering and wire shape; only real remote inspection proves Git ref
+effects.
 
 Faults should name observable boundaries, for example:
 
@@ -330,15 +360,16 @@ result
 
 effects, in order
   observations
-  published refs and leases
+  published tuple refs and leases
   created pull request specifications
+  published pull request markers and leases
   applied pull request patches
 
 final Git state
   logical commits
   relevant branch configuration
-  managed branches
-  version tags
+  managed head and owned-base branches
+  immutable version tags and pull request markers
 
 final GitHub state
   number, lifecycle state, head, base, title, and complete body
@@ -400,22 +431,23 @@ Measure wall-clock time and critical-path tests, not only the sum of individual
 test durations. Parallel system tests contend for process and filesystem
 resources, so increasing test threads is not a general performance strategy.
 
-Measure focused feedback, the exhaustive semantic proof, adapter and process
+Measure focused feedback, the exhaustive semantic proof, adapter/process
 groups, and the full gate separately. A slow proof must not silently become
 part of every interactive command, and a fast focused subset is not evidence
 that the recovery proof ran.
 
-On the 2026-08-23 macOS reference host, with warm artifacts and one Cargo build
-job, the 36-test planner group including the oracle took 30.98 seconds. Repeated
-warm oracle runs took 32.19–36.40 seconds with 10 Rayon workers and about
-186–198 user CPU seconds. The complete required unit-25 one-Cargo-job suite
-took 85.72 seconds. These are dated same-host baselines, not portable pass/fail
-thresholds.
+On the 2026-08-23 macOS reference host, with warm artifacts, one Cargo build
+job, and one libtest thread, the exact activation tip measured the 36-test
+planner group including the oracle at 30.98 seconds, the complete pre-push
+process target at about 199 seconds, and the complete workspace at about 256
+seconds. Repeated warm oracle runs took 32.19–36.40 seconds with 10 Rayon
+workers and about 186–198 CPU seconds. These are dated same-host baselines, not
+portable pass/fail thresholds.
 
 Comparable validation receipts must record the toolchain, Cargo job count,
 test and Rayon worker counts, warm or cold state, selected layer, and wall
 time. A material regression requires measurement and an explanation. Optimize
-without weakening the oracle's state space, hermeticity, or boundary fidelity.
+without weakening the state space, hermeticity, or boundary fidelity.
 
 ## Adding Coverage
 
@@ -423,8 +455,8 @@ When adding a behavior:
 
 1. State the product risk and observable claim.
 2. Put a local semantic rule in a focused pure test. Update the exhaustive
-   oracle only when a publication stage, durable effect, acknowledgement-loss
-   case, visibility schedule, or the recovery proof changes.
+   oracle only when the publication state machine, a durable effect, a
+   visibility schedule, or the recovery proof changes.
 3. Add an adapter contract only if new protocol translation is involved.
 4. Add a system scenario only if process or hook composition is the subject.
 5. Include the new operation in the typed trace and canonical report.
@@ -446,187 +478,118 @@ parts compose, but they should not repeat the owner's full input matrix.
 | GHerrit ID syntax and derivation | Pure function | One installed commit hook |
 | Branch-management transitions | Pure function | One hook per process boundary |
 | Pull request text and navigation | Pure renderer | One complete lifecycle snapshot |
-| Minimal pull request patches | Pure reconciliation | GraphQL encoding contracts |
-| Version and publication decisions | Pure reconciliation | Bare-remote ref-state contracts |
+| Minimal pull request patches | Pure planner | GraphQL encoding contracts |
+| Owned-tuple, marker, and version decisions | Pure planner | Bare-remote ref-state contracts |
 | GraphQL request and response shape | Codec contract | One complete system flow |
 | Batching boundaries and aliases | Pure batching | One multi-item codec contract |
-| CLI diagnostics | Pure typed errors | Focused command snapshots |
+| Terminal validation and CLI diagnostics | Focused validation/formatting tests | Focused command snapshots |
 | Hook argument forwarding and blocking | Installed-hook system test | None |
-| Retry and concurrent-writer behavior | Exhaustive semantic recovery proof | Focused lease contract |
+| Retry and concurrent-writer behavior | Semantic world | Focused lease contract |
 
 This table is also a deletion rule. Once the primary owner and the stated
 composition evidence exist, another process test needs a distinct boundary
 claim to justify its cost.
 
-## Incremental Migration Sequence
+## Required Publication Evidence
 
-The migration should remain reviewable and bisectable. Each increment must
-leave the full required suite green, carry its own deletion of superseded
-coverage where possible, and avoid creating a second permanent architecture.
+The suite treats the owned publication representation as the sole active
+representation. Ordinary fixtures contain no compatibility representation,
+and no process matrix exists only to repeat pure planner combinations.
 
-### 1. Make the Existing Suite Trustworthy
+### Pure Semantic Evidence
 
-1. Clear inherited command environments and explicitly allow only deterministic
-   variables needed by each process.
-2. Replace fixture presets with explicit capabilities such as a repository, a
-   bare remote, a GitHub transport, or a Git interceptor.
-3. Give every subprocess and server a deadline, deterministic shutdown, and
-   descendant cleanup.
-4. Replace string- and environment-controlled failures with ordered typed fault
-   expectations that fail teardown when unused.
-5. Make the GitHub boundary strict: reject unsupported operations, wrong
-   repository identities, malformed variables, ambiguous results, and unused
-   responses.
-6. Build the test driver as an ordinary Cargo artifact and prove that the
-   production binary cannot enter its protocol.
-7. Add real installed-hook tests for file installation, argument forwarding,
-   and failure propagation.
+The dedicated recovery oracle owns exhaustive combinations of bounded
+histories and durable effect prefixes. It models each published revision as
+exactly:
 
-These steps improve evidence without changing the product model and create a
-reliable base for larger deletions.
+```text
+refs/heads/G                 -> H
+refs/heads/gherrit-bases/G   -> first_parent(H)
+refs/tags/gherrit/G/vN       -> H
+```
 
-### 2. Move Stable Decisions into Pure Production Code
+The tuple is one indivisible action. The independently optional
+`refs/tags/gherrit/G/pr` marker is a later create-only action, never a tuple
+member. Pure tests enumerate acknowledged tuple and marker batches, every
+subset of complete aliased GraphQL operations, restart from each durable
+prefix, and prove that no partial title/body/base application exists within one
+alias.
 
-8. Extract branch-management transitions, checked-out-branch classification,
-   GHerrit ID derivation, stack linking, PR-body rendering, autosquash policy,
-   batching, and publication refspec construction.
-9. Give each extraction exhaustive table tests over its small state space.
-10. Retain one process test for every distinct OS, Git, or hook boundary and
-    remove process permutations that only repeated the extracted decision.
-11. Make repository and PR lookup ambiguity explicit typed errors rather than
-    selecting an arbitrary candidate.
-12. Make observation failures fail closed; an unavailable remote must never be
-    interpreted as an empty remote.
+Focused pure tests separately own exact body text, rendering, parser syntax,
+wire encoding, and local batching boundaries. Those details do not multiply
+the recovery oracle's state space unless they change a durable action or
+visibility schedule.
 
-This phase should reduce the process target to a few seconds before introducing
-new abstractions.
+Planner coverage owns the full root/nonroot, lifecycle, automation, ordering,
+and recovery relation matrices. In particular, it proves that every create
+uses the permanent same-repository `G`/`gherrit-bases/G` key; a final root
+uses the exact default branch; a final nonroot uses its own base; and a marker
+barrier is required before either final projection becomes available.
 
-### 3. Define the Reconciliation Vocabulary
+### Real Git-Boundary Evidence
 
-13. Introduce owned domain identifiers and observations for local commits,
-    managed refs, immutable versions, pull requests, and stack configuration.
-14. Introduce typed outcomes for rejection, publication, PR creation, PR
-    update, and convergence.
-15. Represent ref publication with explicit old-value expectations and desired
-    object IDs. Represent PR updates as minimal patches whose absent fields mean
-    no write.
-16. Convert adapter-specific values into validated domain observations at the
-    edge. The reconciler must not accept HTTP JSON, GraphQL aliases, Git command
-    output, or repository handles.
-17. Express lifecycle rules, including the absorbing merged state, in the
-    domain rather than in transport or orchestration code.
+Git-boundary fixtures seed real commit objects first, then establish a
+published tuple in one ref transaction. The fixture accepts the literal base
+object ID and the independently optional marker target. It must not infer a
+base from another change's current head or infer a marker from pull-request
+state.
 
-These changes may initially wrap the current control flow. The vocabulary is
-complete when every external write can be named without mentioning its
-transport.
+After publication, tests inspect the real bare remote and assert all three
+tuple refs and their exact object IDs. For a changed revision, they also assert
+that one atomic push contains the complete tuple and that no bounded batch
+splits it. Marker tests inspect the separate create-only ref and its absence
+lease, including multiple markers in one bounded batch.
 
-### 4. Introduce the Staged Reconciler
+Lost-acknowledgement tests use a real successful atomic push followed by
+replaced or malformed porcelain. They prove that the remote contains either
+the complete tuple or no tuple, never a partial tuple, and that no GitHub write
+crosses an unacknowledged Git barrier. A fresh invocation supplies convergence
+evidence. An intercepted command line or a fake request log is useful trace
+evidence, but it is not a substitute for inspecting the actual remote refs.
 
-18. Implement `reconcile(ObservedWorld) -> Outcome` as a pure function that
-    returns either a typed rejection, the next semantic stage, or `Done`. Each
-    stage contains independent effects that adapters may execute in bounded
-    batches.
-19. Order stages so required Git publication precedes PR creation and PR
-    updates. Document every dependency in types or constructors rather than in
-    test setup.
-20. Apply any confirmed prefix of a stage's effects to an in-memory world and
-    reconcile again.
-21. Enumerate bounded worlds of up to three commits and check universal
-    invariants: rejection has no effects, successful stages make progress,
-    tags never move, merged state is absorbing, and convergence is idempotent.
-22. For every committed effect prefix, restart from observation alone and prove
-    eventual convergence.
-23. Add deterministic stale-observation schedules and two-writer interleavings;
-    require either safe progress or a typed conflict followed by reobservation.
+Malformed-state tests deliberately use low-level ref helpers to construct an
+incomplete head/base/version representation. They assert fail-closed behavior
+and exact absence of Git and GitHub writes.
 
-At the end of this phase, policy and recovery regressions should require no
-filesystem, HTTP server, async runtime, or subprocess.
+### GitHub Protocol Evidence
 
-### 5. Separate Semantic and Protocol Doubles
+The scripted GraphQL transport proves complete OPEN pagination, exact
+repository coordinates, terminal lookup only for missing local identities,
+stable owned-base creates, complete alias receipts, and minimal final updates.
+Stored fake pull requests keep base name and base object ID independent and
+model auto-merge and merge-queue state independently.
 
-24. Implement `ModelWorld`, a synchronous semantic oracle that stores domain
-    state, applies typed actions, and records a chronological typed trace.
-25. Give `ModelWorld` only GHerrit's rules. It must not parse command lines,
-    refspec syntax, GraphQL, URLs, or HTTP payloads.
-26. Implement `ScriptedHttp` as an ordered sequence of exact request matchers
-    and explicit responses. It must not infer pull request semantics.
-27. Split any temporary combined fake into focused Git interception, scripted
-    HTTP, bare-remote inspection, and process-lifecycle helpers.
-28. Remove the in-process GraphQL interpreter once all semantic scenarios use
-    `ModelWorld` and all wire-shape cases use codec contracts.
+A one-shot visibility expectation may hide a known OPEN pull request from
+exactly one complete scan without removing it from fake state or duplicate-key
+enforcement. This proves that a lost create acknowledgement repeats the stable
+owned-base key without creating a duplicate, and that a present durable marker
+suppresses creation even when OPEN omits the row.
 
-The key deletion gate is independence: changing a domain rule should not
-require a transport snapshot update, and changing GraphQL syntax should not
-change semantic scenario setup.
+### Complete-Process Composition
 
-### 6. Establish Narrow Adapter Contracts
+Retained process scenarios prove that the production artifact composes the
+boundaries:
 
-29. Test local Git observation against temporary repositories, including root,
-    merge, reordered, autosquashed, missing-ID, and malformed-ID histories.
-30. Test remote observation parsing from complete, empty, malformed, duplicate,
-    and failed `ls-remote` results.
-31. Test atomic publication against a real bare remote: new refs, branch
-    replacement, immutable tag creation, lease conflict, partial rejection, and
-    retry after lost acknowledgement.
-32. Test every GraphQL operation's exact document, variables, escaping, result
-    decoding, partial data, missing aliases, ambiguous nodes, unknown enum
-    values, and error envelopes.
-33. Test batching separately at zero, one, limit, limit-plus-one, and multiple
-    batch boundaries, including response-to-operation mapping.
-34. Keep schema validation in a dedicated fast contract target instead of
-    reparsing the complete schema for every scenario.
+1. One-change, two-change, and a small mixed established/new stack publish
+   complete tuples. Direct ref assertions verify every literal first parent.
+   GitHub state verifies the root/default and nonroot/self-owned final bases.
+2. A representative lifecycle trace shows tuple publication, GraphQL creation,
+   marker publication, and final GraphQL projection in that order.
+   The shared fake records schema-validated GraphQL request receipt and Git
+   push completion callbacks under one lock. This is a chronological fake-side
+   observation, not proof that the client consumed either response; universal
+   barrier ordering comes from the one-use production types.
+3. Incomplete head/base/version state and owned-base automation violations
+   reject before every write and preserve all existing refs and pull requests.
+4. Lost tuple, create, and marker acknowledgements leave safe durable prefixes;
+   fresh invocations converge without a same-attempt confirmation read or
+   mutation retry.
+5. Cancellation-safe gates prove that global heads and the first OPEN page
+   start concurrently, local history work can overlap held OPEN pagination,
+   and an empty local stack drops its held OPEN read. The nonlocal-after-OPEN
+   relation is structural: nonlocal IDs exist only after consuming correlated
+   OPEN evidence, and the additional history future borrows exactly those IDs.
 
-Adapter contracts are complete when an adapter can be replaced without
-rewriting domain tests and protocol defects fail without running a full CLI
-scenario.
-
-### 7. Reduce System Tests to Composition Evidence
-
-35. Keep one full successful private-stack lifecycle that verifies user output,
-    real remote refs, and complete semantic PR state.
-36. Keep one drifted retry lifecycle proving that already-published Git state
-    still leads to PR repair.
-37. Keep one installed pre-push rejection proving that a failed hook blocks the
-    enclosing `git push` and leaves the remote unchanged.
-38. Keep focused installed-hook tests for commit-message arguments and
-    post-checkout argument forwarding.
-39. Keep process snapshots only for diagnostics or output whose exact rendering
-    is the claim.
-40. Delete URL, lifecycle-state, batching-size, projection-field, and fixture
-    permutations whose primary evidence now belongs to lower layers.
-
-Every retained system test should state the boundary that prevents it from
-moving lower.
-
-### 8. Make the CI Shape Match the Architecture
-
-41. Run formatting, linting, focused pure tests, the exhaustive recovery proof,
-    codec tests, adapter contracts, and system tests as visibly separate
-    targets.
-42. Put the fastest deterministic signal first while preserving required status
-    checks for every supported platform.
-43. Run ordinary tests without credentials or live endpoints. Put a live GitHub
-    canary in an explicitly scheduled or manually invoked workflow with an
-    ephemeral repository and guaranteed cleanup.
-44. Measure cached and clean wall-clock duration per layer and publish enough
-    timing data to identify critical-path regressions.
-45. Enforce bounded execution at the outer CI job as well as inside each
-    process helper.
-
-### 9. Finish by Deleting Migration Scaffolding
-
-46. Remove compatibility builders, fake state fields, snapshots, feature flags,
-    and helper APIs with no remaining callers.
-47. Search for tests that install hooks incidentally, inspect fake internals,
-    control faults through strings, inherit the host environment, or sleep for
-    coordination; each remaining occurrence needs an explicit boundary reason.
-48. Re-run the evidence table as an audit: every product risk must have a clear
-    primary owner and every expensive test must protect a unique claim.
-49. Record final layer timings and update the performance tiers and baselines
-    from measured CI and development-machine results.
-50. Treat future additions that bypass the action model or enlarge a semantic
-    protocol fake as architecture changes requiring explicit justification.
-
-The target is not the fewest tests. It is the smallest set of independent,
-high-information tests that makes unsafe behavior difficult to introduce and
-failures cheap to understand.
+Comprehensive readable snapshots show complete results, traces, refs, and pull
+requests. Exact structural assertions remain mandatory for object IDs,
+whole-tuple atomicity, barrier order, and absence of writes.

@@ -8,18 +8,18 @@ use super::{
     bounded_diagnostic_detail,
     destination::{DefaultBranch, PushDestination, RepositoryCoordinates},
     local::GherritPrId,
+    plan::{PlannedCreate, PlannedUpdate},
     pull_request::{
-        CreateAuthorization, CreateAuthorizations, InitialPullRequestIdentities,
-        PullRequestIdentity, PullRequestNodeId, PullRequestNumber, TerminalHistories,
+        InitialPullRequestIdentities, PullRequestIdentity, PullRequestNodeId, PullRequestNumber,
+        TerminalHistories, owned_base_name,
     },
 };
 
 mod transport;
 
-#[allow(unused_imports)]
-pub(super) use transport::{
-    Github, LegacyGithubObservation, MutationAcknowledgement, OpenObservation,
-};
+pub(super) use transport::Github;
+#[cfg(test)]
+pub(super) use transport::OpenObservation;
 
 const MAX_MUTATION_ALIASES: usize = 64;
 // A 131,072-byte pull-request body made entirely from U+0001 expands to
@@ -51,10 +51,9 @@ enum Nullable<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Complete pull-request facts returned by the repository-wide open scan.
 ///
-/// The compatibility selector currently consumes only identity, lifecycle,
-/// and head-repository facts. Keeping the exact refs, object IDs, and policy
-/// state here makes the observation itself complete, so later validation does
-/// not need another network read.
+/// Correlation consumes identity, lifecycle, and head-repository facts while
+/// retaining the exact refs, object IDs, and policy state. Keeping the row
+/// complete means later validation never needs another network read.
 pub(super) struct OpenPullRequest {
     pub(super) number: u64,
     pub(super) node_id: String,
@@ -73,7 +72,7 @@ pub(super) struct OpenPullRequest {
 ///
 /// Only the paginator constructs this value. It remains nested inside
 /// [`OpenObservation`](transport::OpenObservation) until correlation or the
-/// temporary legacy selector consumes that observation.
+/// correlation consumes that observation.
 #[derive(Debug)]
 pub(super) struct CompleteOpenRows {
     pull_requests: Box<[OpenPullRequest]>,
@@ -164,15 +163,6 @@ impl RepositoryTerminalHistories {
         Self { coordinates, exact }
     }
 
-    /// FIXME(#264): Delete this legacy unwrap with the pre-activation
-    /// observation adapter.
-    fn into_legacy_for(self, expected: &RepositoryCoordinates) -> Result<CreateAuthorizations> {
-        if &self.coordinates != expected {
-            bail!("terminal pull request evidence came from a different GitHub repository");
-        }
-        self.exact.into_legacy_authorizations()
-    }
-
     #[cfg(test)]
     pub(super) fn for_test(destination: &PushDestination, exact: TerminalHistories) -> Self {
         Self::from_transport(destination.repository_coordinates(), exact)
@@ -186,6 +176,23 @@ impl<'destination> CorrelatedRepository<'destination> {
         pull_requests: super::pull_request::CorrelatedPullRequests,
     ) -> Self {
         Self { destination, repository, pull_requests }
+    }
+
+    pub(super) fn nonlocal_ids(&self) -> Box<[GherritPrId]> {
+        self.pull_requests.nonlocal().iter().map(|pull_request| pull_request.id().clone()).collect()
+    }
+
+    pub(super) fn missing_local_ids(&self) -> Box<[GherritPrId]> {
+        self.pull_requests
+            .local()
+            .iter()
+            .filter_map(|pull_request| match pull_request {
+                super::pull_request::LocalPullRequestObservation::Open(_) => None,
+                super::pull_request::LocalPullRequestObservation::NeedsTerminalProof(id) => {
+                    Some(id.clone())
+                }
+            })
+            .collect()
     }
 
     pub(super) fn into_planning_parts_for(
@@ -729,12 +736,12 @@ impl TerminalPullRequestQuery {
 
 /// A request to create one pull request.
 ///
-/// The active legacy path consumes its private authorization token. The
-/// dormant planner path is reachable only after its exact neutral terminal
-/// join selected `Empty`. Both paths derive the head and response correlation
-/// ID from the selected change ID.
+/// Construction is reachable only through a planner-owned specification. The
+/// planner issues that specification at the exact join of OPEN absence,
+/// terminal-history emptiness, and marker absence. The head and response
+/// correlation ID both derive from that authorized change ID.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct CreatePullRequest {
+struct CreatePullRequest {
     id: GherritPrId,
     repository_id: String,
     base_branch: String,
@@ -744,29 +751,8 @@ pub(super) struct CreatePullRequest {
 }
 
 impl CreatePullRequest {
-    pub(super) fn new(
-        authorization: CreateAuthorization,
-        repository_id: String,
-        base_branch: String,
-        title: String,
-        body: String,
-    ) -> Self {
-        Self::from_id(authorization.into_id(), repository_id, base_branch, title, body)
-    }
-
-    /// Constructs an operation only after the dormant planner's exact neutral
-    /// terminal-history join selected an empty history.
-    pub(super) fn from_planner(
-        id: GherritPrId,
-        repository_id: String,
-        base_branch: String,
-        title: String,
-        body: String,
-    ) -> Self {
-        Self::from_id(id, repository_id, base_branch, title, body)
-    }
-
-    fn from_id(
+    /// Converts one planner-owned create specification into its wire model.
+    fn new(
         id: GherritPrId,
         repository_id: String,
         base_branch: String,
@@ -850,7 +836,7 @@ impl ExpectedCreateReceipt {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct PreparedCreateBatch {
+struct PreparedCreateBatch {
     request: Value,
     serialized_bytes: usize,
     expected: Box<[ExpectedCreateReceipt]>,
@@ -1006,48 +992,9 @@ pub(super) struct PreparedCreates {
 }
 
 impl PreparedCreates {
-    /// FIXME(#264): Delete this subset-oriented legacy constructor with the
-    /// pre-activation publisher.
-    pub(super) fn new(
-        initial: InitialPullRequestIdentities,
-        authorizations: CreateAuthorizations,
-        operations: Vec<CreatePullRequest>,
-    ) -> Result<Self> {
-        if operations.is_empty() {
-            bail!("A prepared create action requires at least one operation");
-        }
-        let expected = authorizations.into_expected_ids()?;
-        let mut operation_ids = HashSet::with_capacity(operations.len());
-        for (index, operation) in operations.iter().enumerate() {
-            if !operation_ids.insert(operation.id.clone()) {
-                bail!(
-                    "GraphQL create mutation at item {index} repeats change '{}'. No mutation was sent.",
-                    operation.id.as_str()
-                );
-            }
-            if !expected.contains(&operation.id) {
-                bail!(
-                    "GraphQL create mutation at item {index} lacks terminal authorization for '{}'. No mutation was sent.",
-                    operation.id.as_str()
-                );
-            }
-        }
-        if operation_ids != expected {
-            let mut missing =
-                expected.difference(&operation_ids).map(GherritPrId::as_str).collect::<Vec<_>>();
-            missing.sort_unstable();
-            bail!(
-                "GraphQL create plan omits authorized change(s): {}. No mutation was sent.",
-                missing.join(", ")
-            );
-        }
-
-        Self::from_exact(initial, operations)
-    }
-
     /// Prepares operations whose complete authorization set was consumed by
     /// the planner's exact ordered join.
-    pub(super) fn from_exact(
+    fn from_exact(
         initial: InitialPullRequestIdentities,
         operations: Vec<CreatePullRequest>,
     ) -> Result<Self> {
@@ -1074,6 +1021,10 @@ impl PreparedCreates {
             by_change: HashMap::new(),
         };
         Ok(Self { batches, receipts })
+    }
+
+    pub(super) fn planned_ids(&self) -> Box<[GherritPrId]> {
+        self.receipts.order.clone()
     }
 
     #[cfg(test)]
@@ -1120,23 +1071,9 @@ impl ExactCreateReceipts {
     ) -> impl ExactSizeIterator<Item = (&GherritPrId, &PullRequestIdentity)> {
         self.values.iter().map(|(id, identity)| (id, identity))
     }
-
-    pub(super) fn into_values(self) -> Box<[(GherritPrId, PullRequestIdentity)]> {
-        self.values
-    }
 }
 
 impl CompleteCreateReceipts {
-    #[allow(dead_code)] // Consumed by the pending owned-base activation path.
-    pub(super) fn len(&self) -> usize {
-        self.by_change.len()
-    }
-
-    #[cfg(test)]
-    pub(super) fn identity(&self, id: &GherritPrId) -> Option<&PullRequestIdentity> {
-        self.by_change.get(id)
-    }
-
     /// Consumes this receipt proof against one exact expected order.
     pub(super) fn into_exact(mut self, expected: &[GherritPrId]) -> Result<ExactCreateReceipts> {
         if self.order.as_ref() != expected {
@@ -1158,34 +1095,11 @@ impl CompleteCreateReceipts {
         }
         Ok(ExactCreateReceipts { values })
     }
-
-    /// FIXME(#264): Delete with the pre-activation publisher.
-    pub(super) fn into_legacy_created(mut self) -> Vec<CreatedPullRequest> {
-        self.order
-            .into_vec()
-            .into_iter()
-            .map(|id| {
-                let identity = self.by_change.remove(&id).expect("complete receipt has every ID");
-                CreatedPullRequest {
-                    head_branch: id.as_str().to_owned(),
-                    number: u64::from(identity.number().get()),
-                    node_id: identity.node_id().as_str().to_owned(),
-                }
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct CreatedPullRequest {
-    pub(super) head_branch: String,
-    pub(super) number: u64,
-    pub(super) node_id: String,
 }
 
 /// A nonempty minimal update to one exact preplanned pull request identity.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct UpdatePullRequest {
+struct UpdatePullRequest {
     identity: PullRequestIdentity,
     title: Option<String>,
     body: Option<String>,
@@ -1194,7 +1108,7 @@ pub(super) struct UpdatePullRequest {
 }
 
 impl UpdatePullRequest {
-    pub(super) fn new(
+    fn new(
         identity: PullRequestIdentity,
         title: Option<String>,
         body: Option<String>,
@@ -1350,7 +1264,7 @@ impl ExpectedUpdateReceipt {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct PreparedUpdateBatch {
+struct PreparedUpdateBatch {
     request: Value,
     serialized_bytes: usize,
     expected: Box<[ExpectedUpdateReceipt]>,
@@ -1423,7 +1337,7 @@ pub(super) struct PreparedUpdates {
 }
 
 impl PreparedUpdates {
-    pub(super) fn new(operations: Vec<UpdatePullRequest>) -> Result<Self> {
+    fn new(operations: Vec<UpdatePullRequest>) -> Result<Self> {
         if operations.is_empty() {
             bail!("A prepared update action requires at least one operation");
         }
@@ -1467,6 +1381,36 @@ impl PreparedUpdates {
     pub(super) fn request_batches_for_test(&self) -> impl Iterator<Item = &Value> {
         self.batches.iter().map(|batch| &batch.request)
     }
+}
+
+/// Converts planner-owned create specifications into exact GraphQL wire data.
+pub(super) fn prepare_creates(
+    initial: InitialPullRequestIdentities,
+    planned: Box<[PlannedCreate]>,
+) -> Result<PreparedCreates> {
+    let operations = planned
+        .into_vec()
+        .into_iter()
+        .map(|planned| {
+            let (repository_id, id, title, body) = planned.into_parts();
+            let base_branch = owned_base_name(&id);
+            CreatePullRequest::new(id, repository_id, base_branch, title, body)
+        })
+        .collect();
+    PreparedCreates::from_exact(initial, operations)
+}
+
+/// Converts planner-owned update specifications into exact GraphQL wire data.
+pub(super) fn prepare_updates(planned: Box<[PlannedUpdate]>) -> Result<PreparedUpdates> {
+    let operations = planned
+        .into_vec()
+        .into_iter()
+        .map(|planned| {
+            let (identity, title, body, base_branch) = planned.into_parts();
+            UpdatePullRequest::new(identity, title, body, base_branch)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    PreparedUpdates::new(operations)
 }
 
 #[cfg(test)]
@@ -1813,7 +1757,6 @@ mod observation_tests {
 #[cfg(test)]
 mod mutation_tests {
     use super::*;
-    use crate::pre_push::pull_request::TerminalExhaustionAccumulator;
 
     fn id(value: &str) -> GherritPrId {
         GherritPrId::from_ref_component(value.as_bytes()).unwrap()
@@ -1823,29 +1766,13 @@ mod mutation_tests {
         InitialPullRequestIdentities::from_open(&pull_requests).unwrap()
     }
 
-    fn legacy_authorizations(ids: &[&str]) -> CreateAuthorizations {
-        let ids = ids.iter().map(|value| id(value)).collect::<Vec<_>>();
-        let mut accumulator = TerminalExhaustionAccumulator::new(ids.iter().cloned()).unwrap();
-        for id in ids {
-            accumulator = accumulator
-                .record_page(TerminalPullRequestEvidence::for_test(
-                    id,
-                    None,
-                    TerminalPullRequestPage { pull_requests: Vec::new(), next_cursor: None },
-                ))
-                .unwrap();
-        }
-        accumulator.into_legacy_authorizations().unwrap()
-    }
-
     fn creates(ids: &[&str], initial: InitialPullRequestIdentities) -> PreparedCreates {
-        let mut authorizations = legacy_authorizations(ids);
         let operations = ids
             .iter()
             .map(|value| {
                 let id = id(value);
                 CreatePullRequest::new(
-                    authorizations.take(&id).unwrap(),
+                    id,
                     "REPO_NODE_ID".to_owned(),
                     "main".to_owned(),
                     format!("Title {value}"),
@@ -1853,7 +1780,7 @@ mod mutation_tests {
                 )
             })
             .collect();
-        PreparedCreates::new(initial, authorizations, operations).unwrap()
+        PreparedCreates::from_exact(initial, operations).unwrap()
     }
 
     fn created(client_id: &str, head: &str, number: u64, node_id: &str) -> Value {
@@ -1899,39 +1826,6 @@ mod mutation_tests {
             None,
         )
         .unwrap()
-    }
-
-    #[test]
-    fn create_preparation_consumes_the_exact_authorization_set() {
-        let mut authorization_set = legacy_authorizations(&["A", "B"]);
-        let a = id("A");
-        let operation = CreatePullRequest::new(
-            authorization_set.take(&a).unwrap(),
-            "REPO_NODE_ID".to_owned(),
-            "main".to_owned(),
-            "A".to_owned(),
-            String::new(),
-        );
-        assert!(
-            PreparedCreates::new(initial(Vec::new()), authorization_set, vec![operation]).is_err()
-        );
-
-        let mut authorization_set = legacy_authorizations(&["A", "B"]);
-        let operations = ["A", "B"]
-            .map(|value| {
-                let value = id(value);
-                CreatePullRequest::new(
-                    authorization_set.take(&value).unwrap(),
-                    "REPO_NODE_ID".to_owned(),
-                    "main".to_owned(),
-                    value.as_str().to_owned(),
-                    String::new(),
-                )
-            })
-            .into_iter()
-            .take(1)
-            .collect();
-        assert!(PreparedCreates::new(initial(Vec::new()), authorization_set, operations).is_err());
     }
 
     #[test]
@@ -2082,9 +1976,9 @@ mod mutation_tests {
                 (id("B"), PullRequestIdentity::new(2, "PR_2".to_owned()).unwrap()),
             ])
             .unwrap();
-        let complete = complete.finish().unwrap();
-        assert_eq!(complete.len(), 2);
-        assert_eq!(complete.identity(&id("B")).unwrap().number().get(), 2);
+        let exact = complete.finish().unwrap().into_exact(&[id("A"), id("B")]).unwrap();
+        assert_eq!(exact.iter().len(), 2);
+        assert_eq!(exact.iter().nth(1).unwrap().1.number().get(), 2);
 
         let mut ordered = receipt_plan(&["A", "B"], initial(Vec::new()));
         ordered
@@ -2171,10 +2065,7 @@ mod mutation_tests {
 
     #[test]
     fn concrete_prepared_mutation_actions_must_be_nonempty() {
-        assert!(
-            PreparedCreates::new(initial(Vec::new()), legacy_authorizations(&[]), Vec::new())
-                .is_err()
-        );
+        assert!(PreparedCreates::from_exact(initial(Vec::new()), Vec::new()).is_err());
         assert!(PreparedUpdates::new(Vec::new()).is_err());
     }
 }

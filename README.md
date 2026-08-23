@@ -15,9 +15,8 @@ synchronizes them to GitHub as a chain of dependent Pull Requests.
 ### Prerequisites
 
   * **Rust**: You must have a working Rust toolchain (`cargo`).
-  * **GitHub CLI (`gh`)**: GHerrit uses the `gh` tool to authenticate to GitHub
-    so it can create and manage PRs. Ensure you are authenticated (`gh auth
-    login`).
+  * **GitHub token**: Set `GITHUB_TOKEN` to a token which can read and write
+    pull requests in the destination repository.
 
 ### Setup
 
@@ -67,9 +66,12 @@ git push
 **GHerrit intercepts this push.** Instead of pushing your local branch directly, it:
 
 1.  Analyzes your stack of commits.
-2.  Pushes each commit to a dedicated "phantom branch" on GitHub.
-3.  Creates or Updates a Pull Request for each commit.
-4.  Updates the PR bodies to include navigation links.
+2.  Publishes each changed commit's head, literal first-parent base, and new
+    immutable version tag as one atomic tuple.
+3.  Creates missing Pull Requests on their permanent owned bases.
+4.  Records established Pull Requests with a separate immutable Git marker,
+    then updates their final bases and numbered navigation through GitHub's
+    GraphQL API.
 5.  Injects a "Patch History" table into the PR description. Because GHerrit
     tracks every version of your commit, this table provides direct links to
     view the **diff between versions** (e.g., "Compare v3 vs v2"). This allows
@@ -127,7 +129,7 @@ then you can stop reading now.*
 
 ### Core Architecture
 
-#### `gherrit-pr-id` Trailer and Phantom Branches
+#### `gherrit-pr-id` Trailer and Owned Publication Refs
 
 Inspired by Gerrit, each commit managed by GHerrit includes a trailer line in
 its commit message, e.g., `gherrit-pr-id: G847...`.
@@ -137,25 +139,41 @@ merge the contents of one *branch* into another). A branch can contain multiple
 commits, leading to a one-to-many relationship between PRs and commits. In the
 Gerrit style, we want a one-to-one relationship between PRs and commits.
 However, Git commits do not have stable identifiers – commit hashes change on
-rebase, on `git commit --amend`, etc. The `gerrit-pr-id` trailer acts as a
+rebase, on `git commit --amend`, etc. The `gherrit-pr-id` trailer acts as a
 stable key for the commit that survives rebases and other commit changes.
 
-Since the user will have a single branch locally containing multiple commits, a
-normal `git push` would simply result in a single PR for the whole branch.
-Instead, GHerrit pushes changes by synthesizing "phantom" branches: Each commit
-is pushed to a branch whose name matches that commit's `gherrit-pr-id` trailer.
-GHerrit then uses the GitHub API to create or update one PR for each commit,
-setting the base and source branches to the appropriate phantom branches.
+Since the user has a single local branch containing multiple commits, a normal
+`git push` would result in one PR for the whole branch. GHerrit instead gives
+each change two owned branches. For change `G`, `refs/heads/G` points to the
+change's current revision and `refs/heads/gherrit-bases/G` points to that
+revision's literal first parent. The latter never names another change's
+mutable head branch.
+
+Every pull request is created with head `G` and base `gherrit-bases/G`. This
+stable creation key remains the same across amendments, rebases, reorders, and
+root-status changes. After Git records that the pull request exists, the final
+GraphQL projection places a root pull request on the repository's default
+branch; every nonroot pull request remains on its own `gherrit-bases/G` branch.
 
 #### Version Tags
 
-In addition to pushing branches, GHerrit pushes a lightweight tag for every
+Alongside both owned branches, GHerrit publishes a lightweight tag for every
 version of every commit in the stack, formatted as
-`refs/tags/gherrit/<id>/v<version>`. Normally, force-push workflows destroy the
-history of previous iterations. By tagging every version, GHerrit persists the
-entire evolution of a PR. These version tags can be used to diff any two
-versions of a PR – this is how GHerrit generates the **Patch History Table** in
-the PR description.
+`refs/tags/gherrit/<id>/v<version>`. The three refs form one point-in-time
+publication tuple:
+
+```text
+refs/heads/G                 -> current revision
+refs/heads/gherrit-bases/G   -> current revision's literal first parent
+refs/tags/gherrit/G/vN       -> current revision
+```
+
+When any member must change, GHerrit publishes the whole tuple atomically; it
+never exposes a head-only or head-and-tag update. Normally, force-push
+workflows destroy the history of previous iterations. By tagging every
+version, GHerrit persists the entire evolution of a PR. These version tags can
+be used to diff any two versions of a PR – this is how GHerrit generates the
+**Patch History Table** in the PR description.
 
 The tags advertised by the configured push destination are the authoritative
 version history. GHerrit neither reads nor creates local version tags, so a
@@ -174,12 +192,12 @@ before publishing any prefix of it.
 
 GHerrit's publication protocol assumes one publisher at a time. For every
 change it does update, GHerrit nevertheless rejects drift between observation
-and the Git write: the managed branch is leased against the exact object
+and the Git write: both mutable branches are leased against the exact objects
 observed at the push destination, and a new version tag (e.g., `v2`) is leased
 against absence:
-`--force-with-lease=refs/tags/gherrit/<id>/v<ver>:`. The branch and tag updates
-for each bounded publication batch are sent in one atomic push. Up-to-date
-managed refs are not included in a push, and GitHub mutations are not
+`--force-with-lease=refs/tags/gherrit/<id>/v<ver>:`. All three tuple members are
+sent in the same atomic push and are never split between bounded batches.
+Up-to-date tuples are not included in a push, and GitHub mutations are not
 serialized with Git writes, so these leases are not a general multi-publisher
 lock.
 
@@ -187,6 +205,14 @@ The trailing colon (`:`) tells Git to ensure the ref does **not** already exist
 on the remote. If another user has already pushed `v2` in the interim, the
 assertion fails and the complete atomic batch is rejected. The publisher must
 observe the destination again before retrying.
+
+Pull-request existence uses a separate immutable marker,
+`refs/tags/gherrit/<id>/pr`, rather than a fourth member of the publication
+tuple. GHerrit prepares this create-only marker only after it has acknowledged
+or observed the corresponding pull request. Exact acknowledgement of the
+marker batch is a second Git barrier: final GraphQL body and base updates are
+not available before it. A lost marker acknowledgement therefore leaves the
+pull request safely on its owned base for a later attempt.
 
 #### `pre-push` Hook
 

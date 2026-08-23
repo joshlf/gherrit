@@ -3,7 +3,12 @@ mod unmanaged;
 
 #[test]
 fn test_pre_push_ancestry_check() {
-    let ctx = testutil::test_context!().with_remote().with_initial_commit().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
 
     // Create an orphan branch
     ctx.run_git(&["checkout", "--orphan", "lonely-branch"]);

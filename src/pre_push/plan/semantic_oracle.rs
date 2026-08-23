@@ -998,7 +998,7 @@ fn actual_plan(
         .map(|(options, refspecs)| parse_git_request(options, refspecs))
         .collect::<Vec<_>>();
     let git_gate = !git.is_empty();
-    match publication.projection {
+    match publication.into_projection_for_test() {
         ReadyProjection::Final(final_projection) => Ok(ActualPlan {
             git,
             updates: parse_final_projection(final_projection, assigned, intent, bodies),
@@ -1064,8 +1064,8 @@ fn parse_git_request(options: &[String], refspecs: &[String]) -> Vec<GitTuple> {
     let leases = push_leases(options, refspecs);
     assert_eq!(leases.len() % 3, 0);
     leases
-        .chunks_exact(3)
-        .zip(refspecs.chunks_exact(3))
+        .chunks(3)
+        .zip(refspecs.chunks(3))
         .map(|(leases, refs)| parse_git_tuple(leases, refs))
         .collect()
 }

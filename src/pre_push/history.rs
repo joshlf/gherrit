@@ -71,6 +71,7 @@ pub(super) struct PullRequestMarker {
 }
 
 impl PullRequestMarker {
+    #[cfg(test)]
     pub(super) fn target(self) -> ObjectId {
         self.target
     }
@@ -307,16 +308,19 @@ impl ValidatedPublishedHistory {
         &self.id
     }
 
+    #[cfg(test)]
     pub(super) fn published_len(&self) -> usize {
         self.published.len()
     }
 
+    #[cfg(test)]
     pub(super) fn published_versions(
         &self,
     ) -> impl ExactSizeIterator<Item = (Version, Revision)> + '_ {
         self.published.versioned()
     }
 
+    #[cfg(test)]
     pub(super) fn published_current(&self) -> CurrentVersion {
         self.published.current()
     }

@@ -119,9 +119,15 @@ fn push_destination_controls_observation_publication_and_github_identity() {
     let v2_ref = format!("refs/tags/gherrit/{id}/v2");
     let local_high_ref = format!("refs/tags/gherrit/{id}/v999");
     let fetch_high_ref = format!("refs/tags/gherrit/{id}/v77");
-    let push_v1_oid = ctx.remote_ref_oid("refs/heads/main").unwrap();
-    ctx.remote_git_cmd().args(["update-ref", &managed_ref, "refs/heads/main"]).assert().success();
-    ctx.remote_git_cmd().args(["update-ref", &v1_ref, "refs/heads/main"]).assert().success();
+    let push_v1_oid = ctx.head_oid();
+    let push_base_oid = ctx.remote_ref_oid("refs/heads/main").unwrap();
+    ctx.seed_owned_base_tuple(&testutil::OwnedBaseTuple {
+        id: id.clone(),
+        version: 1,
+        head_oid: push_v1_oid.clone(),
+        base_oid: push_base_oid.clone(),
+        marker_oid: None,
+    });
 
     // Fetch-side and local version state deliberately disagree with the push
     // destination. Neither may participate in authority.
@@ -143,20 +149,23 @@ fn push_destination_controls_observation_publication_and_github_identity() {
             .success();
     }
     ctx.git_cmd().args(["update-ref", &local_high_ref, "HEAD"]).assert().success();
+    ctx.amend();
 
     ctx.hook_cmd("pre-push").assert().success();
 
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
-    assert_private_remote(&pushes[0], &push_destination);
-    assert_eq!(recorded_remote(&pushes[0]), "gherrit-publication-1");
+    assert_eq!(pushes.len(), 2);
+    for push in &pushes {
+        assert_private_remote(push, &push_destination);
+        assert_eq!(recorded_remote(push), "gherrit-publication-1");
+    }
     assert_eq!(ctx.remote_ref_oid(&managed_ref).as_deref(), Some(ctx.head_oid().as_str()));
     assert_eq!(ctx.remote_ref_oid(&v1_ref).as_deref(), Some(push_v1_oid.as_str()));
     assert_eq!(ctx.remote_ref_oid(&v2_ref).as_deref(), Some(ctx.head_oid().as_str()));
     assert_eq!(ctx.remote_ref_oid(&local_high_ref), None);
     assert_eq!(
         bare_ref_oid(&ctx, &fetch_repository, &managed_ref).as_deref(),
-        Some(push_v1_oid.as_str())
+        Some(push_base_oid.as_str())
     );
     assert_eq!(bare_ref_oid(&ctx, &fetch_repository, &v2_ref), None);
     assert_eq!(ctx.github().repository(), ("push-owner".to_string(), "push-repo".to_string()));
@@ -262,7 +271,7 @@ fn baseline_keys_and_duplicate_destinations_force_a_fresh_internal_name() {
         Some(ctx.head_oid().as_str())
     );
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes.len(), 2);
     assert_private_remote(&pushes[0], &destination);
     assert_eq!(recorded_remote(&pushes[0]), "gherrit-publication-1");
 }
@@ -283,7 +292,7 @@ fn similarly_prefixed_configuration_does_not_block_the_first_internal_name() {
     ctx.hook_cmd("pre-push").assert().success();
 
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes.len(), 2);
     assert_private_remote(&pushes[0], &destination);
     assert_eq!(recorded_remote(&pushes[0]), "gherrit-publication");
 }
@@ -312,7 +321,7 @@ fn fetch_url_is_the_single_push_destination_when_pushurl_is_absent() {
     ctx.hook_cmd("pre-push").assert().success();
 
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes.len(), 2);
     assert_private_remote(&pushes[0], &fetch_destination);
 }
 
@@ -337,7 +346,7 @@ fn git_observation_does_not_follow_an_http_redirect() {
 
     assert_eq!(ctx.github().git_redirect_source_requests(), 1);
     assert_eq!(ctx.github().git_redirect_trap_requests(), 0);
-    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.github().requests().len(), 1);
     assert!(ctx.recorded_pushes().is_empty());
 }
 
@@ -408,7 +417,7 @@ fn unrelated_url_scoped_redirect_configuration_is_accepted() {
 
     assert_eq!(ctx.github().git_redirect_source_requests(), 1);
     assert_eq!(ctx.github().git_redirect_trap_requests(), 0);
-    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.github().requests().len(), 1);
     assert!(ctx.recorded_pushes().is_empty());
 }
 
@@ -633,7 +642,7 @@ fn one_instead_of_rewrite_resolves_to_a_stable_destination() {
     ctx.hook_cmd("pre-push").assert().success();
 
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes.len(), 2);
     assert_private_remote(&pushes[0], &destination);
 }
 
@@ -658,7 +667,7 @@ fn one_push_instead_of_rewrite_resolves_to_a_stable_destination() {
     ctx.hook_cmd("pre-push").assert().success();
 
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes.len(), 2);
     assert_private_remote(&pushes[0], &destination);
 }
 
@@ -696,7 +705,7 @@ fn a_destination_which_is_also_a_remote_name_uses_the_literal_repository() {
     ctx.hook_cmd("pre-push")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Head branch"))
+        .stderr(predicate::str::contains("Base branch"))
         .stderr(predicate::str::contains("does not exist"));
 
     assert_eq!(
@@ -815,7 +824,7 @@ fn push_instead_of_does_not_rewrite_an_explicit_internal_push_url() {
     assert_eq!(ctx.remote_ref_oid(&managed_ref).as_deref(), Some(ctx.head_oid().as_str()));
     assert_eq!(bare_ref_oid(&ctx, &trap, &managed_ref), None);
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes.len(), 2);
     assert_private_remote(&pushes[0], &destination);
 }
 
@@ -847,7 +856,7 @@ fn probe_activated_push_destination_configuration_forces_a_fresh_final_name() {
     assert_eq!(ctx.remote_ref_oid(&managed_ref).as_deref(), Some(ctx.head_oid().as_str()));
     assert_eq!(bare_ref_oid(&ctx, &trap, &managed_ref), None);
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes.len(), 2);
     assert_private_remote(&pushes[0], &destination);
     assert_eq!(recorded_remote(&pushes[0]), "gherrit-publication-1");
 }
@@ -880,7 +889,7 @@ fn probe_activated_remote_configuration_forces_a_fresh_final_name() {
 
     assert_eq!(ctx.remote_ref_oid(&managed_ref).as_deref(), Some(ctx.head_oid().as_str()));
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes.len(), 2);
     assert_private_remote(&pushes[0], &destination);
     assert_eq!(recorded_remote(&pushes[0]), "gherrit-publication-1");
 }
@@ -908,7 +917,7 @@ fn a_failed_local_destination_does_not_disclose_any_path_spelling() {
         .stderr(predicate::str::contains("normalized-secret").not())
         .stderr(predicate::str::contains("repo.git").not());
 
-    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.github().requests().len(), 1);
     assert!(ctx.recorded_pushes().is_empty());
 }
 
@@ -929,7 +938,7 @@ fn an_option_like_remote_name_is_resolved_as_data() {
     ctx.hook_cmd("pre-push").assert().success();
 
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes.len(), 2);
     assert_private_remote(&pushes[0], &destination);
 }
 
@@ -950,7 +959,7 @@ fn a_remote_name_containing_an_equals_sign_is_resolved_as_data() {
     ctx.hook_cmd("pre-push").assert().success();
 
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes.len(), 2);
     assert_private_remote(&pushes[0], &destination);
 }
 
@@ -1066,7 +1075,7 @@ fn a_change_id_cannot_name_the_exact_default_branch() {
         "gherrit-pr-id 'main', which conflicts with the repository default branch",
     ));
 
-    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.github().requests().len(), 1);
     assert!(ctx.recorded_pushes().is_empty());
     assert_eq!(ctx.remote_ref_oid("refs/heads/main").as_deref(), Some(default_tip.as_str()));
 }
@@ -1118,7 +1127,7 @@ fn a_head_change_id_remains_publishable_after_tail_matching_refs_exist() {
     assert_eq!(ctx.remote_ref_oid("refs/tags/gherrit/HEAD/v1").as_deref(), Some(v1_oid.as_str()));
     assert_eq!(ctx.remote_ref_oid("refs/tags/gherrit/HEAD/v2").as_deref(), Some(v2_oid.as_str()));
     assert!(ctx.remote_ref_oid("refs/tags/HEAD").is_some());
-    assert_eq!(ctx.recorded_pushes().len(), 2);
+    assert_eq!(ctx.recorded_pushes().len(), 3);
 }
 
 #[test]

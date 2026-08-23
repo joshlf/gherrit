@@ -7,7 +7,10 @@ use std::{
 use axum::{extract::State as AxumState, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::{mock_server::MockState, FailureKind, GitOperation, TestEnvironment};
+use crate::{
+    mock_server::MockState, ExternalEvent, FailureKind, GitOperation, PushRecord, ResponseGateKind,
+    TestEnvironment,
+};
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct State {
@@ -228,9 +231,9 @@ fn is_active_managed_tag_query(remote: &str, arguments: &[String]) -> bool {
     }
 
     let mut ids = HashSet::with_capacity(patterns.len() / 2);
-    patterns.chunks_exact(2).all(|pair| {
+    patterns.chunks(2).all(|pair| {
         let [root, wildcard] = pair else {
-            unreachable!("chunks_exact(2) always yields pairs");
+            unreachable!("the even pattern count makes every chunk a pair");
         };
         let Some(id) = root.strip_prefix("refs/tags/gherrit/") else {
             return false;
@@ -341,14 +344,29 @@ async fn handle_git(
     let is_production =
         request.args.get(1).is_some_and(|argument| argument == "--no-replace-objects");
     let operation = GitOperation::from_args(&request.args);
-    if is_production {
-        if let Some(operation) = operation {
-            handler.shared.write().unwrap().git.record_invocation(operation, request.args.clone());
+    let (failure, response_gate) = {
+        let mut state = handler.shared.write().unwrap();
+        if is_production {
+            if let Some(operation) = operation {
+                state.git.record_invocation(operation, request.args.clone());
+            }
         }
+        let failure =
+            operation.and_then(|operation| check_and_apply_failure(&mut state, operation));
+        let response_gate = operation
+            .and_then(|operation| match operation {
+                GitOperation::LsRemoteHeads => Some(ResponseGateKind::GlobalHeads),
+                GitOperation::LsRemoteActiveManagedTags => {
+                    Some(ResponseGateKind::ActiveManagedTags)
+                }
+                _ => None,
+            })
+            .and_then(|kind| state.response_gates.take(kind));
+        (failure, response_gate)
+    };
+    if let Some(response_gate) = response_gate {
+        response_gate.wait().await;
     }
-    let failure = operation.and_then(|operation| {
-        check_and_apply_failure(&mut handler.shared.write().unwrap(), operation)
-    });
     let push_stdout = match failure {
         Some(FailureKind::Git(operation)) => {
             return Json(GitResponse {
@@ -453,7 +471,47 @@ async fn complete_git(
 
 fn record_push(shared: &RwLock<MockState>, args: Vec<String>, exit_code: i32) {
     assert_eq!(subcommand(&args), Some("push"), "record_push requires a Git push");
-    shared.write().unwrap().git.record_push(args, exit_code);
+    let branch_updates = (exit_code == 0).then(|| pushed_branch_updates(&args));
+    let mut shared = shared.write().unwrap();
+    shared
+        .external_events
+        .push(ExternalEvent::GitPush(PushRecord { arguments: args.clone(), exit_code }));
+    shared.git.record_push(args, exit_code);
+    if let Some(branch_updates) = branch_updates {
+        let cross_repository_prs = shared.cross_repository_prs.clone();
+        for (branch, oid) in branch_updates {
+            for pull_request in &mut shared.prs {
+                if pull_request.base.ref_field == branch {
+                    pull_request.base.sha.clone_from(&oid);
+                }
+                if !cross_repository_prs.contains(&pull_request.number)
+                    && pull_request.head.ref_field == branch
+                {
+                    pull_request.head.sha.clone_from(&oid);
+                }
+            }
+        }
+    }
+}
+
+/// Extracts the literal same-repository branch movements emitted by GHerrit.
+///
+/// Production publishes object IDs, not symbolic sources. Ignoring every
+/// other Git refspec shape keeps this fixture helper narrower than Git's
+/// general refspec grammar while making subsequent OPEN observations follow
+/// the refs a successful push moved.
+fn pushed_branch_updates(args: &[String]) -> Vec<(String, String)> {
+    args.iter()
+        .filter_map(|argument| {
+            let (source, destination) = argument.split_once(':')?;
+            let source = source.strip_prefix('+').unwrap_or(source);
+            let branch = destination.strip_prefix("refs/heads/")?;
+            ((source.len() == 40 || source.len() == 64)
+                && source.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !branch.is_empty())
+            .then(|| (branch.to_owned(), source.to_owned()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -461,6 +519,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+    use crate::mock_server::{MockPrArgs, PrEntry};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -878,6 +937,7 @@ mod tests {
         assert!(response.passthrough);
         assert!(response.report_exit_status);
         assert!(handler.shared.read().unwrap().git.pushes.is_empty());
+        assert!(handler.shared.read().unwrap().external_events.is_empty());
 
         let status = complete_git(
             AxumState(handler.clone()),
@@ -887,8 +947,96 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(
             handler.shared.read().unwrap().git.pushes,
-            [Push { args: invocation, exit_code: 0 }]
+            [Push { args: invocation.clone(), exit_code: 0 }]
         );
+        assert_eq!(
+            handler.shared.read().unwrap().external_events,
+            [ExternalEvent::GitPush(PushRecord { arguments: invocation, exit_code: 0 })]
+        );
+    }
+
+    #[test]
+    fn successful_push_refreshes_only_target_repository_pull_request_refs() {
+        let handler = handler_state();
+        {
+            let mut state = handler.shared.write().unwrap();
+            state.add_pr(PrEntry::mock(MockPrArgs {
+                id: 1,
+                title: "Same repository".to_owned(),
+                body: String::new(),
+                head: "Gsame".to_owned(),
+                base: "gherrit-bases/Gsame".to_owned(),
+                repo_owner: "owner",
+                repo_name: "repo",
+            }));
+            state.add_pr(PrEntry::mock(MockPrArgs {
+                id: 2,
+                title: "Fork".to_owned(),
+                body: String::new(),
+                head: "Gsame".to_owned(),
+                base: "main".to_owned(),
+                repo_owner: "owner",
+                repo_name: "repo",
+            }));
+            state.cross_repository_prs.insert(2);
+        }
+        let head = "a".repeat(40);
+        let base = "b".repeat(40);
+        let main = "c".repeat(40);
+        record_push(
+            &handler.shared,
+            args(&[
+                "git",
+                "push",
+                "origin",
+                &format!("{head}:refs/heads/Gsame"),
+                &format!("{base}:refs/heads/gherrit-bases/Gsame"),
+                &format!("{main}:refs/heads/main"),
+            ]),
+            0,
+        );
+
+        let state = handler.shared.read().unwrap();
+        assert_eq!(state.prs[0].head.sha, head);
+        assert_eq!(state.prs[0].base.sha, base);
+        assert_ne!(state.prs[1].head.sha, head, "a fork head belongs to another repository");
+        assert_eq!(state.prs[1].base.sha, main);
+    }
+
+    #[test]
+    fn failed_push_does_not_refresh_pull_request_refs() {
+        let handler = handler_state();
+        let original = {
+            let mut state = handler.shared.write().unwrap();
+            state.add_pr(PrEntry::mock(MockPrArgs {
+                id: 1,
+                title: "Same repository".to_owned(),
+                body: String::new(),
+                head: "Gsame".to_owned(),
+                base: "gherrit-bases/Gsame".to_owned(),
+                repo_owner: "owner",
+                repo_name: "repo",
+            }));
+            (state.prs[0].head.sha.clone(), state.prs[0].base.sha.clone())
+        };
+        let head = "a".repeat(40);
+        let base = "b".repeat(40);
+        record_push(
+            &handler.shared,
+            args(&[
+                "git",
+                "push",
+                "origin",
+                &format!("{head}:refs/heads/Gsame"),
+                &format!("{base}:refs/heads/gherrit-bases/Gsame"),
+            ]),
+            1,
+        );
+
+        let state = handler.shared.read().unwrap();
+        assert_eq!((state.prs[0].head.sha.clone(), state.prs[0].base.sha.clone()), original);
+        assert_eq!(state.git.pushes.len(), 1);
+        assert_eq!(state.git.pushes[0].exit_code, 1);
     }
 
     #[tokio::test]

@@ -159,15 +159,6 @@ impl LocalChange {
         self.first_parent
     }
 
-    pub(super) fn title(&self) -> &str {
-        self.title.as_str()
-    }
-
-    #[allow(dead_code)] // Consumed by the pending owned-base planner.
-    pub(super) fn pull_request_title(&self) -> &PullRequestTitle {
-        &self.title
-    }
-
     pub(super) fn body(&self) -> &str {
         self.body.as_str()
     }

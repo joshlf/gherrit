@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     fmt,
     time::Duration,
 };
@@ -14,18 +14,15 @@ use serde_json::Value;
 
 use super::{
     CompleteCreateReceipts, CompleteOpenRows, CorrelatedRepository, FirstOpenPullRequests,
-    FirstOpenPullRequestsPage, NextOpenPullRequests, OpenPullRequest, PreparedCreates,
-    PreparedUpdates, Repository, RepositoryTerminalHistories, TerminalPullRequestQuery,
-    TerminalPullRequests, graphql_error_detail,
+    FirstOpenPullRequestsPage, NextOpenPullRequests, PreparedCreates, PreparedUpdates, Repository,
+    RepositoryTerminalHistories, TerminalPullRequestQuery, TerminalPullRequests,
+    graphql_error_detail,
 };
 use crate::pre_push::{
     bounded_diagnostic_detail,
     destination::{PushDestination, RepositoryCoordinates},
     local::GherritPrId,
-    pull_request::{
-        CreateAuthorizations, InitialPullRequestIdentities, TerminalExhaustionAccumulator,
-        correlate_complete,
-    },
+    pull_request::{TerminalExhaustionAccumulator, correlate_complete},
     remote::RemoteHeads,
 };
 
@@ -135,9 +132,9 @@ pub(in crate::pre_push) struct Github {
 
 /// One complete repository-wide OPEN observation.
 ///
-/// The rows and initial identity namespaces remain opaque. Correlation or the
-/// temporary legacy adapter must consume this value directly; no API exposes a
-/// detachable list which can be truncated and relabelled as complete.
+/// The rows and initial identity namespaces remain opaque. Correlation consumes
+/// this value directly; no API exposes a detachable list which can be truncated
+/// and relabelled as complete.
 #[derive(Debug)]
 pub(in crate::pre_push) struct OpenObservation {
     repository: Repository,
@@ -159,7 +156,6 @@ impl OpenObservation {
         Ok(Self { repository: page.repository, rows: CompleteOpenRows::new(page.pull_requests)? })
     }
 
-    #[allow(dead_code)] // Consumed by the pending owned-base activation path.
     pub(in crate::pre_push) fn correlate<'a, 'destination>(
         self,
         local_ids: impl IntoIterator<Item = &'a GherritPrId>,
@@ -168,79 +164,6 @@ impl OpenObservation {
         let correlated = correlate_complete(local_ids, heads, self.rows)?;
         Ok(CorrelatedRepository::new(heads.destination(), self.repository, correlated))
     }
-
-    fn into_legacy_selection(self, local_ids: &[GherritPrId]) -> Result<LegacyOpenSelection> {
-        let (pull_requests, initial_identities) = self.rows.into_values();
-        let local_id_set = local_ids.iter().collect::<HashSet<_>>();
-        let mut candidates = HashMap::<GherritPrId, Vec<OpenPullRequest>>::new();
-
-        for pull_request in pull_requests.into_vec() {
-            if pull_request.is_cross_repository {
-                continue;
-            }
-            let Ok(id) = GherritPrId::from_ref_component(pull_request.head_branch.as_bytes())
-            else {
-                continue;
-            };
-            if local_id_set.contains(&id) {
-                candidates.entry(id).or_default().push(pull_request);
-            }
-        }
-
-        let mut selected = Vec::with_capacity(local_ids.len());
-        let mut missing = Vec::new();
-        for id in local_ids {
-            match candidates.remove(id) {
-                None => {
-                    missing.push(id.clone());
-                    selected.push(None);
-                }
-                Some(mut candidates) if candidates.len() == 1 => {
-                    selected.push(Some(candidates.pop().expect("one candidate is present")));
-                }
-                Some(candidates) => {
-                    let id = bounded_diagnostic_detail(id.as_str());
-                    let mut numbers = candidates
-                        .iter()
-                        .map(|pull_request| pull_request.number)
-                        .collect::<Vec<_>>();
-                    numbers.sort_unstable();
-                    let numbers = numbers
-                        .into_iter()
-                        .map(|number| format!("#{number}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    bail!(
-                        "Found multiple open pull requests for GHerrit ID '{}': {numbers}. GHerrit cannot safely choose one.",
-                        id
-                    );
-                }
-            }
-        }
-
-        Ok(LegacyOpenSelection {
-            repository: self.repository,
-            local_pull_requests: selected,
-            initial_identities,
-            missing: missing.into_boxed_slice(),
-        })
-    }
-}
-
-#[derive(Debug)]
-struct LegacyOpenSelection {
-    repository: Repository,
-    local_pull_requests: Vec<Option<OpenPullRequest>>,
-    initial_identities: InitialPullRequestIdentities,
-    missing: Box<[GherritPrId]>,
-}
-
-/// Complete compatibility observation consumed by the pre-activation caller.
-pub(in crate::pre_push) struct LegacyGithubObservation {
-    pub(in crate::pre_push) repository: Repository,
-    pub(in crate::pre_push) local_pull_requests: Vec<Option<OpenPullRequest>>,
-    pub(in crate::pre_push) initial_identities: InitialPullRequestIdentities,
-    pub(in crate::pre_push) create_authorizations: CreateAuthorizations,
 }
 
 /// A mutation either has a complete acknowledgement or is indeterminate.
@@ -438,22 +361,6 @@ impl Github {
             self.coordinates.clone(),
             accumulator.into_terminal_histories()?,
         ))
-    }
-
-    /// Temporary adapter for the legacy orchestration retained until activation.
-    pub(in crate::pre_push) async fn observe_legacy_pull_requests(
-        &self,
-        ids: &[GherritPrId],
-    ) -> Result<LegacyGithubObservation> {
-        let selection = self.observe_open_pull_requests().await?.into_legacy_selection(ids)?;
-        let authorizations = self.observe_terminal_pull_requests(selection.missing).await?;
-        let authorizations = authorizations.into_legacy_for(&selection.repository.coordinates)?;
-        Ok(LegacyGithubObservation {
-            repository: selection.repository,
-            local_pull_requests: selection.local_pull_requests,
-            initial_identities: selection.initial_identities,
-            create_authorizations: authorizations,
-        })
     }
 
     pub(in crate::pre_push) async fn create_pull_requests(
@@ -843,6 +750,8 @@ mod tests {
             head_oid: "2".repeat(40),
             base: "main".to_owned(),
             base_oid: "1".repeat(40),
+            auto_merge: false,
+            in_merge_queue: false,
         });
         context.github().set_pull_request_state(number, state);
     }
@@ -957,21 +866,16 @@ mod tests {
         ]);
         let github = test_github(context.mock_server_url(), Timeouts::PRODUCTION);
 
-        let ids = [
-            GherritPrId::from_ref_component(b"G0").unwrap(),
-            GherritPrId::from_ref_component(b"G100").unwrap(),
-        ];
-        let selection =
-            github.observe_open_pull_requests().await.unwrap().into_legacy_selection(&ids).unwrap();
+        let observation = github.observe_open_pull_requests().await.unwrap();
+        let (pull_requests, initial_identities) = observation.rows.into_values();
 
         context.github().assert_graphql_transcript_consumed();
-        assert!(selection.local_pull_requests.iter().all(Option::is_some));
-        assert_eq!(selection.initial_identities.len(), 101);
+        assert_eq!(initial_identities.len(), 101);
         assert_eq!(
-            selection
-                .local_pull_requests
+            pull_requests
                 .iter()
-                .map(|pull_request| pull_request.as_ref().unwrap().number)
+                .filter(|pull_request| matches!(pull_request.head_branch.as_str(), "G0" | "G100"))
+                .map(|pull_request| pull_request.number)
                 .collect::<Vec<_>>(),
             [1, 101]
         );
@@ -1011,18 +915,15 @@ mod tests {
             exchange(25, Some("cursor:50")),
         ]);
         let github = test_github(context.mock_server_url(), Timeouts::PRODUCTION);
-        let ids = [
-            GherritPrId::from_ref_component(b"G0").unwrap(),
-            GherritPrId::from_ref_component(b"G50").unwrap(),
-        ];
-
-        let selection =
-            github.observe_open_pull_requests().await.unwrap().into_legacy_selection(&ids).unwrap();
+        let observation = github.observe_open_pull_requests().await.unwrap();
+        let (pull_requests, initial_identities) = observation.rows.into_values();
 
         context.github().assert_graphql_transcript_consumed();
         assert_eq!(context.github().requests().len(), 5);
-        assert_eq!(selection.initial_identities.len(), 51);
-        assert!(selection.local_pull_requests.iter().all(Option::is_some));
+        assert_eq!(initial_identities.len(), 51);
+        assert_eq!(pull_requests.len(), 51);
+        assert!(pull_requests.iter().any(|pull_request| pull_request.head_branch == "G0"));
+        assert!(pull_requests.iter().any(|pull_request| pull_request.head_branch == "G50"));
     }
 
     #[tokio::test]

@@ -335,7 +335,7 @@ fn requests_for_test(plan: &PublicationPlan<'_>) -> Vec<(Vec<String>, Vec<String
 }
 
 fn into_projection_for_test(plan: PublicationPlan<'_>) -> ReadyProjection<'_> {
-    plan.projection
+    plan.into_projection_for_test()
 }
 
 fn only_query(request_text: String) -> String {
@@ -552,6 +552,49 @@ fn root_status_does_not_change_the_create_repository_head_base_key() {
         serialized_create_key(&root),
         "repositoryId: \"R_repository\", baseRefName: \"gherrit-bases/Gone\", headRefName: \"Gone\""
     );
+}
+
+#[test]
+fn create_stage_requires_one_exact_nonempty_ordered_authorization_set() {
+    let one = id("Gone");
+    let two = id("Gtwo");
+    let three = id("Gthree");
+    assert!(
+        validate_create_stage_ids(
+            &[one.clone(), two.clone()],
+            &[one.clone(), two.clone()],
+            &[one.clone(), two.clone()],
+        )
+        .is_ok()
+    );
+
+    for (planned, projected, pending) in [
+        (Vec::new(), Vec::new(), Vec::new()),
+        (vec![one.clone(), two.clone()], vec![one.clone()], vec![one.clone(), two.clone()]),
+        (
+            vec![one.clone(), two.clone()],
+            vec![one.clone(), two.clone(), three.clone()],
+            vec![one.clone(), two.clone()],
+        ),
+        (
+            vec![one.clone(), one.clone()],
+            vec![one.clone(), one.clone()],
+            vec![one.clone(), one.clone()],
+        ),
+        (
+            vec![one.clone(), two.clone()],
+            vec![two.clone(), one.clone()],
+            vec![one.clone(), two.clone()],
+        ),
+        (vec![one.clone(), two.clone()], vec![one.clone(), two.clone()], vec![one.clone()]),
+        (
+            vec![one.clone(), two.clone()],
+            vec![one.clone(), two.clone()],
+            vec![one.clone(), two.clone(), three.clone()],
+        ),
+    ] {
+        assert!(validate_create_stage_ids(&planned, &projected, &pending).is_err());
+    }
 }
 
 #[test]
@@ -1905,7 +1948,8 @@ fn existing_projection_emits_each_exact_title_body_base_difference_mask() {
             assert!(update.is_none());
             continue;
         }
-        let request = PreparedUpdates::new(vec![update.unwrap()]).unwrap().request_text();
+        let request =
+            prepare_updates(vec![update.unwrap()].into_boxed_slice()).unwrap().request_text();
         assert_eq!(request.contains("title:"), mask & 1 != 0, "mask={mask:03b}");
         assert_eq!(request.contains("body:"), mask & 2 != 0, "mask={mask:03b}");
         assert_eq!(request.contains("baseRefName:"), mask & 4 != 0, "mask={mask:03b}");

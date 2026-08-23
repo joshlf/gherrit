@@ -474,7 +474,7 @@ fn io_error(stage: IoStage, error: &io::Error) -> CommandError {
 mod tests {
     use std::{
         env, fs,
-        io::{Read as _, Write as _},
+        io::Write as _,
         process,
         time::{Duration, Instant},
     };

@@ -1,101 +1,6 @@
-use std::{collections::BTreeMap, fs};
+use std::fs;
 
 use predicates::prelude::*;
-
-fn observation_fields(open: bool) -> Vec<String> {
-    let mut fields = if open {
-        vec![
-            "nodes.autoMergeRequest.enabledAt",
-            "nodes.baseRefName",
-            "nodes.baseRefOid",
-            "nodes.body",
-            "nodes.headRefName",
-            "nodes.headRefOid",
-            "nodes.id",
-            "nodes.isCrossRepository",
-            "nodes.isInMergeQueue",
-            "nodes.number",
-            "nodes.state",
-            "nodes.title",
-        ]
-    } else {
-        vec![
-            "nodes.headRefName",
-            "nodes.id",
-            "nodes.isCrossRepository",
-            "nodes.number",
-            "nodes.state",
-        ]
-    };
-    fields.extend(["pageInfo.endCursor", "pageInfo.hasNextPage"]);
-    fields.into_iter().map(str::to_owned).collect()
-}
-
-fn four_create_transcript(ids: &[String]) -> Vec<testutil::GraphQlExchange> {
-    assert_eq!(ids.len(), 4);
-    let open = testutil::GraphQlExchange::Repository {
-        owner: testutil::DEFAULT_OWNER.to_owned(),
-        repository: testutil::DEFAULT_REPO.to_owned(),
-        selected_fields: vec![
-            "defaultBranchRef.name".to_owned(),
-            "defaultBranchRef.target.oid".to_owned(),
-            "id".to_owned(),
-        ],
-        connections: vec![testutil::PullRequestConnectionExchange {
-            alias: None,
-            head: None,
-            first: 100,
-            after: None,
-            states: vec!["OPEN".to_owned()],
-            selected_fields: observation_fields(true),
-        }],
-    };
-    let terminal = testutil::GraphQlExchange::Repository {
-        owner: testutil::DEFAULT_OWNER.to_owned(),
-        repository: testutil::DEFAULT_REPO.to_owned(),
-        selected_fields: Vec::new(),
-        connections: ids
-            .iter()
-            .enumerate()
-            .map(|(index, id)| testutil::PullRequestConnectionExchange {
-                alias: Some(format!("op{index}")),
-                head: Some(id.clone()),
-                first: 100,
-                after: None,
-                states: vec!["CLOSED".to_owned(), "MERGED".to_owned()],
-                selected_fields: observation_fields(false),
-            })
-            .collect(),
-    };
-    let create = testutil::GraphQlExchange::Mutation {
-        operations: ids
-            .iter()
-            .enumerate()
-            .map(|(index, id)| testutil::MutationExchange {
-                operation: testutil::GraphQlOperation::CreatePr,
-                alias: Some(format!("op{index}")),
-                input: BTreeMap::from([
-                    (
-                        "baseRefName".to_owned(),
-                        if index == 0 { "main".to_owned() } else { ids[index - 1].clone() },
-                    ),
-                    ("body".to_owned(), "\n".to_owned()),
-                    ("clientMutationId".to_owned(), format!("gherrit:create:{id}")),
-                    ("headRefName".to_owned(), id.clone()),
-                    ("repositoryId".to_owned(), "REPO_NODE_ID".to_owned()),
-                    ("title".to_owned(), format!("Work {index}")),
-                ]),
-                selected_fields: vec![
-                    "clientMutationId".to_owned(),
-                    "pullRequest.headRefName".to_owned(),
-                    "pullRequest.id".to_owned(),
-                    "pullRequest.number".to_owned(),
-                ],
-            })
-            .collect(),
-    };
-    vec![open, terminal, create]
-}
 
 fn stack_with_raw_commit_message(message: &str) -> testutil::TestContext {
     let ctx = testutil::test_context!()
@@ -121,10 +26,10 @@ fn unpublished_managed_commit(branch: &str) -> testutil::TestContext {
     ctx
 }
 
-fn assert_identity_failure_before_github_or_writes(ctx: testutil::TestContext, diagnostic: &str) {
+fn assert_identity_failure_after_open_before_writes(ctx: testutil::TestContext, diagnostic: &str) {
     ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(diagnostic));
 
-    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.github().requests(), [vec![testutil::GraphQlOperation::Query]]);
     assert!(ctx.recorded_pushes().is_empty());
 }
 
@@ -165,17 +70,17 @@ fn linked_managed_stack(ctx: &testutil::TestContext, branch: &str, id: &str) -> 
 }
 
 #[test]
-fn test_empty_stack_id_fails_before_github_or_writes() {
+fn test_empty_stack_id_fails_after_open_before_writes() {
     let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: ");
 
-    assert_identity_failure_before_github_or_writes(ctx, "missing gherrit-pr-id trailer");
+    assert_identity_failure_after_open_before_writes(ctx, "missing gherrit-pr-id trailer");
 }
 
 #[test]
-fn test_multiple_stack_ids_fail_before_github_or_writes() {
+fn test_multiple_stack_ids_fail_after_open_before_writes() {
     let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: Gone\ngherrit-pr-id: Gtwo");
 
-    assert_identity_failure_before_github_or_writes(ctx, "multiple gherrit-pr-id trailers");
+    assert_identity_failure_after_open_before_writes(ctx, "multiple gherrit-pr-id trailers");
 }
 
 #[test]
@@ -184,25 +89,25 @@ fn test_body_lookalike_is_not_a_stack_id() {
         "Work\n\ngherrit-pr-id: Gexample\n\nThis final paragraph is not a trailer.",
     );
 
-    assert_identity_failure_before_github_or_writes(ctx, "missing gherrit-pr-id trailer");
+    assert_identity_failure_after_open_before_writes(ctx, "missing gherrit-pr-id trailer");
 }
 
 #[test]
-fn test_continued_stack_id_fails_before_github_or_writes() {
+fn test_continued_stack_id_fails_after_open_before_writes() {
     let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: Gone\n continuation");
 
-    assert_identity_failure_before_github_or_writes(ctx, "invalid gherrit-pr-id trailer");
+    assert_identity_failure_after_open_before_writes(ctx, "invalid gherrit-pr-id trailer");
 }
 
 #[test]
 fn test_empty_and_valid_stack_ids_are_multiple() {
     let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: \ngherrit-pr-id: Gvalid");
 
-    assert_identity_failure_before_github_or_writes(ctx, "multiple gherrit-pr-id trailers");
+    assert_identity_failure_after_open_before_writes(ctx, "multiple gherrit-pr-id trailers");
 }
 
 #[test]
-fn test_duplicate_stack_ids_fail_before_github_or_writes() {
+fn test_duplicate_stack_ids_fail_after_open_before_writes() {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_initial_commit()
@@ -218,7 +123,7 @@ fn test_duplicate_stack_ids_fail_before_github_or_writes() {
         .failure()
         .stderr(predicate::str::contains("multiple commits with gherrit-pr-id 'Gduplicate'"));
 
-    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.github().requests(), [vec![testutil::GraphQlOperation::Query]]);
     assert!(ctx.recorded_pushes().is_empty());
 }
 
@@ -282,12 +187,12 @@ fn test_replacement_cannot_hide_a_stack_id_duplicated_through_a_merge() {
         "HEAD ancestry contains multiple commits with gherrit-pr-id 'Gduplicate'",
     ));
 
-    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.github().requests(), [vec![testutil::GraphQlOperation::Query]]);
     assert!(ctx.recorded_pushes().is_empty());
 }
 
 #[test]
-fn test_stack_id_duplicated_in_default_history_fails_before_github_or_writes() {
+fn test_stack_id_duplicated_in_default_history_fails_after_open_before_writes() {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_initial_commit()
@@ -304,7 +209,7 @@ fn test_stack_id_duplicated_in_default_history_fails_before_github_or_writes() {
         "HEAD ancestry contains multiple commits with gherrit-pr-id 'Gduplicate'",
     ));
 
-    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.github().requests(), [vec![testutil::GraphQlOperation::Query]]);
     assert_eq!(ctx.recorded_pushes(), fixture_pushes);
 }
 
@@ -333,13 +238,18 @@ fn test_default_branch_must_be_on_the_first_parent_stack_path() {
         .failure()
         .stderr(predicate::str::contains("does not descend from 'main' on its first-parent path"));
 
-    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.github().requests(), [vec![testutil::GraphQlOperation::Query]]);
     assert!(ctx.recorded_pushes().is_empty());
 }
 
 #[test]
 fn test_nonempty_common_grafts_file_in_linked_worktree_blocks_publication() {
-    let ctx = testutil::test_context!().with_remote().with_initial_commit().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
     let linked = linked_managed_stack(&ctx, "linked-feature", "Glinked");
     let linked_head = ctx
         .git_cmd()
@@ -364,7 +274,12 @@ fn test_nonempty_common_grafts_file_in_linked_worktree_blocks_publication() {
 
 #[test]
 fn test_common_shallow_file_is_checked_despite_gix_config_redirection() {
-    let ctx = testutil::test_context!().with_remote().with_initial_commit().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
     let linked = linked_managed_stack(&ctx, "shallow-feature", "Gshallow");
     ctx.git_cmd()
         .current_dir(&linked)
@@ -399,7 +314,12 @@ fn test_common_shallow_file_is_checked_despite_gix_config_redirection() {
 
 #[test]
 fn test_effective_shallow_file_from_gix_config_blocks_publication() {
-    let ctx = testutil::test_context!().with_remote().with_initial_commit().build();
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
     ctx.checkout_managed_private("configured-shallow");
     let id = ctx.commit_with_gherrit_id("Configured shallow work");
     ctx.run_git(&["config", "gitoxide.core.shallowFile", "alternate-shallow"]);
@@ -498,7 +418,7 @@ fn test_pre_push_ls_remote_failure() {
     );
     assert!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteOther).is_empty());
     assert!(ctx.github().pull_requests().is_empty());
-    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.github().requests(), [vec![testutil::GraphQlOperation::Query]]);
 }
 
 #[test]
@@ -522,7 +442,7 @@ fn active_managed_tag_observation_failure_stops_before_writes() {
     ctx.assert_failure_consumed();
     assert_eq!(ctx.remote_refs("refs"), refs_before);
     assert!(ctx.recorded_pushes().is_empty());
-    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.github().requests(), [vec![testutil::GraphQlOperation::Query]]);
 }
 
 #[test]
@@ -549,7 +469,7 @@ fn noncanonical_remote_version_fails_before_writes() {
     ctx.assert_failure_consumed();
     assert_eq!(ctx.remote_refs("refs"), refs_before);
     assert!(ctx.recorded_pushes().is_empty());
-    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.github().requests(), [vec![testutil::GraphQlOperation::Query]]);
 }
 
 #[test]
@@ -804,79 +724,6 @@ fn test_pre_push_pr_create_redirect_is_not_followed() {
 }
 
 #[test]
-fn every_subset_of_one_create_batch_can_commit_before_acknowledgement_is_lost() {
-    const CREATE_COUNT: usize = 4;
-
-    for mask in 0_u8..(1 << CREATE_COUNT) {
-        let ctx = testutil::test_context!()
-            .with_remote()
-            .with_initial_commit()
-            .with_mock_github()
-            .with_git_interceptor()
-            .build();
-        ctx.checkout_managed_private(&format!("create-subset-{mask:04b}"));
-        let ids = (0..CREATE_COUNT)
-            .map(|index| ctx.commit_with_gherrit_id(&format!("Work {index}")))
-            .collect::<Vec<_>>();
-        ctx.github().expect_graphql_transcript(four_create_transcript(&ids));
-        let applied_client_ids = ids
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| mask & (1 << index) != 0)
-            .map(|(_, id)| format!("gherrit:create:{id}"))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        ctx.inject_failure(testutil::FailureKind::ApplyMutationIdsThenDisconnect(
-            applied_client_ids,
-        ));
-
-        ctx.gherrit_cmd()
-            .args(["hook", "pre-push"])
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains("indeterminate"));
-
-        ctx.assert_failure_consumed();
-        ctx.github().assert_graphql_transcript_consumed();
-        let requests = ctx.github().requests();
-        assert_eq!(requests.len(), 3, "mask={mask:04b}");
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request.contains(&testutil::GraphQlOperation::CreatePr))
-                .count(),
-            1,
-            "the create mutation must be sent exactly once for mask={mask:04b}"
-        );
-        assert_eq!(
-            requests.last(),
-            Some(&vec![testutil::GraphQlOperation::CreatePr; CREATE_COUNT]),
-            "no retry, next batch, or observation may follow mask={mask:04b}"
-        );
-        let mut actual_heads = ctx
-            .github()
-            .pull_requests()
-            .into_iter()
-            .map(|pull_request| pull_request.head)
-            .collect::<Vec<_>>();
-        actual_heads.sort_unstable();
-        let mut expected_heads = ids
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| mask & (1 << index) != 0)
-            .map(|(_, id)| id.clone())
-            .collect::<Vec<_>>();
-        expected_heads.sort_unstable();
-        assert_eq!(actual_heads, expected_heads, "mask={mask:04b}");
-        assert_eq!(
-            ctx.recorded_pushes().iter().filter(|push| push.succeeded()).count(),
-            1,
-            "Git publication remains one independent successful push for mask={mask:04b}"
-        );
-    }
-}
-
-#[test]
 fn test_later_mutation_batch_failure_preserves_prior_effects_and_stops() {
     const COMMIT_COUNT: usize = 129;
     const MUTATION_BATCH_LEN: usize = 64;
@@ -888,9 +735,21 @@ fn test_later_mutation_batch_failure_preserves_prior_effects_and_stops() {
         .with_git_interceptor()
         .build();
     ctx.checkout_managed_private("feature-multi-batch-ambiguity");
-    let ids = (0..COMMIT_COUNT)
-        .map(|index| ctx.commit_with_gherrit_id(&format!("Work {index}")))
+    let mut literal_parent = ctx.head_oid();
+    let tuples = (0..COMMIT_COUNT)
+        .map(|index| {
+            let id = ctx.commit_with_gherrit_id(&format!("Work {index}"));
+            let head = ctx.head_oid();
+            testutil::OwnedBaseTuple {
+                id,
+                version: 1,
+                head_oid: head.clone(),
+                base_oid: std::mem::replace(&mut literal_parent, head),
+                marker_oid: None,
+            }
+        })
         .collect::<Vec<_>>();
+    let ids = tuples.iter().map(|tuple| tuple.id.as_str()).collect::<Vec<_>>();
     ctx.inject_failure(testutil::FailureKind::SecondCreatePrHttp(
         testutil::RetryableHttpStatus::ServiceUnavailable,
     ));
@@ -913,13 +772,111 @@ fn test_later_mutation_batch_failure_preserves_prior_effects_and_stops() {
         "the third mutation batch must not be sent after an indeterminate acknowledgement"
     );
 
+    let events = ctx.external_events();
+    let create_batches = events
+        .iter()
+        .filter_map(|event| match event {
+            testutil::ExternalEvent::GraphQl(testutil::GraphQlExchange::Mutation {
+                operations,
+            }) if operations
+                .iter()
+                .all(|operation| operation.operation == testutil::GraphQlOperation::CreatePr) =>
+            {
+                Some(operations)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(create_batches.len(), 2);
+    for (batch, expected) in create_batches
+        .iter()
+        .zip([&ids[..MUTATION_BATCH_LEN], &ids[MUTATION_BATCH_LEN..2 * MUTATION_BATCH_LEN]])
+    {
+        assert_eq!(
+            batch
+                .iter()
+                .map(|operation| operation.input["headRefName"].as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+    assert!(create_batches.iter().flat_map(|batch| batch.as_slice()).all(|operation| {
+        operation.operation == testutil::GraphQlOperation::CreatePr
+            && operation.input["headRefName"] != ids[2 * MUTATION_BATCH_LEN]
+    }));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        testutil::ExternalEvent::GraphQl(testutil::GraphQlExchange::Mutation {
+            operations,
+        }) if operations
+            .iter()
+            .any(|operation| operation.operation == testutil::GraphQlOperation::UpdatePr)
+    )));
+
+    let writes = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                testutil::ExternalEvent::GitPush(_)
+                    | testutil::ExternalEvent::GraphQl(testutil::GraphQlExchange::Mutation { .. })
+            )
+        })
+        .collect::<Vec<_>>();
+    let first_create = writes
+        .iter()
+        .position(|event| matches!(event, testutil::ExternalEvent::GraphQl(_)))
+        .expect("create mutation events exist");
+    assert!(first_create > 0, "tuple publication precedes create mutations");
+    assert!(
+        writes[..first_create]
+            .iter()
+            .all(|event| matches!(event, testutil::ExternalEvent::GitPush(_)))
+    );
+    assert_eq!(writes.len(), first_create + 2);
+    assert!(writes[first_create..].iter().all(|event| matches!(
+        event,
+        testutil::ExternalEvent::GraphQl(testutil::GraphQlExchange::Mutation {
+            operations,
+        }) if operations.len() == MUTATION_BATCH_LEN
+            && operations
+                .iter()
+                .all(|operation| operation.operation == testutil::GraphQlOperation::CreatePr)
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(testutil::ExternalEvent::GraphQl(testutil::GraphQlExchange::Mutation {
+            operations,
+        })) if operations.len() == MUTATION_BATCH_LEN
+    ));
+
+    let push_invocations = ctx.recorded_git_invocations(testutil::GitOperation::Push);
+    assert!(push_invocations.iter().flatten().all(|argument| !argument.ends_with("/pr")));
+    assert_eq!(
+        push_invocations.len(),
+        events.iter().filter(|event| matches!(event, testutil::ExternalEvent::GitPush(_))).count(),
+        "no uncompleted marker push may escape after the failed create batch"
+    );
+    ctx.assert_owned_base_tuples(&tuples);
+
     let pull_requests = ctx.github().pull_requests();
     assert_eq!(pull_requests.len(), MUTATION_BATCH_LEN);
     assert_eq!(
         pull_requests.iter().map(|pr| pr.head.as_str()).collect::<Vec<_>>(),
-        ids[..MUTATION_BATCH_LEN].iter().map(String::as_str).collect::<Vec<_>>(),
+        ids[..MUTATION_BATCH_LEN],
         "effects from the completely acknowledged first batch must persist"
     );
+    for (pull_request, tuple) in pull_requests.iter().zip(&tuples[..MUTATION_BATCH_LEN]) {
+        assert_eq!(pull_request.head, tuple.id);
+        assert_eq!(pull_request.head_oid, tuple.head_oid);
+        assert_eq!(pull_request.base, format!("gherrit-bases/{}", tuple.id));
+        assert_eq!(pull_request.base_oid, tuple.base_oid);
+        let body = pull_request.body.as_deref().expect("created pull request has a body");
+        assert!(
+            !body.lines().any(|line| line.trim_start().starts_with('-') && line.contains('#')),
+            "retained body must remain provisional and unnumbered"
+        );
+    }
 }
 
 #[test]
@@ -975,6 +932,8 @@ fn duplicate_observed_pull_request_identities_stop_before_git_publication() {
                 head_oid: first_oid.clone(),
                 base: "main".to_owned(),
                 base_oid: main_oid,
+                auto_merge: false,
+                in_merge_queue: false,
             });
             ctx.github().seed_pull_request(testutil::PullRequestSeed {
                 number: 2,
@@ -984,6 +943,8 @@ fn duplicate_observed_pull_request_identities_stop_before_git_publication() {
                 head_oid: second_oid,
                 base: first,
                 base_oid: first_oid,
+                auto_merge: false,
+                in_merge_queue: false,
             });
 
             let diagnostic = match collision {

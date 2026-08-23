@@ -5,10 +5,6 @@
 //! pull requests without consulting version tags, and it retains every OPEN
 //! identity so a later create receipt cannot reuse one which appeared in the
 //! initial observation.
-//!
-//! The activation commit wires these values into planning after the remaining
-//! graph and projection foundations land in the private integration worktree.
-#![allow(dead_code)]
 
 use std::{
     collections::{HashMap, HashSet},
@@ -48,10 +44,12 @@ impl Metadata {
         &self.id
     }
 
+    #[cfg(test)]
     pub(super) fn parent(&self) -> Option<&GherritPrId> {
         self.parent.as_ref()
     }
 
+    #[cfg(test)]
     pub(super) fn child(&self) -> Option<&GherritPrId> {
         self.child.as_ref()
     }
@@ -228,6 +226,7 @@ impl InitialPullRequestIdentities {
         Ok(Self { numbers, node_ids })
     }
 
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.numbers.len()
     }
@@ -326,10 +325,12 @@ impl ManagedOpenPullRequest {
         self.base
     }
 
+    #[cfg(test)]
     pub(super) fn title(&self) -> &str {
         &self.title
     }
 
+    #[cfg(test)]
     pub(super) fn body(&self) -> &str {
         &self.body
     }
@@ -382,6 +383,7 @@ impl CorrelatedPullRequests {
         &self.nonlocal
     }
 
+    #[cfg(test)]
     pub(super) fn initial_identities(&self) -> &InitialPullRequestIdentities {
         &self.initial_identities
     }
@@ -536,7 +538,7 @@ fn classify_base(
     Ok(ObservedBase { kind, oid })
 }
 
-fn owned_base_name(id: &GherritPrId) -> String {
+pub(super) fn owned_base_name(id: &GherritPrId) -> String {
     format!("gherrit-bases/{}", id.as_str())
 }
 
@@ -671,11 +673,6 @@ impl TerminalExhaustionAccumulator {
         debug_assert!(retired.is_empty());
         Ok(TerminalHistories { entries })
     }
-
-    /// FIXME(#264): Delete this conversion with the pre-activation publisher.
-    pub(super) fn into_legacy_authorizations(self) -> Result<CreateAuthorizations> {
-        self.into_terminal_histories()?.into_legacy_authorizations()
-    }
 }
 
 /// Exact neutral terminal history for one missing OPEN pull request.
@@ -706,144 +703,6 @@ impl TerminalHistories {
             .map(|(_, history)| history)
             .collect::<Vec<_>>()
             .into_boxed_slice())
-    }
-
-    /// FIXME(#264): Delete this conversion with the pre-activation publisher.
-    pub(super) fn into_legacy_authorizations(self) -> Result<CreateAuthorizations> {
-        if self
-            .entries
-            .iter()
-            .any(|(_, history)| matches!(history, TerminalHistory::Retired { .. }))
-        {
-            let mut message = self
-                .entries
-                .iter()
-                .filter_map(|(_, history)| match history {
-                    TerminalHistory::Retired { identity, state } => Some((identity, state)),
-                    TerminalHistory::Empty => None,
-                })
-                .map(|(identity, state)| {
-                    let state = match state {
-                        TerminalPullRequestState::Closed => "closed",
-                        TerminalPullRequestState::Merged => "merged",
-                    };
-                    format!(
-                        "Cannot push to {state} PR #{}. Please open a new PR or reopen the existing one.\n",
-                        identity.number().get()
-                    )
-                })
-                .collect::<String>();
-            message.push_str("You may want to rebase on the latest changes before pushing.");
-            bail!(message);
-        }
-
-        let expected =
-            self.entries.into_vec().into_iter().map(|(id, _)| id).collect::<HashSet<_>>();
-        let by_id =
-            expected.iter().cloned().map(|id| (id.clone(), CreateAuthorization { id })).collect();
-        Ok(CreateAuthorizations { by_id, expected })
-    }
-}
-
-/// Exact completed terminal-exhaustion evidence.
-#[derive(Debug)]
-pub(super) struct CreateAuthorizations {
-    by_id: HashMap<GherritPrId, CreateAuthorization>,
-    expected: HashSet<GherritPrId>,
-}
-
-impl CreateAuthorizations {
-    pub(super) fn len(&self) -> usize {
-        self.by_id.len()
-    }
-
-    /// FIXME(#264): Delete this subset seam with the pre-activation publisher.
-    pub(super) fn take(&mut self, id: &GherritPrId) -> Result<CreateAuthorization> {
-        self.by_id.remove(id).ok_or_else(|| {
-            eyre!("no unconsumed terminal-exhaustion authorization exists for '{}'", id.as_str())
-        })
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
-    }
-
-    /// Consumes the complete authorization set against one exact ordered set.
-    pub(super) fn into_exact(
-        mut self,
-        expected_in_stack_order: &[GherritPrId],
-    ) -> Result<Box<[CreateAuthorization]>> {
-        let mut expected = HashSet::with_capacity(expected_in_stack_order.len());
-        for id in expected_in_stack_order {
-            if !expected.insert(id.clone()) {
-                bail!("creation authorization join repeats expected change '{}'", id.as_str());
-            }
-        }
-        if expected != self.expected {
-            if let Some(missing) =
-                expected_in_stack_order.iter().find(|id| !self.expected.contains(*id))
-            {
-                bail!(
-                    "creation authorization join has no terminal proof for '{}'",
-                    missing.as_str()
-                );
-            }
-            let mut extra =
-                self.expected.difference(&expected).map(GherritPrId::as_str).collect::<Vec<_>>();
-            extra.sort_unstable();
-            bail!(
-                "creation authorization join has unexpected terminal proof(s): {}",
-                extra.join(", ")
-            );
-        }
-
-        let authorizations = expected_in_stack_order
-            .iter()
-            .map(|id| {
-                self.by_id.remove(id).ok_or_else(|| {
-                    eyre!(
-                        "creation authorization join has no unconsumed proof for '{}'",
-                        id.as_str()
-                    )
-                })
-            })
-            .collect::<Result<Box<[_]>>>()?;
-        debug_assert!(self.by_id.is_empty());
-        Ok(authorizations)
-    }
-
-    /// Consumes the complete authorization set and returns its original IDs.
-    ///
-    /// A caller may take tokens one at a time to construct create operations,
-    /// but preparation must still prove that no authorization was left behind
-    /// and that no taken token's operation was subsequently omitted.
-    /// FIXME(#264): Delete this subset seam with the pre-activation publisher.
-    pub(super) fn into_expected_ids(self) -> Result<HashSet<GherritPrId>> {
-        if !self.by_id.is_empty() {
-            let mut leftovers = self.by_id.keys().map(GherritPrId::as_str).collect::<Vec<_>>();
-            leftovers.sort_unstable();
-            bail!(
-                "pull request creation left terminal authorization(s) unconsumed: {}",
-                leftovers.join(", ")
-            );
-        }
-        Ok(self.expected)
-    }
-}
-
-/// One-use authorization to plan creation for exactly one change ID.
-#[derive(Debug)]
-pub(super) struct CreateAuthorization {
-    id: GherritPrId,
-}
-
-impl CreateAuthorization {
-    pub(super) fn id(&self) -> &GherritPrId {
-        &self.id
-    }
-
-    pub(super) fn into_id(self) -> GherritPrId {
-        self.id
     }
 }
 
@@ -906,25 +765,6 @@ mod tests {
                 .unwrap();
         }
         accumulator.into_terminal_histories().unwrap()
-    }
-
-    fn legacy_authorizations(values: &[&str]) -> CreateAuthorizations {
-        terminal_histories(values).into_legacy_authorizations().unwrap()
-    }
-
-    #[test]
-    fn exact_authorization_join_rejects_every_set_and_order_contradiction() {
-        assert!(legacy_authorizations(&["A", "B"]).into_exact(&[id("A")]).is_err());
-        assert!(legacy_authorizations(&["A"]).into_exact(&[id("A"), id("B")]).is_err());
-        assert!(legacy_authorizations(&["A"]).into_exact(&[id("A"), id("A")]).is_err());
-        let missing = legacy_authorizations(&[]).into_exact(&[id("B"), id("A")]).unwrap_err();
-        assert!(missing.to_string().contains("'B'"));
-
-        let exact = legacy_authorizations(&["A", "B"]).into_exact(&[id("B"), id("A")]).unwrap();
-        assert_eq!(
-            exact.iter().map(|authorization| authorization.id().as_str()).collect::<Vec<_>>(),
-            ["B", "A"]
-        );
     }
 
     fn raw_open(
@@ -1334,26 +1174,6 @@ mod tests {
     }
 
     #[test]
-    fn complete_terminal_exhaustion_supports_the_exact_legacy_adapter() {
-        let a = id("A");
-        let b = id("B");
-        let accumulator = TerminalExhaustionAccumulator::new([a.clone(), b.clone()]).unwrap();
-        let accumulator =
-            accumulator.record_page(evidence(&a, None, terminal_page(Some("a-1")))).unwrap();
-        let accumulator = accumulator.record_page(evidence(&b, None, terminal_page(None))).unwrap();
-        let accumulator =
-            accumulator.record_page(evidence(&a, Some("a-1"), terminal_page(None))).unwrap();
-
-        let mut authorizations = accumulator.into_legacy_authorizations().unwrap();
-        assert_eq!(authorizations.len(), 2);
-        assert_eq!(authorizations.take(&b).unwrap().id(), &b);
-        assert_eq!(authorizations.take(&a).unwrap().id(), &a);
-        assert!(authorizations.is_empty());
-        assert!(authorizations.take(&a).is_err());
-        assert!(authorizations.take(&id("C")).is_err());
-    }
-
-    #[test]
     fn terminal_histories_preserve_requested_order_and_neutral_states() {
         let empty = id("Gempty");
         let retired = id("Gretired");
@@ -1400,11 +1220,15 @@ mod tests {
         assert!(accumulator.record_page(evidence(&b, None, terminal_page(None))).is_err());
 
         let accumulator = TerminalExhaustionAccumulator::new([a]).unwrap();
-        assert!(accumulator.into_legacy_authorizations().is_err());
+        assert!(accumulator.into_terminal_histories().is_err());
 
-        let empty =
-            TerminalExhaustionAccumulator::new([]).unwrap().into_legacy_authorizations().unwrap();
-        assert_eq!(empty.len(), 0);
+        let empty = TerminalExhaustionAccumulator::new([])
+            .unwrap()
+            .into_terminal_histories()
+            .unwrap()
+            .into_exact(&[])
+            .unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]
@@ -1445,47 +1269,23 @@ mod tests {
         for state in [TerminalPullRequestState::Closed, TerminalPullRequestState::Merged] {
             let g = id("G");
             let accumulator = TerminalExhaustionAccumulator::new([g.clone()]).unwrap();
-            let error = accumulator
+            let exact = accumulator
                 .record_page(evidence(&g, None, retired_page(7, "terminal", state)))
                 .unwrap()
-                .into_legacy_authorizations()
-                .unwrap_err();
-            assert!(error.to_string().contains("Cannot push to"));
+                .into_terminal_histories()
+                .unwrap()
+                .into_exact(std::slice::from_ref(&g))
+                .unwrap();
+            assert!(matches!(
+                &exact[0],
+                TerminalHistory::Retired { identity, state: observed }
+                    if identity.number().get() == 7 && *observed == state
+            ));
         }
     }
 
     #[test]
-    fn retired_diagnostics_are_complete_and_keep_requested_id_order() {
-        let g1 = id("G1");
-        let g2 = id("G2");
-        let accumulator = TerminalExhaustionAccumulator::new([g1.clone(), g2.clone()]).unwrap();
-        let accumulator = accumulator
-            .record_page(evidence(
-                &g2,
-                None,
-                retired_page(22, "terminal-22", TerminalPullRequestState::Closed),
-            ))
-            .unwrap();
-        let error = accumulator
-            .record_page(evidence(
-                &g1,
-                None,
-                retired_page(11, "terminal-11", TerminalPullRequestState::Merged),
-            ))
-            .unwrap()
-            .into_legacy_authorizations()
-            .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "Cannot push to merged PR #11. Please open a new PR or reopen the existing one.\n\
-             Cannot push to closed PR #22. Please open a new PR or reopen the existing one.\n\
-             You may want to rebase on the latest changes before pushing."
-        );
-    }
-
-    #[test]
-    fn multiple_terminal_pull_requests_keep_the_legacy_ambiguity_diagnostic() {
+    fn multiple_terminal_pull_requests_keep_the_ambiguity_diagnostic() {
         let g = id("G");
         let accumulator = TerminalExhaustionAccumulator::new([g.clone()]).unwrap();
         let page = TerminalPullRequestPage {

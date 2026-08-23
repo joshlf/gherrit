@@ -37,6 +37,7 @@ fn installed_pre_push_blocks_the_enclosing_push() {
         .with_remote()
         .with_installed_hooks()
         .with_initial_commit()
+        .with_mock_github()
         .build();
 
     ctx.checkout_new("blocked-boundary");
@@ -60,6 +61,7 @@ fn installed_pre_push_blocks_an_inherited_custom_graft_file() {
         .with_remote()
         .with_installed_hooks()
         .with_initial_commit()
+        .with_mock_github()
         .build();
 
     ctx.checkout_new("custom-graft-boundary");
@@ -86,6 +88,7 @@ fn installed_pre_push_blocks_an_inherited_custom_shallow_file() {
         .with_remote()
         .with_installed_hooks()
         .with_initial_commit()
+        .with_mock_github()
         .build();
 
     ctx.checkout_new("custom-shallow-boundary");

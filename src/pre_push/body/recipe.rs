@@ -1,9 +1,8 @@
 //! Bounded pull-request content and frozen stack-level body recipes.
 //!
-//! This module is dormant until the owned-base planner activates it. Keeping
-//! the recipe at stack scope makes order, identity, navigation, and number
-//! assignment one fact instead of independently supplied per-change fields.
-#![allow(dead_code)]
+//! Keeping the recipe at stack scope makes order, identity, navigation, and
+//! number assignment one fact instead of independently supplied per-change
+//! fields.
 
 use std::{collections::HashSet, fmt};
 
@@ -185,6 +184,7 @@ impl RenderedBody {
         &self.id
     }
 
+    #[cfg(test)]
     pub(in crate::pre_push) fn body(&self) -> &GeneratedBody {
         &self.body
     }
@@ -344,6 +344,7 @@ impl StackBodyRecipes {
         Ok(Self { provisional: provisional.into_boxed_slice(), final_bodies })
     }
 
+    #[cfg(test)]
     pub(in crate::pre_push) fn provisional_bodies(&self) -> &[RenderedBody] {
         &self.provisional
     }

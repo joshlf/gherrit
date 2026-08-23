@@ -9,4 +9,5 @@ STDOUT:
 
 STDERR:
 [gherrit] Branch feature-ls-remote-fail is MANAGED. Syncing stack...
+[gherrit] [WARN] Using custom GitHub API URL: [MOCK_SERVER_URL]
 [gherrit] [ERROR] `git ls-remote` failed for GHerrit remote 'origin'
