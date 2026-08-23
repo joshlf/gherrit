@@ -7,14 +7,14 @@
 
 use std::borrow::Cow;
 
-use color_eyre::eyre::{Result, bail, eyre};
+use color_eyre::eyre::{Result, bail};
 
 use super::{
     body::{
         BodyLinkContext, BodyRecipeInput, FinalBodyRecipes, GeneratedBody, RenderedBody,
         StackBodyRecipes,
     },
-    destination::{DefaultBranch, PushDestination},
+    destination::DefaultBranch,
     github::{
         CompleteCreateReceipts, CorrelatedRepository, CreatePullRequest, PreparedCreates,
         PreparedUpdates, RepositoryTerminalHistories, UpdatePreflight, UpdatePullRequest,
@@ -25,82 +25,37 @@ use super::{
         ValidatedPublishedHistory,
     },
     local::{GherritPrId, LocalStack},
-    publication::{PushOutcome, PushRequest, plan_owned_base_pushes},
+    publication::{PreparedPushes, plan_owned_base_pushes},
     pull_request::{
         BaseKind, LocalPullRequestObservation, ManagedOpenParts, ManagedOpenPullRequest,
         PullRequestIdentity,
     },
     remote::{ActiveRemoteChanges, ObservedChangeHistory},
-    subprocess,
 };
 
 /// One complete plan whose GitHub projection remains behind Git publication.
 pub(super) struct PublicationPlan<'destination> {
-    state: PublicationState<'destination>,
-}
-
-enum PublicationState<'destination> {
-    Ready(ReadyProjection),
-    Pending(PendingGitPublication<'destination>),
-}
-
-struct PendingGitPublication<'destination> {
-    destination: &'destination PushDestination,
-    first: PushRequest,
-    rest: Box<[PushRequest]>,
+    pushes: Option<PreparedPushes<'destination>>,
     projection: ReadyProjection,
 }
 
 impl<'destination> PublicationPlan<'destination> {
-    fn new(
-        destination: &'destination PushDestination,
-        requests: Box<[PushRequest]>,
-        projection: ReadyProjection,
-    ) -> Self {
-        let mut requests = requests.into_vec().into_iter();
-        let Some(first) = requests.next() else {
-            return Self { state: PublicationState::Ready(projection) };
-        };
-        Self {
-            state: PublicationState::Pending(PendingGitPublication {
-                destination,
-                first,
-                rest: requests.collect(),
-                projection,
-            }),
+    fn new(pushes: Option<PreparedPushes<'destination>>, projection: ReadyProjection) -> Self {
+        Self { pushes, projection }
+    }
+
+    #[cfg(test)]
+    fn push_arguments_for_test(&self) -> Vec<(Vec<String>, Vec<String>)> {
+        match &self.pushes {
+            Some(pushes) => pushes.arguments_for_test(),
+            None => Vec::new(),
         }
     }
 
     /// Consumes the plan and releases projection only after exact Git success.
     pub(super) async fn publish(self) -> Result<ReadyProjection> {
-        match self.state {
-            PublicationState::Ready(projection) => Ok(projection),
-            PublicationState::Pending(pending) => pending.publish().await,
-        }
-    }
-}
-
-impl PendingGitPublication<'_> {
-    async fn publish(self) -> Result<ReadyProjection> {
-        for request in std::iter::once(self.first).chain(self.rest) {
-            log::info!("Pushing chunk to remote...");
-            let output = subprocess::output(
-                self.destination.push(request.options(), request.refspecs()),
-                subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
-            )
-            .await
-            .map_err(|error| {
-                eyre!(
-                    "Could not execute or acknowledge `git push` for GHerrit remote '{}'; remote refs may or may not have changed. Run GHerrit again to observe them before continuing: {error}",
-                    self.destination.configured_remote()
-                )
-            })?;
-            if request.outcome(output.status(), output.stdout()) == PushOutcome::Indeterminate {
-                bail!(
-                    "Could not acknowledge `git push` for GHerrit remote '{}'; remote refs may or may not have changed. Run GHerrit again to observe them before continuing.",
-                    self.destination.configured_remote()
-                );
-            }
+        if let Some(pushes) = self.pushes {
+            pushes.publish().await?;
         }
         Ok(self.projection)
     }
@@ -369,7 +324,7 @@ pub(super) fn plan_publication<'destination>(
     )?;
 
     let history_refs = realities.iter().map(LocalReality::history).collect::<Vec<_>>();
-    let requests = plan_owned_base_pushes(&history_refs)?;
+    let pushes = plan_owned_base_pushes(destination, &history_refs)?;
     let (body_inputs, drafts): (Vec<_>, Vec<_>) = realities
         .into_iter()
         .map(LocalReality::into_body_and_projection)
@@ -380,7 +335,7 @@ pub(super) fn plan_publication<'destination>(
     let projection =
         prepare_projection(repository_id, &default_branch, drafts, initial_identities, recipes)?;
 
-    Ok(PublicationPlan::new(destination, requests, projection))
+    Ok(PublicationPlan::new(pushes, projection))
 }
 
 fn validate_stack_default(stack: &DefaultBranch, agreed: &DefaultBranch) -> Result<()> {
