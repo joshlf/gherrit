@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
-const ACTIVE_VERSION_QUERY_BUDGET_BYTES: usize = 16 * 1024;
+const ACTIVE_MANAGED_TAG_QUERY_BUDGET_BYTES: usize = 16 * 1024;
 const MANY_ACTIVE_ID_COUNT: usize = 60;
 const MANY_ACTIVE_ID_LEN: usize = 120;
 
@@ -19,7 +19,7 @@ fn commit_many_active_changes(ctx: &testutil::TestContext) -> Vec<String> {
             [root.len() + 1, root.len() + 3]
         })
         .sum::<usize>();
-    assert!(pattern_bytes > ACTIVE_VERSION_QUERY_BUDGET_BYTES);
+    assert!(pattern_bytes > ACTIVE_MANAGED_TAG_QUERY_BUDGET_BYTES);
 
     ids.iter().enumerate().for_each(|(index, id)| {
         ctx.commit_with_explicit_gherrit_id(&format!("Change {index}"), id);
@@ -27,7 +27,7 @@ fn commit_many_active_changes(ctx: &testutil::TestContext) -> Vec<String> {
     ids
 }
 
-fn active_version_patterns(ids: &[String]) -> Vec<String> {
+fn active_managed_tag_patterns(ids: &[String]) -> Vec<String> {
     ids.iter()
         .flat_map(|id| {
             let root = format!("refs/tags/gherrit/{id}");
@@ -36,7 +36,7 @@ fn active_version_patterns(ids: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn observed_active_version_patterns(queries: &[Vec<String>]) -> Vec<String> {
+fn observed_active_managed_tag_patterns(queries: &[Vec<String>]) -> Vec<String> {
     queries
         .iter()
         .flatten()
@@ -125,9 +125,10 @@ fn test_full_stack_lifecycle_mocked() {
     );
 
     let heads = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads);
-    let versions = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions);
+    let managed_tags =
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveManagedTags);
     assert_eq!(heads.len(), 1, "one attempt has one global head observation");
-    assert_eq!(versions.len(), 1, "an ordinary stack has one exact history observation");
+    assert_eq!(managed_tags.len(), 1, "an ordinary stack has one exact managed-tag observation");
     assert!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteOther).is_empty());
     assert_eq!(
         heads[0],
@@ -150,10 +151,12 @@ fn test_full_stack_lifecycle_mocked() {
         .map(ToOwned::to_owned)
     );
     assert!(
-        versions[0].iter().any(|argument| argument == &format!("refs/tags/gherrit/{commit_a_id}"))
+        managed_tags[0]
+            .iter()
+            .any(|argument| argument == &format!("refs/tags/gherrit/{commit_a_id}"))
     );
     assert!(
-        versions[0]
+        managed_tags[0]
             .iter()
             .any(|argument| argument == &format!("refs/tags/gherrit/{commit_b_id}/*"))
     );
@@ -862,10 +865,10 @@ fn publication_between_head_and_history_observations_is_rejected_before_writes()
 
     // The two reads are intentionally not described as one snapshot. Model a
     // concurrent publisher committing a coherent head/tag tuple after the
-    // global head query but before the exact version query. Coupling the two
+    // global head query but before the exact managed-tag query. Coupling the two
     // results must reject the torn observation before either system is
     // mutated by this attempt.
-    ctx.update_remote_refs_before_active_version_observation([
+    ctx.update_remote_refs_before_active_managed_tag_observation([
         (managed_ref.as_str(), concurrent_oid.as_str()),
         (v2_ref.as_str(), concurrent_oid.as_str()),
     ]);
@@ -885,10 +888,40 @@ fn publication_between_head_and_history_observations_is_rejected_before_writes()
     assert_ne!(ctx.head_oid(), concurrent_oid);
     assert_eq!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads).len(), 2);
     assert_eq!(
-        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions).len(),
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveManagedTags).len(),
         2
     );
     assert!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteOther).is_empty());
+}
+
+#[test]
+fn active_legacy_orchestration_fails_closed_when_a_pr_marker_is_advertised() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("legacy-marker-rejection");
+    ctx.commit_with_explicit_gherrit_id("Initial change", "Gone");
+    ctx.hook_cmd("pre-push").assert().success();
+
+    let head = ctx.head_oid();
+    ctx.remote_git_cmd()
+        .args(["update-ref", "refs/tags/gherrit/Gone/pr", head.as_str()])
+        .assert()
+        .success();
+    ctx.amend();
+    let github_requests_before = ctx.github().requests().len();
+    let pushes_before = ctx.recorded_pushes().len();
+
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicates::str::contains(
+        "legacy publication cannot safely consume the pull-request marker",
+    ));
+
+    assert_eq!(ctx.github().requests().len(), github_requests_before);
+    assert_eq!(ctx.recorded_pushes().len(), pushes_before);
+    assert_eq!(ctx.remote_ref_oid("refs/tags/gherrit/Gone/pr").as_deref(), Some(head.as_str()));
 }
 
 #[test]
@@ -909,7 +942,7 @@ fn malformed_inactive_version_history_is_not_observed() {
 
     ctx.hook_cmd("pre-push").assert().success();
 
-    let queries = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions);
+    let queries = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveManagedTags);
     assert_eq!(queries.len(), 1);
     assert!(queries[0].iter().all(|argument| !argument.contains("Ginactive")));
     assert!(queries[0].iter().any(|argument| argument == "refs/tags/gherrit/Gactive"));
@@ -921,7 +954,7 @@ fn malformed_inactive_version_history_is_not_observed() {
 }
 
 #[test]
-fn active_version_observation_batches_cover_every_local_id() {
+fn active_managed_tag_observation_batches_cover_every_local_id() {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_initial_commit()
@@ -933,16 +966,16 @@ fn active_version_observation_batches_cover_every_local_id() {
 
     ctx.hook_cmd("pre-push").assert().success();
 
-    let queries = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions);
-    assert!(queries.len() > 1, "fixture must require more than one active-history query");
-    assert_eq!(observed_active_version_patterns(&queries), active_version_patterns(&ids));
+    let queries = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveManagedTags);
+    assert!(queries.len() > 1, "fixture must require more than one managed-tag query");
+    assert_eq!(observed_active_managed_tag_patterns(&queries), active_managed_tag_patterns(&ids));
     assert!(queries.iter().all(|query| {
         query
             .iter()
             .filter(|argument| argument.starts_with("refs/tags/gherrit/"))
             .map(|argument| argument.len() + 1)
             .sum::<usize>()
-            <= ACTIVE_VERSION_QUERY_BUDGET_BYTES
+            <= ACTIVE_MANAGED_TAG_QUERY_BUDGET_BYTES
     }));
     assert_eq!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads).len(), 1);
     assert!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteOther).is_empty());
@@ -970,7 +1003,7 @@ fn active_version_observation_batches_cover_every_local_id() {
 }
 
 #[test]
-fn later_active_version_observation_failure_blocks_every_write() {
+fn later_active_managed_tag_observation_failure_blocks_every_write() {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_initial_commit()
@@ -980,17 +1013,17 @@ fn later_active_version_observation_failure_blocks_every_write() {
     ctx.checkout_managed_private("failed-later-active-history");
     let ids = commit_many_active_changes(&ctx);
     let refs_before = ctx.remote_refs("refs");
-    ctx.expect_git_output(testutil::GitOperation::LsRemoteActiveVersions, "");
-    ctx.expect_git_failure(testutil::GitOperation::LsRemoteActiveVersions);
+    ctx.expect_git_output(testutil::GitOperation::LsRemoteActiveManagedTags, "");
+    ctx.expect_git_failure(testutil::GitOperation::LsRemoteActiveManagedTags);
 
     ctx.hook_cmd("pre-push").assert().failure().stderr(predicates::str::contains(
-        "`git ls-remote` failed while observing active version history",
+        "`git ls-remote` failed while observing active managed tags",
     ));
 
     ctx.assert_failure_consumed();
-    let queries = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions);
+    let queries = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveManagedTags);
     assert_eq!(queries.len(), 2, "the first batch succeeded before the second failed");
-    assert_eq!(observed_active_version_patterns(&queries), active_version_patterns(&ids));
+    assert_eq!(observed_active_managed_tag_patterns(&queries), active_managed_tag_patterns(&ids));
     assert_eq!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads).len(), 1);
     assert!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteOther).is_empty());
     assert!(ctx.github().requests().is_empty());
@@ -1033,7 +1066,7 @@ fn empty_local_stack_only_observes_global_heads() {
 
     assert_eq!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads).len(), 1);
     assert!(
-        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions).is_empty()
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveManagedTags).is_empty()
     );
     assert!(ctx.recorded_pushes().is_empty());
 }
@@ -1081,7 +1114,7 @@ fn oversized_late_id_fails_after_global_heads_but_before_active_history() {
 
     assert_eq!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads).len(), 1);
     assert!(
-        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions).is_empty()
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveManagedTags).is_empty()
     );
     assert!(ctx.recorded_pushes().is_empty());
     assert!(ctx.github().requests().is_empty());

@@ -137,6 +137,98 @@ pub(super) fn plan_owned_base_pushes<'destination>(
     PreparedPushes::new(destination, requests)
 }
 
+/// One required missing marker, derived only from validated local history.
+#[derive(Clone, Debug)]
+pub(super) struct MissingPullRequestMarker {
+    id: GherritPrId,
+    target: ObjectId,
+}
+
+impl MissingPullRequestMarker {
+    pub(super) fn from_history(history: &ValidatedChangeHistory) -> Option<Self> {
+        history.pull_request_marker().is_none().then(|| Self {
+            id: history.id().clone(),
+            target: history.projected_current().revision().head(),
+        })
+    }
+}
+
+struct MarkerPushArguments {
+    option: String,
+    refspec: String,
+    expected_receipt: (String, ExpectedRefReceipt),
+}
+
+impl MarkerPushArguments {
+    fn new(marker: &MissingPullRequestMarker) -> Self {
+        let destination = format!("refs/tags/gherrit/{}/pr", marker.id.as_str());
+        let source = marker.target.to_string();
+        Self {
+            option: format!("--force-with-lease={destination}:"),
+            refspec: format!("{source}:{destination}"),
+            expected_receipt: (
+                destination,
+                ExpectedRefReceipt::new(source, ExpectedRefTransition::CreateOrAlreadyDesired),
+            ),
+        }
+    }
+
+    fn encoded_argv_bytes(&self) -> usize {
+        self.option.len() + self.refspec.len() + 2
+    }
+}
+
+/// Plans one absent-leased durable marker per unmarked local pull request.
+pub(super) fn plan_marker_pushes<'destination>(
+    destination: &'destination PushDestination,
+    markers: &[MissingPullRequestMarker],
+) -> Result<Option<PreparedPushes<'destination>>> {
+    let requests = plan_marker_requests_with_budget(markers, PUSH_VARIABLE_ARGV_BUDGET_BYTES)?;
+    PreparedPushes::new(destination, requests)
+}
+
+fn plan_marker_requests_with_budget(
+    markers: &[MissingPullRequestMarker],
+    budget: usize,
+) -> Result<Box<[PushRequest]>> {
+    let arguments = markers.iter().map(MarkerPushArguments::new).collect::<Vec<_>>();
+    ExpectedReceipts::new(arguments.iter().map(|value| value.expected_receipt.clone()))?;
+
+    let mut requests = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 0;
+    for (index, arguments) in arguments.into_iter().enumerate() {
+        let encoded = arguments.encoded_argv_bytes();
+        if encoded > budget {
+            bail!(
+                "Git marker target {index} requires {encoded} bytes of variable push arguments, which exceeds the {budget}-byte variable-argument budget"
+            );
+        }
+        if !current.is_empty() && current_bytes > budget - encoded {
+            requests.push(marker_request(std::mem::take(&mut current))?);
+            current_bytes = 0;
+        }
+        current_bytes += encoded;
+        current.push(arguments);
+    }
+    if !current.is_empty() {
+        requests.push(marker_request(current)?);
+    }
+    Ok(requests.into_boxed_slice())
+}
+
+fn marker_request(arguments: Vec<MarkerPushArguments>) -> Result<PushRequest> {
+    let mut options = FIXED_PUSH_OPTIONS.map(str::to_owned).to_vec();
+    let mut refspecs = Vec::with_capacity(arguments.len());
+    let mut receipts = Vec::with_capacity(arguments.len());
+    for arguments in arguments {
+        options.push(arguments.option);
+        refspecs.push(arguments.refspec);
+        receipts.push(arguments.expected_receipt);
+    }
+    Ok(PushRequest { options, refspecs, expected: ExpectedReceipts::new(receipts)? })
+}
+
 fn plan_owned_base_requests_with_budget(
     histories: &[&ValidatedChangeHistory],
     budget: usize,
@@ -1200,6 +1292,79 @@ printf 'Done\n'
     }
 
     #[test]
+    fn marker_publication_uses_exact_absent_leases_and_indivisible_byte_batches() {
+        let first = MissingPullRequestMarker { id: change_id("Gone"), target: object_id(0x11) };
+        let second = MissingPullRequestMarker { id: change_id("Gtwo"), target: object_id(0x22) };
+        let encoded = MarkerPushArguments::new(&first).encoded_argv_bytes();
+
+        let exact =
+            plan_marker_requests_with_budget(std::slice::from_ref(&first), encoded).unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(
+            exact[0].options,
+            [
+                "--porcelain".to_owned(),
+                "--atomic".to_owned(),
+                "--no-verify".to_owned(),
+                "--no-follow-tags".to_owned(),
+                "--recurse-submodules=no".to_owned(),
+                "--no-signed".to_owned(),
+                "--no-force-if-includes".to_owned(),
+                "--force-with-lease=refs/tags/gherrit/Gone/pr:".to_owned(),
+            ]
+        );
+        assert_eq!(exact[0].refspecs, [format!("{}:refs/tags/gherrit/Gone/pr", object_id(0x11))]);
+        assert_eq!(
+            exact[0].expected.refs["refs/tags/gherrit/Gone/pr"].transition,
+            ExpectedRefTransition::CreateOrAlreadyDesired
+        );
+        assert!(
+            plan_marker_requests_with_budget(std::slice::from_ref(&first), encoded - 1).is_err()
+        );
+
+        let batches = plan_marker_requests_with_budget(&[first.clone(), second], encoded).unwrap();
+        assert_eq!(batches.len(), 2);
+        assert!(batches.iter().all(|batch| batch.refspecs.len() == 1));
+        assert!(plan_marker_requests_with_budget(&[first.clone(), first], usize::MAX).is_err());
+    }
+
+    #[test]
+    fn marker_receipts_require_exact_source_destination_coverage_and_create_transition() {
+        let marker = MissingPullRequestMarker { id: change_id("Gone"), target: object_id(0x11) };
+        let mut requests =
+            plan_marker_requests_with_budget(&[marker], usize::MAX).unwrap().into_vec();
+        let request = requests.pop().unwrap();
+        let source = object_id(0x11);
+        for flag in ["*", "="] {
+            let output =
+                format!("To private\n{flag}\t{source}:refs/tags/gherrit/Gone/pr\tstatus\nDone\n");
+            assert_eq!(
+                classify_push_receipts(&request.expected, output.as_bytes()),
+                PushOutcome::AcknowledgedSuccess
+            );
+        }
+        for output in [
+            format!("To private\n+\t{source}:refs/tags/gherrit/Gone/pr\tstatus\nDone\n"),
+            format!("To private\n!\t{source}:refs/tags/gherrit/Gone/pr\trejected\nDone\n"),
+            "To private\nDone\n".to_owned(),
+            format!(
+                "To private\n*\t{source}:refs/tags/gherrit/Gone/pr\tstatus\n*\t{source}:refs/tags/gherrit/Gextra/pr\tstatus\nDone\n"
+            ),
+            format!(
+                "To private\n*\t{source}:refs/tags/gherrit/Gone/pr\tstatus\n=\t{source}:refs/tags/gherrit/Gone/pr\tstatus\nDone\n"
+            ),
+            format!("To private\n*\t{}:refs/tags/gherrit/Gone/pr\tstatus\nDone\n", object_id(0x22)),
+            format!("To private\n* {source}:refs/tags/gherrit/Gone/pr status\nDone\n"),
+        ] {
+            assert_eq!(
+                classify_push_receipts(&request.expected, output.as_bytes()),
+                PushOutcome::Indeterminate,
+                "output={output:?}"
+            );
+        }
+    }
+
+    #[test]
     fn owned_base_publication_uses_absence_leases_for_first_publication() {
         let fixture = validated_history("Gnew", false, true);
         let requests = plan_owned_base_requests(&[&fixture.history]).unwrap();
@@ -1463,6 +1628,30 @@ printf 'Done\n'
         let error = plan.publish_with_timeout_for_test(Duration::from_secs(10)).await.unwrap_err();
 
         assert!(error.to_string().contains("Could not acknowledge `git push`"), "error={error:?}");
+        assert_eq!(fs::read_to_string(invocation_count).unwrap().trim(), "2");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn acknowledged_marker_prefix_then_indeterminate_batch_is_not_success() {
+        let (_directory, destination, invocation_count) = fake_git_destination(ACKNOWLEDGED_PREFIX);
+        let markers = [
+            MissingPullRequestMarker {
+                id: change_id(&format!("G{}", "a".repeat(5_000))),
+                target: object_id(2),
+            },
+            MissingPullRequestMarker {
+                id: change_id(&format!("G{}", "b".repeat(5_000))),
+                target: object_id(3),
+            },
+        ];
+        let pushes = plan_marker_pushes(&destination, &markers).unwrap().unwrap();
+        assert_eq!(pushes.arguments_for_test().len(), 2);
+
+        let error =
+            pushes.publish_with_timeout_for_test(Duration::from_secs(10)).await.unwrap_err();
+
+        assert!(error.to_string().contains("Could not acknowledge `git push`"));
         assert_eq!(fs::read_to_string(invocation_count).unwrap().trim(), "2");
     }
 

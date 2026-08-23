@@ -24,7 +24,9 @@ use super::{
         ValidatedPublishedHistory,
     },
     local::{GherritPrId, LocalStack},
-    publication::{PreparedPushes, plan_owned_base_pushes},
+    publication::{
+        MissingPullRequestMarker, PreparedPushes, plan_marker_pushes, plan_owned_base_pushes,
+    },
     pull_request::{
         BaseKind, LocalPullRequestObservation, ManagedOpenParts, ManagedOpenPullRequest,
         PullRequestIdentity, TerminalHistory,
@@ -35,11 +37,14 @@ use super::{
 /// One complete plan whose GitHub projection remains behind Git publication.
 pub(super) struct PublicationPlan<'destination> {
     pushes: Option<PreparedPushes<'destination>>,
-    projection: ReadyProjection,
+    projection: ReadyProjection<'destination>,
 }
 
 impl<'destination> PublicationPlan<'destination> {
-    fn new(pushes: Option<PreparedPushes<'destination>>, projection: ReadyProjection) -> Self {
+    fn new(
+        pushes: Option<PreparedPushes<'destination>>,
+        projection: ReadyProjection<'destination>,
+    ) -> Self {
         Self { pushes, projection }
     }
 
@@ -52,7 +57,7 @@ impl<'destination> PublicationPlan<'destination> {
     }
 
     /// Consumes the plan and releases projection only after exact Git success.
-    pub(super) async fn publish(self) -> Result<ReadyProjection> {
+    pub(super) async fn publish(self) -> Result<ReadyProjection<'destination>> {
         if let Some(pushes) = self.pushes {
             pushes.publish().await?;
         }
@@ -62,22 +67,92 @@ impl<'destination> PublicationPlan<'destination> {
 
 /// The minimal action available only after the Git acknowledgement barrier.
 #[derive(Debug)]
-pub(super) enum ReadyProjection {
+pub(super) enum ReadyProjection<'destination> {
+    Final(FinalProjection),
+    Markers(PreparedMarkers<'destination>),
+    Creates { creates: Box<PreparedCreates>, projection: ProjectionSeed<'destination> },
+}
+
+/// The only states released after every required marker is acknowledged.
+#[derive(Debug)]
+pub(super) enum FinalProjection {
     NoAction,
     Updates(PreparedUpdates),
-    Creates { creates: Box<PreparedCreates>, projection: ProjectionSeed },
+}
+
+impl FinalProjection {
+    fn from_operations(operations: Vec<UpdatePullRequest>) -> Result<Self> {
+        if operations.is_empty() {
+            Ok(Self::NoAction)
+        } else {
+            Ok(Self::Updates(PreparedUpdates::new(operations)?))
+        }
+    }
+}
+
+/// One consuming marker barrier with its already-preflighted final action.
+#[derive(Debug)]
+pub(super) struct PreparedMarkers<'destination> {
+    pushes: PreparedPushes<'destination>,
+    final_projection: FinalProjection,
+}
+
+impl<'destination> PreparedMarkers<'destination> {
+    fn new(
+        destination: &'destination super::destination::PushDestination,
+        markers: &[MissingPullRequestMarker],
+        final_projection: FinalProjection,
+    ) -> Result<Self> {
+        let pushes = plan_marker_pushes(destination, markers)?
+            .ok_or_else(|| color_eyre::eyre::eyre!("a marker gate requires a marker action"))?;
+        Ok(Self { pushes, final_projection })
+    }
+
+    fn from_pushes(pushes: PreparedPushes<'destination>, updates: PreparedUpdates) -> Self {
+        Self { pushes, final_projection: FinalProjection::Updates(updates) }
+    }
+
+    pub(super) async fn publish(self) -> Result<FinalProjection> {
+        self.pushes.publish().await?;
+        Ok(self.final_projection)
+    }
+
+    #[cfg(test)]
+    pub(super) fn arguments_for_test(&self) -> Vec<(Vec<String>, Vec<String>)> {
+        self.pushes.arguments_for_test()
+    }
+
+    #[cfg(test)]
+    pub(super) fn operation_count(&self) -> usize {
+        match &self.final_projection {
+            FinalProjection::NoAction => 0,
+            FinalProjection::Updates(updates) => updates.operation_count(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn request_text(&self) -> String {
+        match &self.final_projection {
+            FinalProjection::NoAction => String::new(),
+            FinalProjection::Updates(updates) => updates.request_text(),
+        }
+    }
 }
 
 /// Frozen facts whose only missing inputs are exact created PR identities.
 #[derive(Debug)]
-pub(super) struct ProjectionSeed {
+pub(super) struct ProjectionSeed<'destination> {
     entries: Box<[ProjectionEntry]>,
     final_bodies: FinalBodyRecipes,
+    marker_pushes: PreparedPushes<'destination>,
 }
 
-impl ProjectionSeed {
+impl<'destination> ProjectionSeed<'destination> {
     /// Consumes one exact complete receipt set and prepares every final update.
-    pub(super) fn complete(self, receipts: CompleteCreateReceipts) -> Result<PreparedUpdates> {
+    pub(super) fn complete(
+        self,
+        receipts: CompleteCreateReceipts,
+    ) -> Result<PreparedMarkers<'destination>> {
         let created_ids = self
             .entries
             .iter()
@@ -127,7 +202,8 @@ impl ProjectionSeed {
         if created.next().is_some() {
             bail!("createPullRequest receipts extend beyond the projection seed");
         }
-        PreparedUpdates::new(operations)
+        let updates = PreparedUpdates::new(operations)?;
+        Ok(PreparedMarkers::from_pushes(self.marker_pushes, updates))
     }
 }
 
@@ -309,6 +385,12 @@ pub(super) fn plan_publication<'destination>(
                             return Err(retired_history_error(&identity, state));
                         }
                     }
+                    if history.pull_request_marker().is_some() {
+                        bail!(
+                            "GHerrit change '{}' has a pull-request marker but no OPEN pull request",
+                            change.id().as_str()
+                        );
+                    }
                     Ok(LocalReality::Create { history })
                 }
             }
@@ -327,6 +409,10 @@ pub(super) fn plan_publication<'destination>(
 
     let history_refs = realities.iter().map(LocalReality::history).collect::<Vec<_>>();
     let pushes = plan_owned_base_pushes(destination, &history_refs)?;
+    let markers = realities
+        .iter()
+        .filter_map(|reality| MissingPullRequestMarker::from_history(reality.history()))
+        .collect::<Vec<_>>();
     let (body_inputs, drafts): (Vec<_>, Vec<_>) = realities
         .into_iter()
         .map(LocalReality::into_body_and_projection)
@@ -334,8 +420,15 @@ pub(super) fn plan_publication<'destination>(
         .into_iter()
         .unzip();
     let recipes = StackBodyRecipes::new(body_context, stack, body_inputs)?;
-    let projection =
-        prepare_projection(repository_id, &default_branch, drafts, initial_identities, recipes)?;
+    let projection = prepare_projection(
+        destination,
+        repository_id,
+        &default_branch,
+        drafts,
+        initial_identities,
+        recipes,
+        markers,
+    )?;
 
     Ok(PublicationPlan::new(pushes, projection))
 }
@@ -365,6 +458,7 @@ fn validate_local_pull_request(
         pull_request,
         history.contains_published_head(pull_request.head_oid()),
         history.contains_published_first_parent(pull_request.base().oid()),
+        history.pull_request_marker().is_some(),
         Some(desired_base),
         default_branch,
     )
@@ -409,6 +503,7 @@ fn validate_nonlocal_pull_request(
         pull_request,
         history.contains_published_head(pull_request.head_oid()),
         history.contains_published_first_parent(pull_request.base().oid()),
+        history.pull_request_marker().is_some(),
         None,
         default_branch,
     )
@@ -419,6 +514,7 @@ fn validate_pull_request(
     pull_request: &ManagedOpenPullRequest,
     published_head: bool,
     published_first_parent: bool,
+    has_pull_request_marker: bool,
     desired_base: Option<BaseKind>,
     default_branch: &DefaultBranch,
 ) -> Result<()> {
@@ -434,6 +530,9 @@ fn validate_pull_request(
             "OPEN pull request for '{}' has a head not present in published history",
             id.as_str()
         );
+    }
+    if !has_pull_request_marker && pull_request.base().kind() != BaseKind::Owned {
+        bail!("Unmarked OPEN pull request for '{}' must still use its owned base", id.as_str());
     }
     match pull_request.base().kind() {
         BaseKind::Default if pull_request.base().oid() != default_branch.tip() => {
@@ -494,13 +593,15 @@ fn retired_history_line(identity: &PullRequestIdentity, state: TerminalPullReque
     )
 }
 
-fn prepare_projection(
+fn prepare_projection<'destination>(
+    destination: &'destination super::destination::PushDestination,
     repository_id: String,
     default_branch: &DefaultBranch,
     drafts: Vec<ProjectionDraft>,
     initial_identities: super::pull_request::InitialPullRequestIdentities,
     recipes: StackBodyRecipes,
-) -> Result<ReadyProjection> {
+    markers: Vec<MissingPullRequestMarker>,
+) -> Result<ReadyProjection<'destination>> {
     if drafts.len() != recipes.final_bodies().titles().len() {
         bail!("body recipe and projection evidence have different change counts");
     }
@@ -568,10 +669,15 @@ fn prepare_projection(
     if create_operations.is_empty() {
         let bodies = final_bodies.complete([])?;
         let operations = exact_updates(entries, bodies)?;
-        return if operations.is_empty() {
-            Ok(ReadyProjection::NoAction)
+        let final_projection = FinalProjection::from_operations(operations)?;
+        return if markers.is_empty() {
+            Ok(ReadyProjection::Final(final_projection))
         } else {
-            Ok(ReadyProjection::Updates(PreparedUpdates::new(operations)?))
+            Ok(ReadyProjection::Markers(PreparedMarkers::new(
+                destination,
+                &markers,
+                final_projection,
+            )?))
         };
     }
 
@@ -593,9 +699,15 @@ fn prepare_projection(
     preflight_updates(&conservative)?;
 
     let creates = PreparedCreates::from_exact(initial_identities, create_operations)?;
+    let marker_pushes = plan_marker_pushes(destination, &markers)?
+        .ok_or_else(|| color_eyre::eyre::eyre!("created pull requests require marker actions"))?;
     Ok(ReadyProjection::Creates {
         creates: Box::new(creates),
-        projection: ProjectionSeed { entries: entries.into_boxed_slice(), final_bodies },
+        projection: ProjectionSeed {
+            entries: entries.into_boxed_slice(),
+            final_bodies,
+            marker_pushes,
+        },
     })
 }
 
