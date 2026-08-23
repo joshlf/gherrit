@@ -7,6 +7,7 @@ use tempfile::TempDir;
 use super::*;
 use crate::{
     pre_push::{
+        destination::PushDestination,
         github::{OpenObservation, TerminalPullRequestEvidence, TerminalPullRequestPage},
         pull_request::{PullRequestIdentity, TerminalExhaustionAccumulator, TerminalHistories},
         remote::{
@@ -271,20 +272,12 @@ fn missing_nonroot_plan(repository: &TestRepository, value: &str) -> Publication
     .unwrap()
 }
 
-fn requests_for_test<'plan>(plan: &'plan PublicationPlan<'_>) -> Vec<&'plan PushRequest> {
-    match &plan.state {
-        PublicationState::Ready(_) => Vec::new(),
-        PublicationState::Pending(pending) => {
-            std::iter::once(&pending.first).chain(pending.rest.iter()).collect()
-        }
-    }
+fn requests_for_test(plan: &PublicationPlan<'_>) -> Vec<(Vec<String>, Vec<String>)> {
+    plan.push_arguments_for_test()
 }
 
 fn into_projection_for_test(plan: PublicationPlan<'_>) -> ReadyProjection {
-    match plan.state {
-        PublicationState::Ready(projection) => projection,
-        PublicationState::Pending(pending) => pending.projection,
-    }
+    plan.projection
 }
 
 fn only_query(request_text: String) -> String {
@@ -372,7 +365,7 @@ fn first_publication_hides_create_and_update_work_behind_git_publication() {
     let git = plan;
     let requests = requests_for_test(&git);
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].refspecs().count(), 3);
+    assert_eq!(requests[0].1.len(), 3);
     let ReadyProjection::Creates { creates, projection } = into_projection_for_test(git) else {
         panic!("first publication must create its pull request");
     };
@@ -516,8 +509,8 @@ async fn pending_publication_executes_the_exact_request_before_releasing_project
     let plan = first_publication_plan(&repository, &destination);
     let requests = requests_for_test(&plan);
     assert_eq!(requests.len(), 1);
-    let expected_options = requests[0].options().collect::<Vec<_>>();
-    let expected_refspecs = requests[0].refspecs().collect::<Vec<_>>();
+    let expected_options = requests[0].0.clone();
+    let expected_refspecs = requests[0].1.clone();
 
     assert!(matches!(plan.publish().await.unwrap(), ReadyProjection::Creates { .. }));
 

@@ -394,16 +394,22 @@ struct AdvertisedVersionRef {
 ///
 /// FIXME(#264): Delete this compatibility seam when the active planner consumes
 /// opaque [`ObservedChangeHistory`] values.
-#[derive(Debug)]
-pub(super) struct ObservedStack<'stack> {
+pub(super) struct ObservedStack<'stack, 'destination> {
+    destination: &'destination PushDestination,
     changes: Vec<ObservedChange<'stack>>,
 }
 
-impl<'stack> ObservedStack<'stack> {
+impl fmt::Debug for ObservedStack<'_, '_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("ObservedStack").field("changes", &self.changes).finish()
+    }
+}
+
+impl<'stack, 'destination> ObservedStack<'stack, 'destination> {
     pub(super) fn couple(
         stack: &'stack LocalStack,
-        heads: &RemoteHeads<'_>,
-        mut versions: ActiveVersionTags<'_>,
+        heads: &RemoteHeads<'destination>,
+        mut versions: ActiveVersionTags<'destination>,
     ) -> Result<Self> {
         if !std::ptr::eq(heads.destination, versions.destination) {
             bail!("legacy head and version observations came from different destinations");
@@ -428,11 +434,20 @@ impl<'stack> ObservedStack<'stack> {
         if !versions.histories.is_empty() {
             bail!("remote version observation contains a change outside the local stack");
         }
-        Ok(Self { changes })
+        Ok(Self { destination: heads.destination, changes })
+    }
+
+    pub(super) fn destination(&self) -> &'destination PushDestination {
+        self.destination
+    }
+
+    pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = &ObservedChange<'stack>> {
+        self.changes.iter()
     }
 
     #[cfg(test)]
-    pub(super) fn for_test(
+    pub(super) fn for_test_at(
+        destination: &'destination PushDestination,
         stack: &'stack LocalStack,
         states: impl IntoIterator<
             Item = (Option<ObjectId>, Option<ObjectId>, BTreeMap<Version, ObjectId>),
@@ -450,12 +465,30 @@ impl<'stack> ObservedStack<'stack> {
                 versions,
             })
             .collect();
-        Self { changes }
+        Self { destination, changes }
     }
+}
 
-    pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = &ObservedChange<'stack>> {
-        self.changes.iter()
+impl<'stack> ObservedStack<'stack, 'static> {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        stack: &'stack LocalStack,
+        states: impl IntoIterator<
+            Item = (Option<ObjectId>, Option<ObjectId>, BTreeMap<Version, ObjectId>),
+        >,
+    ) -> Self {
+        let destination = test_push_destination();
+        ObservedStack::for_test_at(destination, stack, states)
     }
+}
+
+#[cfg(test)]
+fn test_push_destination() -> &'static PushDestination {
+    static DESTINATION: std::sync::OnceLock<PushDestination> = std::sync::OnceLock::new();
+    DESTINATION.get_or_init(|| {
+        PushDestination::for_test("origin", "https://github.com/owner/repository.git", Vec::new())
+            .expect("the test destination is valid")
+    })
 }
 
 /// One local change coupled to its complete remote publication observation.
