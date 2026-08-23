@@ -60,6 +60,22 @@ pub(super) struct CurrentVersion {
     revision: Revision,
 }
 
+/// Durable evidence that a pull request existed for one published revision.
+///
+/// The target is deliberately independent of the current version: later
+/// publication may move the managed head while this historical witness stays
+/// valid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PullRequestMarker {
+    target: ObjectId,
+}
+
+impl PullRequestMarker {
+    pub(super) fn target(self) -> ObjectId {
+        self.target
+    }
+}
+
 impl CurrentVersion {
     pub(super) fn number(self) -> Version {
         self.number
@@ -129,6 +145,7 @@ impl PublishedHistory {
 pub(super) struct NormalizedPublishedHistory {
     id: GherritPrId,
     published: Option<PublishedHistory>,
+    pull_request_marker: Option<PullRequestMarker>,
 }
 
 impl NormalizedPublishedHistory {
@@ -140,9 +157,18 @@ impl NormalizedPublishedHistory {
         let id = observed.id().clone();
         let head = observed.candidate_head();
         let owned_base = observed.owned_base();
+        let marker_target = observed.pull_request_marker_target();
         let tags = observed.versions();
         match (head, owned_base, tags.len() == 0) {
-            (None, None, true) => return Ok(Self { id, published: None }),
+            (None, None, true) if marker_target.is_none() => {
+                return Ok(Self { id, published: None, pull_request_marker: None });
+            }
+            (None, None, true) => {
+                bail!(
+                    "Remote GHerrit change '{}' has a pull-request marker but no published history",
+                    id.as_str()
+                );
+            }
             (Some(_), Some(_), false) => {}
             (None, _, false) => {
                 bail!(
@@ -198,7 +224,18 @@ impl NormalizedPublishedHistory {
                 id.as_str()
             );
         }
-        Ok(Self { id, published: Some(history) })
+        let pull_request_marker = marker_target
+            .map(|target| {
+                if !history.iter().any(|revision| revision.head() == target) {
+                    bail!(
+                        "Pull-request marker for GHerrit change '{}' does not target a published version head",
+                        id.as_str()
+                    );
+                }
+                Ok(PullRequestMarker { target })
+            })
+            .transpose()?;
+        Ok(Self { id, published: Some(history), pull_request_marker })
     }
 
     /// Consumes normalized history and couples it to one real proposed commit.
@@ -218,7 +255,12 @@ impl NormalizedPublishedHistory {
         if proposed.first_parent() != change.first_parent() {
             bail!("Local change {} does not retain its literal first parent", change.head());
         }
-        Ok(ChangeHistory { id: self.id, published: self.published, proposed })
+        Ok(ChangeHistory {
+            id: self.id,
+            published: self.published,
+            proposed,
+            pull_request_marker: self.pull_request_marker,
+        })
     }
 
     /// Consumes and validates all history for an existing nonlocal change.
@@ -231,7 +273,11 @@ impl NormalizedPublishedHistory {
             eyre!("Existing GHerrit change '{}' has no published history", self.id.as_str())
         })?;
         graph.validate_complete_revisions(&self.id, published.iter(), default_tip)?;
-        Ok(ValidatedPublishedHistory { id: self.id, published })
+        Ok(ValidatedPublishedHistory {
+            id: self.id,
+            published,
+            pull_request_marker: self.pull_request_marker,
+        })
     }
 }
 
@@ -240,6 +286,7 @@ impl NormalizedPublishedHistory {
 pub(super) struct ValidatedPublishedHistory {
     id: GherritPrId,
     published: PublishedHistory,
+    pull_request_marker: Option<PullRequestMarker>,
 }
 
 impl ValidatedPublishedHistory {
@@ -261,6 +308,10 @@ impl ValidatedPublishedHistory {
         self.published.current()
     }
 
+    pub(super) fn pull_request_marker(&self) -> Option<PullRequestMarker> {
+        self.pull_request_marker
+    }
+
     pub(super) fn contains_published_head(&self, head: ObjectId) -> bool {
         self.published.iter().any(|revision| revision.head() == head)
     }
@@ -279,6 +330,7 @@ pub(super) struct ChangeHistory {
     id: GherritPrId,
     published: Option<PublishedHistory>,
     proposed: Revision,
+    pull_request_marker: Option<PullRequestMarker>,
 }
 
 impl ChangeHistory {
@@ -293,6 +345,7 @@ impl ChangeHistory {
             id: self.id,
             published: self.published,
             proposed: self.proposed,
+            pull_request_marker: self.pull_request_marker,
         })
     }
 
@@ -312,6 +365,7 @@ pub(super) struct ValidatedChangeHistory {
     id: GherritPrId,
     published: Option<PublishedHistory>,
     proposed: Revision,
+    pull_request_marker: Option<PullRequestMarker>,
 }
 
 impl ValidatedChangeHistory {
@@ -333,6 +387,10 @@ impl ValidatedChangeHistory {
 
     pub(super) fn proposed(&self) -> Revision {
         self.proposed
+    }
+
+    pub(super) fn pull_request_marker(&self) -> Option<PullRequestMarker> {
+        self.pull_request_marker
     }
 
     pub(super) fn needs_publication(&self) -> bool {
@@ -856,6 +914,16 @@ mod tests {
         owned_base: Option<ObjectId>,
         tags: &BTreeMap<Version, ObjectId>,
     ) -> remote::ObservedChangeHistory {
+        observed_change_with_marker(id, head, owned_base, tags, None)
+    }
+
+    fn observed_change_with_marker(
+        id: &GherritPrId,
+        head: Option<ObjectId>,
+        owned_base: Option<ObjectId>,
+        tags: &BTreeMap<Version, ObjectId>,
+        marker: Option<ObjectId>,
+    ) -> remote::ObservedChangeHistory {
         let default = ObjectId::from_bytes_or_panic(&[1; 20]);
         let mut heads =
             format!("ref: refs/heads/main\tHEAD\n{default}\tHEAD\n{default}\trefs/heads/main\n");
@@ -865,11 +933,14 @@ mod tests {
         if let Some(owned_base) = owned_base {
             writeln!(heads, "{owned_base}\trefs/heads/gherrit-bases/{}", id.as_str()).unwrap();
         }
-        let versions = tags
+        let mut managed_tags = tags
             .iter()
             .map(|(version, oid)| format!("{oid}\trefs/tags/gherrit/{}/v{version}\n", id.as_str()))
             .collect::<String>();
-        remote::parse_active_change_for_test(id.clone(), heads.as_bytes(), versions.as_bytes())
+        if let Some(marker) = marker {
+            writeln!(managed_tags, "{marker}\trefs/tags/gherrit/{}/pr", id.as_str()).unwrap();
+        }
+        remote::parse_active_change_for_test(id.clone(), heads.as_bytes(), managed_tags.as_bytes())
             .expect("complete test observation")
     }
 
@@ -940,6 +1011,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn pull_request_marker_requires_and_targets_only_published_history() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[], &[]);
+        let first = repository.commit("first", &[root], &["Gone"]);
+        let current = repository.commit("current", &[root], &["Gone"]);
+        let proposal = repository.commit("proposal", &[root], &["Gone"]);
+        let external = repository.commit("external", &[root], &[]);
+        let graph = load(&repository, [first, current, proposal, external]);
+        let id = change_id("Gone");
+
+        let marker_without_history = NormalizedPublishedHistory::from_observation(
+            observed_change_with_marker(&id, None, None, &BTreeMap::new(), Some(first)),
+            &graph,
+        )
+        .unwrap_err();
+        assert!(marker_without_history.to_string().contains("marker but no published history"));
+
+        for target in [proposal, external] {
+            let error = NormalizedPublishedHistory::from_observation(
+                observed_change_with_marker(
+                    &id,
+                    Some(current),
+                    Some(root),
+                    &tags([(1, first), (2, current)]),
+                    Some(target),
+                ),
+                &graph,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("does not target a published version head"));
+        }
+
+        let normalized = NormalizedPublishedHistory::from_observation(
+            observed_change_with_marker(
+                &id,
+                Some(current),
+                Some(root),
+                &tags([(1, first), (2, current)]),
+                Some(first),
+            ),
+            &graph,
+        )
+        .unwrap();
+        let stack = LocalStack::for_test(root, [(id.clone(), proposal)]);
+        let validated = normalized
+            .with_proposal(stack.iter().next().unwrap(), &graph)
+            .unwrap()
+            .validate(&graph, None)
+            .unwrap();
+        assert_eq!(validated.pull_request_marker().map(PullRequestMarker::target), Some(first));
+        assert_eq!(validated.published_current().unwrap().revision().head(), current);
+        assert_eq!(validated.projected_current().revision().head(), proposal);
     }
 
     #[test]

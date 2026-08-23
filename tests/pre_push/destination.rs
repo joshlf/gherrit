@@ -163,11 +163,11 @@ fn push_destination_controls_observation_publication_and_github_identity() {
     assert_eq!(ctx.github().pull_requests().len(), 1);
 
     let head_queries = ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteHeads);
-    let version_queries =
-        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions);
+    let managed_tag_queries =
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveManagedTags);
     assert_eq!(head_queries.len(), 1);
-    assert_eq!(version_queries.len(), 1);
-    for arguments in head_queries.iter().chain(&version_queries) {
+    assert_eq!(managed_tag_queries.len(), 1);
+    for arguments in head_queries.iter().chain(&managed_tag_queries) {
         assert_private_remote_arguments(arguments, &[&push_destination, &fetch_destination]);
     }
     assert!(head_queries[0].contains(&"HEAD".to_owned()));
@@ -175,8 +175,8 @@ fn push_destination_controls_observation_publication_and_github_identity() {
     assert!(head_queries[0].contains(&"refs/tags/gherrit".to_owned()));
     assert!(!head_queries[0].contains(&managed_ref));
     assert!(!head_queries[0].contains(&format!("refs/heads/gherrit-bases/{id}")));
-    assert!(version_queries[0].contains(&format!("refs/tags/gherrit/{id}")));
-    assert!(version_queries[0].contains(&format!("refs/tags/gherrit/{id}/*")));
+    assert!(managed_tag_queries[0].contains(&format!("refs/tags/gherrit/{id}")));
+    assert!(managed_tag_queries[0].contains(&format!("refs/tags/gherrit/{id}/*")));
 }
 
 #[test]

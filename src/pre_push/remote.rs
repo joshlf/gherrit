@@ -33,8 +33,8 @@ const HEAD_ADVERTISEMENT_PATTERNS: [&str; 3] = ["HEAD", "refs/heads/*", "refs/ta
 const HEAD_PREFIX: &[u8] = b"refs/heads/";
 const OWNED_BASE_ROOT: &[u8] = b"refs/heads/gherrit-bases";
 const OWNED_BASE_PREFIX: &[u8] = b"refs/heads/gherrit-bases/";
-const VERSION_ROOT: &[u8] = b"refs/tags/gherrit";
-const VERSION_PREFIX: &[u8] = b"refs/tags/gherrit/";
+const MANAGED_TAG_ROOT: &[u8] = b"refs/tags/gherrit";
+const MANAGED_TAG_PREFIX: &[u8] = b"refs/tags/gherrit/";
 
 /// Complete, syntactically valid state from one repository-wide head query.
 pub(super) struct RemoteHeads<'destination> {
@@ -104,10 +104,10 @@ impl<'destination> RemoteHeads<'destination> {
         self,
         local_ids: &[GherritPrId],
         nonlocal_ids: &[GherritPrId],
-        version_output: &[u8],
+        managed_tag_output: &[u8],
     ) -> Result<ActiveRemoteChanges<'destination>> {
         let expected = local_ids.iter().chain(nonlocal_ids);
-        let ParsedVersionTags { histories } = parse_versions(version_output, expected)?;
+        let ParsedManagedTags { histories } = parse_managed_tags(managed_tag_output, expected)?;
         DestinationObservation { heads: self, histories }.into_active(local_ids, nonlocal_ids)
     }
 }
@@ -116,11 +116,11 @@ impl<'destination> RemoteHeads<'destination> {
     /// Consumes the complete head observation to begin cumulative history
     /// observation at the same exact destination.
     #[allow(dead_code)]
-    pub(super) async fn observe_versions(
+    pub(super) async fn observe_managed_tags(
         self,
         local_ids: &[GherritPrId],
     ) -> Result<DestinationObservation<'destination>> {
-        let histories = observe_version_histories(self.destination, local_ids.iter()).await?;
+        let histories = observe_managed_tag_namespaces(self.destination, local_ids.iter()).await?;
         Ok(DestinationObservation { heads: self, histories })
     }
 }
@@ -129,7 +129,7 @@ impl<'destination> RemoteHeads<'destination> {
 /// the retained repository-wide head observation.
 pub(super) struct DestinationObservation<'destination> {
     heads: RemoteHeads<'destination>,
-    histories: HashMap<GherritPrId, BTreeMap<Version, AdvertisedVersionRef>>,
+    histories: HashMap<GherritPrId, AdvertisedChangeNamespace>,
 }
 
 impl fmt::Debug for DestinationObservation<'_> {
@@ -140,7 +140,7 @@ impl fmt::Debug for DestinationObservation<'_> {
             .field("covered_change_count", &self.histories.len())
             .field(
                 "advertised_ref_count",
-                &self.histories.values().map(BTreeMap::len).sum::<usize>(),
+                &self.histories.values().map(AdvertisedChangeNamespace::ref_count).sum::<usize>(),
             )
             .finish()
     }
@@ -164,7 +164,7 @@ impl<'destination> DestinationObservation<'destination> {
         }
 
         let additional =
-            observe_version_histories(self.heads.destination, nonlocal_ids.iter()).await?;
+            observe_managed_tag_namespaces(self.heads.destination, nonlocal_ids.iter()).await?;
         for (id, history) in additional {
             if self.histories.insert(id, history).is_some() {
                 bail!("additional remote observation overlaps previously covered changes");
@@ -197,31 +197,32 @@ impl<'destination> DestinationObservation<'destination> {
         }
 
         let heads = &self.heads;
-        let observe = |id: &GherritPrId, versions: BTreeMap<Version, AdvertisedVersionRef>| {
-            ObservedChangeHistory {
+        let observe =
+            |id: &GherritPrId, namespace: AdvertisedChangeNamespace| ObservedChangeHistory {
                 id: id.clone(),
                 candidate_head: heads.candidate_head(id),
                 owned_base: heads.owned_base(id),
-                versions: versions
+                versions: namespace
+                    .versions
                     .into_iter()
                     .map(|(version, advertised)| (version, advertised.object_id))
                     .collect(),
-            }
-        };
+                pull_request_marker: namespace.pull_request_marker,
+            };
         let local = local_ids
             .iter()
             .map(|id| {
-                let versions =
+                let namespace =
                     self.histories.remove(id).expect("exact local coverage was proved above");
-                observe(id, versions)
+                observe(id, namespace)
             })
             .collect();
         let nonlocal = nonlocal_ids
             .iter()
             .map(|id| {
-                let versions =
+                let namespace =
                     self.histories.remove(id).expect("exact nonlocal coverage was proved above");
-                observe(id, versions)
+                observe(id, namespace)
             })
             .collect();
         debug_assert!(self.histories.is_empty());
@@ -246,7 +247,7 @@ impl<'destination> DestinationObservation<'destination> {
             let history = self.histories.get(id).ok_or_else(|| {
                 eyre!("object acquisition requested unobserved GHerrit change '{}'", id.as_str())
             })?;
-            for advertised in history.values() {
+            for advertised in history.versions.values() {
                 object_ids.insert(advertised.object_id);
                 source_refs.push(advertised.source_ref.clone());
             }
@@ -317,6 +318,7 @@ pub(super) struct ObservedChangeHistory {
     candidate_head: Option<ObjectId>,
     owned_base: Option<ObjectId>,
     versions: Box<[(Version, ObjectId)]>,
+    pull_request_marker: Option<ObjectId>,
 }
 
 impl ObservedChangeHistory {
@@ -335,6 +337,10 @@ impl ObservedChangeHistory {
     pub(super) fn versions(&self) -> impl ExactSizeIterator<Item = (Version, ObjectId)> + '_ {
         self.versions.iter().copied()
     }
+
+    pub(super) fn pull_request_marker_target(&self) -> Option<ObjectId> {
+        self.pull_request_marker
+    }
 }
 
 fn unique_id_names<'id>(ids: &'id [GherritPrId], context: &str) -> Result<HashSet<&'id str>> {
@@ -352,32 +358,42 @@ fn unique_id_names<'id>(ids: &'id [GherritPrId], context: &str) -> Result<HashSe
 /// FIXME(#264): Delete this compatibility value with [`ObservedStack`] when
 /// activation switches orchestration to [`DestinationObservation`]. It cannot
 /// enter complete-history normalization.
-pub(super) struct ActiveVersionTags<'destination> {
+pub(super) struct ActiveManagedTags<'destination> {
     destination: &'destination PushDestination,
-    histories: HashMap<GherritPrId, BTreeMap<Version, AdvertisedVersionRef>>,
+    histories: HashMap<GherritPrId, AdvertisedChangeNamespace>,
 }
 
-impl fmt::Debug for ActiveVersionTags<'_> {
+impl fmt::Debug for ActiveManagedTags<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ActiveVersionTags")
+            .debug_struct("ActiveManagedTags")
             .field("covered_change_count", &self.histories.len())
             .field(
                 "advertised_ref_count",
-                &self.histories.values().map(BTreeMap::len).sum::<usize>(),
+                &self.histories.values().map(AdvertisedChangeNamespace::ref_count).sum::<usize>(),
             )
             .finish()
     }
 }
 
-impl ActiveVersionTags<'_> {
-    fn take_history(&mut self, id: &GherritPrId) -> Option<BTreeMap<Version, ObjectId>> {
-        self.histories.remove(id).map(|history| {
-            history
-                .into_iter()
-                .map(|(version, advertised)| (version, advertised.object_id))
-                .collect()
-        })
+impl ActiveManagedTags<'_> {
+    fn take_history(&mut self, id: &GherritPrId) -> Result<Option<BTreeMap<Version, ObjectId>>> {
+        self.histories
+            .remove(id)
+            .map(|history| {
+                if history.pull_request_marker.is_some() {
+                    bail!(
+                        "legacy publication cannot safely consume the pull-request marker for '{}'",
+                        id.as_str()
+                    );
+                }
+                Ok(history
+                    .versions
+                    .into_iter()
+                    .map(|(version, advertised)| (version, advertised.object_id))
+                    .collect())
+            })
+            .transpose()
     }
 }
 
@@ -388,6 +404,18 @@ impl ActiveVersionTags<'_> {
 struct AdvertisedVersionRef {
     object_id: ObjectId,
     source_ref: String,
+}
+
+#[derive(Default)]
+struct AdvertisedChangeNamespace {
+    versions: BTreeMap<Version, AdvertisedVersionRef>,
+    pull_request_marker: Option<ObjectId>,
+}
+
+impl AdvertisedChangeNamespace {
+    fn ref_count(&self) -> usize {
+        self.versions.len() + usize::from(self.pull_request_marker.is_some())
+    }
 }
 
 /// Legacy remote state for each local change, in stack order.
@@ -409,17 +437,17 @@ impl<'stack, 'destination> ObservedStack<'stack, 'destination> {
     pub(super) fn couple(
         stack: &'stack LocalStack,
         heads: &RemoteHeads<'destination>,
-        mut versions: ActiveVersionTags<'destination>,
+        mut managed_tags: ActiveManagedTags<'destination>,
     ) -> Result<Self> {
-        if !std::ptr::eq(heads.destination, versions.destination) {
-            bail!("legacy head and version observations came from different destinations");
+        if !std::ptr::eq(heads.destination, managed_tags.destination) {
+            bail!("legacy head and managed-tag observations came from different destinations");
         }
         let changes = stack
             .iter()
             .map(|change| {
-                let history = versions.take_history(change.id()).ok_or_else(|| {
+                let history = managed_tags.take_history(change.id())?.ok_or_else(|| {
                     eyre!(
-                        "version history for GHerrit change '{}' was not observed",
+                        "managed tag namespace for GHerrit change '{}' was not observed",
                         change.id().as_str()
                     )
                 })?;
@@ -431,8 +459,8 @@ impl<'stack, 'destination> ObservedStack<'stack, 'destination> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        if !versions.histories.is_empty() {
-            bail!("remote version observation contains a change outside the local stack");
+        if !managed_tags.histories.is_empty() {
+            bail!("remote managed-tag observation contains a change outside the local stack");
         }
         Ok(Self { destination: heads.destination, changes })
     }
@@ -560,28 +588,29 @@ async fn observe_remote_heads_command(
 /// Legacy free-standing history observation used only by the active publisher.
 ///
 /// FIXME(#264): Delete this wrapper at activation. New code must consume
-/// [`RemoteHeads::observe_versions`] so head and tag provenance cannot diverge.
-pub(super) async fn observe_active_version_tags<'destination, 'id>(
+/// [`RemoteHeads::observe_managed_tags`] so head and tag provenance cannot
+/// diverge.
+pub(super) async fn observe_active_managed_tags<'destination, 'id>(
     destination: &'destination PushDestination,
     ids: impl IntoIterator<Item = &'id GherritPrId>,
-) -> Result<ActiveVersionTags<'destination>> {
-    let histories = observe_version_histories(destination, ids).await?;
-    Ok(ActiveVersionTags { destination, histories })
+) -> Result<ActiveManagedTags<'destination>> {
+    let histories = observe_managed_tag_namespaces(destination, ids).await?;
+    Ok(ActiveManagedTags { destination, histories })
 }
 
-async fn observe_version_histories<'id>(
+async fn observe_managed_tag_namespaces<'id>(
     destination: &PushDestination,
     ids: impl IntoIterator<Item = &'id GherritPrId>,
-) -> Result<HashMap<GherritPrId, BTreeMap<Version, AdvertisedVersionRef>>> {
+) -> Result<HashMap<GherritPrId, AdvertisedChangeNamespace>> {
     let ids = ids.into_iter().collect::<Vec<_>>();
-    let version_queries = plan_queries(&ids, version_pattern_bytes)?;
+    let tag_queries = plan_queries(&ids, managed_tag_pattern_bytes)?;
     let started = Instant::now();
     let mut total_bytes = 0_usize;
     let mut total_records = 0_usize;
     let mut histories = HashMap::new();
-    for query in &version_queries {
-        let command = destination.ls_remote(["--quiet".to_owned()], query.version_patterns());
-        let output = observe_active_version_query(
+    for query in &tag_queries {
+        let command = destination.ls_remote(["--quiet".to_owned()], query.managed_tag_patterns());
+        let output = observe_active_managed_tag_query(
             command,
             destination.configured_remote(),
             subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
@@ -589,19 +618,19 @@ async fn observe_version_histories<'id>(
         .await?;
         total_bytes = total_bytes.saturating_add(output.stdout().len());
         total_records = total_records.saturating_add(git_output_records(output.stdout()).count());
-        let ParsedVersionTags { histories: query_histories } =
-            parse_versions(output.stdout(), query.ids())?;
-        for (id, versions) in query_histories {
-            if histories.insert(id, versions).is_some() {
-                bail!("version history was returned by more than one query");
+        let ParsedManagedTags { histories: query_histories } =
+            parse_managed_tags(output.stdout(), query.ids())?;
+        for (id, namespace) in query_histories {
+            if histories.insert(id, namespace).is_some() {
+                bail!("managed tag namespace was returned by more than one query");
             }
         }
     }
 
     log::trace!(
-        "Observed GHerrit version history for {} active change(s) in {} request(s) ({} bytes, {} records) in {:?}",
+        "Observed GHerrit managed tag namespaces for {} active change(s) in {} request(s) ({} bytes, {} records) in {:?}",
         ids.len(),
-        version_queries.len(),
+        tag_queries.len(),
         total_bytes,
         total_records,
         started.elapsed()
@@ -609,17 +638,17 @@ async fn observe_version_histories<'id>(
     Ok(histories)
 }
 
-async fn observe_active_version_query(
+async fn observe_active_managed_tag_query(
     command: Command,
     configured_remote: &str,
     timeout: Duration,
 ) -> Result<subprocess::CommandOutput> {
     let output = subprocess::output(command, timeout).await.wrap_err_with(|| {
-        format!("Failed to observe active version history at GHerrit remote '{configured_remote}'")
+        format!("Failed to observe active managed tags at GHerrit remote '{configured_remote}'")
     })?;
     if !output.status().success() {
         bail!(
-            "`git ls-remote` failed while observing active version history at GHerrit remote '{configured_remote}'"
+            "`git ls-remote` failed while observing active managed tags at GHerrit remote '{configured_remote}'"
         );
     }
     Ok(output)
@@ -640,8 +669,8 @@ impl Query {
         std::iter::once(&self.first).chain(&self.rest)
     }
 
-    fn version_patterns(&self) -> Vec<String> {
-        self.ids().flat_map(version_patterns).collect()
+    fn managed_tag_patterns(&self) -> Vec<String> {
+        self.ids().flat_map(managed_tag_patterns).collect()
     }
 }
 
@@ -695,13 +724,14 @@ fn plan_queries_with_budget(
     Ok(queries)
 }
 
-fn version_patterns(id: &GherritPrId) -> [String; 2] {
-    let root = format!("{}{}", str::from_utf8(VERSION_PREFIX).expect("ASCII prefix"), id.as_str());
+fn managed_tag_patterns(id: &GherritPrId) -> [String; 2] {
+    let root =
+        format!("{}{}", str::from_utf8(MANAGED_TAG_PREFIX).expect("ASCII prefix"), id.as_str());
     [root.clone(), format!("{root}/*")]
 }
 
-fn version_pattern_bytes(id: &GherritPrId) -> usize {
-    version_patterns(id).iter().map(|pattern| pattern.len() + 1).sum()
+fn managed_tag_pattern_bytes(id: &GherritPrId) -> usize {
+    managed_tag_patterns(id).iter().map(|pattern| pattern.len() + 1).sum()
 }
 
 /// A source-only acquisition inseparably bound to one remote observation.
@@ -784,7 +814,7 @@ pub(super) async fn complete_graph_wave(
         observed
             .histories
             .values()
-            .flat_map(BTreeMap::values)
+            .flat_map(|history| history.versions.values())
             .map(|advertised| advertised.object_id),
     );
     complete_roots.sort_unstable();
@@ -958,8 +988,8 @@ fn parse_advertised_refs(output: &[u8]) -> Result<AdvertisedRefs> {
         let logical_name = name.strip_suffix(b"^{}").unwrap_or(name);
         validate_direct_advertised_ref_name(name)?;
         validate_reserved_ref_name(logical_name)?;
-        if name != logical_name && is_version_tag_name(logical_name) {
-            bail!("managed version tag is annotated rather than lightweight");
+        if name != logical_name && is_managed_tag_name(logical_name) {
+            bail!("managed tag is annotated rather than lightweight");
         }
         match direct.entry(name.to_vec()) {
             Entry::Vacant(entry) => {
@@ -1013,8 +1043,8 @@ fn parse_remote_heads(output: &[u8]) -> Result<ParsedRemoteHeads> {
         }
         if let Some(id) = parse_owned_base_name(&name)? {
             owned_bases.insert(id, object_id);
-        } else if parse_version_tag_name(&name)?.is_some() {
-            bail!("head advertisement unexpectedly included immutable version history");
+        } else if parse_managed_tag_name(&name)?.is_some() {
+            bail!("head advertisement unexpectedly included managed tag history");
         } else if let Some(id) = parse_top_level_change_head(&name) {
             candidate_heads.insert(id, object_id);
         }
@@ -1046,12 +1076,12 @@ pub(super) fn parse_remote_heads_for_destination_for_test<'destination>(
 pub(super) fn parse_active_change_for_test(
     id: GherritPrId,
     head_output: &[u8],
-    version_output: &[u8],
+    managed_tag_output: &[u8],
 ) -> Result<ObservedChangeHistory> {
     // History-domain tests enter through both production byte parsers and the
     // exact active-set consumer. They never manufacture the opaque value.
     let heads = parse_remote_heads_for_test(head_output)?;
-    let ParsedVersionTags { histories } = parse_versions(version_output, [&id])?;
+    let ParsedManagedTags { histories } = parse_managed_tags(managed_tag_output, [&id])?;
     let active = DestinationObservation { heads, histories }.into_active(&[id], &[])?;
     let mut local = active.local.into_vec();
     if local.len() != 1 {
@@ -1087,11 +1117,11 @@ fn validate_reserved_ref_name(name: &[u8]) -> Result<()> {
     if name.starts_with(OWNED_BASE_PREFIX) {
         parse_owned_base_name(name)?.expect("the reserved prefix was checked above");
     }
-    if name == VERSION_ROOT {
-        bail!("remote ref uses the reserved version-tag namespace root");
+    if name == MANAGED_TAG_ROOT {
+        bail!("remote ref uses the reserved managed-tag namespace root");
     }
-    if name.starts_with(VERSION_PREFIX) {
-        parse_version_tag_name(name)?.expect("the reserved prefix was checked above");
+    if name.starts_with(MANAGED_TAG_PREFIX) {
+        parse_managed_tag_name(name)?.expect("the reserved prefix was checked above");
     }
     Ok(())
 }
@@ -1099,11 +1129,11 @@ fn validate_reserved_ref_name(name: &[u8]) -> Result<()> {
 fn is_managed_ref_name(name: &[u8]) -> bool {
     parse_top_level_change_head(name).is_some()
         || name.starts_with(OWNED_BASE_PREFIX)
-        || name.starts_with(VERSION_PREFIX)
+        || name.starts_with(MANAGED_TAG_PREFIX)
 }
 
-fn is_version_tag_name(name: &[u8]) -> bool {
-    name.starts_with(VERSION_PREFIX)
+fn is_managed_tag_name(name: &[u8]) -> bool {
+    name.starts_with(MANAGED_TAG_PREFIX)
 }
 
 fn parse_top_level_change_head(name: &[u8]) -> Option<GherritPrId> {
@@ -1120,19 +1150,29 @@ fn parse_owned_base_name(name: &[u8]) -> Result<Option<GherritPrId>> {
     Ok(Some(id))
 }
 
-fn parse_version_tag_name(name: &[u8]) -> Result<Option<(GherritPrId, Version)>> {
-    let Some(suffix) = name.strip_prefix(VERSION_PREFIX) else {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedTag {
+    Version(Version),
+    PullRequestMarker,
+}
+
+fn parse_managed_tag_name(name: &[u8]) -> Result<Option<(GherritPrId, ManagedTag)>> {
+    let Some(suffix) = name.strip_prefix(MANAGED_TAG_PREFIX) else {
         return Ok(None);
     };
     let mut components = suffix.split(|byte| *byte == b'/');
-    let (Some(id), Some(version), None) = (components.next(), components.next(), components.next())
+    let (Some(id), Some(leaf), None) = (components.next(), components.next(), components.next())
     else {
-        bail!("remote version tag does not have the canonical change/vN shape");
+        bail!("remote managed tag does not have the canonical change/(vN|pr) shape");
     };
     let id = GherritPrId::from_ref_component(id)
-        .wrap_err("remote version tag has an invalid change ID")?;
-    let version = parse_version(version).wrap_err("remote version tag is not canonical")?;
-    Ok(Some((id, version)))
+        .wrap_err("remote managed tag has an invalid change ID")?;
+    let tag = if leaf == b"pr" {
+        ManagedTag::PullRequestMarker
+    } else {
+        ManagedTag::Version(parse_version(leaf).wrap_err("remote managed tag is not canonical")?)
+    };
+    Ok(Some((id, tag)))
 }
 
 struct Record<'a> {
@@ -1187,82 +1227,87 @@ fn requested_names<'a>(
     })
 }
 
-struct ParsedVersionTags {
-    histories: HashMap<GherritPrId, BTreeMap<Version, AdvertisedVersionRef>>,
+struct ParsedManagedTags {
+    histories: HashMap<GherritPrId, AdvertisedChangeNamespace>,
 }
 
-impl fmt::Debug for ParsedVersionTags {
+impl fmt::Debug for ParsedManagedTags {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ParsedVersionTags")
+            .debug_struct("ParsedManagedTags")
             .field("covered_change_count", &self.histories.len())
             .field(
                 "advertised_ref_count",
-                &self.histories.values().map(BTreeMap::len).sum::<usize>(),
+                &self.histories.values().map(AdvertisedChangeNamespace::ref_count).sum::<usize>(),
             )
             .finish()
     }
 }
 
-fn parse_versions<'a>(
+fn parse_managed_tags<'a>(
     output: &[u8],
     ids: impl IntoIterator<Item = &'a GherritPrId>,
-) -> Result<ParsedVersionTags> {
+) -> Result<ParsedManagedTags> {
     let requested = requested_names(ids, |id| id.as_str().to_owned())?;
-    let mut histories =
-        requested.values().cloned().map(|id| (id, BTreeMap::new())).collect::<HashMap<_, _>>();
+    let mut histories = requested
+        .values()
+        .cloned()
+        .map(|id| (id, AdvertisedChangeNamespace::default()))
+        .collect::<HashMap<_, _>>();
 
     for record in records(output) {
         let record = record?;
-        if record.name == VERSION_ROOT {
-            bail!("remote ref uses the version-tag namespace root");
+        if record.name == MANAGED_TAG_ROOT {
+            bail!("remote ref uses the managed-tag namespace root");
         }
-        let Some(suffix) = record.name.strip_prefix(VERSION_PREFIX) else {
+        if let Some(component) =
+            record.name.strip_prefix(MANAGED_TAG_PREFIX).filter(|suffix| !suffix.contains(&b'/'))
+        {
+            GherritPrId::from_ref_component(component)
+                .wrap_err("remote managed-tag namespace root has an invalid change ID")?;
+            if requested.contains_key(component) {
+                bail!("remote managed-tag namespace root exists for a requested GHerrit change");
+            }
+            bail!("remote advertised a managed-tag namespace for an unrequested GHerrit change");
+        }
+        let Some((parsed_id, tag)) = parse_managed_tag_name(record.name)? else {
             continue;
         };
-        let Some(separator) = suffix.iter().position(|byte| *byte == b'/') else {
-            if let Some(id) = requested.get(suffix) {
-                bail!("remote version namespace root exists for GHerrit change '{}'", id.as_str());
-            }
-            GherritPrId::from_ref_component(suffix)
-                .wrap_err("remote version namespace root has an invalid change ID")?;
-            bail!("remote advertised a version namespace for an unrequested GHerrit change");
-        };
-        let (id_component, suffix) = suffix.split_at(separator);
-        GherritPrId::from_ref_component(id_component)
-            .wrap_err("remote version tag has an invalid change ID")?;
-        let id = requested.get(id_component).ok_or_else(|| {
-            eyre!("remote advertised version history for an unrequested GHerrit change")
-        })?;
-        let suffix = suffix.strip_prefix(b"/").ok_or_else(|| {
-            eyre!("remote version tag for GHerrit change '{}' has no version", id.as_str())
+        let id = requested.get(parsed_id.as_str().as_bytes()).ok_or_else(|| {
+            eyre!("remote advertised managed tags for an unrequested GHerrit change")
         })?;
         if record.peeled {
             bail!(
-                "remote version tag for GHerrit change '{}' is annotated rather than lightweight",
+                "remote managed tag for GHerrit change '{}' is annotated rather than lightweight",
                 id.as_str()
             );
         }
-        let version = parse_version(suffix).wrap_err_with(|| {
-            format!("remote version tag for GHerrit change '{}' is not canonical", id.as_str())
-        })?;
-        let source_ref = str::from_utf8(record.name)
-            .expect("a validated managed version ref is ASCII")
-            .to_owned();
-        let advertised = AdvertisedVersionRef { object_id: record.object_id, source_ref };
-        if histories
-            .get_mut(id)
-            .expect("requested changes have initialized histories")
-            .insert(version, advertised)
-            .is_some()
-        {
-            bail!(
-                "remote advertised version v{version} for GHerrit change '{}' more than once",
-                id.as_str()
-            );
+        let namespace =
+            histories.get_mut(id).expect("requested changes have initialized histories");
+        match tag {
+            ManagedTag::Version(version) => {
+                let source_ref = str::from_utf8(record.name)
+                    .expect("a validated managed version ref is ASCII")
+                    .to_owned();
+                let advertised = AdvertisedVersionRef { object_id: record.object_id, source_ref };
+                if namespace.versions.insert(version, advertised).is_some() {
+                    bail!(
+                        "remote advertised version v{version} for GHerrit change '{}' more than once",
+                        id.as_str()
+                    );
+                }
+            }
+            ManagedTag::PullRequestMarker => {
+                if namespace.pull_request_marker.replace(record.object_id).is_some() {
+                    bail!(
+                        "remote advertised the pull-request marker for GHerrit change '{}' more than once",
+                        id.as_str()
+                    );
+                }
+            }
         }
     }
-    Ok(ParsedVersionTags { histories })
+    Ok(ParsedManagedTags { histories })
 }
 
 fn parse_version(suffix: &[u8]) -> Result<Version> {
@@ -1325,7 +1370,7 @@ mod tests {
 
     fn empty_observation(ids: &[GherritPrId]) -> DestinationObservation<'static> {
         let heads = parse_remote_heads_for_test(&head_advertisement("")).unwrap();
-        let ParsedVersionTags { histories } = parse_versions(b"", ids).unwrap();
+        let ParsedManagedTags { histories } = parse_managed_tags(b"", ids).unwrap();
         DestinationObservation { heads, histories }
     }
 
@@ -1525,7 +1570,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn async_version_observation_accepts_success_and_rejects_nonzero_status() {
+    async fn async_managed_tag_observation_accepts_success_and_rejects_nonzero_status() {
         let (directory, environment, remote) = seeded_remote();
         let main = environment.stdout(
             directory.path(),
@@ -1543,7 +1588,7 @@ mod tests {
         );
         let requested = ids(&["Gone"]);
         let query = Query::new(requested[0].clone());
-        let output = observe_active_version_query(
+        let output = observe_active_managed_tag_query(
             environment.ls_remote(
                 directory.path(),
                 &remote,
@@ -1555,10 +1600,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let observed = parse_versions(output.stdout(), query.ids()).unwrap();
-        assert_eq!(for_id(&observed.histories, "Gone").len(), 1);
+        let observed = parse_managed_tags(output.stdout(), query.ids()).unwrap();
+        assert_eq!(for_id(&observed.histories, "Gone").versions.len(), 1);
 
-        let error = observe_active_version_query(
+        let error = observe_active_managed_tag_query(
             failing_reexec("private-ref", 29),
             "origin",
             Duration::from_secs(5),
@@ -1571,11 +1616,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn async_version_observation_has_a_finite_execution_deadline() {
-        let error =
-            observe_active_version_query(hanging_reexec(), "origin", Duration::from_millis(100))
-                .await
-                .unwrap_err();
+    async fn async_managed_tag_observation_has_a_finite_execution_deadline() {
+        let error = observe_active_managed_tag_query(
+            hanging_reexec(),
+            "origin",
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
 
         assert!(format!("{error:?}").contains("timed out"), "error={error:?}");
     }
@@ -1663,7 +1711,7 @@ mod tests {
         let push_observation = observe_remote_heads(&push_destination)
             .await
             .unwrap()
-            .observe_versions(std::slice::from_ref(&requested))
+            .observe_managed_tags(std::slice::from_ref(&requested))
             .await
             .unwrap();
         assert_eq!(push_observation.remote_heads().default_branch().name(), "main");
@@ -1674,14 +1722,16 @@ mod tests {
         let fetch_observation = observe_remote_heads(&fetch_destination)
             .await
             .unwrap()
-            .observe_versions(std::slice::from_ref(&requested))
+            .observe_managed_tags(std::slice::from_ref(&requested))
             .await
             .unwrap();
         let push_history = push_observation.histories[&requested]
+            .versions
             .iter()
             .map(|(version, advertised)| (*version, advertised.object_id))
             .collect::<Vec<_>>();
         let fetch_history = fetch_observation.histories[&requested]
+            .versions
             .iter()
             .map(|(version, advertised)| (*version, advertised.object_id))
             .collect::<Vec<_>>();
@@ -1691,13 +1741,13 @@ mod tests {
         assert_eq!(fetch_history[0].1.to_string(), fetch_oid);
 
         let legacy_heads = observe_remote_heads(&push_destination).await.unwrap();
-        let legacy_fetch_versions =
-            observe_active_version_tags(&fetch_destination, [&requested]).await.unwrap();
+        let legacy_fetch_managed_tags =
+            observe_active_managed_tags(&fetch_destination, [&requested]).await.unwrap();
         let stack = LocalStack::for_test(
             ObjectId::from_hex(MAIN.as_bytes()).unwrap(),
             [(requested.clone(), ObjectId::from_hex(ONE.as_bytes()).unwrap())],
         );
-        let error = ObservedStack::couple(&stack, &legacy_heads, legacy_fetch_versions)
+        let error = ObservedStack::couple(&stack, &legacy_heads, legacy_fetch_managed_tags)
             .expect_err("even the legacy seam rejects A-heads/B-tags");
         assert!(error.to_string().contains("different destinations"), "{error:?}");
 
@@ -1873,7 +1923,7 @@ mod tests {
         let observed = observe_remote_heads(&destination)
             .await
             .unwrap()
-            .observe_versions(std::slice::from_ref(&change))
+            .observe_managed_tags(std::slice::from_ref(&change))
             .await
             .unwrap();
         let repo = util::Repo::open(client.to_str().unwrap()).unwrap();
@@ -2050,7 +2100,7 @@ mod tests {
 
         let malformed_version = format!("{ONE}\t{VERSION_SECRET}\textra");
         let requested = ids(&["GprivateSecret"]);
-        let error = parse_versions(malformed_version.as_bytes(), &requested).unwrap_err();
+        let error = parse_managed_tags(malformed_version.as_bytes(), &requested).unwrap_err();
         let diagnostic = format!("{error:?}");
         assert!(
             diagnostic.contains(&format!("record 1 ({} bytes)", malformed_version.len())),
@@ -2065,7 +2115,7 @@ mod tests {
             format!("refs/tags/gherrit/{UNREQUESTED_SECRET}/v1"),
         ] {
             let output = format!("{ONE}\t{name}\n");
-            let error = parse_versions(output.as_bytes(), &requested).unwrap_err();
+            let error = parse_managed_tags(output.as_bytes(), &requested).unwrap_err();
             let diagnostic = format!("{error:?}");
             assert!(diagnostic.contains("unrequested GHerrit change"), "{diagnostic}");
             assert!(!diagnostic.contains(UNREQUESTED_SECRET), "diagnostic={diagnostic}");
@@ -2093,6 +2143,7 @@ mod tests {
             "refs/tags/gherrit",
             "refs/tags/gherrit/",
             "refs/tags/gherrit/Gone/v1",
+            "refs/tags/gherrit/Gone/pr",
         ] {
             assert!(
                 parse_remote_heads(&head_advertisement(&format!("{ONE}\t{name}\n"))).is_err(),
@@ -2111,7 +2162,7 @@ mod tests {
 
     #[test]
     fn rejects_non_utf8_reserved_names_and_symbolic_managed_refs() {
-        for prefix in [OWNED_BASE_PREFIX, VERSION_PREFIX] {
+        for prefix in [OWNED_BASE_PREFIX, MANAGED_TAG_PREFIX] {
             let mut output = head_advertisement("");
             output.extend_from_slice(format!("{ONE}\t").as_bytes());
             output.extend_from_slice(prefix);
@@ -2134,11 +2185,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_symbolic_version_tags_and_reserved_namespace_roots() {
+    fn rejects_symbolic_managed_tags_and_reserved_namespace_roots() {
         for (name, expected) in [
             ("refs/tags/gherrit/Gone/v1", "symbolic rather than direct"),
+            ("refs/tags/gherrit/Gone/pr", "symbolic rather than direct"),
             ("refs/heads/gherrit-bases", "reserved owned-base namespace root"),
-            ("refs/tags/gherrit", "reserved version-tag namespace root"),
+            ("refs/tags/gherrit", "reserved managed-tag namespace root"),
         ] {
             let output = head_advertisement(&format!("ref: refs/heads/unrelated\t{name}\n"));
             let error = parse_remote_heads(&output).unwrap_err();
@@ -2147,25 +2199,42 @@ mod tests {
     }
 
     #[test]
+    fn exact_managed_tag_parser_rejects_a_symbolic_pull_request_marker() {
+        let requested = ids(&["Gone"]);
+        let output = b"ref: refs/tags/gherrit/Gone/v1\trefs/tags/gherrit/Gone/pr\n";
+
+        let error = parse_managed_tags(output, &requested).unwrap_err();
+
+        assert!(error.to_string().contains("unexpectedly contained a symbolic ref"));
+    }
+
+    #[test]
     fn version_history_is_ordered_complete_and_may_repeat_objects() {
-        let output =
-            format!("{ONE}\trefs/tags/gherrit/Gone/v2\n{ONE}\trefs/tags/gherrit/Gone/v1\n");
+        let output = format!(
+            "{ONE}\trefs/tags/gherrit/Gone/v2\n{TWO}\trefs/tags/gherrit/Gone/pr\n{ONE}\trefs/tags/gherrit/Gone/v1\n"
+        );
         let requested = ids(&["Gone", "Gmissing"]);
-        let observation = parse_versions(output.as_bytes(), &requested).unwrap();
+        let observation = parse_managed_tags(output.as_bytes(), &requested).unwrap();
 
         assert_eq!(
             for_id(&observation.histories, "Gone")
+                .versions
                 .iter()
                 .map(|(version, advertised)| { (version.get(), advertised.object_id.to_string()) })
                 .collect::<Vec<_>>(),
             [(1, ONE.to_owned()), (2, ONE.to_owned())]
         );
-        assert!(for_id(&observation.histories, "Gmissing").is_empty());
-        let sources = for_id(&observation.histories, "Gone").values().collect::<Vec<_>>();
+        assert!(for_id(&observation.histories, "Gmissing").versions.is_empty());
+        let sources = for_id(&observation.histories, "Gone").versions.values().collect::<Vec<_>>();
         assert_eq!(sources[0].object_id.to_string(), ONE);
         assert_eq!(sources[0].source_ref, "refs/tags/gherrit/Gone/v1");
         assert_eq!(sources[1].object_id.to_string(), ONE);
         assert_eq!(sources[1].source_ref, "refs/tags/gherrit/Gone/v2");
+        assert_eq!(
+            for_id(&observation.histories, "Gone").pull_request_marker,
+            Some(ObjectId::from_hex(TWO.as_bytes()).unwrap())
+        );
+        assert_eq!(for_id(&observation.histories, "Gmissing").pull_request_marker, None);
     }
 
     #[test]
@@ -2176,11 +2245,16 @@ mod tests {
             format!("{ONE}\trefs/tags/gherrit/Gone/v0\n"),
             format!("{ONE}\trefs/tags/gherrit/Gone/v01\n"),
             format!("{ONE}\trefs/tags/gherrit/Gone/v1/extra\n"),
+            format!("{ONE}\trefs/tags/gherrit/Gone/pr/extra\n"),
+            format!("{ONE}\trefs/tags/gherrit/Gone/pr0\n"),
             format!("{ONE}\trefs/tags/gherrit/Gone/v18446744073709551616\n"),
             format!("{ONE}\trefs/tags/gherrit/Gone/v1\n{TWO}\trefs/tags/gherrit/Gone/v1\n"),
             format!("{ONE}\trefs/tags/gherrit/Gone/v1\n{TWO}\trefs/tags/gherrit/Gone/v1^{{}}\n"),
+            format!("{ONE}\trefs/tags/gherrit/Gone/pr\n{TWO}\trefs/tags/gherrit/Gone/pr\n"),
+            format!("{ONE}\trefs/tags/gherrit/Gone/pr^{{}}\n"),
+            format!("{ONE}\trefs/tags/gherrit/Gother/pr\n"),
         ] {
-            assert!(parse_versions(output.as_bytes(), &requested).is_err(), "{output:?}");
+            assert!(parse_managed_tags(output.as_bytes(), &requested).is_err(), "{output:?}");
         }
     }
 
@@ -2188,25 +2262,26 @@ mod tests {
     fn active_query_planning_uses_exact_patterns_and_preflights_every_id() {
         let requested = ids(&["Gone", "Gtwo"]);
         let refs = requested.iter().collect::<Vec<_>>();
-        let one = version_pattern_bytes(&requested[0]);
-        let two = version_pattern_bytes(&requested[1]);
-        let split = plan_queries_with_budget(&refs, version_pattern_bytes, one + two - 1).unwrap();
+        let one = managed_tag_pattern_bytes(&requested[0]);
+        let two = managed_tag_pattern_bytes(&requested[1]);
+        let split =
+            plan_queries_with_budget(&refs, managed_tag_pattern_bytes, one + two - 1).unwrap();
 
         assert_eq!(split.len(), 2);
         assert_eq!(
-            split[0].version_patterns(),
+            split[0].managed_tag_patterns(),
             ["refs/tags/gherrit/Gone", "refs/tags/gherrit/Gone/*"]
         );
         assert_eq!(
-            split[1].version_patterns(),
+            split[1].managed_tag_patterns(),
             ["refs/tags/gherrit/Gtwo", "refs/tags/gherrit/Gtwo/*"]
         );
-        assert!(plan_queries_with_budget(&refs, version_pattern_bytes, one - 1).is_err());
-        assert!(plan_queries_with_budget(&[], version_pattern_bytes, one).unwrap().is_empty());
+        assert!(plan_queries_with_budget(&refs, managed_tag_pattern_bytes, one - 1).is_err());
+        assert!(plan_queries_with_budget(&[], managed_tag_pattern_bytes, one).unwrap().is_empty());
         assert!(
             plan_queries_with_budget(
                 &[&requested[0], &requested[0]],
-                version_pattern_bytes,
+                managed_tag_pattern_bytes,
                 usize::MAX
             )
             .is_err()
@@ -2236,10 +2311,11 @@ mod tests {
     #[test]
     fn acquisition_selects_every_exact_ref_when_versions_repeat_an_object() {
         let requested = ids(&["Gone"]);
-        let output =
-            format!("{ONE}\trefs/tags/gherrit/Gone/v2\n{ONE}\trefs/tags/gherrit/Gone/v1\n");
-        let ParsedVersionTags { histories } =
-            parse_versions(output.as_bytes(), &requested).unwrap();
+        let output = format!(
+            "{ONE}\trefs/tags/gherrit/Gone/v2\n{TWO}\trefs/tags/gherrit/Gone/pr\n{ONE}\trefs/tags/gherrit/Gone/v1\n"
+        );
+        let ParsedManagedTags { histories } =
+            parse_managed_tags(output.as_bytes(), &requested).unwrap();
         let heads = parse_remote_heads_for_test(&head_advertisement("")).unwrap();
         let observation = DestinationObservation { heads, histories };
 
@@ -2287,11 +2363,11 @@ mod tests {
         let observed = observe_remote_heads(&destination)
             .await
             .unwrap()
-            .observe_versions(&[empty.clone(), local.clone()])
+            .observe_managed_tags(&[empty.clone(), local.clone()])
             .await
             .unwrap();
-        assert!(observed.histories[&empty].is_empty());
-        assert_eq!(observed.histories[&local].len(), 2);
+        assert!(observed.histories[&empty].versions.is_empty());
+        assert_eq!(observed.histories[&local].versions.len(), 2);
         let observed = observed.observe_additional(std::slice::from_ref(&nonlocal)).await.unwrap();
         let active = observed
             .into_active(&[local.clone(), empty.clone()], std::slice::from_ref(&nonlocal))
@@ -2311,7 +2387,7 @@ mod tests {
         let duplicate_error = observe_remote_heads(&destination)
             .await
             .unwrap()
-            .observe_versions(&[local.clone(), local.clone()])
+            .observe_managed_tags(&[local.clone(), local.clone()])
             .await
             .expect_err("the first wave rejects duplicate IDs");
         assert!(duplicate_error.to_string().contains("same GHerrit change twice"));
@@ -2319,7 +2395,7 @@ mod tests {
         let observed = observe_remote_heads(&destination)
             .await
             .unwrap()
-            .observe_versions(std::slice::from_ref(&local))
+            .observe_managed_tags(std::slice::from_ref(&local))
             .await
             .unwrap();
         let overlap_error = observed
@@ -2331,7 +2407,7 @@ mod tests {
         let observed = observe_remote_heads(&destination)
             .await
             .unwrap()
-            .observe_versions(std::slice::from_ref(&local))
+            .observe_managed_tags(std::slice::from_ref(&local))
             .await
             .unwrap();
         let duplicate_error = observed
@@ -2384,7 +2460,7 @@ mod tests {
     }
 
     #[test]
-    fn coupling_rejects_missing_active_version_coverage() {
+    fn coupling_rejects_missing_active_managed_tag_coverage() {
         let change = id("Gone");
         let stack = LocalStack::for_test(
             ObjectId::from_hex(MAIN.as_bytes()).unwrap(),
@@ -2397,14 +2473,15 @@ mod tests {
             destination: &destination,
             parsed: parse_remote_heads(&head_advertisement("")).unwrap(),
         };
-        let versions = ActiveVersionTags { destination: &destination, histories: HashMap::new() };
+        let managed_tags =
+            ActiveManagedTags { destination: &destination, histories: HashMap::new() };
 
-        let error = ObservedStack::couple(&stack, &heads, versions).unwrap_err();
+        let error = ObservedStack::couple(&stack, &heads, managed_tags).unwrap_err();
         assert!(error.to_string().contains("was not observed"), "error={error:?}");
     }
 
     #[test]
-    fn coupling_rejects_extra_active_version_coverage() {
+    fn coupling_rejects_extra_active_managed_tag_coverage() {
         let change = id("Gone");
         let stack = LocalStack::for_test(
             ObjectId::from_hex(MAIN.as_bytes()).unwrap(),
@@ -2417,12 +2494,38 @@ mod tests {
             destination: &destination,
             parsed: parse_remote_heads(&head_advertisement("")).unwrap(),
         };
-        let versions = ActiveVersionTags {
+        let managed_tags = ActiveManagedTags {
             destination: &destination,
-            histories: HashMap::from([(change, BTreeMap::new()), (id("Gextra"), BTreeMap::new())]),
+            histories: HashMap::from([
+                (change, AdvertisedChangeNamespace::default()),
+                (id("Gextra"), AdvertisedChangeNamespace::default()),
+            ]),
         };
 
-        let error = ObservedStack::couple(&stack, &heads, versions).unwrap_err();
+        let error = ObservedStack::couple(&stack, &heads, managed_tags).unwrap_err();
         assert!(error.to_string().contains("outside the local stack"), "error={error:?}");
+    }
+
+    #[test]
+    fn legacy_coupling_fails_closed_on_a_pull_request_marker() {
+        let change = id("Gone");
+        let stack = LocalStack::for_test(
+            ObjectId::from_hex(MAIN.as_bytes()).unwrap(),
+            [(change.clone(), ObjectId::from_hex(ONE.as_bytes()).unwrap())],
+        );
+        let destination =
+            PushDestination::for_test("origin", "https://github.com/owner/repo.git", Vec::new())
+                .unwrap();
+        let heads = RemoteHeads {
+            destination: &destination,
+            parsed: parse_remote_heads(&head_advertisement("")).unwrap(),
+        };
+        let ParsedManagedTags { histories } =
+            parse_managed_tags(format!("{ONE}\trefs/tags/gherrit/Gone/pr\n").as_bytes(), [&change])
+                .unwrap();
+        let managed_tags = ActiveManagedTags { destination: &destination, histories };
+
+        let error = ObservedStack::couple(&stack, &heads, managed_tags).unwrap_err();
+        assert!(error.to_string().contains("cannot safely consume the pull-request marker"));
     }
 }

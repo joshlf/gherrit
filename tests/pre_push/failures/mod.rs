@@ -494,7 +494,7 @@ fn test_pre_push_ls_remote_failure() {
     assert_eq!(ctx.remote_refs("refs"), refs_before);
     assert!(ctx.recorded_pushes().is_empty());
     assert!(
-        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions).is_empty()
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveManagedTags).is_empty()
     );
     assert!(ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteOther).is_empty());
     assert!(ctx.github().pull_requests().is_empty());
@@ -502,22 +502,22 @@ fn test_pre_push_ls_remote_failure() {
 }
 
 #[test]
-fn active_version_observation_failure_stops_before_writes() {
+fn active_managed_tag_observation_failure_stops_before_writes() {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_initial_commit()
         .with_mock_github()
         .with_git_interceptor()
         .build();
-    ctx.checkout_managed_private("feature-version-observation-fail");
+    ctx.checkout_managed_private("feature-managed-tag-observation-fail");
     ctx.commit_with_gherrit_id("Work");
     let refs_before = ctx.remote_refs("refs");
-    ctx.expect_git_failure(testutil::GitOperation::LsRemoteActiveVersions);
+    ctx.expect_git_failure(testutil::GitOperation::LsRemoteActiveManagedTags);
 
     ctx.hook_cmd("pre-push")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("observing active version history"));
+        .stderr(predicate::str::contains("observing active managed tags"));
 
     ctx.assert_failure_consumed();
     assert_eq!(ctx.remote_refs("refs"), refs_before);
@@ -537,7 +537,7 @@ fn noncanonical_remote_version_fails_before_writes() {
     ctx.commit_with_explicit_gherrit_id("Work", "Ginvalid");
     let refs_before = ctx.remote_refs("refs");
     ctx.expect_git_output(
-        testutil::GitOperation::LsRemoteActiveVersions,
+        testutil::GitOperation::LsRemoteActiveManagedTags,
         "1111111111111111111111111111111111111111\trefs/tags/gherrit/Ginvalid/v0\n",
     );
 
@@ -574,7 +574,7 @@ fn test_pre_push_rejects_a_null_managed_branch_object_id() {
     assert_eq!(ctx.remote_refs("refs"), refs_before);
     assert!(ctx.recorded_pushes().is_empty());
     assert!(
-        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveVersions).is_empty()
+        ctx.recorded_git_invocations(testutil::GitOperation::LsRemoteActiveManagedTags).is_empty()
     );
     assert!(ctx.github().pull_requests().is_empty());
 }
