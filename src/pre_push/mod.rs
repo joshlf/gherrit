@@ -26,6 +26,8 @@ mod remote;
 // activation change. Keep it independently testable while that cutover is built.
 #[allow(dead_code)]
 mod subprocess;
+#[cfg(test)]
+mod test_effect;
 mod version;
 
 const MAX_EXTERNAL_DIAGNOSTIC_BYTES: usize = 256;

@@ -66,6 +66,8 @@ struct OwnedPushTupleArguments {
     options: [String; 3],
     refspecs: [String; 3],
     expected_receipts: [(String, ExpectedRefReceipt); 3],
+    #[cfg(test)]
+    effect: super::test_effect::TupleEffect,
 }
 
 impl OwnedPushTupleArguments {
@@ -114,7 +116,26 @@ impl OwnedPushTupleArguments {
                 ),
             ),
         ];
-        Ok(Some(Self { options, refspecs, expected_receipts }))
+        #[cfg(test)]
+        let effect = super::test_effect::TupleEffect {
+            id: history.id().clone(),
+            previous: current.map(|current| super::test_effect::RevisionEffect {
+                head: current.revision().head(),
+                first_parent: current.revision().first_parent(),
+            }),
+            desired: super::test_effect::RevisionEffect {
+                head: proposed.head(),
+                first_parent: proposed.first_parent(),
+            },
+            version: history.projected_current().number().get(),
+        };
+        Ok(Some(Self {
+            options,
+            refspecs,
+            expected_receipts,
+            #[cfg(test)]
+            effect,
+        }))
     }
 
     fn encoded_argv_bytes(&self) -> usize {
@@ -157,6 +178,8 @@ struct MarkerPushArguments {
     option: String,
     refspec: String,
     expected_receipt: (String, ExpectedRefReceipt),
+    #[cfg(test)]
+    effect: super::test_effect::MarkerEffect,
 }
 
 impl MarkerPushArguments {
@@ -170,6 +193,11 @@ impl MarkerPushArguments {
                 destination,
                 ExpectedRefReceipt::new(source, ExpectedRefTransition::CreateOrAlreadyDesired),
             ),
+            #[cfg(test)]
+            effect: super::test_effect::MarkerEffect {
+                id: marker.id.clone(),
+                target: marker.target,
+            },
         }
     }
 
@@ -221,12 +249,22 @@ fn marker_request(arguments: Vec<MarkerPushArguments>) -> Result<PushRequest> {
     let mut options = FIXED_PUSH_OPTIONS.map(str::to_owned).to_vec();
     let mut refspecs = Vec::with_capacity(arguments.len());
     let mut receipts = Vec::with_capacity(arguments.len());
+    #[cfg(test)]
+    let mut effects = Vec::with_capacity(arguments.len());
     for arguments in arguments {
+        #[cfg(test)]
+        effects.push(super::test_effect::GitEffect::Marker(arguments.effect.clone()));
         options.push(arguments.option);
         refspecs.push(arguments.refspec);
         receipts.push(arguments.expected_receipt);
     }
-    Ok(PushRequest { options, refspecs, expected: ExpectedReceipts::new(receipts)? })
+    Ok(PushRequest {
+        options,
+        refspecs,
+        expected: ExpectedReceipts::new(receipts)?,
+        #[cfg(test)]
+        effects,
+    })
 }
 
 fn plan_owned_base_requests_with_budget(
@@ -276,12 +314,22 @@ fn plan_owned_base_requests_with_budget(
             let mut options = FIXED_PUSH_OPTIONS.map(str::to_owned).to_vec();
             let mut refspecs = Vec::with_capacity(batch.len() * 3);
             let mut receipts = Vec::with_capacity(batch.len() * 3);
+            #[cfg(test)]
+            let mut effects = Vec::with_capacity(batch.len());
             for tuple in batch {
+                #[cfg(test)]
+                effects.push(super::test_effect::GitEffect::Tuple(tuple.arguments.effect.clone()));
                 options.extend(tuple.arguments.options);
                 refspecs.extend(tuple.arguments.refspecs);
                 receipts.extend(tuple.arguments.expected_receipts);
             }
-            Ok(PushRequest { options, refspecs, expected: ExpectedReceipts::new(receipts)? })
+            Ok(PushRequest {
+                options,
+                refspecs,
+                expected: ExpectedReceipts::new(receipts)?,
+                #[cfg(test)]
+                effects,
+            })
         })
         .collect::<Result<Box<[_]>>>()
 }
@@ -393,7 +441,13 @@ impl PushPlan {
             refspecs.extend(tuple.arguments.refspecs);
             expected_receipts.extend(tuple.arguments.expected_receipts);
         }
-        Ok(PushRequest { options, refspecs, expected: ExpectedReceipts::new(expected_receipts)? })
+        Ok(PushRequest {
+            options,
+            refspecs,
+            expected: ExpectedReceipts::new(expected_receipts)?,
+            #[cfg(test)]
+            effects: Vec::new(),
+        })
     }
 
     #[cfg(test)]
@@ -411,6 +465,8 @@ struct PushRequest {
     options: Vec<String>,
     refspecs: Vec<String>,
     expected: ExpectedReceipts,
+    #[cfg(test)]
+    effects: Vec<super::test_effect::GitEffect>,
 }
 
 impl PushRequest {
@@ -651,6 +707,17 @@ impl<'destination> PreparedPushes<'destination> {
             .map(|request| {
                 (request.options().collect::<Vec<_>>(), request.refspecs().collect::<Vec<_>>())
             })
+            .collect()
+    }
+
+    /// Returns semantic operations in their sequential push-request batches.
+    #[cfg(test)]
+    pub(super) fn effect_batches_for_test(
+        &self,
+    ) -> super::test_effect::EffectBatches<super::test_effect::GitEffect> {
+        std::iter::once(&self.first)
+            .chain(self.rest.iter())
+            .map(|request| request.effects.clone().into_boxed_slice())
             .collect()
     }
 

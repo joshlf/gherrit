@@ -493,6 +493,40 @@ impl std::error::Error for GraphLoadError {
 }
 
 impl CommitGraphEvidence {
+    /// Builds complete literal graph evidence without consulting Git.
+    ///
+    /// This adapter is restricted to pure planner tests; production still
+    /// obtains and validates commit facts from Git.
+    #[cfg(test)]
+    pub(super) fn from_literal_commits_for_test(
+        commits: impl IntoIterator<Item = (ObjectId, Vec<ObjectId>, Vec<GherritPrId>)>,
+    ) -> Result<Self> {
+        let mut facts = HashMap::new();
+        let mut trailer_identities = HashMap::new();
+        for (oid, parents, identities) in commits {
+            if oid.is_null() {
+                bail!("literal test graph contains a null commit object ID");
+            }
+            if facts.insert(oid, CommitFacts { parents: parents.into_boxed_slice() }).is_some() {
+                bail!("literal test graph repeats commit object {oid}");
+            }
+            if !identities.is_empty() {
+                trailer_identities.insert(
+                    oid,
+                    identities.into_iter().map(|id| id.as_str().as_bytes().to_vec()).collect(),
+                );
+            }
+        }
+        if let Some(parent) = facts
+            .values()
+            .flat_map(|commit| commit.parents.iter())
+            .find(|parent| !facts.contains_key(*parent))
+        {
+            bail!("literal test graph omits parent commit object {parent}");
+        }
+        Ok(Self { commits: facts, trailer_identities })
+    }
+
     /// Loads the complete all-parent ancestry of `roots` from the literal ODB.
     pub(super) fn load(
         repository: &util::Repo,

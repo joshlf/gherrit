@@ -64,6 +64,40 @@ impl<'destination> PublicationPlan<'destination> {
         }
         Ok(self.projection)
     }
+
+    /// Returns the first semantic action without inspecting transport bytes.
+    #[cfg(test)]
+    pub(super) fn first_stage_for_test(&self) -> super::test_effect::Stage {
+        if let Some(pushes) = &self.pushes {
+            let batches = pushes
+                .effect_batches_for_test()
+                .into_vec()
+                .into_iter()
+                .map(|batch| {
+                    batch
+                        .into_vec()
+                        .into_iter()
+                        .map(|effect| match effect {
+                            super::test_effect::GitEffect::Tuple(effect) => effect,
+                            super::test_effect::GitEffect::Marker(_) => {
+                                panic!("the tuple barrier contains a marker effect")
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            return super::test_effect::Stage::Tuples(batches);
+        }
+        match &self.projection {
+            ReadyProjection::Final(final_projection) => final_projection.stage_for_test(),
+            ReadyProjection::Markers(markers) => {
+                super::test_effect::Stage::Markers(markers.effect_batches_for_test())
+            }
+            ReadyProjection::Creates { creates, .. } => {
+                super::test_effect::Stage::Creates(creates.effect_batches_for_test())
+            }
+        }
+    }
 }
 
 /// The minimal action available only after the Git acknowledgement barrier.
@@ -87,6 +121,16 @@ impl FinalProjection {
             Ok(Self::NoAction)
         } else {
             Ok(Self::Updates(PreparedUpdates::new(operations)?))
+        }
+    }
+
+    #[cfg(test)]
+    fn stage_for_test(&self) -> super::test_effect::Stage {
+        match self {
+            Self::NoAction => super::test_effect::Stage::Done,
+            Self::Updates(updates) => {
+                super::test_effect::Stage::Updates(updates.effect_batches_for_test())
+            }
         }
     }
 }
@@ -121,6 +165,29 @@ impl<'destination> PreparedMarkers<'destination> {
     #[cfg(test)]
     pub(super) fn arguments_for_test(&self) -> Vec<(Vec<String>, Vec<String>)> {
         self.pushes.arguments_for_test()
+    }
+
+    #[cfg(test)]
+    fn effect_batches_for_test(
+        &self,
+    ) -> super::test_effect::EffectBatches<super::test_effect::MarkerEffect> {
+        self.pushes
+            .effect_batches_for_test()
+            .into_vec()
+            .into_iter()
+            .map(|batch| {
+                batch
+                    .into_vec()
+                    .into_iter()
+                    .map(|effect| match effect {
+                        super::test_effect::GitEffect::Marker(effect) => effect,
+                        super::test_effect::GitEffect::Tuple(_) => {
+                            panic!("the marker barrier contains a tuple effect")
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -725,6 +792,9 @@ fn canonical_body_for_comparison(body: &str) -> Cow<'_, str> {
 fn bodies_equal(observed: &str, desired: &str) -> bool {
     canonical_body_for_comparison(observed) == canonical_body_for_comparison(desired)
 }
+
+#[cfg(test)]
+mod semantic_oracle;
 
 #[cfg(test)]
 mod tests;

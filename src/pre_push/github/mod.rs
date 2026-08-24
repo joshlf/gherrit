@@ -28,6 +28,24 @@ const MAX_MUTATION_ALIASES: usize = 64;
 // fields while retaining a deterministic preflight request limit.
 const MAX_MUTATION_REQUEST_BYTES: usize = 1024 * 1024;
 
+#[cfg(test)]
+fn partition_effects<T>(
+    effects: impl IntoIterator<Item = T>,
+    lengths: impl IntoIterator<Item = usize>,
+) -> super::test_effect::EffectBatches<T> {
+    let mut effects = effects.into_iter();
+    let batches = lengths
+        .into_iter()
+        .map(|length| {
+            let batch = effects.by_ref().take(length).collect::<Box<[_]>>();
+            assert_eq!(batch.len(), length, "a prepared batch outlived its typed effects");
+            batch
+        })
+        .collect();
+    assert!(effects.next().is_none(), "typed effects outlived their prepared batches");
+    batches
+}
+
 fn graphql_error_detail(response: &Value) -> Option<String> {
     response
         .get("errors")
@@ -186,6 +204,25 @@ impl<'destination> CorrelatedRepository<'destination> {
         pull_requests: super::pull_request::CorrelatedPullRequests,
     ) -> Self {
         Self { destination, repository, pull_requests }
+    }
+
+    /// Constructs decoded and correlated repository evidence for semantic
+    /// tests.
+    #[cfg(test)]
+    pub(super) fn from_typed_for_test(
+        destination: &'destination PushDestination,
+        repository_node_id: String,
+        default_branch: DefaultBranch,
+        local: Vec<super::pull_request::LocalPullRequestObservation>,
+    ) -> Result<Self> {
+        let repository = Repository {
+            node_id: repository_node_id,
+            default_branch,
+            coordinates: destination.repository_coordinates(),
+        };
+        let pull_requests =
+            super::pull_request::CorrelatedPullRequests::from_typed_for_test(local, Vec::new())?;
+        Ok(Self::new(destination, repository, pull_requests))
     }
 
     pub(super) fn into_planning_parts_for(
@@ -980,6 +1017,8 @@ impl CreateReceiptPlan {
 pub(super) struct PreparedCreates {
     batches: Box<[PreparedCreateBatch]>,
     receipts: CreateReceiptPlan,
+    #[cfg(test)]
+    effect_batches: super::test_effect::EffectBatches<super::test_effect::CreateEffect>,
 }
 
 impl PreparedCreates {
@@ -1041,6 +1080,17 @@ impl PreparedCreates {
         }
         let order = operations.iter().map(|operation| operation.id.clone()).collect::<Vec<_>>();
         let batches = prepare_create_batches(&operations)?;
+        #[cfg(test)]
+        let effect_batches = partition_effects(
+            operations.iter().map(|operation| super::test_effect::CreateEffect {
+                id: operation.id.clone(),
+                repository_id: operation.repository_id.clone(),
+                base_branch: operation.base_branch.clone(),
+                title: operation.title.clone(),
+                body: operation.body.clone(),
+            }),
+            batches.iter().map(|batch| batch.expected.len()),
+        );
         let receipts = CreateReceiptPlan {
             expected,
             order: order.into_boxed_slice(),
@@ -1049,7 +1099,12 @@ impl PreparedCreates {
             node_ids: HashSet::new(),
             by_change: HashMap::new(),
         };
-        Ok(Self { batches, receipts })
+        Ok(Self {
+            batches,
+            receipts,
+            #[cfg(test)]
+            effect_batches,
+        })
     }
 
     #[cfg(test)]
@@ -1064,6 +1119,14 @@ impl PreparedCreates {
     #[cfg(test)]
     pub(super) fn operation_count(&self) -> usize {
         self.batches.iter().map(|batch| batch.expected.len()).sum()
+    }
+
+    /// Returns typed create operations in their GraphQL request batches.
+    #[cfg(test)]
+    pub(super) fn effect_batches_for_test(
+        &self,
+    ) -> super::test_effect::EffectBatches<super::test_effect::CreateEffect> {
+        self.effect_batches.clone()
     }
 
     #[cfg(test)]
@@ -1391,6 +1454,8 @@ fn prepare_update_batches(operations: &[UpdatePullRequest]) -> Result<Box<[Prepa
 #[derive(Debug)]
 pub(super) struct PreparedUpdates {
     batches: Box<[PreparedUpdateBatch]>,
+    #[cfg(test)]
+    effect_batches: super::test_effect::EffectBatches<super::test_effect::UpdateEffect>,
 }
 
 impl PreparedUpdates {
@@ -1421,12 +1486,35 @@ impl PreparedUpdates {
                 );
             }
         }
-        Ok(Self { batches: prepare_update_batches(&operations)? })
+        let batches = prepare_update_batches(&operations)?;
+        #[cfg(test)]
+        let effect_batches = partition_effects(
+            operations.iter().map(|operation| super::test_effect::UpdateEffect {
+                identity: operation.identity.clone(),
+                title: operation.title.clone(),
+                body: operation.body.clone(),
+                base_branch: operation.base_branch.clone(),
+            }),
+            batches.iter().map(|batch| batch.expected.len()),
+        );
+        Ok(Self {
+            batches,
+            #[cfg(test)]
+            effect_batches,
+        })
     }
 
     #[cfg(test)]
     pub(super) fn operation_count(&self) -> usize {
         self.batches.iter().map(|batch| batch.expected.len()).sum()
+    }
+
+    /// Returns typed update operations in their GraphQL request batches.
+    #[cfg(test)]
+    pub(super) fn effect_batches_for_test(
+        &self,
+    ) -> super::test_effect::EffectBatches<super::test_effect::UpdateEffect> {
+        self.effect_batches.clone()
     }
 
     #[cfg(test)]

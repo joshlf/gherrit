@@ -348,6 +348,28 @@ impl ManagedOpenPullRequest {
             body: self.body,
         }
     }
+
+    /// Constructs already-correlated OPEN evidence for semantic tests.
+    #[cfg(test)]
+    pub(super) fn from_typed_for_test(
+        id: GherritPrId,
+        identity: PullRequestIdentity,
+        head_oid: ObjectId,
+        base_kind: BaseKind,
+        base_oid: ObjectId,
+        title: String,
+        body: String,
+    ) -> Self {
+        Self {
+            id,
+            identity,
+            head_oid,
+            base: ObservedBase { kind: base_kind, oid: base_oid },
+            title: title.into_boxed_str(),
+            body: body.into_boxed_str(),
+            has_landing_automation: false,
+        }
+    }
 }
 
 /// Correlated state for one local ID, in exact local stack order.
@@ -395,6 +417,36 @@ impl CorrelatedPullRequests {
         InitialPullRequestIdentities,
     ) {
         (self.local, self.nonlocal, self.initial_identities)
+    }
+
+    /// Constructs already-correlated planner input without OPEN wire data.
+    #[cfg(test)]
+    pub(super) fn from_typed_for_test(
+        local: Vec<LocalPullRequestObservation>,
+        nonlocal: Vec<ManagedOpenPullRequest>,
+    ) -> Result<Self> {
+        let identities = local
+            .iter()
+            .filter_map(|observation| match observation {
+                LocalPullRequestObservation::Open(pull_request) => Some(pull_request.identity()),
+                LocalPullRequestObservation::NeedsTerminalProof(_) => None,
+            })
+            .chain(nonlocal.iter().map(ManagedOpenPullRequest::identity));
+        let mut numbers = HashSet::new();
+        let mut node_ids = HashSet::new();
+        for identity in identities {
+            if !numbers.insert(identity.number()) {
+                bail!("literal correlated test input repeats a pull request number");
+            }
+            if !node_ids.insert(identity.node_id().clone()) {
+                bail!("literal correlated test input repeats a pull request node ID");
+            }
+        }
+        Ok(Self {
+            local: local.into_boxed_slice(),
+            nonlocal: nonlocal.into_boxed_slice(),
+            initial_identities: InitialPullRequestIdentities { numbers, node_ids },
+        })
     }
 }
 
@@ -692,6 +744,12 @@ impl TerminalHistories {
     /// Temporary predicate used by the active publisher until activation.
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Constructs exact empty terminal history in caller-supplied order.
+    #[cfg(test)]
+    pub(super) fn empty_for_test(ids: impl IntoIterator<Item = GherritPrId>) -> Self {
+        Self { entries: ids.into_iter().map(|id| (id, TerminalHistory::Empty)).collect() }
     }
 
     pub(super) fn into_exact(
