@@ -17,8 +17,8 @@ use super::{
     destination::DefaultBranch,
     github::{
         CompleteCreateReceipts, CorrelatedRepository, CreatePullRequest, PreparedCreates,
-        PreparedUpdates, RepositoryTerminalHistories, UpdatePreflight, UpdatePullRequest,
-        preflight_updates,
+        PreparedUpdates, RepositoryTerminalHistories, TerminalPullRequestState, UpdatePreflight,
+        UpdatePullRequest, preflight_updates,
     },
     history::{
         CommitGraphEvidence, NormalizedPublishedHistory, ValidatedChangeHistory,
@@ -28,7 +28,7 @@ use super::{
     publication::{PreparedPushes, plan_owned_base_pushes},
     pull_request::{
         BaseKind, LocalPullRequestObservation, ManagedOpenParts, ManagedOpenPullRequest,
-        PullRequestIdentity,
+        PullRequestIdentity, TerminalHistory,
     },
     remote::{ActiveRemoteChanges, ObservedChangeHistory},
 };
@@ -135,13 +135,13 @@ impl ProjectionSeed {
 #[derive(Debug)]
 enum LocalReality {
     Existing { history: ValidatedChangeHistory, pull_request: ManagedOpenPullRequest },
-    Create { history: ValidatedChangeHistory, id: GherritPrId },
+    Create { history: ValidatedChangeHistory },
 }
 
 impl LocalReality {
     fn history(&self) -> &ValidatedChangeHistory {
         match self {
-            Self::Existing { history, .. } | Self::Create { history, .. } => history,
+            Self::Existing { history, .. } | Self::Create { history } => history,
         }
     }
 
@@ -155,8 +155,9 @@ impl LocalReality {
                     ProjectionDraft::Existing(pull_request.into_validated_parts()),
                 ))
             }
-            Self::Create { history, id } => {
-                Ok((BodyRecipeInput::missing(id.clone(), history)?, ProjectionDraft::Create(id)))
+            Self::Create { history } => {
+                let id = history.id().clone();
+                Ok((BodyRecipeInput::missing(id, history)?, ProjectionDraft::Create))
             }
         }
     }
@@ -164,7 +165,7 @@ impl LocalReality {
 
 enum ProjectionDraft {
     Existing(ManagedOpenParts),
-    Create(GherritPrId),
+    Create,
 }
 
 #[derive(Debug)]
@@ -251,8 +252,10 @@ pub(super) fn plan_publication<'destination>(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    let mut exact_empty_ids =
-        terminal_histories.into_exact_empty_ids(&missing_ids)?.into_vec().into_iter();
+    let exact_terminal_histories = terminal_histories.into_exact(&missing_ids)?;
+    if let Some(error) = retired_histories_error(&exact_terminal_histories) {
+        return Err(error);
+    }
 
     let realities = stack
         .iter()
@@ -294,27 +297,11 @@ pub(super) fn plan_publication<'destination>(
                     Ok(LocalReality::Existing { history, pull_request })
                 }
                 LocalPullRequestObservation::NeedsTerminalProof(_) => {
-                    let terminal_id = exact_empty_ids.next().ok_or_else(|| {
-                        color_eyre::eyre::eyre!(
-                            "terminal-history order ended before local change '{}'",
-                            change.id().as_str()
-                        )
-                    })?;
-                    if &terminal_id != change.id() {
-                        bail!(
-                            "terminal history identifies '{}', expected '{}'",
-                            terminal_id.as_str(),
-                            change.id().as_str()
-                        );
-                    }
-                    Ok(LocalReality::Create { history, id: terminal_id })
+                    Ok(LocalReality::Create { history })
                 }
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    if exact_empty_ids.next().is_some() {
-        bail!("terminal-history order extends beyond the local stack");
-    }
 
     validate_nonlocal(
         nonlocal.into_vec(),
@@ -456,6 +443,33 @@ fn validate_pull_request(
     Ok(())
 }
 
+fn retired_histories_error(histories: &[TerminalHistory]) -> Option<color_eyre::Report> {
+    let mut message = histories
+        .iter()
+        .filter_map(|history| match history {
+            TerminalHistory::Empty => None,
+            TerminalHistory::Retired { identity, state } => Some((identity, state)),
+        })
+        .map(|(identity, state)| retired_history_line(identity, *state))
+        .collect::<String>();
+    if message.is_empty() {
+        return None;
+    }
+    message.push_str("You may want to rebase on the latest changes before pushing.");
+    Some(color_eyre::eyre::eyre!(message))
+}
+
+fn retired_history_line(identity: &PullRequestIdentity, state: TerminalPullRequestState) -> String {
+    let state = match state {
+        TerminalPullRequestState::Closed => "closed",
+        TerminalPullRequestState::Merged => "merged",
+    };
+    format!(
+        "Cannot push to {state} PR #{}. Please open a new PR or reopen the existing one.\n",
+        identity.number().get()
+    )
+}
+
 fn prepare_projection(
     repository_id: String,
     default_branch: &DefaultBranch,
@@ -494,10 +508,7 @@ fn prepare_projection(
                     base_update,
                 }));
             }
-            ProjectionDraft::Create(id) => {
-                if &id != title_id {
-                    bail!("title recipe at stack position {index} does not match terminal history");
-                }
+            ProjectionDraft::Create => {
                 let rendered = provisional.next().ok_or_else(|| {
                     color_eyre::eyre::eyre!(
                         "body recipe omitted provisional change '{}'",
@@ -512,6 +523,7 @@ fn prepare_projection(
                         title_id.as_str()
                     );
                 }
+                let id = title_id.clone();
                 let base_update = (desired_base(index) == BaseKind::Default)
                     .then(|| BaseKind::Default.branch_name(default_branch.name(), &id));
                 create_operations.push(CreatePullRequest::new(
