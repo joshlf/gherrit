@@ -291,6 +291,21 @@ impl<'destination> ActiveRemoteChanges<'destination> {
         (self.destination, self.default_branch, self.local, self.nonlocal)
     }
 
+    /// Constructs already-decoded planner input for semantic tests.
+    #[cfg(test)]
+    pub(super) fn from_typed_for_test(
+        destination: &'destination PushDestination,
+        default_branch: DefaultBranch,
+        local: Vec<ObservedChangeHistory>,
+    ) -> Self {
+        Self {
+            destination,
+            default_branch,
+            local: local.into_boxed_slice(),
+            nonlocal: Box::new([]),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn destination(&self) -> &'destination PushDestination {
         self.destination
@@ -340,6 +355,33 @@ impl ObservedChangeHistory {
 
     pub(super) fn pull_request_marker_target(&self) -> Option<ObjectId> {
         self.pull_request_marker
+    }
+
+    /// Constructs an exact decoded history without rendering an advertisement.
+    #[cfg(test)]
+    pub(super) fn from_typed_for_test(
+        id: GherritPrId,
+        published: &[(ObjectId, ObjectId)],
+        pull_request_marker: Option<ObjectId>,
+    ) -> Result<Self> {
+        if let Some(marker) = pull_request_marker
+            && !published.iter().any(|(head, _)| *head == marker)
+        {
+            bail!("literal test marker does not target published history");
+        }
+        let (candidate_head, owned_base) =
+            published.last().copied().map_or((None, None), |(head, base)| (Some(head), Some(base)));
+        let versions = published
+            .iter()
+            .enumerate()
+            .map(|(index, (head, _))| {
+                Version::from_history_index(index)
+                    .map(|version| (version, *head))
+                    .ok_or_else(|| eyre!("literal test history has too many versions"))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_boxed_slice();
+        Ok(Self { id, candidate_head, owned_base, versions, pull_request_marker })
     }
 }
 

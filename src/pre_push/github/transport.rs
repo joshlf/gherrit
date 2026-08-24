@@ -462,7 +462,7 @@ impl Github {
         &self,
         creates: PreparedCreates,
     ) -> MutationAcknowledgement<CompleteCreateReceipts> {
-        let PreparedCreates { batches, mut receipts } = creates;
+        let PreparedCreates { batches, mut receipts, .. } = creates;
         for batch in batches.into_vec() {
             log::trace!(
                 "Sending GraphQL create batch ({} operations, {} bytes)",
