@@ -177,11 +177,6 @@ impl RepositoryTerminalHistories {
     pub(super) fn for_test(destination: &PushDestination, exact: TerminalHistories) -> Self {
         Self::from_transport(destination.repository_coordinates(), exact)
     }
-
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.exact.len()
-    }
 }
 
 impl<'destination> CorrelatedRepository<'destination> {

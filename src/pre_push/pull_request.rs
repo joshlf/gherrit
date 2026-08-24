@@ -586,7 +586,8 @@ impl TerminalProgress {
 ///
 /// Construction fixes the covered IDs. A page must match the cursor currently
 /// expected for that ID. No result is exposed until every requested connection
-/// is exhausted, and the result preserves both empty and retired history.
+/// is exhausted, and the result preserves requested order plus both empty and
+/// retired history.
 #[derive(Debug)]
 pub(super) struct TerminalExhaustionAccumulator {
     order: Box<[GherritPrId]>,
@@ -656,7 +657,7 @@ impl TerminalExhaustionAccumulator {
             bail!("terminal observation did not exhaust change ID(s): {}", incomplete.join(", "));
         }
         let mut retired = self.retired;
-        let by_id = self
+        let entries = self
             .order
             .into_vec()
             .into_iter()
@@ -667,9 +668,10 @@ impl TerminalExhaustionAccumulator {
                     });
                 (id, history)
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         debug_assert!(retired.is_empty());
-        Ok(TerminalHistories { by_id })
+        Ok(TerminalHistories { entries })
     }
 }
 
@@ -680,47 +682,32 @@ pub(super) enum TerminalHistory {
     Retired { identity: PullRequestIdentity, state: TerminalPullRequestState },
 }
 
-/// Complete neutral terminal evidence for the exact requested ID set.
+/// Complete terminal histories in the caller's original requested order.
 #[derive(Debug)]
 pub(super) struct TerminalHistories {
-    by_id: HashMap<GherritPrId, TerminalHistory>,
+    entries: Box<[(GherritPrId, TerminalHistory)]>,
 }
 
 impl TerminalHistories {
-    pub(super) fn len(&self) -> usize {
-        self.by_id.len()
-    }
-
-    pub(super) fn take(&mut self, id: &GherritPrId) -> Result<TerminalHistory> {
-        self.by_id
-            .remove(id)
-            .ok_or_else(|| eyre!("no unconsumed terminal history exists for '{}'", id.as_str()))
-    }
-
+    /// Temporary predicate used by the active publisher until activation.
     pub(super) fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
+        self.entries.is_empty()
     }
 
-    /// Consumes complete empty terminal history against one exact local order.
-    ///
-    /// The observation is keyed by ID, so response arrival order is
-    /// irrelevant. The caller supplies the local-stack order only after the
-    /// observed and expected ID sets agree exactly.
-    pub(super) fn into_exact_empty_ids(
+    pub(super) fn into_exact(
         self,
         expected_in_stack_order: &[GherritPrId],
-    ) -> Result<Box<[GherritPrId]>> {
-        let mut expected = HashSet::with_capacity(expected_in_stack_order.len());
-        for id in expected_in_stack_order {
-            if !expected.insert(id.clone()) {
-                bail!("terminal-history join repeats expected change '{}'", id.as_str());
-            }
+    ) -> Result<Box<[TerminalHistory]>> {
+        if !self.entries.iter().map(|(id, _)| id).eq(expected_in_stack_order) {
+            bail!("terminal-history join does not match the exact requested change order");
         }
-        let observed = self.into_legacy_empty_ids()?;
-        if observed != expected {
-            bail!("terminal-history join does not match the exact missing-OPEN change set");
-        }
-        Ok(expected_in_stack_order.to_vec().into_boxed_slice())
+        Ok(self
+            .entries
+            .into_vec()
+            .into_iter()
+            .map(|(_, history)| history)
+            .collect::<Vec<_>>()
+            .into_boxed_slice())
     }
 
     /// Temporary adapter for the active publisher removed by activation.
@@ -728,15 +715,14 @@ impl TerminalHistories {
     /// This checks the legacy behavior but returns only the exact missing IDs;
     /// it deliberately does not turn terminal observation into an authority.
     pub(super) fn into_legacy_empty_ids(self) -> Result<HashSet<GherritPrId>> {
-        let mut retired = self
-            .by_id
+        let retired = self
+            .entries
             .iter()
             .filter_map(|(_, history)| match history {
                 TerminalHistory::Empty => None,
                 TerminalHistory::Retired { identity, state } => Some((identity, state)),
             })
             .collect::<Vec<_>>();
-        retired.sort_unstable_by_key(|(identity, _)| identity.number().get());
         if !retired.is_empty() {
             let mut message = retired
                 .into_iter()
@@ -754,7 +740,7 @@ impl TerminalHistories {
             message.push_str("You may want to rebase on the latest changes before pushing.");
             bail!(message);
         }
-        Ok(self.by_id.into_keys().collect())
+        Ok(self.entries.into_vec().into_iter().map(|(id, _)| id).collect())
     }
 }
 
@@ -1210,24 +1196,52 @@ mod tests {
         TerminalPullRequestEvidence::for_test(id.clone(), after.map(str::to_owned), page)
     }
 
-    #[test]
-    fn complete_terminal_exhaustion_yields_neutral_evidence() {
-        let a = id("A");
-        let b = id("B");
-        let accumulator = TerminalExhaustionAccumulator::new([a.clone(), b.clone()]).unwrap();
-        let accumulator =
-            accumulator.record_page(evidence(&a, None, terminal_page(Some("a-1")))).unwrap();
-        let accumulator = accumulator.record_page(evidence(&b, None, terminal_page(None))).unwrap();
-        let accumulator =
-            accumulator.record_page(evidence(&a, Some("a-1"), terminal_page(None))).unwrap();
+    fn terminal_histories(values: &[&str]) -> TerminalHistories {
+        let ids = values.iter().map(|value| id(value)).collect::<Vec<_>>();
+        let accumulator = TerminalExhaustionAccumulator::new(ids.iter().cloned()).unwrap();
+        ids.into_iter()
+            .fold(accumulator, |accumulator, id| {
+                accumulator.record_page(evidence(&id, None, terminal_page(None))).unwrap()
+            })
+            .into_terminal_histories()
+            .unwrap()
+    }
 
-        let mut histories = accumulator.into_terminal_histories().unwrap();
-        assert_eq!(histories.len(), 2);
-        assert!(matches!(histories.take(&b).unwrap(), TerminalHistory::Empty));
-        assert!(matches!(histories.take(&a).unwrap(), TerminalHistory::Empty));
-        assert!(histories.is_empty());
-        assert!(histories.take(&a).is_err());
-        assert!(histories.take(&id("C")).is_err());
+    #[test]
+    fn terminal_histories_preserve_requested_order_and_neutral_states() {
+        let empty = id("Gempty");
+        let retired = id("Gretired");
+        let accumulator = TerminalExhaustionAccumulator::new([empty.clone(), retired.clone()])
+            .unwrap()
+            .record_page(evidence(
+                &retired,
+                None,
+                retired_page(17, "terminal-17", TerminalPullRequestState::Merged),
+            ))
+            .unwrap()
+            .record_page(evidence(&empty, None, terminal_page(None)))
+            .unwrap();
+
+        let exact = accumulator
+            .into_terminal_histories()
+            .unwrap()
+            .into_exact(&[empty.clone(), retired.clone()])
+            .unwrap();
+        assert!(matches!(exact[0], TerminalHistory::Empty));
+        let TerminalHistory::Retired { identity, state } = &exact[1] else {
+            panic!("the second requested ID must retain its retired history");
+        };
+        assert_eq!(identity.number().get(), 17);
+        assert_eq!(*state, TerminalPullRequestState::Merged);
+    }
+
+    #[test]
+    fn terminal_history_join_rejects_every_length_set_duplicate_and_order_mismatch() {
+        assert!(terminal_histories(&["A", "B"]).into_exact(&[id("A")]).is_err());
+        assert!(terminal_histories(&["A"]).into_exact(&[id("A"), id("B")]).is_err());
+        assert!(terminal_histories(&["A", "B"]).into_exact(&[id("A"), id("C")]).is_err());
+        assert!(terminal_histories(&["A", "B"]).into_exact(&[id("A"), id("A")]).is_err());
+        assert!(terminal_histories(&["A", "B"]).into_exact(&[id("B"), id("A")]).is_err());
     }
 
     #[test]
@@ -1244,7 +1258,7 @@ mod tests {
 
         let empty =
             TerminalExhaustionAccumulator::new([]).unwrap().into_terminal_histories().unwrap();
-        assert_eq!(empty.len(), 0);
+        assert!(empty.into_exact(&[]).unwrap().is_empty());
     }
 
     #[test]
@@ -1285,18 +1299,18 @@ mod tests {
         for state in [TerminalPullRequestState::Closed, TerminalPullRequestState::Merged] {
             let g = id("G");
             let accumulator = TerminalExhaustionAccumulator::new([g.clone()]).unwrap();
-            let mut histories = accumulator
+            let histories = accumulator
                 .record_page(evidence(&g, None, retired_page(7, "terminal", state)))
                 .unwrap()
                 .into_terminal_histories()
                 .unwrap();
             let TerminalHistory::Retired { identity, state: observed } =
-                histories.take(&g).unwrap()
+                &histories.into_exact(std::slice::from_ref(&g)).unwrap()[0]
             else {
                 panic!("terminal pull request must remain retired evidence");
             };
             assert_eq!(identity.number().get(), 7);
-            assert_eq!(observed, state);
+            assert_eq!(*observed, state);
         }
     }
 
@@ -1333,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_terminal_pull_requests_keep_the_legacy_ambiguity_diagnostic() {
+    fn multiple_terminal_pull_requests_keep_the_ambiguity_diagnostic() {
         let g = id("G");
         let accumulator = TerminalExhaustionAccumulator::new([g.clone()]).unwrap();
         let page = TerminalPullRequestPage {
