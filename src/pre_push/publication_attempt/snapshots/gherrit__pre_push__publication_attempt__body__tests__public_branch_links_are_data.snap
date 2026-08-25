@@ -1,5 +1,5 @@
 ---
-source: src/pre_push/body/recipe.rs
+source: src/pre_push/publication_attempt/body.rs
 expression: rendered
 ---
 ===== "main" =====
