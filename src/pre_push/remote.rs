@@ -1,99 +1,229 @@
-//! Complete destination-scoped publication observations.
+//! Exact remote Git evidence for the local change set.
 //!
-//! A missing ref is meaningful only when its exact namespace was queried.
-//! This adapter therefore observes each requested managed head together with
-//! its complete remote version history and exposes only normalized states.
+//! Git's ref-pattern matching does not turn an omitted record into proof that
+//! a ref is absent. This module first plans every bounded query, then decodes
+//! one response per query. The first response must repeat the default branch
+//! at the tip from which the local stack was derived. Only after that check do
+//! missing requested refs become exact absence evidence.
+//!
+//! The decoded values deliberately remain structural. This layer validates
+//! advertisement framing, ref ownership, and canonical names, but it does not
+//! decide whether version history is contiguous or whether heads, bases, and
+//! markers describe a valid published change. A later domain layer consumes
+//! the complete raw tuple and makes those decisions.
 
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    str,
+};
 
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::{ObjectId, bstr::ByteSlice as _};
 
-use super::destination::{PushDestination, git_output_records};
+use super::{
+    destination::{DefaultBranch, git_output_records},
+    local::GherritPrId,
+    version::Version,
+};
 
-// Variable arguments stay well below Windows' roughly 32-KiB command-line
-// limit. This also gives POSIX implementations a conservative bound.
+// This stays well below Windows' roughly 32-KiB command-line limit and is a
+// conservative bound on POSIX systems. The count includes one terminating
+// byte per argument.
 const QUERY_ARGV_BUDGET_BYTES: usize = 16 * 1024;
-const HEAD_PREFIX: &str = "refs/heads/";
-const VERSION_PREFIX: &str = "refs/tags/gherrit/";
+const HEAD_PREFIX: &[u8] = b"refs/heads/";
+const OWNED_BASE_PREFIX: &[u8] = b"refs/heads/gherrit-bases/";
+const MANAGED_TAG_ROOT: &[u8] = b"refs/tags/gherrit";
+const MANAGED_TAG_PREFIX: &[u8] = b"refs/tags/gherrit/";
 
-/// One validated destination state for a requested GHerrit change.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RemotePublication {
-    Absent,
-    Published { head: ObjectId, latest_version: usize },
+/// A complete, bounded request plan for exactly the supplied local IDs.
+///
+/// Construction validates all request arguments before any caller can execute
+/// the first query. Responses must later be decoded in this same order.
+pub(super) struct ExactLocalQueryPlan {
+    default_branch: DefaultBranch,
+    queries: Vec<Query>,
 }
 
-/// Observes the managed head and complete remote version history for every
-/// requested change, in request order.
-///
-/// Every query is planned before the first network request. An oversized or
-/// duplicate ID late in the input therefore cannot fail after an earlier
-/// prefix was observed.
-pub(super) async fn observe_publications(
-    destination: &PushDestination,
-    gherrit_ids: &[String],
-) -> Result<Vec<RemotePublication>> {
-    let queries = plan_queries(gherrit_ids)?;
-
-    let mut observed = Vec::with_capacity(gherrit_ids.len());
-    for query in queries {
-        let output = destination
-            .observe_refs(["--quiet".to_owned()], query.patterns())
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "Failed to observe GHerrit publication state at remote '{}'",
-                    destination.configured_remote()
-                )
-            })?;
-        if !output.status().success() {
-            bail!(
-                "`git ls-remote` failed while observing GHerrit publication state at remote '{}'",
-                destination.configured_remote()
-            );
-        }
-        observed.extend(parse_publications(output.stdout(), query.ids())?);
+impl ExactLocalQueryPlan {
+    pub(super) fn new(default_branch: DefaultBranch, ids: &[GherritPrId]) -> Result<Self> {
+        Self::with_budget(default_branch, ids, QUERY_ARGV_BUDGET_BYTES)
     }
-    Ok(observed)
+
+    fn with_budget(
+        default_branch: DefaultBranch,
+        ids: &[GherritPrId],
+        budget: usize,
+    ) -> Result<Self> {
+        if ids.is_empty() {
+            bail!("exact local remote observation requires at least one change");
+        }
+        if ids.iter().any(|id| id.as_str() == default_branch.name()) {
+            bail!("a local GHerrit change aliases the repository default branch");
+        }
+
+        let default_pattern_bytes = default_branch.full_ref_name().len() + 1;
+        let local_budget = budget.checked_sub(default_pattern_bytes).ok_or_else(|| {
+            eyre!("The repository default branch is too long for exact remote observation")
+        })?;
+        if local_budget == 0 {
+            bail!("The repository default branch is too long for exact remote observation");
+        }
+
+        let queries = plan_queries(ids, local_budget)?;
+        Ok(Self { default_branch, queries })
+    }
+
+    /// Returns one exact ref-pattern vector per required network request.
+    ///
+    /// Only the first query repeats the default branch. Every other argument
+    /// names a requested change's candidate head, owned base, or complete
+    /// managed-tag namespace, including its pull-request marker.
+    pub(super) fn patterns(&self) -> impl ExactSizeIterator<Item = Vec<String>> + '_ {
+        self.queries
+            .iter()
+            .enumerate()
+            .map(|(index, query)| query.patterns((index == 0).then_some(&self.default_branch)))
+    }
+
+    /// Decodes one successful, complete response per planned query.
+    ///
+    /// Process success is intentionally not represented here. The eventual
+    /// command boundary must admit only stdout from a successful query before
+    /// calling this pure decoder.
+    pub(super) fn decode<'output>(
+        self,
+        outputs: impl IntoIterator<Item = &'output [u8]>,
+    ) -> Result<RawExactLocalObservation> {
+        let Self { default_branch, queries } = self;
+        let mut outputs = outputs.into_iter();
+        let mut changes = Vec::new();
+
+        for (index, query) in queries.iter().enumerate() {
+            let output = outputs.next().ok_or_else(|| {
+                eyre!("exact local remote observation omitted a planned query response")
+            })?;
+            let expected_default = (index == 0).then_some(&default_branch);
+            changes.extend(parse_query(output, query.ids(), expected_default)?);
+        }
+        if outputs.next().is_some() {
+            bail!("exact local remote observation supplied an unplanned query response");
+        }
+
+        Ok(RawExactLocalObservation { default_branch, changes: changes.into_boxed_slice() })
+    }
+}
+
+/// Exact remote ref evidence for the requested local IDs, in request order.
+#[derive(Debug)]
+pub(super) struct RawExactLocalObservation {
+    default_branch: DefaultBranch,
+    changes: Box<[RawExactLocalChange]>,
+}
+
+impl RawExactLocalObservation {
+    pub(super) fn default_branch(&self) -> &DefaultBranch {
+        &self.default_branch
+    }
+
+    pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = &RawExactLocalChange> {
+        self.changes.iter()
+    }
+}
+
+/// The unnormalized refs advertised for one requested change.
+///
+/// An absent field means that its exact ref or namespace was requested and no
+/// corresponding record appeared after the default-branch recheck succeeded.
+#[derive(Debug)]
+pub(super) struct RawExactLocalChange {
+    id: GherritPrId,
+    candidate_head: Option<ObjectId>,
+    owned_base: Option<ObjectId>,
+    versions: Box<[RawVersionRef]>,
+    pull_request_marker: Option<ObjectId>,
+}
+
+impl RawExactLocalChange {
+    pub(super) fn id(&self) -> &GherritPrId {
+        &self.id
+    }
+
+    pub(super) fn candidate_head(&self) -> Option<ObjectId> {
+        self.candidate_head
+    }
+
+    pub(super) fn owned_base(&self) -> Option<ObjectId> {
+        self.owned_base
+    }
+
+    pub(super) fn versions(&self) -> impl ExactSizeIterator<Item = &RawVersionRef> {
+        self.versions.iter()
+    }
+
+    pub(super) fn pull_request_marker(&self) -> Option<ObjectId> {
+        self.pull_request_marker
+    }
+}
+
+/// One exact, canonical lightweight version ref from an advertisement.
+#[derive(Debug)]
+pub(super) struct RawVersionRef {
+    version: Version,
+    object_id: ObjectId,
+    source_ref: Box<str>,
+}
+
+impl RawVersionRef {
+    pub(super) fn version(&self) -> Version {
+        self.version
+    }
+
+    pub(super) fn object_id(&self) -> ObjectId {
+        self.object_id
+    }
+
+    pub(super) fn source_ref(&self) -> &str {
+        &self.source_ref
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
 struct Query {
-    ids: Vec<String>,
+    first: GherritPrId,
+    rest: Vec<GherritPrId>,
 }
 
 impl Query {
-    fn new(first: String) -> Self {
-        Self { ids: vec![first] }
+    fn new(first: GherritPrId) -> Self {
+        Self { first, rest: Vec::new() }
     }
 
-    fn ids(&self) -> &[String] {
-        &self.ids
+    fn ids(&self) -> impl Iterator<Item = &GherritPrId> {
+        std::iter::once(&self.first).chain(&self.rest)
     }
 
-    fn patterns(&self) -> Vec<String> {
-        self.ids.iter().flat_map(|id| publication_patterns(id)).collect()
+    fn patterns(&self, default_branch: Option<&DefaultBranch>) -> Vec<String> {
+        default_branch
+            .map(DefaultBranch::full_ref_name)
+            .into_iter()
+            .chain(self.ids().flat_map(local_patterns))
+            .collect()
     }
 }
 
-fn plan_queries(ids: &[String]) -> Result<Vec<Query>> {
-    plan_queries_with_budget(ids, QUERY_ARGV_BUDGET_BYTES)
-}
-
-fn plan_queries_with_budget(ids: &[String], budget: usize) -> Result<Vec<Query>> {
+fn plan_queries(ids: &[GherritPrId], budget: usize) -> Result<Vec<Query>> {
     let mut seen = HashSet::new();
     let planned = ids
         .iter()
         .map(|id| {
             if !seen.insert(id.as_str()) {
-                bail!("remote observation requested GHerrit change '{id}' more than once");
+                bail!("remote observation requested the same GHerrit change twice");
             }
-            let bytes = publication_pattern_bytes(id);
+            let bytes = local_pattern_bytes(id);
             if bytes > budget {
                 bail!(
                     "GHerrit change ID is too long for a remote observation query ({} bytes)",
-                    id.len()
+                    id.as_str().len()
                 );
             }
             Ok((id.clone(), bytes))
@@ -110,7 +240,7 @@ fn plan_queries_with_budget(ids: &[String], budget: usize) -> Result<Vec<Query>>
         }
         current_bytes += bytes;
         match &mut current {
-            Some(query) => query.ids.push(id),
+            Some(query) => query.rest.push(id),
             None => current = Some(Query::new(id)),
         }
     }
@@ -120,29 +250,270 @@ fn plan_queries_with_budget(ids: &[String], budget: usize) -> Result<Vec<Query>>
     Ok(queries)
 }
 
-fn publication_patterns(id: &str) -> [String; 3] {
-    let version_root = format!("{VERSION_PREFIX}{id}");
-    [format!("{HEAD_PREFIX}{id}"), version_root.clone(), format!("{version_root}/*")]
+fn local_patterns(id: &GherritPrId) -> [String; 4] {
+    let tag_root = format!("refs/tags/gherrit/{}", id.as_str());
+    [
+        format!("refs/heads/{}", id.as_str()),
+        format!("refs/heads/gherrit-bases/{}", id.as_str()),
+        tag_root.clone(),
+        format!("{tag_root}/*"),
+    ]
 }
 
-fn publication_pattern_bytes(id: &str) -> usize {
-    publication_patterns(id).iter().map(|pattern| pattern.len() + 1).sum()
+fn local_pattern_bytes(id: &GherritPrId) -> usize {
+    local_patterns(id).iter().map(|pattern| pattern.len() + 1).sum()
 }
 
-struct Record<'a> {
+#[derive(Default)]
+struct PendingChange {
+    candidate_head: Option<ObjectId>,
+    owned_base: Option<ObjectId>,
+    versions: BTreeMap<Version, RawVersionRef>,
+    pull_request_marker: Option<ObjectId>,
+}
+
+fn parse_query<'id>(
+    output: &[u8],
+    ids: impl Iterator<Item = &'id GherritPrId>,
+    expected_default: Option<&DefaultBranch>,
+) -> Result<Vec<RawExactLocalChange>> {
+    let ids = ids.collect::<Vec<_>>();
+    let requested = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str().as_bytes().to_vec(), index))
+        .collect::<HashMap<_, _>>();
+    debug_assert_eq!(requested.len(), ids.len());
+    let mut pending = (0..ids.len()).map(|_| PendingChange::default()).collect::<Vec<_>>();
+    let expected_default_name =
+        expected_default.map(|default| default.full_ref_name().into_bytes());
+    let mut observed_default = false;
+    let mut seen_records = HashSet::new();
+
+    for record in records(output) {
+        let record = record?;
+        if !seen_records.insert((record.name.to_vec(), record.peeled)) {
+            bail!("exact local observation returned the same remote ref record more than once");
+        }
+        if expected_default_name.as_deref() == Some(record.name) {
+            if observed_default {
+                bail!("exact local observation returned the default branch more than once");
+            }
+            if record.peeled {
+                bail!("exact local observation returned a peeled default branch");
+            }
+            let expected = expected_default.expect("a default name came from a default value");
+            if record.object_id != expected.tip() {
+                bail!("the default branch moved after local stack derivation");
+            }
+            observed_default = true;
+            continue;
+        }
+
+        if let Some(id) = parse_owned_base_name(record.name)? {
+            let index = requested.get(id.as_str().as_bytes()).ok_or_else(|| {
+                eyre!("exact local observation returned an unrequested GHerrit owned base")
+            })?;
+            if record.peeled {
+                bail!("exact local observation returned a peeled owned base");
+            }
+            if pending[*index].owned_base.replace(record.object_id).is_some() {
+                bail!("exact local observation returned the same owned base more than once");
+            }
+            continue;
+        }
+
+        if let Some(id) = parse_top_level_change_head(record.name) {
+            let index = requested.get(id.as_str().as_bytes()).ok_or_else(|| {
+                eyre!("exact local observation returned an unrequested GHerrit head")
+            })?;
+            if record.peeled {
+                bail!("exact local observation returned a peeled candidate head");
+            }
+            if pending[*index].candidate_head.replace(record.object_id).is_some() {
+                bail!("exact local observation returned the same candidate head more than once");
+            }
+            continue;
+        }
+
+        if record.name == MANAGED_TAG_ROOT {
+            bail!("remote ref uses the managed-tag namespace root");
+        }
+        if let Some(component) =
+            record.name.strip_prefix(MANAGED_TAG_PREFIX).filter(|suffix| !suffix.contains(&b'/'))
+        {
+            let id = GherritPrId::from_ref_component(component)
+                .wrap_err("remote managed-tag namespace root has an invalid change ID")?;
+            if !requested.contains_key(id.as_str().as_bytes()) {
+                bail!("remote advertised a managed-tag namespace for an unrequested change");
+            }
+            bail!("remote managed-tag namespace root exists for a requested GHerrit change");
+        }
+        if let Some((id, tag)) = parse_managed_tag_name(record.name)? {
+            let index = requested.get(id.as_str().as_bytes()).ok_or_else(|| {
+                eyre!("remote advertised managed tags for an unrequested GHerrit change")
+            })?;
+            if record.peeled {
+                bail!(
+                    "remote managed tag for GHerrit change '{}' is annotated rather than lightweight",
+                    id.as_str()
+                );
+            }
+            let change = &mut pending[*index];
+            match tag {
+                ManagedTag::Version(version) => {
+                    let source_ref = str::from_utf8(record.name)
+                        .expect("a validated managed version ref is ASCII")
+                        .into();
+                    let version_ref =
+                        RawVersionRef { version, object_id: record.object_id, source_ref };
+                    if change.versions.insert(version, version_ref).is_some() {
+                        bail!(
+                            "remote advertised version v{version} for GHerrit change '{}' more than once",
+                            id.as_str()
+                        );
+                    }
+                }
+                ManagedTag::PullRequestMarker => {
+                    if change.pull_request_marker.replace(record.object_id).is_some() {
+                        bail!(
+                            "remote advertised the pull-request marker for GHerrit change '{}' more than once",
+                            id.as_str()
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Ref patterns match a slash-delimited tail, not necessarily a full
+        // ref name. An archival namespace can therefore legitimately produce
+        // a validated record such as
+        // `refs/heads/archive/refs/heads/Gone`. It is not GHerrit-owned state
+        // and must neither populate nor invalidate the exact requested tuple.
+        if is_requested_tail_match(record.name, &ids, expected_default) {
+            continue;
+        }
+        bail!("exact local observation returned an unrelated remote ref");
+    }
+
+    if expected_default.is_some() && !observed_default {
+        bail!("exact local observation omitted the default branch");
+    }
+
+    Ok(ids
+        .into_iter()
+        .zip(pending)
+        .map(|(id, pending)| RawExactLocalChange {
+            id: id.clone(),
+            candidate_head: pending.candidate_head,
+            owned_base: pending.owned_base,
+            versions: pending.versions.into_values().collect(),
+            pull_request_marker: pending.pull_request_marker,
+        })
+        .collect())
+}
+
+fn is_requested_tail_match(
+    name: &[u8],
+    ids: &[&GherritPrId],
+    expected_default: Option<&DefaultBranch>,
+) -> bool {
+    if expected_default
+        .is_some_and(|default| has_exact_ref_tail(name, default.full_ref_name().as_bytes()))
+    {
+        return true;
+    }
+
+    ids.iter().any(|id| {
+        let [candidate, owned_base, tag_root, _] = local_patterns(id);
+        has_exact_ref_tail(name, candidate.as_bytes())
+            || has_exact_ref_tail(name, owned_base.as_bytes())
+            || has_exact_ref_tail(name, tag_root.as_bytes())
+            || has_namespace_tail(name, tag_root.as_bytes())
+    })
+}
+
+fn has_exact_ref_tail(name: &[u8], tail: &[u8]) -> bool {
+    name.strip_suffix(tail).is_some_and(|prefix| prefix.is_empty() || prefix.ends_with(b"/"))
+}
+
+fn has_namespace_tail(name: &[u8], root: &[u8]) -> bool {
+    std::iter::once(0)
+        .chain(
+            name.iter()
+                .enumerate()
+                .filter_map(|(index, byte)| (*byte == b'/').then_some(index + 1)),
+        )
+        .any(|index| {
+            name[index..]
+                .strip_prefix(root)
+                .and_then(|suffix| suffix.strip_prefix(b"/"))
+                .is_some_and(|leaf| !leaf.is_empty())
+        })
+}
+
+fn parse_top_level_change_head(name: &[u8]) -> Option<GherritPrId> {
+    let id = name.strip_prefix(HEAD_PREFIX)?;
+    (!id.contains(&b'/')).then(|| GherritPrId::from_ref_component(id).ok()).flatten()
+}
+
+fn parse_owned_base_name(name: &[u8]) -> Result<Option<GherritPrId>> {
+    let Some(id) = name.strip_prefix(OWNED_BASE_PREFIX) else {
+        return Ok(None);
+    };
+    let id = GherritPrId::from_ref_component(id)
+        .wrap_err("remote owned-base ref has an invalid change ID")?;
+    Ok(Some(id))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedTag {
+    Version(Version),
+    PullRequestMarker,
+}
+
+fn parse_managed_tag_name(name: &[u8]) -> Result<Option<(GherritPrId, ManagedTag)>> {
+    let Some(suffix) = name.strip_prefix(MANAGED_TAG_PREFIX) else {
+        return Ok(None);
+    };
+    let mut components = suffix.split(|byte| *byte == b'/');
+    let (Some(id), Some(leaf), None) = (components.next(), components.next(), components.next())
+    else {
+        bail!("remote managed tag does not have the canonical change/(vN|pr) shape");
+    };
+    let id = GherritPrId::from_ref_component(id)
+        .wrap_err("remote managed tag has an invalid change ID")?;
+    let tag = if leaf == b"pr" {
+        ManagedTag::PullRequestMarker
+    } else {
+        ManagedTag::Version(parse_version(leaf).wrap_err("remote managed tag is not canonical")?)
+    };
+    Ok(Some((id, tag)))
+}
+
+struct Record<'output> {
     object_id: ObjectId,
-    name: &'a [u8],
+    name: &'output [u8],
     peeled: bool,
 }
 
 fn records(output: &[u8]) -> impl Iterator<Item = Result<Record<'_>>> {
-    git_output_records(output).map(|record| {
+    git_output_records(output).enumerate().map(|(index, record)| {
         let mut fields = record.split(|byte| *byte == b'\t');
         let (Some(value), Some(name), None) = (fields.next(), fields.next(), fields.next()) else {
-            bail!("malformed `git ls-remote` record: {record:?}");
+            bail!("malformed `git ls-remote` record {} ({} bytes)", index + 1, record.len());
         };
         if value.starts_with(b"ref: ") {
-            bail!("remote publication observation unexpectedly contained a symbolic ref");
+            bail!("exact local observation unexpectedly contained a symbolic ref");
+        }
+        if value.len() != 40
+            || !value.iter().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            bail!("remote ref value is not a canonical SHA-1 object ID");
+        }
+        if value.iter().all(|byte| *byte == b'0') {
+            bail!("remote ref has a null object ID");
         }
 
         let (logical_name, peeled) = match name.strip_suffix(b"^{}") {
@@ -154,302 +525,364 @@ fn records(output: &[u8]) -> impl Iterator<Item = Result<Record<'_>>> {
         if peeled && full_name.category() != Some(gix::refs::Category::Tag) {
             bail!("peeled remote ref is not a tag");
         }
-
         let object_id =
-            ObjectId::from_hex(value).wrap_err("remote ref value is not an object ID")?;
-        if object_id.is_null() {
-            bail!("remote ref has a null object ID");
-        }
+            ObjectId::from_hex(value).wrap_err("remote ref value is not a SHA-1 object ID")?;
         Ok(Record { object_id, name: logical_name, peeled })
     })
 }
 
-#[derive(Default)]
-struct RawPublication {
-    head: Option<ObjectId>,
-    versions: BTreeMap<usize, ObjectId>,
-}
-
-fn parse_publications(output: &[u8], requested_ids: &[String]) -> Result<Vec<RemotePublication>> {
-    let mut raw = requested_ids.iter().try_fold(HashMap::new(), |mut raw, id| {
-        match raw.entry(id.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(RawPublication::default());
-            }
-            Entry::Occupied(_) => {
-                bail!("remote observation requested GHerrit change '{id}' more than once");
-            }
-        }
-        Ok(raw)
-    })?;
-    let requested_heads = requested_ids
-        .iter()
-        .map(|id| (format!("{HEAD_PREFIX}{id}").into_bytes(), id.as_str()))
-        .collect::<HashMap<_, _>>();
-    let requested_versions = requested_ids
-        .iter()
-        .map(|id| (id.as_bytes().to_vec(), id.as_str()))
-        .collect::<HashMap<_, _>>();
-
-    for record in records(output) {
-        let record = record?;
-        if let Some(id) = requested_heads.get(record.name) {
-            if record.peeled {
-                bail!("managed head for GHerrit change '{id}' was advertised as a peeled tag");
-            }
-            if raw
-                .get_mut(*id)
-                .expect("requested changes have initialized observations")
-                .head
-                .replace(record.object_id)
-                .is_some()
-            {
-                bail!(
-                    "remote advertised the managed head for GHerrit change '{id}' more than once"
-                );
-            }
-            continue;
-        }
-
-        let Some(suffix) = record.name.strip_prefix(VERSION_PREFIX.as_bytes()) else {
-            // `ls-remote` patterns also match an arbitrary ref whose tail is
-            // one of the requested names. Such a ref is outside the exact
-            // managed namespace and carries no publication evidence.
-            continue;
-        };
-        let Some(separator) = suffix.iter().position(|byte| *byte == b'/') else {
-            if let Some(id) = requested_versions.get(suffix) {
-                bail!("remote version namespace root exists for GHerrit change '{id}'");
-            }
-            continue;
-        };
-        let (id_component, version) = suffix.split_at(separator);
-        let Some(id) = requested_versions.get(id_component) else {
-            continue;
-        };
-        if record.peeled {
-            bail!(
-                "remote version tag for GHerrit change '{id}' is annotated rather than lightweight"
-            );
-        }
-        let version = version
-            .strip_prefix(b"/")
-            .ok_or_else(|| eyre!("remote version tag for GHerrit change '{id}' has no version"))?;
-        let version = parse_version(version).wrap_err_with(|| {
-            format!("remote version tag for GHerrit change '{id}' is not canonical")
-        })?;
-        if raw
-            .get_mut(*id)
-            .expect("requested changes have initialized observations")
-            .versions
-            .insert(version, record.object_id)
-            .is_some()
-        {
-            bail!("remote advertised version v{version} for GHerrit change '{id}' more than once");
-        }
-    }
-
-    requested_ids
-        .iter()
-        .map(|id| {
-            let raw = raw.remove(id).expect("requested changes have initialized observations");
-            normalize_publication(id, raw)
-        })
-        .collect()
-}
-
-fn parse_version(suffix: &[u8]) -> Result<usize> {
-    let digits = suffix.strip_prefix(b"v").ok_or_else(|| eyre!("missing 'v' prefix"))?;
+fn parse_version(suffix: &[u8]) -> Result<Version> {
+    let digits =
+        suffix.strip_prefix(b"v").ok_or_else(|| eyre!("version does not use the vN form"))?;
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         bail!("version is not decimal");
     }
     if digits[0] == b'0' {
         bail!("version is zero or has a leading zero");
     }
-    digits.iter().try_fold(0_usize, |value, digit| {
+    let value = digits.iter().try_fold(0_u64, |value, digit| {
         value
             .checked_mul(10)
-            .and_then(|value| value.checked_add(usize::from(*digit - b'0')))
-            .ok_or_else(|| eyre!("version overflows usize"))
-    })
-}
-
-fn normalize_publication(id: &str, raw: RawPublication) -> Result<RemotePublication> {
-    match (raw.head, raw.versions.is_empty()) {
-        (None, true) => return Ok(RemotePublication::Absent),
-        (Some(_), true) => {
-            bail!("Remote GHerrit change '{id}' has a managed head but no version tags")
-        }
-        (None, false) => {
-            bail!("Remote GHerrit change '{id}' has version tags but no managed head")
-        }
-        (Some(_), false) => {}
-    }
-
-    raw.versions.iter().enumerate().try_for_each(|(index, (actual, _))| {
-        let expected = index
-            .checked_add(1)
-            .ok_or_else(|| eyre!("Remote GHerrit change '{id}' has too many versions"))?;
-        if *actual != expected {
-            bail!(
-                "Remote GHerrit change '{id}' has noncontiguous version tags: expected v{expected}, observed v{actual}"
-            );
-        }
-        Ok(())
+            .and_then(|value| value.checked_add(u64::from(*digit - b'0')))
+            .ok_or_else(|| eyre!("version overflows u64"))
     })?;
-    let (&latest_version, &latest_head) = raw
-        .versions
-        .last_key_value()
-        .ok_or_else(|| eyre!("Remote GHerrit change '{id}' has no version tags"))?;
-    let head = raw.head.expect("nonempty publication has a managed head");
-    if head != latest_head {
-        bail!("Remote GHerrit change '{id}' head does not match its latest version tag");
-    }
-
-    Ok(RemotePublication::Published { head, latest_version })
+    Version::new(value).ok_or_else(|| eyre!("version is zero"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ONE: &str = "1111111111111111111111111111111111111111";
-    const TWO: &str = "2222222222222222222222222222222222222222";
-    const THREE: &str = "3333333333333333333333333333333333333333";
+    const DEFAULT: &str = "1111111111111111111111111111111111111111";
+    const HEAD: &str = "2222222222222222222222222222222222222222";
+    const BASE: &str = "3333333333333333333333333333333333333333";
+    const MARKER: &str = "4444444444444444444444444444444444444444";
+    const SHA256: &str = "5555555555555555555555555555555555555555555555555555555555555555";
 
-    fn ids(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_owned()).collect()
+    fn id(value: &str) -> GherritPrId {
+        GherritPrId::from_ref_component(value.as_bytes()).unwrap()
     }
 
-    fn object_id(value: &str) -> ObjectId {
-        ObjectId::from_hex(value.as_bytes()).unwrap()
+    fn default_branch() -> DefaultBranch {
+        DefaultBranch::new("main".to_owned(), ObjectId::from_hex(DEFAULT.as_bytes()).unwrap())
+            .unwrap()
+    }
+
+    fn decode<'output>(
+        ids: &[GherritPrId],
+        outputs: impl IntoIterator<Item = &'output [u8]>,
+    ) -> Result<RawExactLocalObservation> {
+        let default = default_branch();
+        ExactLocalQueryPlan::new(default, ids)?.decode(outputs)
+    }
+
+    fn full_output() -> String {
+        format!(
+            "{DEFAULT}\trefs/heads/main\n\
+             {HEAD}\trefs/heads/Gone\n\
+             {BASE}\trefs/heads/gherrit-bases/Gone\n\
+             {HEAD}\trefs/tags/gherrit/Gone/v1\n\
+             {MARKER}\trefs/tags/gherrit/Gone/pr\n"
+        )
     }
 
     #[test]
-    fn parses_complete_destination_histories_and_authoritative_absence() {
-        let requested = ids(&["Gone", "Gtwo", "Gabsent"]);
-        let mut output = format!(
-            "{ONE}\trefs/heads/Gone\n\
-             {ONE}\trefs/tags/gherrit/Gone/v2\n\
-             {TWO}\trefs/tags/gherrit/Gone/v1\n\
-             {THREE}\trefs/heads/Gtwo\n\
-             {THREE}\trefs/tags/gherrit/Gtwo/v1\n\
-             {TWO}\trefs/heads/archive/refs/heads/Gone\n\
-             {TWO}\trefs/tags/archive/refs/tags/gherrit/Gone/v3\n"
-        )
-        .into_bytes();
-        output.extend_from_slice(format!("{TWO}\trefs/heads/archive/").as_bytes());
-        output.extend_from_slice(b"\xff/refs/heads/Gone\n");
+    fn plans_only_exact_local_namespaces_and_rechecks_default_once() {
+        let default = default_branch();
+        let ids = [id("A"), id("B")];
+        let plan = ExactLocalQueryPlan::new(default, &ids).unwrap();
+        let patterns = plan.patterns().collect::<Vec<_>>();
 
+        assert_eq!(patterns.len(), 1);
         assert_eq!(
-            parse_publications(&output, &requested).unwrap(),
+            patterns[0],
             [
-                RemotePublication::Published { head: object_id(ONE), latest_version: 2 },
-                RemotePublication::Published { head: object_id(THREE), latest_version: 1 },
-                RemotePublication::Absent,
+                "refs/heads/main",
+                "refs/heads/A",
+                "refs/heads/gherrit-bases/A",
+                "refs/tags/gherrit/A",
+                "refs/tags/gherrit/A/*",
+                "refs/heads/B",
+                "refs/heads/gherrit-bases/B",
+                "refs/tags/gherrit/B",
+                "refs/tags/gherrit/B/*",
             ]
         );
-        assert_eq!(parse_publications(b"", &requested).unwrap(), [RemotePublication::Absent; 3]);
     }
 
     #[test]
-    fn accepts_contiguous_history_with_repeated_objects() {
-        let requested = ids(&["Gone"]);
+    fn plans_every_batch_before_observation_and_rejects_invalid_sets() {
+        let default = default_branch();
+        let a = id("A");
+        let b = id("B");
+        let per_query_budget = local_pattern_bytes(&a) + local_pattern_bytes(&b) - 1;
+        let total_budget = default.full_ref_name().len() + 1 + per_query_budget;
+        let plan =
+            ExactLocalQueryPlan::with_budget(default, &[a.clone(), b], total_budget).unwrap();
+        let patterns = plan.patterns().collect::<Vec<_>>();
+        assert_eq!(patterns.len(), 2);
+        assert_eq!(patterns[0][0], "refs/heads/main");
+        assert!(!patterns[1].iter().any(|pattern| pattern == "refs/heads/main"));
+
+        assert!(ExactLocalQueryPlan::new(default_branch(), &[]).is_err());
+        assert!(ExactLocalQueryPlan::new(default_branch(), &[a.clone(), a]).is_err());
+        assert!(ExactLocalQueryPlan::new(default_branch(), &[id("main")]).is_err());
+        assert!(
+            ExactLocalQueryPlan::with_budget(
+                default_branch(),
+                &[id("A")],
+                total_budget - per_query_budget
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn decodes_unordered_records_but_preserves_requested_change_order() {
+        let ids = [id("First"), id("Second")];
         let output = format!(
-            "{TWO}\trefs/heads/Gone\n\
-             {ONE}\trefs/tags/gherrit/Gone/v1\n\
-             {TWO}\trefs/tags/gherrit/Gone/v3\n\
-             {TWO}\trefs/tags/gherrit/Gone/v2\n"
+            "{HEAD}\trefs/tags/gherrit/Second/v2\n\
+             {BASE}\trefs/heads/gherrit-bases/First\n\
+             {DEFAULT}\trefs/heads/main\n\
+             {MARKER}\trefs/tags/gherrit/Second/pr\n\
+             {HEAD}\trefs/heads/Second\n\
+             {BASE}\trefs/tags/gherrit/Second/v1\n"
         );
+        let observed = decode(&ids, [output.as_bytes()]).unwrap();
+        assert_eq!(observed.default_branch().name(), "main");
+        assert_eq!(observed.default_branch().tip().to_string(), DEFAULT);
+        let changes = observed.iter().collect::<Vec<_>>();
 
         assert_eq!(
-            parse_publications(output.as_bytes(), &requested).unwrap()[0],
-            RemotePublication::Published { head: object_id(TWO), latest_version: 3 }
+            changes.iter().map(|change| change.id().as_str()).collect::<Vec<_>>(),
+            ["First", "Second"]
+        );
+        assert_eq!(changes[0].owned_base().unwrap().to_string(), BASE);
+        assert_eq!(changes[1].candidate_head().unwrap().to_string(), HEAD);
+        assert_eq!(changes[1].pull_request_marker().unwrap().to_string(), MARKER);
+        assert_eq!(
+            changes[1]
+                .versions()
+                .map(|version| (
+                    version.version().get(),
+                    version.object_id().to_string(),
+                    version.source_ref()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (1, BASE.to_owned(), "refs/tags/gherrit/Second/v1"),
+                (2, HEAD.to_owned(), "refs/tags/gherrit/Second/v2"),
+            ]
         );
     }
 
     #[test]
-    fn rejects_partial_gapped_and_mismatched_publications() {
-        let requested = ids(&["Gone"]);
-        for (output, message) in [
-            (format!("{ONE}\trefs/heads/Gone\n"), "head but no version tags"),
-            (format!("{ONE}\trefs/tags/gherrit/Gone/v1\n"), "tags but no managed head"),
-            (
-                format!(
-                    "{TWO}\trefs/heads/Gone\n\
-                     {ONE}\trefs/tags/gherrit/Gone/v1\n\
-                     {TWO}\trefs/tags/gherrit/Gone/v3\n"
-                ),
-                "noncontiguous version tags",
-            ),
-            (
-                format!(
-                    "{TWO}\trefs/heads/Gone\n\
-                     {ONE}\trefs/tags/gherrit/Gone/v1\n"
-                ),
-                "does not match its latest version tag",
-            ),
+    fn missing_refs_mean_absence_only_after_the_default_tip_is_rechecked() {
+        let ids = [id("Gone")];
+        let present_default = format!("{DEFAULT}\trefs/heads/main\n");
+        let observed = decode(&ids, [present_default.as_bytes()]).unwrap();
+        let change = observed.iter().next().unwrap();
+        assert_eq!(change.candidate_head(), None);
+        assert_eq!(change.owned_base(), None);
+        assert_eq!(change.versions().len(), 0);
+        assert_eq!(change.pull_request_marker(), None);
+
+        assert!(decode(&ids, [b"".as_slice()]).is_err());
+        let moved = format!("{HEAD}\trefs/heads/main\n");
+        assert!(decode(&ids, [moved.as_bytes()]).unwrap_err().to_string().contains("moved"));
+        let duplicate = format!("{DEFAULT}\trefs/heads/main\n{DEFAULT}\trefs/heads/main\n");
+        assert!(decode(&ids, [duplicate.as_bytes()]).is_err());
+    }
+
+    #[test]
+    fn each_planned_batch_has_exact_coverage_and_response_cardinality() {
+        let default = default_branch();
+        let a = id("A");
+        let b = id("B");
+        let local_budget = local_pattern_bytes(&a) + local_pattern_bytes(&b) - 1;
+        let budget = default.full_ref_name().len() + 1 + local_budget;
+        let first = format!("{DEFAULT}\trefs/heads/main\n{HEAD}\trefs/heads/A\n");
+        let second = format!("{BASE}\trefs/heads/B\n");
+
+        let observed = ExactLocalQueryPlan::with_budget(default, &[a.clone(), b.clone()], budget)
+            .unwrap()
+            .decode([first.as_bytes(), second.as_bytes()])
+            .unwrap();
+        assert_eq!(observed.iter().map(|change| change.id()).collect::<Vec<_>>(), [&a, &b]);
+
+        assert!(
+            ExactLocalQueryPlan::with_budget(default_branch(), &[a.clone(), b.clone()], budget)
+                .unwrap()
+                .decode([first.as_bytes()])
+                .is_err()
+        );
+        assert!(
+            ExactLocalQueryPlan::with_budget(default_branch(), &[a, b], budget)
+                .unwrap()
+                .decode([first.as_bytes(), second.as_bytes(), b"".as_slice()])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn later_batches_reject_a_default_record_instead_of_reinterpreting_it() {
+        let default = default_branch();
+        let a = id("A");
+        let b = id("B");
+        let local_budget = local_pattern_bytes(&a) + local_pattern_bytes(&b) - 1;
+        let budget = default.full_ref_name().len() + 1 + local_budget;
+        let first = format!("{DEFAULT}\trefs/heads/main\n");
+        let second = format!("{DEFAULT}\trefs/heads/main\n");
+        assert!(
+            ExactLocalQueryPlan::with_budget(default, &[a, b], budget)
+                .unwrap()
+                .decode([first.as_bytes(), second.as_bytes()])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_unrequested_records_in_every_owned_namespace() {
+        let ids = [id("Gone")];
+        for record in [
+            format!("{HEAD}\trefs/heads/Other\n"),
+            format!("{HEAD}\trefs/heads/gherrit-bases/Other\n"),
+            format!("{HEAD}\trefs/tags/gherrit/Other/v1\n"),
+            format!("{HEAD}\trefs/tags/gherrit/Other/pr\n"),
+            format!("{HEAD}\trefs/tags/unrelated\n"),
         ] {
-            let error = parse_publications(output.as_bytes(), &requested).unwrap_err();
-            assert!(error.to_string().contains(message), "error={error:?}");
+            let output = format!("{DEFAULT}\trefs/heads/main\n{record}");
+            assert!(decode(&ids, [output.as_bytes()]).is_err(), "accepted {output:?}");
         }
     }
 
     #[test]
-    fn rejects_duplicate_annotated_and_noncanonical_managed_refs() {
-        let requested = ids(&["Gone"]);
-        for output in [
-            format!("{ONE}\trefs/tags/gherrit/Gone\n"),
-            format!("{ONE}\trefs/tags/gherrit/Gone/v0\n"),
-            format!("{ONE}\trefs/tags/gherrit/Gone/v01\n"),
-            format!("{ONE}\trefs/tags/gherrit/Gone/v1/extra\n"),
-            format!("{ONE}\trefs/tags/gherrit/Gone/v{}0\n", usize::MAX),
-            format!("{ONE}\trefs/heads/Gone\n{TWO}\trefs/heads/Gone\n"),
+    fn validated_tail_matches_are_ignored_without_weakening_absence() {
+        let ids = [id("Gone")];
+        let output = format!(
+            "{DEFAULT}\trefs/heads/main\n\
+             {HEAD}\trefs/heads/archive/refs/heads/main\n\
+             {HEAD}\trefs/heads/archive/refs/heads/Gone\n\
+             {BASE}\trefs/heads/archive/refs/heads/gherrit-bases/Gone\n\
+             {HEAD}\trefs/tags/archive/refs/tags/gherrit/Gone\n\
+             {BASE}\trefs/tags/archive/refs/tags/gherrit/Gone/v9\n\
+             {MARKER}\trefs/tags/archive/refs/tags/gherrit/Gone/pr\n"
+        );
+        let observed = decode(&ids, [output.as_bytes()]).unwrap();
+        let change = observed.iter().next().unwrap();
+        assert_eq!(change.candidate_head(), None);
+        assert_eq!(change.owned_base(), None);
+        assert_eq!(change.versions().len(), 0);
+        assert_eq!(change.pull_request_marker(), None);
+
+        let duplicate_noise = format!(
+            "{DEFAULT}\trefs/heads/main\n\
+             {HEAD}\trefs/heads/archive/refs/heads/Gone\n\
+             {HEAD}\trefs/heads/archive/refs/heads/Gone\n"
+        );
+        assert!(decode(&ids, [duplicate_noise.as_bytes()]).is_err());
+
+        let peeled_noise = format!(
+            "{DEFAULT}\trefs/heads/main\n\
+             {HEAD}\trefs/tags/archive/refs/tags/gherrit/Gone/v1\n\
+             {BASE}\trefs/tags/archive/refs/tags/gherrit/Gone/v1^{{}}\n"
+        );
+        let observed = decode(&ids, [peeled_noise.as_bytes()]).unwrap();
+        let change = observed.iter().next().unwrap();
+        assert_eq!(change.candidate_head(), None);
+        assert_eq!(change.owned_base(), None);
+        assert_eq!(change.versions().len(), 0);
+        assert_eq!(change.pull_request_marker(), None);
+    }
+
+    #[test]
+    fn rejects_duplicate_refs_and_all_peeled_owned_refs() {
+        let ids = [id("Gone")];
+        for records in [
+            format!("{HEAD}\trefs/heads/Gone\n{BASE}\trefs/heads/Gone\n"),
             format!(
-                "{ONE}\trefs/tags/gherrit/Gone/v1\n\
-                 {TWO}\trefs/tags/gherrit/Gone/v1\n"
+                "{HEAD}\trefs/heads/gherrit-bases/Gone\n{BASE}\trefs/heads/gherrit-bases/Gone\n"
             ),
-            format!(
-                "{ONE}\trefs/tags/gherrit/Gone/v1\n\
-                 {TWO}\trefs/tags/gherrit/Gone/v1^{{}}\n"
-            ),
+            format!("{HEAD}\trefs/tags/gherrit/Gone/v1\n{BASE}\trefs/tags/gherrit/Gone/v1\n"),
+            format!("{HEAD}\trefs/tags/gherrit/Gone/pr\n{BASE}\trefs/tags/gherrit/Gone/pr\n"),
+            format!("{HEAD}\trefs/heads/Gone^{{}}\n"),
+            format!("{HEAD}\trefs/heads/gherrit-bases/Gone^{{}}\n"),
+            format!("{HEAD}\trefs/tags/gherrit/Gone/v1\n{BASE}\trefs/tags/gherrit/Gone/v1^{{}}\n"),
+            format!("{HEAD}\trefs/tags/gherrit/Gone/pr\n{BASE}\trefs/tags/gherrit/Gone/pr^{{}}\n"),
         ] {
-            assert!(parse_publications(output.as_bytes(), &requested).is_err(), "{output:?}");
+            let output = format!("{DEFAULT}\trefs/heads/main\n{records}");
+            assert!(decode(&ids, [output.as_bytes()]).is_err(), "accepted {output:?}");
         }
     }
 
     #[test]
-    fn rejects_every_untrusted_record_shape() {
-        let requested = ids(&["Gone"]);
-        for output in [
-            b"\n".as_slice(),
-            b"not a record\n",
-            b"xyz\trefs/heads/unrelated\n",
-            b"0000000000000000000000000000000000000000\trefs/heads/unrelated\n",
-            b"ref: refs/heads/main\trefs/heads/unrelated\n",
+    fn rejects_malformed_symbolic_null_non_sha1_and_noncanonical_object_ids() {
+        let ids = [id("Gone")];
+        for record in [
+            b"not-a-record\n".to_vec(),
+            b"ref: refs/heads/other\trefs/heads/Gone\n".to_vec(),
+            format!("{}\trefs/heads/Gone\n", "0".repeat(40)).into_bytes(),
+            format!("{SHA256}\trefs/heads/Gone\n").into_bytes(),
+            format!("{}\trefs/heads/Gone\n", "ABCDEF0123456789ABCDEF0123456789ABCDEF01")
+                .into_bytes(),
+            format!("{HEAD}\trefs/heads/Gone\textra\n").into_bytes(),
+            format!("{HEAD}\trefs/heads/bad..name\n").into_bytes(),
         ] {
-            assert!(parse_publications(output, &requested).is_err(), "{output:?}");
+            let mut output = format!("{DEFAULT}\trefs/heads/main\n").into_bytes();
+            output.extend(record);
+            assert!(decode(&ids, [&output[..]]).is_err(), "accepted {output:?}");
         }
     }
 
     #[test]
-    fn query_planning_uses_exact_patterns_and_preflights_every_id() {
-        let requested = ids(&["Gone", "Gtwo"]);
-        let one = publication_pattern_bytes(&requested[0]);
-        let two = publication_pattern_bytes(&requested[1]);
-        let split = plan_queries_with_budget(&requested, one + two - 1).unwrap();
+    fn managed_tag_names_are_canonical() {
+        let ids = [id("Gone")];
+        for name in [
+            "refs/tags/gherrit",
+            "refs/tags/gherrit/Gone",
+            "refs/tags/gherrit/Gone/v0",
+            "refs/tags/gherrit/Gone/v01",
+            "refs/tags/gherrit/Gone/v",
+            "refs/tags/gherrit/Gone/vx",
+            "refs/tags/gherrit/Gone/other",
+            "refs/tags/gherrit/Gone/v18446744073709551616",
+            "refs/tags/gherrit/Gone/v1/extra",
+            "refs/tags/gherrit/Gone/pr/extra",
+        ] {
+            let output = format!("{DEFAULT}\trefs/heads/main\n{HEAD}\t{name}\n");
+            assert!(decode(&ids, [output.as_bytes()]).is_err(), "accepted {name}");
+        }
+    }
 
-        assert_eq!(split.len(), 2);
-        assert_eq!(
-            split[0].patterns(),
-            ["refs/heads/Gone", "refs/tags/gherrit/Gone", "refs/tags/gherrit/Gone/*",]
+    #[test]
+    fn raw_observation_does_not_claim_history_or_relationship_validity() {
+        let ids = [id("Gone")];
+        let output = format!(
+            "{DEFAULT}\trefs/heads/main\n\
+             {HEAD}\trefs/heads/Gone\n\
+             {BASE}\trefs/tags/gherrit/Gone/v3\n\
+             {MARKER}\trefs/tags/gherrit/Gone/pr\n"
         );
-        assert_eq!(
-            split[1].patterns(),
-            ["refs/heads/Gtwo", "refs/tags/gherrit/Gtwo", "refs/tags/gherrit/Gtwo/*",]
-        );
-        assert!(plan_queries_with_budget(&requested, one - 1).is_err());
-        assert!(plan_queries_with_budget(&ids(&["Gone", "Gone"]), one * 2).is_err());
-        assert!(plan_queries_with_budget(&[], one).unwrap().is_empty());
+        let observed = decode(&ids, [output.as_bytes()]).unwrap();
+        let change = observed.iter().next().unwrap();
+        assert_eq!(change.candidate_head().unwrap().to_string(), HEAD);
+        assert_eq!(change.owned_base(), None);
+        assert_eq!(change.versions().next().unwrap().version().get(), 3);
+        assert_eq!(change.pull_request_marker().unwrap().to_string(), MARKER);
+    }
+
+    #[test]
+    fn native_line_framing_allows_only_the_hosts_terminator() {
+        let ids = [id("Gone")];
+        let native = full_output();
+        let no_final_lf = native.strip_suffix('\n').unwrap();
+        let crlf = native.replace('\n', "\r\n");
+        for output in [native.as_bytes(), no_final_lf.as_bytes()] {
+            assert!(decode(&ids, [output]).is_ok(), "rejected {output:?}");
+        }
+        #[cfg(windows)]
+        assert!(decode(&ids, [crlf.as_bytes()]).is_ok());
+        #[cfg(not(windows))]
+        assert!(decode(&ids, [crlf.as_bytes()]).is_err());
     }
 }
