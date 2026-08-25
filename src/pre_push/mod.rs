@@ -11,7 +11,9 @@ mod autosquash;
 mod batching;
 mod body;
 mod destination;
+#[cfg(test)]
 mod github;
+mod legacy_github;
 mod legacy_remote;
 mod local;
 mod publication;
@@ -28,7 +30,7 @@ use batching::{
 };
 use body::PrBody;
 use destination::{DefaultBranch, PushDestination};
-use github::{
+use legacy_github::{
     CreatePullRequest, CreatedPullRequest, FindPullRequest, MutationOperation,
     PullRequest as PrState, PullRequestNodeId, PullRequestNumber, QueryOperation,
     Repository as GithubRepository, UpdatePullRequest, decode_mutation_batch_response,
