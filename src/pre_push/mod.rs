@@ -35,10 +35,6 @@ mod legacy_remote;
 mod local;
 #[cfg_attr(not(test), expect(dead_code, reason = "the exact planner activates with its executor"))]
 mod plan;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "exact publication activates with the staged planner")
-)]
 mod publication;
 mod reconcile;
 #[cfg_attr(
@@ -139,6 +135,19 @@ impl GithubEndpoint {
         }
         None
     }
+
+    /// Validates that this API endpoint and Git destination identify the same
+    /// service boundary.
+    ///
+    /// A custom endpoint is an explicit test dependency and may accompany a
+    /// custom Git transport. The production endpoint accepts only Git's
+    /// built-in transports to the public GitHub service.
+    fn validate_destination(&self, destination: &PushDestination) -> Result<()> {
+        if self.custom_url().is_none() && !destination.supports_production_github() {
+            bail!("The selected Git destination is not hosted by the production GitHub endpoint");
+        }
+        Ok(())
+    }
 }
 
 pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<()> {
@@ -167,7 +176,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
 
     let configured_remote =
         repo.default_remote_name().wrap_err("Failed to read the configured GHerrit remote")?;
-    let destination = PushDestination::resolve(configured_remote)?;
+    let destination = PushDestination::resolve(repo, configured_remote)?;
     let git_default_branch = destination.observe_default_branch().await?;
     let commits = LocalStack::collect_captured(repo, &branch_name, head, &git_default_branch)
         .wrap_err("Failed to collect commits")?;
@@ -180,9 +189,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     if github_endpoint.is_disabled() {
         bail!("The GHerrit test driver cannot sync PRs without a configured GitHub endpoint");
     }
-    if github_endpoint.custom_url().is_none() && !destination.supports_production_github() {
-        bail!("The selected Git destination is not hosted by the production GitHub endpoint");
-    }
+    github_endpoint.validate_destination(&destination)?;
 
     let token = util::get_github_token()?;
     let mut builder = Octocrab::builder().personal_token(token);
@@ -210,7 +217,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     };
     ensure_pull_requests_open(prs.iter().map(|pr| (pr.number.get(), pr.state)))?;
 
-    let latest_versions = push_to_origin(repo.git_dir_identity(), &destination, &commits).await?;
+    let latest_versions = push_to_origin(&destination, &commits).await?;
     let public_branch = public_stack_branch(repo, &branch_name);
 
     let num_commits = commits.len();
@@ -231,7 +238,6 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
 
 #[allow(clippy::too_many_lines)]
 async fn push_to_origin(
-    git_dir: &util::GitDirIdentity,
     destination: &PushDestination,
     commits: &LocalStack,
 ) -> Result<HashMap<String, usize>> {
@@ -256,7 +262,7 @@ async fn push_to_origin(
 
         log::info!("Pushing chunk to remote...");
         let output = subprocess::output(
-            destination.push(git_dir, options, refspecs),
+            destination.push(options, refspecs),
             subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
         )
         .await
