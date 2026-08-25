@@ -39,22 +39,22 @@ This PR is on branch [feature/雪-and-markdown](../tree/feature/雪-and-markdown
 
 **Branch**
 ```bash
-git fetch origin refs/heads/Gmiddle && git checkout -b pr-Gmiddle FETCH_HEAD
+git fetch https://github.com/octo/widgets.git refs/heads/Gmiddle && git checkout -b pr-Gmiddle FETCH_HEAD
 ```
 
 **Checkout**
 ```bash
-git fetch origin refs/heads/Gmiddle && git checkout FETCH_HEAD
+git fetch https://github.com/octo/widgets.git refs/heads/Gmiddle && git checkout FETCH_HEAD
 ```
 
 **Cherry Pick**
 ```bash
-git fetch origin refs/heads/Gmiddle && git cherry-pick FETCH_HEAD
+git fetch https://github.com/octo/widgets.git refs/heads/Gmiddle && git cherry-pick FETCH_HEAD
 ```
 
 **Pull**
 ```bash
-git pull origin refs/heads/Gmiddle
+git pull https://github.com/octo/widgets.git refs/heads/Gmiddle
 ```
 
 </details>

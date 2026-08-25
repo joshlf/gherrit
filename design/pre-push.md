@@ -1339,6 +1339,12 @@ destination. Immediately after resolution, GHerrit validates the destination
 against the selected API endpoint, before initial remote observation or any
 empty-stack return.
 
+Pull request download commands name the destination repository through a
+canonical, credential-free `https://github.com/OWNER/REPOSITORY.git` URL. They
+do not name the configured local remote, whose fetch URL may identify a
+different repository, or reproduce the resolved destination literal, which
+may contain a private filesystem path or transport spelling.
+
 The production GitHub endpoint accepts only Git's `https` and `ssh` transports
 to `github.com`, including GitHub's SCP-style SSH syntax. GitHub supports pushes
 only over HTTPS and SSH; plain HTTP does not authenticate the service, and the
@@ -1418,6 +1424,16 @@ remote name and therefore remain effective without copying. Helpers and
 commands are trusted extensions: GHerrit cannot recognize or redact an
 arbitrary bare secret which they choose to print. GHerrit does not attempt an
 authentication-preserving environment allowlist.
+
+On Unix, each destination-bound command remains in its isolated owned process
+group for descendant cleanup. When GHerrit's process group owns a controlling
+terminal, GHerrit serializes access to that terminal, makes the command's group
+the foreground group, and restores its own group after normal completion,
+failure, timeout, cancellation, or unwinding. The hand-off permits Git, SSH,
+and credential helpers to open `/dev/tty` without being stopped by `SIGTTIN`.
+Restoration blocks `SIGTTOU` only in the worker thread which changes foreground
+ownership. If GHerrit is already a background job or has no controlling
+terminal, it does not take foreground authority from another job.
 
 Every network command is bounded by output, execution, and cleanup deadlines.
 Failures include bounded terminal-safe diagnostics which redact the private

@@ -87,6 +87,15 @@ impl GitOperation {
     }
 }
 
+fn fallible_operation(args: &[String]) -> Option<GitOperation> {
+    let operation = subcommand(args).and_then(GitOperation::from_subcommand)?;
+    // `ls-remote --get-url` only asks Git to resolve configuration; it does
+    // not contact the remote. A simulated remote-operation failure therefore
+    // belongs to the first network-bearing `ls-remote`, not this local probe.
+    (operation != GitOperation::LsRemote || !args.iter().any(|argument| argument == "--get-url"))
+        .then_some(operation)
+}
+
 fn check_and_apply_failure(
     mock_state: &mut MockState,
     operation: GitOperation,
@@ -106,14 +115,25 @@ fn check_and_apply_failure(
 
 /// Returns the subcommand from the command shape emitted by GHerrit.
 ///
-/// The harness recognizes the one global option required by production, but
-/// intentionally does not emulate Git's general global-option grammar. Direct
-/// fixture commands still use the ordinary `git <subcommand>` shape.
+/// The harness recognizes the small global-option grammar emitted by
+/// production, but intentionally does not emulate Git's general option
+/// grammar. Direct fixture commands still use the ordinary `git <subcommand>`
+/// shape.
 fn subcommand(args: &[String]) -> Option<&str> {
-    match args.get(1).map(String::as_str) {
-        Some("--no-replace-objects") => args.get(2).map(String::as_str),
-        Some(argument) if !argument.starts_with('-') => Some(argument),
-        Some(_) | None => None,
+    let mut arguments = args.iter().skip(1).map(String::as_str);
+    if arguments.next()? != "--no-replace-objects" {
+        return args.get(1).map(String::as_str).filter(|argument| !argument.starts_with('-'));
+    }
+
+    loop {
+        match arguments.next()? {
+            "-c" => {
+                arguments.next()?;
+            }
+            argument if argument.starts_with("--config-env=") => {}
+            subcommand if !subcommand.starts_with('-') => return Some(subcommand),
+            _ => return None,
+        }
     }
 }
 
@@ -124,7 +144,7 @@ async fn handle_git(
     let subcommand = subcommand(&request.args);
     let is_push = subcommand == Some("push");
 
-    let failure = subcommand.and_then(GitOperation::from_subcommand).and_then(|operation| {
+    let failure = fallible_operation(&request.args).and_then(|operation| {
         check_and_apply_failure(&mut handler.shared.write().unwrap(), operation)
     });
     if let Some(operation) = failure {
@@ -201,6 +221,25 @@ mod tests {
             subcommand(&args(&["git", "--no-replace-objects", "push", "origin"])),
             Some("push")
         );
+        assert_eq!(
+            subcommand(&args(&[
+                "git",
+                "--no-replace-objects",
+                "--config-env=remote.gherrit-publication.url=GHERRIT_REMOTE_URL",
+                "--config-env=remote.gherrit-publication.pushurl=GHERRIT_REMOTE_URL",
+                "-c",
+                "http.followRedirects=false",
+                "-c",
+                "push.followTags=false",
+                "-c",
+                "push.recurseSubmodules=no",
+                "-c",
+                "push.pushOption=",
+                "push",
+                "gherrit-publication",
+            ])),
+            Some("push")
+        );
         assert_eq!(subcommand(&args(&["git", "ls-remote", "origin"])), Some("ls-remote"));
         assert_eq!(subcommand(&args(&["git"])), None);
         assert_eq!(subcommand(&args(&["git", "--version"])), None);
@@ -223,6 +262,30 @@ mod tests {
         ] {
             assert_eq!(GitOperation::from_subcommand(subcommand), expected);
         }
+
+        assert_eq!(
+            fallible_operation(&args(&[
+                "git",
+                "--no-replace-objects",
+                "ls-remote",
+                "--get-url",
+                "--",
+                "gherrit-publication",
+            ])),
+            None
+        );
+        assert_eq!(
+            fallible_operation(&args(&[
+                "git",
+                "--no-replace-objects",
+                "ls-remote",
+                "--symref",
+                "--",
+                "gherrit-publication",
+                "HEAD",
+            ])),
+            Some(GitOperation::LsRemote)
+        );
     }
 
     #[test]

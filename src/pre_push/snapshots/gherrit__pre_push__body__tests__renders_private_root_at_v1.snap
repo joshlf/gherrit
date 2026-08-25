@@ -23,22 +23,22 @@ Explain why the widgets matter.
 
 **Branch**
 ```bash
-git fetch origin refs/heads/Groot && git checkout -b pr-Groot FETCH_HEAD
+git fetch https://github.com/octo/widgets.git refs/heads/Groot && git checkout -b pr-Groot FETCH_HEAD
 ```
 
 **Checkout**
 ```bash
-git fetch origin refs/heads/Groot && git checkout FETCH_HEAD
+git fetch https://github.com/octo/widgets.git refs/heads/Groot && git checkout FETCH_HEAD
 ```
 
 **Cherry Pick**
 ```bash
-git fetch origin refs/heads/Groot && git cherry-pick FETCH_HEAD
+git fetch https://github.com/octo/widgets.git refs/heads/Groot && git cherry-pick FETCH_HEAD
 ```
 
 **Pull**
 ```bash
-git pull origin refs/heads/Groot
+git pull https://github.com/octo/widgets.git refs/heads/Groot
 ```
 
 </details>
