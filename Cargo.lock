@@ -1074,6 +1074,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "data-encoding",
+ "dunce",
  "env_logger",
  "eyre",
  "fastrand",
@@ -1087,12 +1088,12 @@ dependencies = [
  "predicates",
  "rand 0.9.2",
  "rayon",
- "regex",
  "serde",
  "serde_json",
  "tempfile",
  "testutil",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

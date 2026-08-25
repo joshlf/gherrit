@@ -181,6 +181,131 @@ fn test_manage_toggle_visibility() {
     ctx.assert_config("branch.visibility-feature.pushRemote", Some("."));
 }
 
+fn configure_branch(
+    ctx: &testutil::TestContext,
+    branch: &str,
+    state: Option<&str>,
+    push_remote: Option<&str>,
+    remote: Option<&str>,
+    merge: Option<&str>,
+) {
+    let key = |suffix: &str| format!("branch.{branch}.{suffix}");
+    ctx.set_config(&key("gherritManaged"), state);
+    ctx.set_config(&key("pushRemote"), push_remote);
+    ctx.set_config(&key("remote"), remote);
+    ctx.set_config(&key("merge"), merge);
+}
+
+fn assert_branch_config(
+    ctx: &testutil::TestContext,
+    branch: &str,
+    state: Option<&str>,
+    push_remote: Option<&str>,
+    remote: Option<&str>,
+    merge: Option<&str>,
+) {
+    let key = |suffix: &str| format!("branch.{branch}.{suffix}");
+    ctx.assert_config(&key("gherritManaged"), state);
+    ctx.assert_config(&key("pushRemote"), push_remote);
+    ctx.assert_config(&key("remote"), remote);
+    ctx.assert_config(&key("merge"), merge);
+}
+
+#[test]
+fn private_management_does_not_read_invalid_remote_configuration() {
+    ["empty", "repeated"].into_iter().for_each(|case| {
+        let ctx = testutil::test_context!().build();
+        let branch = format!("private-invalid-{case}-remote");
+        let merge = format!("refs/heads/{branch}");
+        ctx.checkout_new(&branch);
+        match case {
+            "empty" => ctx.set_config("gherrit.remote", Some("")),
+            "repeated" => {
+                ctx.set_config("gherrit.remote", Some("first"));
+                ctx.run_git(&["config", "--add", "gherrit.remote", "second"]);
+            }
+            _ => unreachable!(),
+        }
+
+        ctx.manage_cmd().arg("--private").assert().success();
+        assert_branch_config(
+            &ctx,
+            &branch,
+            Some(testutil::MANAGED_PRIVATE),
+            Some("."),
+            Some("."),
+            Some(&merge),
+        );
+
+        ctx.set_config(&format!("branch.{branch}.pushRemote"), Some("drifted"));
+        ctx.manage_cmd().args(["--private", "--force"]).assert().success();
+        assert_branch_config(
+            &ctx,
+            &branch,
+            Some(testutil::MANAGED_PRIVATE),
+            Some("."),
+            Some("."),
+            Some(&merge),
+        );
+    });
+}
+
+#[test]
+fn current_private_cleanup_does_not_read_invalid_remote_configuration() {
+    ["empty", "repeated"].into_iter().for_each(|case| {
+        let ctx = testutil::test_context!().build();
+        let branch = format!("private-invalid-{case}-remote");
+        let merge = format!("refs/heads/{branch}");
+        ctx.checkout_new(&branch);
+        configure_branch(
+            &ctx,
+            &branch,
+            Some(testutil::MANAGED_PRIVATE),
+            Some("."),
+            Some("."),
+            Some(&merge),
+        );
+        match case {
+            "empty" => ctx.set_config("gherrit.remote", Some("")),
+            "repeated" => {
+                ctx.set_config("gherrit.remote", Some("first"));
+                ctx.run_git(&["config", "--add", "gherrit.remote", "second"]);
+            }
+            _ => unreachable!(),
+        }
+
+        ctx.unmanage_cmd().assert().success();
+        assert_branch_config(&ctx, &branch, Some("false"), None, None, None);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn current_private_cleanup_does_not_read_non_utf8_remote_configuration() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let ctx = testutil::test_context!().build();
+    let branch = "private-non-utf8-remote";
+    let merge = format!("refs/heads/{branch}");
+    ctx.checkout_new(branch);
+    configure_branch(
+        &ctx,
+        branch,
+        Some(testutil::MANAGED_PRIVATE),
+        Some("."),
+        Some("."),
+        Some(&merge),
+    );
+    ctx.git_cmd()
+        .args(["config", "--add", "gherrit.remote"])
+        .arg(std::ffi::OsStr::from_bytes(b"\xff"))
+        .assert()
+        .success();
+
+    ctx.unmanage_cmd().assert().success();
+    assert_branch_config(&ctx, branch, Some("false"), None, None, None);
+}
+
 #[test]
 fn test_manage_mutually_exclusive_flags() {
     let ctx = testutil::test_context!().build();
@@ -192,6 +317,33 @@ fn test_manage_mutually_exclusive_flags() {
         ctx.gherrit_cmd().args(["manage", "--public", "--private"]),
         "manage_mutually_exclusive",
     );
+}
+
+#[test]
+fn forced_public_cleanup_does_not_require_a_parseable_remote() {
+    for requested in ["private", "unmanaged"] {
+        let ctx = testutil::test_context!().build();
+        let branch = format!("forced-public-{requested}");
+        let merge = format!("refs/heads/{branch}");
+        ctx.checkout_new(&branch);
+        ctx.set_config(&format!("branch.{branch}.gherritManaged"), Some(testutil::MANAGED_PUBLIC));
+        ctx.set_config(&format!("branch.{branch}.pushRemote"), Some("drifted"));
+        ctx.set_config(&format!("branch.{branch}.remote"), Some("."));
+        ctx.set_config(&format!("branch.{branch}.merge"), Some(&merge));
+        ctx.set_config("gherrit.remote", Some("first"));
+        ctx.run_git(&["config", "--add", "gherrit.remote", "second"]);
+
+        let mut command =
+            if requested == "private" { ctx.manage_cmd() } else { ctx.unmanage_cmd() };
+        if requested == "private" {
+            command.arg("--private");
+        }
+        command.arg("--force").assert().success();
+        ctx.assert_config(
+            &format!("branch.{branch}.gherritManaged"),
+            Some(if requested == "private" { testutil::MANAGED_PRIVATE } else { "false" }),
+        );
+    }
 }
 
 #[test]
