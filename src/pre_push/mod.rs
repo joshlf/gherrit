@@ -1,43 +1,82 @@
-use std::{collections::HashMap, process::Stdio, time::Duration};
+use std::{collections::HashMap, env, ffi::OsStr, time::Duration};
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
-use gix::{reference::Category, refs::transaction::PreviousValue};
+use gix::reference::Category;
 use octocrab::Octocrab;
 use owo_colors::OwoColorize;
 
-use crate::{
-    re,
-    util::{self, HeadState},
-};
+use crate::util::{self, HeadState};
 
 mod autosquash;
 mod batching;
 mod body;
+mod destination;
 mod github;
 mod local;
 mod publication;
 mod reconcile;
 mod remote;
+mod subprocess;
 
 use batching::{
     BatchPlan, INITIAL_QUERY_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
     classify_response, query_exceeds_limit,
 };
 use body::PrBody;
+use destination::{DefaultBranch, PushDestination};
 use github::{
     CreatePullRequest, CreatedPullRequest, FindPullRequest, MutationOperation,
     PullRequest as PrState, PullRequestNodeId, PullRequestNumber, QueryOperation,
-    RepositoryIdQuery, UpdatePullRequest, decode_mutation_batch_response,
+    Repository as GithubRepository, UpdatePullRequest, decode_mutation_batch_response,
     decode_query_batch_response, prepare_mutation_batches, query_batch_document,
 };
 use local::LocalStack;
-use publication::{PushTarget, plan_push, push_batches};
+use publication::{plan_change, plan_push, push_batches};
 use reconcile::{
     CurrentPr, DesiredPr, PullRequestState, ensure_pull_requests_open, link_stack, plan_update,
 };
-use remote::observe_managed_branches;
+use remote::observe_publications;
 
 const INDETERMINATE_GRAPHQL_MUTATION: &str = "GraphQL mutation acknowledgement is indeterminate; stop this publication attempt and retry the push to reobserve GitHub state";
+const INTERNAL_PRE_PUSH_GIT_DIR_ENV: &str = "GHERRIT_INTERNAL_PRE_PUSH_GIT_DIR";
+const INTERNAL_PRE_PUSH_REMOTE_ENV: &str = "GHERRIT_INTERNAL_PRE_PUSH_REMOTE";
+
+/// Returns whether Git invoked this hook for a push started by GHerrit.
+///
+/// This marker is cooperative recursion control, not a private value or a
+/// security boundary. Binding it to the exact per-worktree Git directory and
+/// Git's remote-name argument prevents an inherited marker from disabling
+/// GHerrit for an unrelated nested push.
+pub(crate) fn is_internal_publication_push(
+    repository: &util::Repo,
+    remote_name: Option<&str>,
+    remote_location: Option<&str>,
+) -> bool {
+    internal_publication_push_matches(
+        repository.git_dir_identity().as_os_str(),
+        remote_name,
+        remote_location,
+        env::var_os(INTERNAL_PRE_PUSH_REMOTE_ENV).as_deref(),
+        env::var_os(INTERNAL_PRE_PUSH_GIT_DIR_ENV).as_deref(),
+    )
+}
+
+fn internal_publication_push_matches(
+    git_dir: &OsStr,
+    remote_name: Option<&str>,
+    remote_location: Option<&str>,
+    remote_marker: Option<&OsStr>,
+    git_dir_marker: Option<&OsStr>,
+) -> bool {
+    matches!(
+        (remote_name, remote_location, remote_marker, git_dir_marker),
+        (Some(remote_name), Some(remote_location), Some(remote_marker), Some(git_dir_marker))
+            if !remote_name.is_empty()
+                && !remote_location.is_empty()
+                && remote_marker == OsStr::new(remote_name)
+                && git_dir_marker == git_dir
+    )
+}
 
 #[derive(Eq, PartialEq)]
 pub(crate) enum GithubEndpoint {
@@ -86,7 +125,12 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
         true => log::info!("Branch {} is MANAGED. Syncing stack...", branch_name.yellow()),
     }
 
-    let commits = LocalStack::collect(repo).wrap_err("Failed to collect commits")?;
+    let configured_remote =
+        repo.default_remote_name().wrap_err("Failed to read the configured GHerrit remote")?;
+    let destination = PushDestination::resolve(configured_remote)?;
+    let git_default_branch = destination.observe_default_branch().await?;
+    let commits =
+        LocalStack::collect(repo, &git_default_branch).wrap_err("Failed to collect commits")?;
 
     if commits.is_empty() {
         log::info!("No commits to sync.");
@@ -112,142 +156,87 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
 
     let gherrit_ids =
         commits.iter().map(|commit| commit.id().as_str().to_owned()).collect::<Vec<_>>();
-    let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
+    let GithubRepositoryState { repository, pull_requests: prs } =
+        batch_fetch_prs(&octocrab, &destination, &gherrit_ids).await?;
+    let repository = GithubRepository {
+        node_id: repository.node_id,
+        default_branch: DefaultBranch::agree(git_default_branch, repository.default_branch)?,
+    };
     ensure_pull_requests_open(prs.iter().map(|pr| (pr.number.get(), pr.state)))?;
 
-    let latest_versions = push_to_origin(repo, &commits)?;
-    let default_branch = repo.find_default_branch_on_default_remote();
+    let latest_versions = push_to_origin(repo.git_dir_identity(), &destination, &commits).await?;
+    let public_branch = public_stack_branch(repo, branch_name);
 
     let num_commits = commits.len();
-    sync_prs(repo, &octocrab, branch_name, &default_branch, &commits, latest_versions, prs).await?;
+    sync_prs(
+        &octocrab,
+        &destination,
+        &repository,
+        public_branch.as_deref(),
+        &commits,
+        latest_versions,
+        prs,
+    )
+    .await?;
 
     log::info!("Successfully synced {num_commits} commits.");
     Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
-fn push_to_origin(repo: &util::Repo, commits: &LocalStack) -> Result<HashMap<String, usize>> {
+async fn push_to_origin(
+    git_dir: &util::GitDirIdentity,
+    destination: &PushDestination,
+    commits: &LocalStack,
+) -> Result<HashMap<String, usize>> {
     let gherrit_ids =
         commits.iter().map(|commit| commit.id().as_str().to_owned()).collect::<Vec<_>>();
+    let observed = observe_publications(destination, &gherrit_ids).await?;
 
-    // Fetch remote branch states to ensure we don't act on stale information.
-    let remote_branch_states = observe_managed_branches(repo, &gherrit_ids)?;
+    // Plan every change before the first write. In particular, a later
+    // exhausted version history must not be discovered after an earlier push.
+    let mut latest_versions = HashMap::with_capacity(commits.len());
+    let mut targets = Vec::with_capacity(commits.len());
+    for (change, observed) in commits.iter().zip(observed) {
+        let (version, target) =
+            plan_change(change.head(), change.id().as_str(), observed)?.into_parts();
+        latest_versions.insert(change.id().as_str().to_owned(), version);
+        targets.extend(target);
+    }
 
-    let mut next_versions = HashMap::new();
-
-    for chunk in push_batches(commits.as_slice()) {
-        let mut targets = Vec::with_capacity(chunk.len());
-
-        for c in chunk {
-            // Determine the next version based on local tags (Optimistic
-            // Locking).
-            let local_max = get_local_version(repo, c.id().as_str()).unwrap_or(0);
-            let next_ver = local_max + 1;
-            next_versions.insert(c.id().as_str().to_owned(), next_ver);
-
-            // Lease the branch to ensure it hasn't changed since our fetch.
-            // If we know the remote SHA, we expect it. If we don't (None), we
-            // expect "" (creation).
-            let expected_sha =
-                remote_branch_states.get(c.id().as_str()).map(String::as_str).unwrap_or("");
-
-            targets.push(PushTarget {
-                object_id: c.head(),
-                gherrit_id: c.id().as_str(),
-                version: next_ver,
-                expected_remote_sha: expected_sha,
-            });
-        }
-
-        let plan = plan_push(&repo.default_remote_name(), &targets);
+    for chunk in push_batches(&targets) {
+        let plan = plan_push(chunk);
+        let publication::PushPlan { options, refspecs } = plan;
 
         log::info!("Pushing chunk to remote...");
-        let mut child = util::cmd("git", plan.arguments)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::piped())
-            .spawn()
-            .wrap_err("Failed to run `git push`")?;
-
-        // Filter output logic (elided for brevity, same as before)
-        {
-            use std::io::{BufRead, BufReader};
-            let stderr = child.stderr.take().unwrap();
-            let reader = BufReader::new(stderr);
-            let mut remote_buffer: Vec<String> = Vec::new();
-            let flush_buffer = |buf: &mut Vec<String>| {
-                if buf.is_empty() {
-                    return;
-                }
-                let block = buf.join("\n");
-                let re = re!(
-                    r"(?m)\n?^remote:\s*\nremote: Create a pull request for '.*' on GitHub by visiting:\s*\nremote:\s*https://github\.com/.*\nremote:\s*$"
+        let output = subprocess::output(
+            destination.push(git_dir, options, refspecs),
+            subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
+        )
+        .await
+        .wrap_err("Failed to run `git push`")?;
+        if !output.status().success() {
+            let message = format!(
+                "`git push` failed for GHerrit remote '{}'. Its outcome is indeterminate; retry the push to reobserve remote state.",
+                destination.configured_remote()
+            );
+            if let Some(diagnostic) = output.child_diagnostic(destination) {
+                bail!(
+                    "{message}\n\nInternal push diagnostic (untrusted and not publication evidence):\n{diagnostic}"
                 );
-                let cleaned = re.replace(&block, "");
-                if !cleaned.is_empty() {
-                    eprintln!("{}", cleaned);
-                }
-                buf.clear();
-            };
-            for line in reader.lines() {
-                let line = line.unwrap();
-                if line.trim_start().starts_with("remote:") {
-                    remote_buffer.push(line);
-                } else {
-                    flush_buffer(&mut remote_buffer);
-                    eprintln!("{}", line);
-                }
             }
-            flush_buffer(&mut remote_buffer);
-        }
-
-        let status = child.wait().unwrap();
-        if !status.success() {
-            // If the push failed, it's likely due to a lease failure
-            // (concurrent modification). If failed, it might be due to the tag
-            // lock or branch lease.
-            let r = repo.default_remote_name();
-            bail!(
-                "`git push` failed. The remote might be ahead or changed. Run `git fetch {r}` to sync."
-            );
-        }
-
-        // Persist the local tags now that the push succeeded.
-        for tag in plan.persisted_tags {
-            let _ = repo.reference(
-                format!("refs/tags/gherrit/{}/v{}", tag.gherrit_id, tag.version),
-                tag.object_id,
-                PreviousValue::Any,
-                "gherrit: persist local version state",
-            );
+            bail!("{message}");
         }
     }
 
-    Ok(next_versions)
+    Ok(latest_versions)
 }
 
-fn get_local_version(repo: &util::Repo, gherrit_id: &str) -> Result<usize> {
-    let prefix = format!("refs/tags/gherrit/{}/v", gherrit_id);
-    let mut max_ver = 0;
-
-    // Use .all() and manual filtering to avoid `prefixed` API type issues.
-    let references = repo.references().map_err(|e| eyre!(e))?;
-
-    for reference in references.all().map_err(|e| eyre!(e))? {
-        let reference = reference.map_err(|e| eyre!(e))?;
-        let name = reference.name().as_bstr().to_string();
-
-        if name.starts_with(&prefix) {
-            // Parse "refs/tags/gherrit/<id>/v<ver>"
-            if let Some(ver_str) = name.rsplit('v').next()
-                && let Ok(ver) = ver_str.parse::<usize>()
-                && ver > max_ver
-            {
-                max_ver = ver;
-            }
-        }
-    }
-
-    Ok(max_ver)
+/// GitHub repository facts and pull requests read through the repository
+/// identity validated by the active push destination.
+struct GithubRepositoryState {
+    repository: GithubRepository,
+    pull_requests: Vec<PrState>,
 }
 
 /// Syncs the local stack of commits with GitHub Pull Requests.
@@ -257,17 +246,17 @@ fn get_local_version(repo: &util::Repo, gherrit_id: &str) -> Result<usize> {
 /// 2. Updates PR metadata (title, body, base branch) to match the local stack.
 /// 3. Updates are queued and executed in batches to optimize performance.
 async fn sync_prs(
-    repo: &util::Repo,
     octocrab: &Octocrab,
-    branch_name: &str,
-    base_branch: &str,
+    destination: &PushDestination,
+    repository: &GithubRepository,
+    public_branch: Option<&str>,
     commits: &LocalStack,
     latest_versions: HashMap<String, usize>,
     prs: Vec<PrState>,
 ) -> Result<()> {
-    let remote = repo.default_remote()?;
-
-    let commits = link_stack(base_branch, commits.iter(), |commit| commit.id().as_str().to_owned());
+    let commits = link_stack(repository.default_branch.name(), commits.iter(), |commit| {
+        commit.id().as_str().to_owned()
+    });
 
     enum PrResolution {
         Existing(PrState),
@@ -313,8 +302,7 @@ async fn sync_prs(
     let num_creations = creations.len();
     let new_prs = if !creations.is_empty() {
         log::info!("Creating {num_creations} PRs...");
-        let repo_id = fetch_repo_id(octocrab, &remote).await?;
-        let created = batch_create_prs(octocrab, &repo_id, creations).await?;
+        let created = batch_create_prs(octocrab, &repository.node_id, creations).await?;
         assert_eq!(created.len(), num_creations);
         log::info!("Created {num_creations} PRs.");
         created.into_iter().map(|created| (created.head_branch.clone(), created)).collect()
@@ -339,7 +327,7 @@ async fn sync_prs(
                     log::info!(
                         "Created PR #{}: {}",
                         created.number.green().bold(),
-                        remote.pr_url(created.number.get()).blue().underline()
+                        destination.pr_url(created.number.get()).blue().underline()
                     );
                     PrState {
                         number: created.number,
@@ -358,15 +346,7 @@ async fn sync_prs(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let public_branch = (!is_private_stack(repo, branch_name))
-        .then(|| {
-            let head_ref = repo.head().ok()?.try_into_referent()?;
-            let (cat, short_name) = head_ref.inner.name.category_and_short_name()?;
-            (cat == Category::LocalBranch).then(|| short_name.to_string())
-        })
-        .flatten();
-
-    let repo_url = remote.repo_url_relative();
+    let repo_url = destination.repo_url_relative();
     let stack_pr_numbers =
         commit_pr_states.iter().map(|(_, state)| state.number.get()).collect::<Vec<_>>();
     let updates = commit_pr_states
@@ -378,7 +358,7 @@ async fn sync_prs(
             let body = PrBody {
                 commit_body: c.body(),
                 repo_url: &repo_url,
-                public_branch: public_branch.as_deref(),
+                public_branch,
                 stack_pr_numbers: &stack_pr_numbers,
                 current_pr_number: pr_state.number.get(),
                 latest_version,
@@ -388,7 +368,7 @@ async fn sync_prs(
             .render();
 
             let pr_num = pr_state.number.green().bold().to_string();
-            let pr_url = remote.pr_url(pr_state.number.get()).blue().underline().to_string();
+            let pr_url = destination.pr_url(pr_state.number.get()).blue().underline().to_string();
 
             let update = plan_update(
                 CurrentPr {
@@ -425,6 +405,16 @@ async fn sync_prs(
     }
 
     Ok(())
+}
+
+fn public_stack_branch(repo: &util::Repo, branch_name: &str) -> Option<String> {
+    (!is_private_stack(repo, branch_name))
+        .then(|| {
+            let head_ref = repo.head().ok()?.try_into_referent()?;
+            let (cat, short_name) = head_ref.inner.name.category_and_short_name()?;
+            (cat == Category::LocalBranch).then(|| short_name.to_string())
+        })
+        .flatten()
 }
 
 fn is_private_stack(repo: &util::Repo, branch: &str) -> bool {
@@ -483,19 +473,6 @@ impl CreatedPullRequestIdentitySet {
     }
 }
 
-/// Fetches the global Repository Node ID for the given owner and repo.
-///
-/// This ID (e.g., "R_kgDOL...") is required for creating PRs via the GraphQL
-/// API, as the `createPullRequest` mutation accepts a `repositoryId` argument,
-/// not owner/name.
-async fn fetch_repo_id(octocrab: &Octocrab, remote: &util::Remote) -> Result<String> {
-    let query = RepositoryIdQuery::new(remote.owner.clone(), remote.repo_name.clone());
-    let request = query.request();
-    let response =
-        run_graphql_query(octocrab, &request).await.wrap_err("Failed to fetch repository ID")?;
-    query.decode(response)
-}
-
 /// Performs batched creation of PRs using GitHub's GraphQL API.
 ///
 /// This avoids rate limits and network latency by grouping creations into
@@ -526,19 +503,39 @@ async fn batch_create_prs(
 }
 
 async fn batch_fetch_prs(
-    repo: &util::Repo,
     octocrab: &Octocrab,
+    destination: &PushDestination,
     head_refs: &[String],
-) -> Result<Vec<PrState>> {
-    let remote = repo.default_remote()?;
-    let owner = remote.owner;
-    let repo_name = remote.repo_name;
-    let queries = head_refs
-        .iter()
-        .cloned()
-        .map(|head_ref| FindPullRequest::new(owner.clone(), repo_name.clone(), head_ref));
+) -> Result<GithubRepositoryState> {
+    let coordinates = destination.coordinates();
+    let queries = head_refs.iter().cloned().enumerate().map(|(index, head_ref)| {
+        if index == 0 {
+            FindPullRequest::with_repository(
+                coordinates.owner().to_owned(),
+                coordinates.repository().to_owned(),
+                head_ref,
+            )
+        } else {
+            FindPullRequest::new(
+                coordinates.owner().to_owned(),
+                coordinates.repository().to_owned(),
+                head_ref,
+            )
+        }
+    });
 
-    Ok(run_batched_queries(octocrab, queries).await?.into_iter().flatten().collect())
+    let mut repository = None;
+    let mut pull_requests = Vec::new();
+    for lookup in run_batched_queries(octocrab, queries).await? {
+        if let Some(observed) = lookup.repository
+            && repository.replace(observed).is_some()
+        {
+            bail!("GitHub returned repository facts more than once");
+        }
+        pull_requests.extend(lookup.pull_request);
+    }
+    let repository = repository.ok_or_else(|| eyre!("GitHub omitted the repository facts"))?;
+    Ok(GithubRepositoryState { repository, pull_requests })
 }
 
 /// Executes mutation batches without retrying after transmission.
@@ -1276,5 +1273,53 @@ mod tests {
             (0..MAX_MUTATION_ALIASES + PARTIAL_SECOND_BATCH_EFFECTS).collect::<Vec<_>>(),
             "acknowledged and ambiguous partial effects remain committed"
         );
+    }
+
+    #[test]
+    fn internal_push_marker_must_match_complete_hook_arguments() {
+        let git_dir = OsStr::new("/repository/.git/worktrees/current");
+        let remote_marker = OsStr::new("gherrit-publication-2");
+        let git_dir_marker = OsStr::new("/repository/.git/worktrees/current");
+
+        assert!(internal_publication_push_matches(
+            git_dir,
+            Some("gherrit-publication-2"),
+            Some("private-destination"),
+            Some(remote_marker),
+            Some(git_dir_marker),
+        ));
+        for (remote_name, remote_location, remote_marker, git_dir_marker) in [
+            (
+                Some("origin"),
+                Some("private-destination"),
+                Some(remote_marker),
+                Some(git_dir_marker),
+            ),
+            (Some("gherrit-publication-2"), Some(""), Some(remote_marker), Some(git_dir_marker)),
+            (Some(""), Some("private-destination"), Some(remote_marker), Some(git_dir_marker)),
+            (Some("gherrit-publication-2"), None, Some(remote_marker), Some(git_dir_marker)),
+            (None, Some("private-destination"), Some(remote_marker), Some(git_dir_marker)),
+            (
+                Some("gherrit-publication-2"),
+                Some("private-destination"),
+                None,
+                Some(git_dir_marker),
+            ),
+            (Some("gherrit-publication-2"), Some("private-destination"), Some(remote_marker), None),
+            (
+                Some("gherrit-publication-2"),
+                Some("private-destination"),
+                Some(remote_marker),
+                Some(OsStr::new("/repository/.git/worktrees/other")),
+            ),
+        ] {
+            assert!(!internal_publication_push_matches(
+                git_dir,
+                remote_name,
+                remote_location,
+                remote_marker,
+                git_dir_marker,
+            ));
+        }
     }
 }
