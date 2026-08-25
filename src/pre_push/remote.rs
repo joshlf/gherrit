@@ -1,21 +1,29 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    process::Stdio,
+};
 
 use color_eyre::eyre::{Context as _, Result, bail};
 use gix::ObjectId;
 
-use super::publication::remote_query_batches;
-use crate::util::{self, CommandExt as _};
+use super::{destination::PushDestination, publication::remote_query_batches};
 
 /// Observes the managed branches relevant to the current stack.
 pub(super) fn observe_managed_branches(
-    repo: &util::Repo,
+    destination: &PushDestination,
     gherrit_ids: &[String],
 ) -> Result<HashMap<String, String>> {
     remote_query_batches(gherrit_ids).try_fold(HashMap::new(), |mut states, chunk| {
-        let mut arguments = vec!["ls-remote".to_string(), repo.default_remote_name()];
-        arguments.extend(chunk.iter().map(|id| format!("refs/heads/{id}")));
-
-        let output = util::cmd("git", arguments).checked_output()?;
+        let refs = chunk.iter().map(|id| format!("refs/heads/{id}"));
+        let mut command = destination.ls_remote(["--quiet".to_owned()], refs);
+        let output =
+            command.stderr(Stdio::null()).output().wrap_err("Failed to run `git ls-remote`")?;
+        if !output.status.success() {
+            bail!(
+                "`git ls-remote` failed while observing managed branches for GHerrit remote '{}'",
+                destination.configured_remote()
+            );
+        }
 
         parse_managed_branches(&output.stdout, chunk)?.into_iter().try_for_each(
             |(id, object_id)| match states.entry(id) {

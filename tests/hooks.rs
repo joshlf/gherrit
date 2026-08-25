@@ -2,6 +2,21 @@ use std::fs;
 
 use predicates::prelude::*;
 
+fn install_composite_pre_push(ctx: &testutil::TestContext, body: &str) {
+    let hook = ctx.repo_path.join(".git/hooks/pre-push");
+    fs::write(
+        hook,
+        format!(
+            "#!/bin/sh\n\
+             set -eu\n\
+             printf 'enter:%s\\n' \"$1\" >> \"$GHERRIT_HOOK_LOG\"\n\
+             gherrit hook pre-push \"$@\"\n\
+             {body}\n"
+        ),
+    )
+    .unwrap();
+}
+
 #[test]
 fn installed_pre_push_projects_the_feature_commit() {
     let ctx = testutil::test_context!()
@@ -29,6 +44,76 @@ fn installed_pre_push_projects_the_feature_commit() {
     assert_eq!(prs.len(), 1);
     assert_eq!(prs[0].head, id);
     testutil::assert_pr_snapshot!(ctx, "installed_pre_push_pr_state");
+}
+
+#[test]
+fn internal_publication_preserves_composite_pre_push_checks() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .build();
+    let log = ctx.dir.path().join("pre-push.log");
+    install_composite_pre_push(&ctx, "printf 'policy:%s\\n' \"$1\" >> \"$GHERRIT_HOOK_LOG\"");
+
+    ctx.checkout_new("composite-boundary");
+    ctx.commit("Feature through composite hook");
+
+    ctx.git_cmd()
+        .env("GHERRIT_HOOK_LOG", &log)
+        .args(["push", "origin", "composite-boundary"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(log).unwrap(),
+        concat!(
+            "enter:origin\n",
+            "enter:gherrit-publication\n",
+            "policy:gherrit-publication\n",
+            "policy:origin\n",
+        )
+    );
+}
+
+#[test]
+fn independent_pre_push_check_can_reject_an_internal_publication() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .with_mock_github()
+        .build();
+    let log = ctx.dir.path().join("pre-push.log");
+    install_composite_pre_push(
+        &ctx,
+        "case \"$1\" in\n\
+         gherrit-publication*)\n\
+           printf 'independent policy rejected publication\\n' >&2\n\
+           exit 73\n\
+           ;;\n\
+         esac",
+    );
+
+    ctx.checkout_new("rejected-composite-boundary");
+    ctx.commit("Feature rejected by independent hook");
+    let id = ctx.gherrit_id("HEAD").unwrap();
+
+    let output = ctx
+        .git_cmd()
+        .env("GHERRIT_HOOK_LOG", &log)
+        .args(["push", "origin", "rejected-composite-boundary"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("independent policy rejected publication"));
+    assert!(stderr.contains("untrusted and not publication evidence"));
+    assert_eq!(fs::read_to_string(log).unwrap(), "enter:origin\nenter:gherrit-publication\n");
+    assert_eq!(ctx.remote_ref_oid(&format!("refs/heads/{id}")), None);
+    assert!(ctx.github().pull_requests().is_empty());
 }
 
 #[test]
