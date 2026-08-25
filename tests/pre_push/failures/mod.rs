@@ -248,6 +248,8 @@ fn test_default_branch_must_be_on_the_first_parent_stack_path() {
 
     ctx.run_git(&["checkout", "main"]);
     ctx.commit("Advance the default branch");
+    ctx.run_git(&["push", "--quiet", "--no-verify", "origin", "refs/heads/main:refs/heads/main"]);
+    let fixture_pushes = ctx.recorded_pushes();
     ctx.run_git(&["checkout", "first-parent"]);
     ctx.run_git(&["merge", "--no-ff", "main", "-m", "Merge the default branch"]);
 
@@ -257,7 +259,7 @@ fn test_default_branch_must_be_on_the_first_parent_stack_path() {
         .stderr(predicate::str::contains("does not descend from 'main' on its first-parent path"));
 
     assert!(ctx.github().requests().is_empty());
-    assert!(ctx.recorded_pushes().is_empty());
+    assert_eq!(ctx.recorded_pushes(), fixture_pushes);
 }
 
 #[test]
@@ -417,7 +419,7 @@ fn test_pre_push_ls_remote_failure() {
     assert_eq!(ctx.remote_refs("refs"), refs_before);
     assert!(ctx.recorded_pushes().is_empty());
     assert!(ctx.github().pull_requests().is_empty());
-    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]]);
+    assert!(ctx.github().requests().is_empty());
 }
 
 #[test]
@@ -458,7 +460,6 @@ fn test_pre_push_pr_list_retries_a_transient_http_failure() {
     assert_eq!(
         ctx.github().requests(),
         [
-            vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::CreatePr],
@@ -502,7 +503,6 @@ fn test_pre_push_pr_list_retries_a_response_transport_failure() {
         [
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::CreatePr],
             vec![testutil::GraphQlOperation::UpdatePr],
         ]
@@ -523,9 +523,9 @@ fn test_pre_push_pr_list_stops_after_three_response_transport_retries() {
 }
 
 #[test]
-fn test_repository_id_query_retries_a_transient_http_failure() {
-    let ctx = unpublished_managed_commit("feature-repository-id-transient");
-    ctx.inject_failure(testutil::FailureKind::RepositoryIdHttp(
+fn test_repository_facts_query_retries_a_transient_http_failure() {
+    let ctx = unpublished_managed_commit("feature-repository-facts-transient");
+    ctx.inject_failure(testutil::FailureKind::RepositoryFactsHttp(
         testutil::RetryableHttpStatus::TooManyRequests,
     ));
 
@@ -537,7 +537,6 @@ fn test_repository_id_query_retries_a_transient_http_failure() {
         [
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::CreatePr],
             vec![testutil::GraphQlOperation::UpdatePr],
         ]
@@ -546,24 +545,22 @@ fn test_repository_id_query_retries_a_transient_http_failure() {
 }
 
 #[test]
-fn test_repository_id_query_stops_after_three_transient_http_retries() {
-    let ctx = unpublished_managed_commit("feature-repository-id-retries-exhausted");
+fn test_repository_facts_query_stops_after_three_transient_http_retries() {
+    let ctx = unpublished_managed_commit("feature-repository-facts-retries-exhausted");
     (0..=3).for_each(|_| {
-        ctx.inject_failure(testutil::FailureKind::RepositoryIdHttp(
+        ctx.inject_failure(testutil::FailureKind::RepositoryFactsHttp(
             testutil::RetryableHttpStatus::ServiceUnavailable,
         ));
     });
 
-    ctx.gherrit_cmd()
-        .args(["hook", "pre-push"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Injected RepositoryIdHttp(ServiceUnavailable) failure"));
+    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().failure().stderr(
+        predicate::str::contains("Injected RepositoryFactsHttp(ServiceUnavailable) failure"),
+    );
 
     ctx.assert_failure_consumed();
-    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]; 5]);
+    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]; 4]);
     assert!(ctx.github().pull_requests().is_empty());
-    assert_eq!(ctx.recorded_pushes().iter().filter(|push| push.succeeded()).count(), 1);
+    assert!(ctx.recorded_pushes().is_empty());
 }
 
 #[test]
@@ -588,11 +585,7 @@ fn test_pre_push_pr_create_failure() {
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),
-        [
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::CreatePr],
-        ],
+        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::CreatePr],],
         "an indeterminate create response must stop without replay or continuation"
     );
     assert!(ctx.github().pull_requests().is_empty());
@@ -622,11 +615,7 @@ fn test_pre_push_pr_create_service_unavailable_is_not_replayed() {
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),
-        [
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::CreatePr],
-        ],
+        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::CreatePr],],
         "a retryable HTTP response must not replay a mutation request"
     );
     assert!(ctx.github().pull_requests().is_empty());
