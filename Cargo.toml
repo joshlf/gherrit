@@ -33,6 +33,7 @@ clap = { version = "4.5.53", features = ["derive"] }
 eyre = "0.6"
 color-eyre = "0.6"
 owo-colors = "4.2"
+percent-encoding = "2.3.2"
 # Octocrab's default retry and redirect middleware can replay mutation POSTs.
 # Keep features explicit because GHerrit sends each mutation request at most
 # once.
