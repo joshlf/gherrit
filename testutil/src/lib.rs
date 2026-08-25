@@ -476,7 +476,7 @@ pub enum FailureKind {
     GraphQl,
     QueryTransport,
     QueryHttp(RetryableHttpStatus),
-    RepositoryIdHttp(RetryableHttpStatus),
+    RepositoryFactsHttp(RetryableHttpStatus),
     CreatePr,
     CreatePrHttp(RetryableHttpStatus),
     SecondCreatePrHttp(RetryableHttpStatus),
@@ -589,6 +589,13 @@ impl MockGithub<'_> {
 
     pub fn redirect_trap_requests(&self) -> usize {
         self.context.inspect_mock_state(|state| state.graphql_redirect_trap_requests)
+    }
+
+    /// Overrides GitHub's view of the default branch without changing Git.
+    pub fn set_default_branch(&self, name: &str, object_id: &str) {
+        self.context.mutate_mock_state(|state| {
+            state.github_default_branch = Some((name.to_owned(), object_id.to_owned()));
+        });
     }
 
     pub fn seed_pull_request(&self, seed: PullRequestSeed) {

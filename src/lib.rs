@@ -105,6 +105,15 @@ enum HookCommands {
 /// hooks, parse process arguments, terminate the process, or create a nested
 /// async runtime. Standalone binaries own those policies.
 pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
+    if let Commands::Hook(HookCommands::PrePush { remote_name, remote_location }) = &cli.command
+        && pre_push::is_internal_publication_push(
+            remote_name.as_deref(),
+            remote_location.as_deref(),
+        )
+    {
+        return Ok(());
+    }
+
     let repo = util::Repo::open(".").wrap_err("Failed to open repo")?;
 
     match cli.command {
