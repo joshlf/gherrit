@@ -1,0 +1,932 @@
+use gix::ObjectId;
+
+use super::*;
+use crate::pre_push::{
+    destination::RepositoryCoordinates,
+    github::{AbsentPullRequest, ObservedBase},
+    history::{ObservedPullRequestMarker, ValidatedChangeHistory},
+    local::{GherritPrId, LocalStack},
+};
+
+const DEFAULT_NAME: &str = "main";
+
+fn oid(value: u16) -> ObjectId {
+    let mut bytes = [0_u8; 20];
+    bytes[18..].copy_from_slice(&value.to_be_bytes());
+    if value == 0 {
+        bytes[17] = 1;
+    }
+    ObjectId::from_bytes_or_panic(&bytes)
+}
+
+fn id(value: &str) -> GherritPrId {
+    GherritPrId::from_ref_component(value.as_bytes()).expect("valid test change ID")
+}
+
+fn identity(number: u32, node: &str) -> PullRequestIdentity {
+    PullRequestIdentity::for_plan_test(number, node)
+}
+
+fn default_branch(name: &str, tip: ObjectId) -> DefaultBranch {
+    DefaultBranch::new(name.to_owned(), tip).expect("valid test default branch")
+}
+
+fn validated_history(
+    id: GherritPrId,
+    published: &[(ObjectId, ObjectId)],
+    proposal: (ObjectId, ObjectId),
+    has_pull_request_marker: bool,
+) -> ValidatedChangeHistory {
+    let marker = has_pull_request_marker.then(|| {
+        let v1 = published.first().expect("a marked test history must have v1").0;
+        ObservedPullRequestMarker::for_plan_test(v1)
+    });
+    ValidatedChangeHistory::for_plan_test(id, published, proposal, marker)
+}
+
+#[derive(Clone)]
+struct HistorySpec {
+    published: Vec<(ObjectId, ObjectId)>,
+    marker: bool,
+}
+
+impl HistorySpec {
+    fn absent() -> Self {
+        Self { published: Vec::new(), marker: false }
+    }
+
+    fn current(head: ObjectId, first_parent: ObjectId, marker: bool) -> Self {
+        Self { published: vec![(head, first_parent)], marker }
+    }
+}
+
+#[derive(Clone)]
+enum PullRequestSpec {
+    Absent,
+    Open(OpenSpec),
+}
+
+#[derive(Clone)]
+struct OpenSpec {
+    number: u32,
+    node: String,
+    head: ObjectId,
+    base_kind: BaseKind,
+    base: ObjectId,
+    title: Option<String>,
+    body: Option<String>,
+    is_draft: bool,
+    landing_automation: bool,
+}
+
+impl OpenSpec {
+    fn new(number: u32, head: ObjectId, base_kind: BaseKind, base: ObjectId) -> Self {
+        Self {
+            number,
+            node: format!("PR_{number}"),
+            head,
+            base_kind,
+            base,
+            title: None,
+            body: None,
+            is_draft: true,
+            landing_automation: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EntrySpec {
+    id: &'static str,
+    history: HistorySpec,
+    pull_request: PullRequestSpec,
+}
+
+struct Inputs {
+    destination: PushDestination,
+    stack: LocalStack,
+    histories: Box<[ValidatedChangeHistory]>,
+    pull_requests: CompleteLocalPullRequests,
+}
+
+fn inputs(specs: &[EntrySpec]) -> Inputs {
+    inputs_with_repository(specs, "owner", "repo", DEFAULT_NAME, oid(10))
+}
+
+fn inputs_with_repository(
+    specs: &[EntrySpec],
+    owner: &str,
+    repository: &str,
+    github_default_name: &str,
+    github_default_tip: ObjectId,
+) -> Inputs {
+    assert!(!specs.is_empty());
+    let destination = PushDestination::for_test();
+    let local_default = default_branch(DEFAULT_NAME, oid(10));
+    let mut parent = local_default.tip();
+    let local = specs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let head = oid(20 + u16::try_from(index).unwrap());
+            let entry = (id(spec.id), head, parent, desired_title(spec.id), desired_body(spec.id));
+            parent = head;
+            entry
+        })
+        .collect::<Vec<_>>();
+    let stack = LocalStack::for_plan_test(local_default, local.clone());
+    let histories = specs
+        .iter()
+        .zip(&local)
+        .map(|(spec, (change_id, head, first_parent, _, _))| {
+            validated_history(
+                change_id.clone(),
+                &spec.history.published,
+                (*head, *first_parent),
+                spec.history.marker,
+            )
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let observations = specs
+        .iter()
+        .map(|spec| match &spec.pull_request {
+            PullRequestSpec::Absent => {
+                LocalPullRequestObservation::Absent(AbsentPullRequest::for_plan_test(id(spec.id)))
+            }
+            PullRequestSpec::Open(open) => {
+                let title = open.title.clone().unwrap_or_else(|| desired_title(spec.id));
+                let body = open.body.clone().unwrap_or_else(|| desired_body(spec.id));
+                LocalPullRequestObservation::Open(ManagedOpenPullRequest::for_plan_test(
+                    id(spec.id),
+                    identity(open.number, &open.node),
+                    open.head,
+                    ObservedBase::for_plan_test(open.base_kind, open.base),
+                    &title,
+                    &body,
+                    open.is_draft,
+                    open.landing_automation,
+                ))
+            }
+        })
+        .collect();
+    let pull_requests = CompleteLocalPullRequests::for_plan_test(
+        RepositoryCoordinates::for_test(owner, repository),
+        default_branch(github_default_name, github_default_tip),
+        observations,
+        &[],
+    )
+    .unwrap();
+    Inputs { destination, stack, histories, pull_requests }
+}
+
+fn desired_title(change_id: &str) -> String {
+    format!("Title for {}", content_key(change_id))
+}
+
+fn desired_body(change_id: &str) -> String {
+    let key = content_key(change_id);
+    format!("Body for {key}.\n\nSecond paragraph for {key}.")
+}
+
+fn content_key(change_id: &str) -> &str {
+    &change_id[..change_id.len().min(32)]
+}
+
+fn plan(specs: &[EntrySpec]) -> Result<PublicationPlan> {
+    plan_with_public_branch(specs, None)
+}
+
+fn plan_with_public_branch(
+    specs: &[EntrySpec],
+    public_branch: Option<String>,
+) -> Result<PublicationPlan> {
+    let Inputs { destination, stack, histories, pull_requests } = inputs(specs);
+    plan_publication(&destination, public_branch, stack, histories, pull_requests)
+}
+
+fn tuple_count(pushes: &PreparedPushes) -> usize {
+    let refs = pushes.batches().map(|batch| batch.refspecs().len()).sum::<usize>();
+    assert_eq!(refs % 3, 0);
+    refs / 3
+}
+
+fn marker_destinations(pushes: &PreparedPushes) -> Vec<String> {
+    marker_refspecs(pushes)
+        .into_iter()
+        .map(|refspec| refspec.split_once(':').unwrap().1.to_owned())
+        .collect()
+}
+
+fn marker_refspecs(pushes: &PreparedPushes) -> Vec<String> {
+    pushes.batches().flat_map(|batch| batch.refspecs()).map(str::to_owned).collect()
+}
+
+fn tuple_for_test(history: &ValidatedChangeHistory) -> Option<Result<TupleTransition>> {
+    tuple_transition(history, publication_revision(history.proposed()).unwrap())
+}
+
+fn ready(plan: PublicationPlan) -> MarkerStage {
+    match plan.after_tuples {
+        AfterTuples::Ready(stage) => stage,
+        AfterTuples::Creates(_) => panic!("expected an all-existing projection"),
+    }
+}
+
+fn creates(plan: PublicationPlan) -> CreateStage {
+    match plan.after_tuples {
+        AfterTuples::Creates(stage) => *stage,
+        AfterTuples::Ready(_) => panic!("expected a create-dependent projection"),
+    }
+}
+
+fn receipts(values: &[(&str, u32, &str)]) -> CompleteCreateReceipts {
+    CompleteCreateReceipts::for_plan_test(
+        values
+            .iter()
+            .map(|(change_id, number, node)| (id(change_id), identity(*number, node)))
+            .collect(),
+    )
+}
+
+fn current_open(
+    change_id: &'static str,
+    proposal_head: ObjectId,
+    proposal_parent: ObjectId,
+    marker: bool,
+    number: u32,
+    base_kind: BaseKind,
+    base: ObjectId,
+) -> EntrySpec {
+    EntrySpec {
+        id: change_id,
+        history: HistorySpec::current(proposal_head, proposal_parent, marker),
+        pull_request: PullRequestSpec::Open(OpenSpec::new(number, proposal_head, base_kind, base)),
+    }
+}
+
+fn single_desired_body() -> String {
+    let destination = PushDestination::for_test();
+    let default = default_branch(DEFAULT_NAME, oid(10));
+    let stack = LocalStack::for_plan_test(
+        default,
+        [(id("Gone"), oid(20), oid(10), desired_title("Gone"), desired_body("Gone"))],
+    );
+    let history = validated_history(id("Gone"), &[(oid(20), oid(10))], (oid(20), oid(10)), true);
+    StackBodyRecipes::new(&destination, None, stack, vec![history])
+        .unwrap()
+        .final_bodies(&[(id("Gone"), super::super::github::PullRequestNumber::for_test(7))])
+        .unwrap()
+        .into_vec()
+        .pop()
+        .unwrap()
+        .into_parts()
+        .1
+        .into_string()
+}
+
+#[test]
+fn planner_accepts_exactly_the_four_supported_local_realities() {
+    let fresh = plan(&[EntrySpec {
+        id: "Gfresh",
+        history: HistorySpec::absent(),
+        pull_request: PullRequestSpec::Absent,
+    }])
+    .unwrap();
+    assert_eq!(tuple_count(&fresh.tuple_pushes), 1);
+    let fresh = creates(fresh);
+    assert_eq!(fresh.creates.operations_for_test()[0].id, id("Gfresh"));
+
+    let recovery = plan(&[EntrySpec {
+        id: "Grecovery",
+        history: HistorySpec::current(oid(20), oid(10), false),
+        pull_request: PullRequestSpec::Absent,
+    }])
+    .unwrap();
+    assert_eq!(tuple_count(&recovery.tuple_pushes), 0);
+    assert_eq!(creates(recovery).creates.operations_for_test().len(), 1);
+
+    let unmarked =
+        plan(&[current_open("Gunmarked", oid(20), oid(10), false, 7, BaseKind::Owned, oid(10))])
+            .unwrap();
+    let unmarked = ready(unmarked);
+    assert_eq!(marker_destinations(&unmarked.marker_pushes), ["refs/tags/gherrit/Gunmarked/pr"]);
+
+    let marked =
+        plan(&[current_open("Gmarked", oid(20), oid(10), true, 7, BaseKind::Default, oid(10))])
+            .unwrap();
+    assert!(marker_destinations(&ready(marked).marker_pushes).is_empty());
+
+    let unexplained = plan(&[EntrySpec {
+        id: "Gunexplained",
+        history: HistorySpec::absent(),
+        pull_request: PullRequestSpec::Open(OpenSpec::new(7, oid(20), BaseKind::Owned, oid(10))),
+    }])
+    .err()
+    .unwrap();
+    assert!(unexplained.to_string().contains("OPEN pull request but no published history"));
+
+    let marked_absent = plan(&[EntrySpec {
+        id: "Gmarkedabsent",
+        history: HistorySpec::current(oid(20), oid(10), true),
+        pull_request: PullRequestSpec::Absent,
+    }])
+    .err()
+    .unwrap();
+    assert!(marked_absent.to_string().contains("marker but no OPEN pull request"));
+}
+
+#[test]
+fn planner_rejects_an_empty_stack_before_deriving_any_stage() {
+    let destination = PushDestination::for_test();
+    let default = default_branch(DEFAULT_NAME, oid(10));
+    let stack = LocalStack::for_plan_test(
+        default.clone(),
+        Vec::<(GherritPrId, ObjectId, ObjectId, String, String)>::new(),
+    );
+    let pull_requests = CompleteLocalPullRequests::for_plan_test(
+        RepositoryCoordinates::for_test("owner", "repo"),
+        default,
+        Vec::new(),
+        &[],
+    )
+    .unwrap();
+
+    let error =
+        plan_publication(&destination, None, stack, Box::new([]), pull_requests).err().unwrap();
+    assert!(error.to_string().contains("requires a nonempty local stack"));
+}
+
+#[test]
+fn all_counts_and_ordered_joins_are_checked_before_planning() {
+    let specs = [
+        EntrySpec {
+            id: "Gone",
+            history: HistorySpec::absent(),
+            pull_request: PullRequestSpec::Absent,
+        },
+        EntrySpec {
+            id: "Gtwo",
+            history: HistorySpec::absent(),
+            pull_request: PullRequestSpec::Absent,
+        },
+    ];
+
+    for change in ["missing history", "extra history", "missing GitHub", "extra GitHub"] {
+        let Inputs { destination, stack, mut histories, pull_requests } = inputs(&specs);
+        let (github_default, observations, preparation) =
+            pull_requests.into_planning_parts_for(&destination).unwrap();
+        let pull_requests = match change {
+            "missing history" => {
+                let mut values = histories.into_vec();
+                values.truncate(1);
+                histories = values.into_boxed_slice();
+                CompleteLocalPullRequests::for_plan_test(
+                    RepositoryCoordinates::for_test("owner", "repo"),
+                    github_default,
+                    observations.into_vec(),
+                    &[],
+                )
+                .unwrap()
+            }
+            "extra history" => {
+                histories = histories
+                    .into_vec()
+                    .into_iter()
+                    .chain([validated_history(id("Gextra"), &[], (oid(99), oid(98)), false)])
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                CompleteLocalPullRequests::for_plan_test(
+                    RepositoryCoordinates::for_test("owner", "repo"),
+                    github_default,
+                    observations.into_vec(),
+                    &[],
+                )
+                .unwrap()
+            }
+            "missing GitHub" => {
+                let values = vec![LocalPullRequestObservation::Absent(
+                    AbsentPullRequest::for_plan_test(id("Gone")),
+                )];
+                CompleteLocalPullRequests::for_plan_test(
+                    RepositoryCoordinates::for_test("owner", "repo"),
+                    github_default,
+                    values,
+                    &[],
+                )
+                .unwrap()
+            }
+            "extra GitHub" => {
+                let mut values = observations.into_vec();
+                values.push(LocalPullRequestObservation::Absent(AbsentPullRequest::for_plan_test(
+                    id("Gextra"),
+                )));
+                CompleteLocalPullRequests::for_plan_test(
+                    RepositoryCoordinates::for_test("owner", "repo"),
+                    github_default,
+                    values,
+                    &[],
+                )
+                .unwrap()
+            }
+            _ => unreachable!(),
+        };
+        drop(preparation);
+        let error =
+            plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+        assert!(error.to_string().contains("different change counts"), "case={change}");
+    }
+
+    let Inputs { destination, stack, mut histories, pull_requests } = inputs(&specs);
+    histories.swap(0, 1);
+    let error =
+        plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+    assert!(error.to_string().contains("Git history at stack position 0"));
+
+    let Inputs { destination, stack, histories, pull_requests } = inputs(&specs);
+    let (github_default, observations, preparation) =
+        pull_requests.into_planning_parts_for(&destination).unwrap();
+    let mut observations = observations.into_vec();
+    observations.swap(0, 1);
+    drop(preparation);
+    let pull_requests = CompleteLocalPullRequests::for_plan_test(
+        RepositoryCoordinates::for_test("owner", "repo"),
+        github_default,
+        observations,
+        &[],
+    )
+    .unwrap();
+    let error =
+        plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+    assert!(error.to_string().contains("GitHub evidence at stack position 0"));
+}
+
+#[test]
+fn repository_default_and_proposal_facts_must_match() {
+    let spec = EntrySpec {
+        id: "Gone",
+        history: HistorySpec::absent(),
+        pull_request: PullRequestSpec::Absent,
+    };
+    for (owner, repository) in [("other", "repo"), ("owner", "other")] {
+        let Inputs { destination, stack, histories, pull_requests } = inputs_with_repository(
+            std::slice::from_ref(&spec),
+            owner,
+            repository,
+            DEFAULT_NAME,
+            oid(10),
+        );
+        let error =
+            plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+        assert!(error.to_string().contains("different push repository"));
+    }
+
+    for (name, tip) in [("trunk", oid(10)), (DEFAULT_NAME, oid(11))] {
+        let Inputs { destination, stack, histories, pull_requests } =
+            inputs_with_repository(std::slice::from_ref(&spec), "owner", "repo", name, tip);
+        let error =
+            plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+        assert!(error.to_string().contains("disagree"));
+    }
+
+    let Inputs { destination, stack, mut histories, pull_requests } =
+        inputs(std::slice::from_ref(&spec));
+    histories[0] = validated_history(id("Gone"), &[], (oid(99), oid(10)), false);
+    let error =
+        plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+    assert!(error.to_string().contains("local proposal and first parent"));
+
+    let Inputs { destination, stack, mut histories, pull_requests } =
+        inputs(std::slice::from_ref(&spec));
+    histories[0] = validated_history(id("Gone"), &[], (oid(20), oid(99)), false);
+    let error =
+        plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+    assert!(error.to_string().contains("local proposal and first parent"));
+}
+
+fn open_for_validation(
+    history: &ValidatedChangeHistory,
+    head: ObjectId,
+    base_kind: BaseKind,
+    base: ObjectId,
+    is_draft: bool,
+    landing_automation: bool,
+) -> ManagedOpenPullRequest {
+    ManagedOpenPullRequest::for_plan_test(
+        history.id().clone(),
+        identity(7, "PR_7"),
+        head,
+        ObservedBase::for_plan_test(base_kind, base),
+        "Test change",
+        "observed body",
+        is_draft,
+        landing_automation,
+    )
+}
+
+#[test]
+fn every_published_owned_head_and_base_pair_is_independently_valid() {
+    let heads = [oid(101), oid(102), oid(103)];
+    let bases = [oid(201), oid(202), oid(203)];
+    let published = heads.into_iter().zip(bases).collect::<Vec<_>>();
+    let history = validated_history(id("Ghistory"), &published, (oid(20), oid(10)), true);
+    let default = default_branch(DEFAULT_NAME, oid(10));
+
+    for head in heads {
+        for base in bases {
+            let pull_request =
+                open_for_validation(&history, head, BaseKind::Owned, base, true, false);
+            validate_open(&history, &pull_request, BaseKind::Owned, &default).unwrap();
+        }
+    }
+
+    let proposal = open_for_validation(&history, oid(20), BaseKind::Owned, bases[0], true, false);
+    assert!(validate_open(&history, &proposal, BaseKind::Owned, &default).is_err());
+
+    let wrong_owned =
+        open_for_validation(&history, heads[0], BaseKind::Owned, oid(999), true, false);
+    assert!(validate_open(&history, &wrong_owned, BaseKind::Owned, &default).is_err());
+
+    let exact_default =
+        open_for_validation(&history, heads[0], BaseKind::Default, default.tip(), true, false);
+    validate_open(&history, &exact_default, BaseKind::Default, &default).unwrap();
+    let wrong_default =
+        open_for_validation(&history, heads[0], BaseKind::Default, oid(999), true, false);
+    assert!(validate_open(&history, &wrong_default, BaseKind::Default, &default).is_err());
+}
+
+#[test]
+fn marker_base_and_landing_automation_rules_form_the_exact_truth_table() {
+    let default = default_branch(DEFAULT_NAME, oid(10));
+    for marker in [false, true] {
+        let history =
+            validated_history(id("Gtruth"), &[(oid(20), oid(10))], (oid(20), oid(10)), marker);
+        for observed in [BaseKind::Default, BaseKind::Owned] {
+            for desired in [BaseKind::Default, BaseKind::Owned] {
+                for landing_automation in [false, true] {
+                    let pull_request = open_for_validation(
+                        &history,
+                        oid(20),
+                        observed,
+                        oid(10),
+                        true,
+                        landing_automation,
+                    );
+                    let accepted =
+                        validate_open(&history, &pull_request, desired, &default).is_ok();
+                    let expected = (marker || observed == BaseKind::Owned)
+                        && (!landing_automation
+                            || (observed == BaseKind::Default && desired == BaseKind::Default));
+                    assert_eq!(
+                        accepted, expected,
+                        "marker={marker}, observed={observed:?}, desired={desired:?}, automation={landing_automation}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tuple_selection_uses_only_absence_or_a_changed_current_revision() {
+    let absent = validated_history(id("Gabsent"), &[], (oid(20), oid(10)), false);
+    assert!(tuple_for_test(&absent).unwrap().is_ok());
+
+    let current =
+        validated_history(id("Gcurrent"), &[(oid(20), oid(10))], (oid(20), oid(10)), false);
+    assert!(tuple_for_test(&current).is_none());
+
+    let changed = validated_history(
+        id("Gchanged"),
+        &[(oid(101), oid(201)), (oid(102), oid(202)), (oid(101), oid(201))],
+        (oid(20), oid(10)),
+        false,
+    );
+    let transition = tuple_for_test(&changed).unwrap().unwrap();
+    let pushes = prepare_tuple_pushes(&[transition]).unwrap();
+    let refspecs = pushes.batches().flat_map(|batch| batch.refspecs()).collect::<Vec<_>>();
+    assert!(refspecs.iter().any(|value| value.ends_with("refs/tags/gherrit/Gchanged/v4")));
+
+    let reused_noncurrent = validated_history(
+        id("Greused"),
+        &[(oid(101), oid(201)), (oid(102), oid(202))],
+        (oid(101), oid(201)),
+        false,
+    );
+    assert!(tuple_for_test(&reused_noncurrent).is_some());
+
+    let reused_current = validated_history(
+        id("Greused"),
+        &[(oid(101), oid(201)), (oid(102), oid(202)), (oid(101), oid(201))],
+        (oid(101), oid(201)),
+        false,
+    );
+    assert!(tuple_for_test(&reused_current).is_none());
+}
+
+#[test]
+fn every_new_marker_targets_the_single_desired_revision() {
+    let existing = EntrySpec {
+        id: "Gexisting",
+        history: HistorySpec { published: vec![(oid(101), oid(10))], marker: false },
+        pull_request: PullRequestSpec::Open(OpenSpec::new(7, oid(101), BaseKind::Owned, oid(10))),
+    };
+    let existing = plan(&[existing]).unwrap();
+    assert_eq!(tuple_count(&existing.tuple_pushes), 1);
+    assert_eq!(
+        marker_refspecs(&ready(existing).marker_pushes),
+        [format!("{}:refs/tags/gherrit/Gexisting/pr", oid(20))]
+    );
+
+    let absent = EntrySpec {
+        id: "Gabsent",
+        history: HistorySpec { published: vec![(oid(101), oid(10))], marker: false },
+        pull_request: PullRequestSpec::Absent,
+    };
+    let absent = plan(&[absent]).unwrap();
+    assert_eq!(tuple_count(&absent.tuple_pushes), 1);
+    let absent = creates(absent);
+    assert_eq!(absent.creates.operations_for_test()[0].head_oid, oid(20));
+    let absent = absent.complete_for_test(receipts(&[("Gabsent", 8, "PR_8")])).unwrap();
+    assert_eq!(
+        marker_refspecs(&absent.marker_pushes),
+        [format!("{}:refs/tags/gherrit/Gabsent/pr", oid(20))]
+    );
+}
+
+fn mixed_specs() -> [EntrySpec; 4] {
+    [
+        current_open("Gone", oid(20), oid(10), true, 11, BaseKind::Default, oid(10)),
+        EntrySpec {
+            id: "Gtwo",
+            history: HistorySpec::absent(),
+            pull_request: PullRequestSpec::Absent,
+        },
+        current_open("Gthree", oid(22), oid(21), false, 33, BaseKind::Owned, oid(21)),
+        EntrySpec {
+            id: "Gfour",
+            history: HistorySpec::current(oid(23), oid(22), false),
+            pull_request: PullRequestSpec::Absent,
+        },
+    ]
+}
+
+#[test]
+fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
+    let plan =
+        plan_with_public_branch(&mixed_specs(), Some("release/candidate".to_owned())).unwrap();
+    assert_eq!(tuple_count(&plan.tuple_pushes), 1);
+    let stage = creates(plan);
+    let create_operations = stage.creates.operations_for_test();
+    assert_eq!(create_operations.len(), 2);
+    assert_eq!(
+        create_operations.iter().map(|operation| operation.id.as_str()).collect::<Vec<_>>(),
+        ["Gtwo", "Gfour"]
+    );
+    assert_eq!(create_operations[0].head_oid, oid(21));
+    assert_eq!(create_operations[0].base_oid, oid(20));
+    assert_eq!(create_operations[1].head_oid, oid(23));
+    assert_eq!(create_operations[1].base_oid, oid(22));
+    assert!(create_operations.iter().all(|operation| !operation.body.contains("\n- ")));
+    for (operation, expected_id) in create_operations.iter().zip(["Gtwo", "Gfour"]) {
+        assert_eq!(operation.title, desired_title(expected_id));
+        assert!(operation.body.contains(&desired_body(expected_id)));
+        assert!(operation.body.contains("[release\\/candidate](../tree/release/candidate)"));
+        assert!(operation.body.contains(&format!("refs/heads/{expected_id}")));
+    }
+
+    let final_stage = stage
+        .complete_for_test(receipts(&[("Gtwo", 22, "PR_22"), ("Gfour", 44, "PR_44")]))
+        .unwrap();
+    assert_eq!(
+        marker_destinations(&final_stage.marker_pushes),
+        ["refs/tags/gherrit/Gtwo/pr", "refs/tags/gherrit/Gthree/pr", "refs/tags/gherrit/Gfour/pr",]
+    );
+    let updates = final_stage.updates.operations_for_test();
+    assert_eq!(
+        updates.iter().map(|update| update.identity.number().get()).collect::<Vec<_>>(),
+        [11, 22, 33, 44]
+    );
+    for update in updates {
+        let body = update.body.as_deref().expect("every stale or created body is updated");
+        for number in [11, 22, 33, 44] {
+            assert!(body.contains(&format!("#{number}")));
+        }
+    }
+    assert!(updates.iter().all(|update| update.title.is_none()));
+    assert!(updates.iter().all(|update| update.base_branch.is_none()));
+    for (update, expected_id) in updates.iter().zip(["Gone", "Gtwo", "Gthree", "Gfour"]) {
+        let body = update.body.as_deref().unwrap();
+        assert!(body.contains(&desired_body(expected_id)));
+        assert!(body.contains("[release\\/candidate](../tree/release/candidate)"));
+        assert!(body.contains(&format!("refs/heads/{expected_id}")));
+        for other_id in ["Gone", "Gtwo", "Gthree", "Gfour"] {
+            assert_eq!(body.contains(&desired_body(other_id)), other_id == expected_id);
+        }
+    }
+}
+
+#[test]
+fn root_and_nonroot_creates_share_the_owned_key_but_only_root_moves_final_base() {
+    let specs = [
+        EntrySpec {
+            id: "Groot",
+            history: HistorySpec::absent(),
+            pull_request: PullRequestSpec::Absent,
+        },
+        EntrySpec {
+            id: "Gtip",
+            history: HistorySpec::absent(),
+            pull_request: PullRequestSpec::Absent,
+        },
+    ];
+    let stage = creates(plan(&specs).unwrap());
+    let creates = stage.creates.operations_for_test();
+    assert_eq!(creates[0].id.as_str(), "Groot");
+    assert_eq!(creates[1].id.as_str(), "Gtip");
+    assert_eq!(creates[0].base_oid, oid(10));
+    assert_eq!(creates[1].base_oid, oid(20));
+
+    let final_stage =
+        stage.complete_for_test(receipts(&[("Groot", 1, "PR_1"), ("Gtip", 2, "PR_2")])).unwrap();
+    let updates = final_stage.updates.operations_for_test();
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].base_branch.as_deref(), Some(DEFAULT_NAME));
+    assert_eq!(updates[1].base_branch, None);
+    assert!(updates.iter().all(|update| update.title.is_none() && update.body.is_some()));
+}
+
+#[test]
+fn a_marked_pull_request_moved_below_the_root_returns_to_its_owned_base() {
+    let specs = [
+        current_open("Groot", oid(20), oid(10), true, 1, BaseKind::Default, oid(10)),
+        current_open("Gmoved", oid(21), oid(20), true, 2, BaseKind::Default, oid(10)),
+    ];
+
+    let stage = ready(plan(&specs).unwrap());
+    let moved = stage
+        .updates
+        .operations_for_test()
+        .iter()
+        .find(|update| update.identity.number().get() == 2)
+        .expect("the moved pull request requires a projection update");
+    assert_eq!(moved.base_branch.as_deref(), Some("gherrit-bases/Gmoved"));
+}
+
+#[test]
+fn receipt_completion_rejects_every_wrong_sequence_before_markers_escape() {
+    let specs = [
+        EntrySpec {
+            id: "Gone",
+            history: HistorySpec::absent(),
+            pull_request: PullRequestSpec::Absent,
+        },
+        EntrySpec {
+            id: "Gtwo",
+            history: HistorySpec::absent(),
+            pull_request: PullRequestSpec::Absent,
+        },
+    ];
+    for values in [
+        vec![],
+        vec![("Gone", 1, "PR_1")],
+        vec![("Gtwo", 2, "PR_2"), ("Gone", 1, "PR_1")],
+        vec![("Gwrong", 1, "PR_1"), ("Gtwo", 2, "PR_2")],
+        vec![("Gone", 1, "PR_1"), ("Gtwo", 2, "PR_2"), ("Gextra", 3, "PR_3")],
+    ] {
+        assert!(creates(plan(&specs).unwrap()).complete_for_test(receipts(&values)).is_err());
+    }
+
+    let duplicate_number = receipts(&[("Gone", 1, "PR_1"), ("Gtwo", 1, "PR_2")]);
+    assert!(creates(plan(&specs).unwrap()).complete_for_test(duplicate_number).is_err());
+
+    let duplicate_node = receipts(&[("Gone", 1, "PR_SAME"), ("Gtwo", 2, "PR_SAME")]);
+    assert!(creates(plan(&specs).unwrap()).complete_for_test(duplicate_node).is_err());
+}
+
+#[test]
+fn exact_update_preflight_after_receipts_still_precedes_marker_release() {
+    let spec = EntrySpec {
+        id: "Gone",
+        history: HistorySpec::absent(),
+        pull_request: PullRequestSpec::Absent,
+    };
+    let oversized_node = "N".repeat(super::super::batching::MAX_MUTATION_REQUEST_BYTES);
+    let receipts =
+        CompleteCreateReceipts::for_plan_test(vec![(id("Gone"), identity(1, &oversized_node))]);
+    let error = creates(plan(&[spec]).unwrap()).complete_for_test(receipts).err().unwrap();
+    let limit = super::super::batching::MAX_MUTATION_REQUEST_BYTES;
+    assert!(error.to_string().contains(&format!("exceeds the {limit}-byte request limit")));
+}
+
+#[test]
+fn graphql_stages_are_preflighted_before_a_tuple_plan_can_escape() {
+    let fresh = EntrySpec {
+        id: "Gfresh",
+        history: HistorySpec::absent(),
+        pull_request: PullRequestSpec::Absent,
+    };
+    let Inputs { destination, stack, histories, pull_requests } = inputs(&[fresh]);
+    let (github_default, observations, _) =
+        pull_requests.into_planning_parts_for(&destination).unwrap();
+    let oversized_repository = "R".repeat(super::super::batching::MAX_MUTATION_REQUEST_BYTES);
+    let pull_requests = CompleteLocalPullRequests::for_plan_test_with_repository_node(
+        RepositoryCoordinates::for_test("owner", "repo"),
+        github_default,
+        observations.into_vec(),
+        &[],
+        &oversized_repository,
+    )
+    .unwrap();
+    let error =
+        plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+    assert!(error.to_string().contains("GraphQL create mutation at item 0"));
+
+    let oversized_node = "N".repeat(super::super::batching::MAX_MUTATION_REQUEST_BYTES);
+    let spec = EntrySpec {
+        id: "Gupdate",
+        history: HistorySpec { published: vec![(oid(101), oid(10))], marker: true },
+        pull_request: PullRequestSpec::Open(OpenSpec {
+            number: 7,
+            node: oversized_node,
+            head: oid(101),
+            base_kind: BaseKind::Default,
+            base: oid(10),
+            title: Some("stale title".to_owned()),
+            body: None,
+            is_draft: true,
+            landing_automation: false,
+        }),
+    };
+    let error = plan(&[spec]).err().unwrap();
+    let limit = super::super::batching::MAX_MUTATION_REQUEST_BYTES;
+    assert!(error.to_string().contains(&format!("exceeds the {limit}-byte request limit")));
+}
+
+#[test]
+fn existing_projection_emits_exactly_the_differing_field_mask() {
+    let desired_body = single_desired_body();
+    for mask in 0_u8..8 {
+        let title_differs = mask & 0b001 != 0;
+        let body_differs = mask & 0b010 != 0;
+        let base_differs = mask & 0b100 != 0;
+        let open = OpenSpec {
+            number: 7,
+            node: "PR_7".to_owned(),
+            head: oid(20),
+            base_kind: if base_differs { BaseKind::Owned } else { BaseKind::Default },
+            base: oid(10),
+            title: title_differs.then(|| "stale title".to_owned()),
+            body: Some(if body_differs { "stale body".to_owned() } else { desired_body.clone() }),
+            is_draft: true,
+            landing_automation: false,
+        };
+        let spec = EntrySpec {
+            id: "Gone",
+            history: HistorySpec::current(oid(20), oid(10), true),
+            pull_request: PullRequestSpec::Open(open),
+        };
+        let stage = ready(plan(&[spec]).unwrap());
+        let updates = stage.updates.operations_for_test();
+        assert_eq!(updates.len(), usize::from(mask != 0), "mask={mask:03b}");
+        if let Some(update) = updates.first() {
+            assert_eq!(update.title.is_some(), title_differs, "mask={mask:03b}");
+            assert_eq!(update.body.is_some(), body_differs, "mask={mask:03b}");
+            assert_eq!(update.base_branch.as_deref(), base_differs.then_some(DEFAULT_NAME));
+        }
+    }
+}
+
+#[test]
+fn body_comparison_normalizes_only_crlf_pairs() {
+    let desired = single_desired_body();
+    assert!(bodies_equal(&desired, &desired.replace('\n', "\r\n")));
+    for changed in [
+        desired.replace('\n', "\r"),
+        format!("{desired}\n"),
+        format!(" {desired}"),
+        format!("{desired} "),
+        desired.replace("GHerrit", "Gherrit"),
+    ] {
+        assert!(!bodies_equal(&desired, &changed));
+    }
+    assert!(!bodies_equal("é", "e\u{301}"));
+
+    let spec = EntrySpec {
+        id: "Gone",
+        history: HistorySpec::current(oid(20), oid(10), true),
+        pull_request: PullRequestSpec::Open(OpenSpec {
+            number: 7,
+            node: "PR_7".to_owned(),
+            head: oid(20),
+            base_kind: BaseKind::Default,
+            base: oid(10),
+            title: None,
+            body: Some(desired.replace('\n', "\r\n")),
+            is_draft: true,
+            landing_automation: false,
+        }),
+    };
+    let stage = ready(plan(&[spec]).unwrap());
+    assert!(stage.updates.operations_for_test().is_empty());
+}
