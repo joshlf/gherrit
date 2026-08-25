@@ -16,6 +16,30 @@ use gix::ObjectId;
 use super::{autosquash, destination::DefaultBranch};
 use crate::util;
 
+const MAX_TITLE_SCALARS: usize = 256;
+
+/// A nonempty title of at most 256 Unicode scalar values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PullRequestTitle(String);
+
+impl PullRequestTitle {
+    fn new(value: String) -> Result<Self> {
+        if value.is_empty() {
+            bail!("A pull request title must not be empty");
+        }
+        if value.chars().nth(MAX_TITLE_SCALARS).is_some() {
+            bail!(
+                "A pull request title must contain at most {MAX_TITLE_SCALARS} Unicode scalar values"
+            );
+        }
+        Ok(Self(value))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 const MAX_GHERRIT_PR_ID_BYTES: usize = 128;
 
 /// An ASCII alphanumeric GHerrit pull request ID of 1 through 128 bytes.
@@ -76,11 +100,23 @@ pub(super) struct LocalChange {
     id: GherritPrId,
     head: ObjectId,
     first_parent: ObjectId,
-    title: String,
+    title: PullRequestTitle,
     body: String,
 }
 
 impl LocalChange {
+    #[cfg(test)]
+    /// Constructs trusted synthetic content for body-renderer unit tests.
+    pub(super) fn for_body_test(
+        id: GherritPrId,
+        head: ObjectId,
+        first_parent: ObjectId,
+        title: String,
+        body: String,
+    ) -> Result<Self> {
+        Ok(Self { id, head, first_parent, title: PullRequestTitle::new(title)?, body })
+    }
+
     fn from_commit(commit: gix::Commit<'_>, title: String) -> Result<Self> {
         let message = commit.message()?;
         let raw_body = message.body.map(AsRef::as_ref);
@@ -109,6 +145,8 @@ impl LocalChange {
             .next()
             .ok_or_else(|| eyre!("Commit {} has no first parent", commit.id))?
             .detach();
+        let title = PullRequestTitle::new(title)
+            .wrap_err_with(|| format!("Commit {} has an invalid pull request title", commit.id))?;
         let body = raw_body.map_or_else(String::new, |_| strip_gherrit_id(body, line));
 
         Ok(Self { id, head: commit.id, first_parent, title, body })
@@ -127,7 +165,11 @@ impl LocalChange {
     }
 
     pub(super) fn title(&self) -> &str {
-        &self.title
+        self.title.as_str()
+    }
+
+    pub(super) fn into_pull_request_content(self) -> (PullRequestTitle, String) {
+        (self.title, self.body)
     }
 
     pub(super) fn body(&self) -> &str {
@@ -240,7 +282,8 @@ impl LocalStack {
                 id,
                 head,
                 first_parent,
-                title: String::new(),
+                title: PullRequestTitle::new("Test change".to_owned())
+                    .expect("history-test title is valid"),
                 body: String::new(),
             })
             .collect();
@@ -261,6 +304,10 @@ impl LocalStack {
 
     pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = &LocalChange> {
         self.changes.iter()
+    }
+
+    pub(super) fn into_changes(self) -> Vec<LocalChange> {
+        self.changes
     }
 }
 
@@ -458,7 +505,7 @@ mod tests {
             id: GherritPrId::from_trailer(object_id(head), id.as_bytes()).unwrap(),
             head: object_id(head),
             first_parent: object_id(first_parent),
-            title: String::new(),
+            title: PullRequestTitle::new("Test change".to_owned()).unwrap(),
             body: String::new(),
         }
     }
@@ -554,6 +601,63 @@ mod tests {
                 b"Work\n\ngherrit-pr-id: Gvalid\ngherrit-pr-id:Gother\nGHERRIT-PR-ID=Gthird"
             ),
             [Some(b"Gvalid".to_vec()), None, None]
+        );
+    }
+
+    #[test]
+    fn pull_request_titles_use_unicode_scalar_limits() {
+        assert!(PullRequestTitle::new(String::new()).is_err());
+        assert_eq!(PullRequestTitle::new("雪".to_owned()).unwrap().as_str(), "雪");
+
+        let ascii_256 = "x".repeat(256);
+        assert_eq!(PullRequestTitle::new(ascii_256.clone()).unwrap().as_str(), ascii_256);
+        assert!(PullRequestTitle::new("x".repeat(257)).is_err());
+
+        let multibyte_256 = "雪".repeat(256);
+        assert!(multibyte_256.len() > 256);
+        assert!(PullRequestTitle::new(multibyte_256).is_ok());
+
+        let combining_256 = "e\u{301}".repeat(128);
+        assert_eq!(combining_256.chars().count(), 256);
+        assert!(PullRequestTitle::new(combining_256).is_ok());
+        assert!(PullRequestTitle::new(format!("{}x", "e\u{301}".repeat(128))).is_err());
+    }
+
+    #[test]
+    fn collected_titles_enforce_the_unicode_scalar_limit() {
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let default_tip = repository.rev_parse_single("refs/heads/main").unwrap().detach();
+        let supplied_default = DefaultBranch::new("main".to_owned(), default_tip).unwrap();
+        context.run_git(&["checkout", "-b", "feature"]);
+
+        let collect = || {
+            let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+            LocalStack::collect(&repository, &supplied_default)
+        };
+
+        let accepted = "雪".repeat(MAX_TITLE_SCALARS);
+        context.commit_with_gherrit_id(&accepted);
+        let stack = collect().unwrap();
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack.iter().next().unwrap().title(), accepted);
+
+        let rejected = format!("{accepted}雪");
+        context.commit_with_gherrit_id(&rejected);
+        let rejected_head = util::Repo::open(context.repo_path.to_str().unwrap())
+            .unwrap()
+            .rev_parse_single("HEAD")
+            .unwrap()
+            .detach();
+        let error = collect().unwrap_err();
+        assert_eq!(
+            error.chain().map(ToString::to_string).collect::<Vec<_>>(),
+            [
+                format!("Commit {rejected_head} has an invalid pull request title"),
+                format!(
+                    "A pull request title must contain at most {MAX_TITLE_SCALARS} Unicode scalar values"
+                ),
+            ]
         );
     }
 
@@ -690,6 +794,21 @@ mod tests {
         assert_eq!(
             strip_gherrit_id(body, line.clone()),
             "Summary\r\n\r\ngherrit-pr-id: Gexample\r\n\r\nNotes\r\n\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn former_metadata_prefix_is_ordinary_commit_text() {
+        let body = "Keep <!-- gherrit-meta: arbitrary text --> exactly.\n\n\
+                    gherrit-pr-id: Greal\n";
+        let trailers = gherrit_id_trailers(body.as_bytes());
+        let [GherritIdTrailer::Exact { line, .. }] = trailers.as_slice() else {
+            panic!("expected one exact identity trailer")
+        };
+
+        assert_eq!(
+            strip_gherrit_id(body, line.clone()),
+            "Keep <!-- gherrit-meta: arbitrary text --> exactly.\n\n"
         );
     }
 }
