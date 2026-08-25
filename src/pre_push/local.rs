@@ -138,6 +138,7 @@ impl LocalChange {
 /// An ordered, validated first-parent path from the default branch to `HEAD`.
 #[derive(Debug)]
 pub(super) struct LocalStack {
+    default_branch: DefaultBranch,
     changes: Vec<LocalChange>,
 }
 
@@ -157,7 +158,7 @@ impl LocalStack {
             );
         }
         if head == default_ref {
-            return Self::new(default_branch, Vec::new());
+            return Self::new(default_branch.clone(), Vec::new());
         }
 
         repo.ensure_publishable_history()?;
@@ -194,12 +195,12 @@ impl LocalStack {
             .map(|(commit, title)| LocalChange::from_commit(commit, title))
             .collect::<Result<Vec<_>>>()?;
 
-        let stack = Self::new(default_branch, changes)?;
+        let stack = Self::new(default_branch.clone(), changes)?;
         ensure_change_ids_unique_in_head_ancestry(repo, &stack, head.detach())?;
         Ok(stack)
     }
 
-    fn new(default_branch: &DefaultBranch, changes: Vec<LocalChange>) -> Result<Self> {
+    fn new(default_branch: DefaultBranch, changes: Vec<LocalChange>) -> Result<Self> {
         let ids = changes.iter().map(|change| change.id.as_str());
         ensure_unique_change_ids(ids)?;
         let default_ref = default_branch.full_ref_name();
@@ -225,7 +226,29 @@ impl LocalStack {
             expected_parent = change.head;
         }
 
-        Ok(Self { changes })
+        Ok(Self { default_branch, changes })
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_history_test(
+        default_branch: DefaultBranch,
+        changes: impl IntoIterator<Item = (GherritPrId, ObjectId, ObjectId)>,
+    ) -> Self {
+        let changes = changes
+            .into_iter()
+            .map(|(id, head, first_parent)| LocalChange {
+                id,
+                head,
+                first_parent,
+                title: String::new(),
+                body: String::new(),
+            })
+            .collect();
+        Self::new(default_branch, changes).expect("valid history-test local stack")
+    }
+
+    pub(super) fn default_branch(&self) -> &DefaultBranch {
+        &self.default_branch
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -537,8 +560,8 @@ mod tests {
     #[test]
     fn stacks_require_unique_change_ids() {
         let error = LocalStack::new(
-            &default_branch("main", 0),
-            vec![change("Gsame", 1, 0), change("Gsame", 2, 1)],
+            default_branch("main", 10),
+            vec![change("Gsame", 1, 10), change("Gsame", 2, 1)],
         )
         .unwrap_err();
 
@@ -548,8 +571,8 @@ mod tests {
     #[test]
     fn stacks_require_one_contiguous_first_parent_path() {
         let stack = LocalStack::new(
-            &default_branch("main", 0),
-            vec![change("Gone", 1, 0), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
+            default_branch("main", 10),
+            vec![change("Gone", 1, 10), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
         )
         .unwrap();
 
@@ -559,8 +582,8 @@ mod tests {
         );
 
         let error = LocalStack::new(
-            &default_branch("main", 0),
-            vec![change("Gone", 1, 0), change("Gtwo", 2, 0)],
+            default_branch("main", 10),
+            vec![change("Gone", 1, 10), change("Gtwo", 2, 10)],
         )
         .unwrap_err();
         assert_eq!(
@@ -593,8 +616,8 @@ mod tests {
     #[test]
     fn stack_order_derives_root_parent_and_child_positions() {
         let stack = LocalStack::new(
-            &default_branch("main", 0),
-            vec![change("Gone", 1, 0), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
+            default_branch("main", 10),
+            vec![change("Gone", 1, 10), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
         )
         .unwrap();
         let ids = stack.iter().map(|change| change.id().as_str()).collect::<Vec<_>>();
@@ -613,8 +636,8 @@ mod tests {
             .into_iter()
             .for_each(|(id, default)| {
                 let error = LocalStack::new(
-                    &default_branch(default, 0),
-                    vec![change(id, 1, 0)],
+                    default_branch(default, 10),
+                    vec![change(id, 1, 10)],
                 )
                 .unwrap_err();
 
@@ -641,8 +664,18 @@ mod tests {
         ]
         .into_iter()
         .for_each(|(id, default)| {
-            LocalStack::new(&default_branch(default, 0), vec![change(id, 1, 0)]).unwrap();
+            LocalStack::new(default_branch(default, 10), vec![change(id, 1, 10)]).unwrap();
         });
+    }
+
+    #[test]
+    fn stacks_retain_the_exact_default_path_origin() {
+        let default = default_branch("trunk", 10);
+        let stack = LocalStack::new(default.clone(), vec![change("Gone", 1, 10)]).unwrap();
+
+        assert_eq!(stack.default_branch(), &default);
+        assert_eq!(stack.iter().next().unwrap().head(), object_id(1));
+        assert_eq!(stack.iter().next().unwrap().first_parent(), default.tip());
     }
 
     #[test]
