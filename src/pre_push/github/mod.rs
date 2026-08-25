@@ -16,10 +16,8 @@ mod observation;
 mod pull_request;
 mod transport;
 
-#[cfg(test)]
-pub(in crate::pre_push) use mutation::CompleteCreateReceipts;
 pub(in crate::pre_push) use mutation::{
-    CreatePullRequest, PreparedCreates, PreparedUpdates, UpdatePullRequest,
+    CompleteCreateReceipts, CreatePullRequest, PreparedCreates, PreparedUpdates, UpdatePullRequest,
 };
 #[cfg(test)]
 pub(in crate::pre_push) use observation::ObservedBase;
