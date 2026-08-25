@@ -119,7 +119,7 @@ impl PushDestination {
     }
 
     #[cfg(test)]
-    fn for_test_url(url: &str, current_dir: &Path) -> Self {
+    pub(super) fn for_test_url(url: &str, current_dir: &Path) -> Self {
         let configured_remote = util::RemoteName::from_config(b"origin").unwrap();
         let resolved = ResolvedDestination::from_git_output(
             configured_remote,
