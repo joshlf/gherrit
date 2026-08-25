@@ -162,7 +162,10 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
         batch_fetch_prs(&octocrab, &destination, &gherrit_ids).await?;
     let repository = GithubRepository {
         node_id: repository.node_id,
-        default_branch: DefaultBranch::agree(git_default_branch, repository.default_branch)?,
+        default_branch: DefaultBranch::agree(
+            commits.default_branch().clone(),
+            repository.default_branch,
+        )?,
     };
     ensure_pull_requests_open(prs.iter().map(|pr| (pr.number.get(), pr.state)))?;
 
