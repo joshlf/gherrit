@@ -20,11 +20,11 @@ use std::{
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::ObjectId;
 
-use super::{
+use super::version::Version;
+use crate::pre_push::{
     destination::{PublicationTarget, PushDestination},
     local::GherritPrId,
     subprocess::{self, REMOTE_GIT_EXECUTION_TIMEOUT},
-    version::Version,
 };
 
 // Hook recursion is an execution-boundary concern, not a reason to bypass
