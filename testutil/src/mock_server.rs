@@ -42,6 +42,7 @@ pub struct MockState {
     pub max_graphql_query_operations_per_request: Option<usize>,
     pub repo_owner: String,
     pub repo_name: String,
+    pub github_default_branch: Option<(String, String)>,
     pub faults: VecDeque<FailureKind>,
 }
 
@@ -209,7 +210,7 @@ pub(super) async fn run_mock_server(
 fn check_and_apply_graphql_failure(
     mock_state: &mut MockState,
     operations: &[GraphQlOperation],
-    is_repository_id_query: bool,
+    includes_repository_facts: bool,
     create_request_number: usize,
 ) -> Option<FailureKind> {
     use FailureKind::*;
@@ -221,7 +222,7 @@ fn check_and_apply_graphql_failure(
             !operations.is_empty()
                 && operations.iter().all(|operation| *operation == GraphQlOperation::Query)
         }
-        RepositoryIdHttp(_) => is_repository_id_query,
+        RepositoryFactsHttp(_) => includes_repository_facts,
         CreatePr | CreatePrHttp(_) | CreatePrRedirect(_) => {
             operations.contains(&GraphQlOperation::CreatePr)
         }
@@ -477,6 +478,27 @@ fn validate_pull_requests_field(field: &executable::Field) -> Result<(), String>
     Ok(())
 }
 
+fn validate_default_branch_ref_field(field: &executable::Field) -> Result<(), String> {
+    const PATH: &str = "repository.defaultBranchRef";
+    for field in validate_exact_fields(&field.selection_set, PATH, &["name", "target"])? {
+        match field.name.as_str() {
+            "name" => {}
+            "target" => validate_scalar_fields(
+                &field.selection_set,
+                "repository.defaultBranchRef.target",
+                &["oid"],
+            )?,
+            _ => {
+                return Err(format!(
+                    "The mock GitHub API does not support field `{PATH}.{}`",
+                    field.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_repository_field(
     field: &executable::Field,
     variables: &GraphQlVariables,
@@ -489,6 +511,7 @@ fn validate_repository_field(
     for field in selected_fields(&field.selection_set, PATH)? {
         match field.name.as_str() {
             "id" => {}
+            "defaultBranchRef" => validate_default_branch_ref_field(field)?,
             "pullRequests" => {
                 validate_pull_requests_field(field)?;
                 resolve_string_argument(
@@ -646,6 +669,24 @@ fn validate_supported_document(
     Ok(())
 }
 
+fn includes_repository_facts(document: &ExecutableDocument) -> bool {
+    document.operations.iter().any(|operation| {
+        operation.selection_set.selections.iter().any(|selection| {
+            let executable::Selection::Field(repository) = selection else {
+                return false;
+            };
+            repository.name == "repository"
+                && repository.selection_set.selections.iter().any(|selection| {
+                    matches!(
+                        selection,
+                        executable::Selection::Field(field)
+                            if field.name == "defaultBranchRef"
+                    )
+                })
+        })
+    })
+}
+
 async fn graphql(
     State(app_state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
@@ -696,7 +737,7 @@ async fn graphql(
     if let Some(failure) = check_and_apply_graphql_failure(
         &mut mock_state,
         &operations,
-        query.trim_start().starts_with("query RepositoryID("),
+        includes_repository_facts(&document),
         create_request_number,
     ) {
         return graphql_failure_response(failure);
@@ -718,7 +759,11 @@ async fn graphql(
                     "createPullRequest" => handle_create_pr(&mut mock_state, field, &|branch| {
                         remote_branch_oid(&app_state, branch)
                     }),
-                    "repository" => handle_repository_query(&mock_state, field, &variables),
+                    "repository" => {
+                        handle_repository_query(&mock_state, field, &variables, &|| {
+                            repository_default_branch(&app_state, &mock_state)
+                        })
+                    }
                     _ => unreachable!("request was checked by validate_supported_document"),
                 };
                 match result {
@@ -780,7 +825,7 @@ fn graphql_failure_response(failure: FailureKind) -> Response {
 
     let status = match failure {
         QueryHttp(status)
-        | RepositoryIdHttp(status)
+        | RepositoryFactsHttp(status)
         | CreatePrHttp(status)
         | SecondCreatePrHttp(status) => retryable_status(status),
         CreatePrRedirect(status) => redirect_status(status),
@@ -848,6 +893,41 @@ fn remote_branch_oid(app_state: &AppState, branch: &str) -> Result<Option<String
         return Err(format!("Remote Git ref `{reference}` has an empty object ID"));
     }
     Ok(Some(oid.to_string()))
+}
+
+fn repository_default_branch(
+    app_state: &AppState,
+    mock_state: &MockState,
+) -> Result<(String, String), String> {
+    if let Some(default_branch) = &mock_state.github_default_branch {
+        return Ok(default_branch.clone());
+    }
+
+    let run = |arguments: &[&str]| {
+        app_state
+            .test_environment
+            .command(&app_state.system_git)
+            .arg("--git-dir")
+            .arg(&app_state.remote_path)
+            .args(arguments)
+            .output()
+            .map_err(|error| format!("Failed to inspect remote default branch: {error}"))
+    };
+    let symbolic = run(&["symbolic-ref", "HEAD"])?;
+    let tip = run(&["rev-parse", "HEAD"])?;
+    if !symbolic.status.success() || !tip.status.success() {
+        return Err("The mock repository has no default branch".to_owned());
+    }
+    let symbolic = std::str::from_utf8(&symbolic.stdout)
+        .map_err(|_| "The mock repository default branch is not UTF-8".to_owned())?
+        .trim_end_matches(['\r', '\n']);
+    let name = symbolic
+        .strip_prefix("refs/heads/")
+        .ok_or_else(|| "The mock repository HEAD is not a local branch".to_owned())?;
+    let tip = std::str::from_utf8(&tip.stdout)
+        .map_err(|_| "The mock repository default branch tip is not UTF-8".to_owned())?
+        .trim_end_matches(['\r', '\n']);
+    Ok((name.to_owned(), tip.to_owned()))
 }
 
 fn extract_input_field<'a>(
@@ -1035,6 +1115,7 @@ fn handle_repository_query(
     mock_state: &MockState,
     field: &executable::Field,
     variables: &GraphQlVariables,
+    default_branch: &dyn Fn() -> Result<(String, String), String>,
 ) -> Result<serde_json::Value, String> {
     const PATH: &str = "repository";
     let owner = resolve_string_argument(field, "owner", PATH, variables)?;
@@ -1048,6 +1129,37 @@ fn handle_repository_query(
 
     for field in selected_fields(&field.selection_set, PATH)? {
         match field.name.as_str() {
+            "defaultBranchRef" => {
+                let (name, oid) = default_branch()?;
+                let mut branch = serde_json::Map::new();
+                for field in selected_fields(&field.selection_set, "repository.defaultBranchRef")? {
+                    let value = match field.name.as_str() {
+                        "name" => serde_json::json!(name),
+                        "target" => {
+                            let mut target = serde_json::Map::new();
+                            for field in selected_fields(
+                                &field.selection_set,
+                                "repository.defaultBranchRef.target",
+                            )? {
+                                match field.name.as_str() {
+                                    "oid" => {
+                                        target.insert(response_key(field), serde_json::json!(oid));
+                                    }
+                                    _ => unreachable!(
+                                        "request was checked by validate_default_branch_ref_field"
+                                    ),
+                                }
+                            }
+                            serde_json::Value::Object(target)
+                        }
+                        _ => {
+                            unreachable!("request was checked by validate_default_branch_ref_field")
+                        }
+                    };
+                    branch.insert(response_key(field), value);
+                }
+                repo_data.insert(response_key(field), serde_json::Value::Object(branch));
+            }
             "pullRequests" => {
                 let head = resolve_string_argument(
                     field,
@@ -1326,6 +1438,7 @@ mod tests {
     fn repository_response_contains_only_selected_fields() {
         let document = parse_document(
             "query { repository(owner: \"owner\", name: \"repo\") { \
+             defaultBranchRef { name, target { oid } } \
              open: pullRequests(headRefName: \"Ghead\", first: 100, \
              states: [OPEN]) { nodes { number, isCrossRepository } \
              pageInfo { hasNextPage } } } }",
@@ -1343,10 +1456,17 @@ mod tests {
             repo_name: "repo",
         }));
         state.cross_repository_prs.insert(1);
-        let response = handle_repository_query(&state, root_field(&document), &None).unwrap();
+        let response = handle_repository_query(&state, root_field(&document), &None, &|| {
+            Ok(("main".to_owned(), "1".repeat(40)))
+        })
+        .unwrap();
         assert_eq!(
             response,
             serde_json::json!({
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": { "oid": "1111111111111111111111111111111111111111" }
+                },
                 "open": {
                     "nodes": [{ "number": 1, "isCrossRepository": true }],
                     "pageInfo": { "hasNextPage": false }
@@ -1367,7 +1487,10 @@ mod tests {
             validate_supported_document(&document, &None).unwrap();
 
             assert_eq!(
-                handle_repository_query(&state, root_field(&document), &None).unwrap(),
+                handle_repository_query(&state, root_field(&document), &None, &|| {
+                    Ok(("main".to_owned(), "1".repeat(40)))
+                })
+                .unwrap(),
                 serde_json::Value::Null,
                 "query: {query}"
             );
