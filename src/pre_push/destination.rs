@@ -28,6 +28,7 @@ const PROXY_ENV: &str = "GHERRIT_PRIVATE_REMOTE_PROXY";
 const PROXY_AUTH_METHOD_ENV: &str = "GHERRIT_PRIVATE_REMOTE_PROXY_AUTH_METHOD";
 const GIT_CONFIG_PARAMETERS_ENV: &str = "GIT_CONFIG_PARAMETERS";
 const DISABLE_HTTP_REDIRECTS: &str = "http.followRedirects=false";
+const DISABLE_BUNDLE_URI: &str = "fetch.bundleURI=";
 const DISABLE_FOLLOW_TAGS: &str = "push.followTags=false";
 const DISABLE_SUBMODULE_PUSHES: &str = "push.recurseSubmodules=no";
 const CLEAR_PUSH_OPTIONS: &str = "push.pushOption=";
@@ -102,7 +103,31 @@ pub(super) struct PushDestination {
     transport: RemoteTransportSettings,
 }
 
+// Exact history acquisition is staged behind the exact-local test boundary
+// until the orchestration slice routes it from `pre_push::run`.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExactObjectFetchMode {
+    Negotiated,
+    Refetch,
+}
+
 impl PushDestination {
+    #[cfg(test)]
+    pub(super) fn for_test() -> Self {
+        let configured_remote = util::RemoteName::from_config(b"origin").unwrap();
+        let resolved = ResolvedDestination::from_git_output(
+            configured_remote,
+            b"https://github.com/owner/repo.git\n",
+        )
+        .unwrap();
+        Self {
+            resolved,
+            internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
+            transport: RemoteTransportSettings::default(),
+        }
+    }
+
     /// Resolves the one exact destination Git would use for pushing.
     ///
     /// The configured remote is supplied by the caller so configuration is
@@ -306,6 +331,23 @@ impl PushDestination {
         self.remote_command("ls-remote", options, ref_patterns)
     }
 
+    /// Constructs the exact-local ref observation command.
+    ///
+    /// Git's positional patterns remain tail filters, so the decoder must
+    /// still accept only complete canonical names. The category options ask a
+    /// protocol-v2 server to advertise only branch and tag namespaces. They
+    /// are fixed here rather than supplied by the caller because all evidence
+    /// requested by the exact-local query plan is in one of those namespaces.
+    fn exact_ref_observation_command(
+        &self,
+        ref_patterns: impl IntoIterator<Item = String>,
+    ) -> Command {
+        self.ls_remote(
+            ["--quiet".to_owned(), "--heads".to_owned(), "--tags".to_owned()],
+            ref_patterns,
+        )
+    }
+
     /// Observes destination refs through the sole bounded execution path.
     ///
     /// Keeping the raw `ls-remote` command private prevents an observation
@@ -321,6 +363,62 @@ impl PushDestination {
             subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
         )
         .await
+    }
+
+    /// Observes refs from the exact repository bound to an acquisition plan.
+    ///
+    /// The repository supplies only the command's working directory. The
+    /// destination and every transport setting still come from this validated
+    /// value, and execution uses the same finite supervisor as every other
+    /// remote ref observation.
+    #[allow(dead_code)]
+    pub(super) async fn observe_refs_from(
+        &self,
+        repository: &util::Repo,
+        ref_patterns: impl IntoIterator<Item = String>,
+    ) -> std::result::Result<subprocess::CommandOutput, subprocess::CommandError> {
+        let mut command = self.exact_ref_observation_command(ref_patterns);
+        command.current_dir(repository.workdir().unwrap_or(repository.path()));
+        subprocess::output(command, subprocess::REMOTE_GIT_EXECUTION_TIMEOUT).await
+    }
+
+    /// Constructs the sole exact-object acquisition command.
+    ///
+    /// Source refs are accepted only through `fetch --stdin`, so no advertised
+    /// ref, object ID, or destination literal can enter the top-level Git
+    /// argument list. The empty refmap is load-bearing: without it, configured
+    /// fetch refspecs could update remote-tracking refs even for source-only
+    /// wants. An empty bundle URI prevents a configured secondary object
+    /// source and its creation-token state from participating in this one
+    /// fetch.
+    #[allow(dead_code)]
+    pub(super) fn exact_object_fetch(&self, mode: ExactObjectFetchMode) -> Command {
+        let fixed = [
+            "--quiet",
+            "--no-progress",
+            "--no-write-fetch-head",
+            "--no-tags",
+            "--no-prune",
+            "--no-prune-tags",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--no-write-commit-graph",
+            "--no-update-shallow",
+            "--no-filter",
+            "--refmap=",
+        ];
+        let mode = match mode {
+            ExactObjectFetchMode::Negotiated => None,
+            ExactObjectFetchMode::Refetch => Some("--refetch"),
+        };
+        let options = fixed.into_iter().chain(mode).chain(std::iter::once("--stdin"));
+        self.adapter_command(
+            ["-c", DISABLE_HTTP_REDIRECTS, "-c", DISABLE_BUNDLE_URI, "fetch"]
+                .into_iter()
+                .chain(options)
+                .chain(["--", self.internal_remote.as_str()])
+                .map(str::to_owned),
+        )
     }
 
     pub(super) fn push(
@@ -1287,11 +1385,7 @@ mod tests {
     }
 
     fn destination() -> PushDestination {
-        PushDestination {
-            resolved: resolved(b"https://github.com/owner/repo.git\n"),
-            internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
-            transport: RemoteTransportSettings::default(),
-        }
+        PushDestination::for_test()
     }
 
     fn git_dir_identity() -> util::GitDirIdentity {
@@ -1608,6 +1702,33 @@ mod tests {
             .map(OsStr::new)
         );
 
+        let exact_observation = destination.exact_ref_observation_command([
+            "refs/heads/main".to_owned(),
+            "refs/tags/gherrit/Gone".to_owned(),
+        ]);
+        assert_eq!(
+            arguments(&exact_observation),
+            [
+                "--no-replace-objects",
+                "--config-env=remote.gherrit-publication.url=GHERRIT_PRIVATE_PUSH_DESTINATION",
+                "--config-env=remote.gherrit-publication.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
+                "-c",
+                "http.followRedirects=false",
+                "ls-remote",
+                "--quiet",
+                "--heads",
+                "--tags",
+                "--",
+                "gherrit-publication",
+                "refs/heads/main",
+                "refs/tags/gherrit/Gone",
+            ]
+            .map(OsStr::new)
+        );
+        assert!(arguments(&ls_remote).iter().all(
+            |argument| *argument != OsStr::new("--heads") && *argument != OsStr::new("--tags")
+        ));
+
         let git_dir = git_dir_identity();
         let push = destination.push(
             &git_dir,
@@ -1709,6 +1830,7 @@ mod tests {
 
         for command in [
             destination.ls_remote(std::iter::empty(), std::iter::empty()),
+            destination.exact_object_fetch(ExactObjectFetchMode::Negotiated),
             destination.push(&git_dir_identity(), std::iter::empty(), std::iter::empty()),
         ] {
             let arguments = arguments(&command);
@@ -1820,6 +1942,75 @@ mod tests {
         assert_eq!(&bytes[..inherited.len()], inherited.as_bytes());
         assert_eq!(bytes[inherited.len()], b' ');
         assert!(bytes.ends_with(b"='false'"));
+    }
+
+    #[test]
+    fn exact_object_fetch_has_one_fixed_source_only_stdin_grammar() {
+        let destination = destination();
+        for (mode, mode_argument) in [
+            (ExactObjectFetchMode::Negotiated, None),
+            (ExactObjectFetchMode::Refetch, Some("--refetch")),
+        ] {
+            let command = destination.exact_object_fetch(mode);
+            let expected = [
+                "--no-replace-objects",
+                "--config-env=remote.gherrit-publication.url=GHERRIT_PRIVATE_PUSH_DESTINATION",
+                "--config-env=remote.gherrit-publication.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
+                "-c",
+                "http.followRedirects=false",
+                "-c",
+                "fetch.bundleURI=",
+                "fetch",
+                "--quiet",
+                "--no-progress",
+                "--no-write-fetch-head",
+                "--no-tags",
+                "--no-prune",
+                "--no-prune-tags",
+                "--no-recurse-submodules",
+                "--no-auto-maintenance",
+                "--no-write-commit-graph",
+                "--no-update-shallow",
+                "--no-filter",
+                "--refmap=",
+            ]
+            .into_iter()
+            .chain(mode_argument)
+            .chain(["--stdin", "--", "gherrit-publication"])
+            .map(OsStr::new)
+            .collect::<Vec<_>>();
+            assert_eq!(arguments(&command), expected);
+            assert_eq!(arguments(&command).last(), Some(&OsStr::new("gherrit-publication")));
+            assert!(arguments(&command).iter().all(|argument| {
+                let argument = argument.to_string_lossy();
+                !argument.contains("refs/") && !argument.contains("https://github.com")
+            }));
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find(|(name, _)| *name == OsStr::new(DESTINATION_ENV))
+                    .and_then(|(_, value)| value),
+                Some(OsStr::new("https://github.com/owner/repo.git"))
+            );
+            for variable in ["GIT_TRACE", "GIT_CURL_VERBOSE"] {
+                assert_eq!(
+                    command
+                        .get_envs()
+                        .find(|(name, _)| *name == OsStr::new(variable))
+                        .and_then(|(_, value)| value),
+                    None
+                );
+            }
+            for variable in ["GIT_TRACE2", "GIT_TRACE2_PERF", "GIT_TRACE2_EVENT"] {
+                assert_eq!(
+                    command
+                        .get_envs()
+                        .find(|(name, _)| *name == OsStr::new(variable))
+                        .and_then(|(_, value)| value),
+                    Some(OsStr::new("0"))
+                );
+            }
+        }
     }
 
     #[test]
