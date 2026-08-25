@@ -15,8 +15,9 @@ use color_eyre::eyre::{Context as _, Report, Result, bail, eyre};
 use gix::ObjectId;
 
 use super::{
+    destination::DefaultBranch,
     local::{GherritIdTrailer, GherritPrId, LocalChange, LocalStack, gherrit_id_trailers},
-    remote::{RawExactLocalChange, RawExactLocalObservation},
+    remote::{RawExactLocalChange, RawExactLocalChangeParts, RawExactLocalObservation},
     version::Version,
 };
 use crate::util;
@@ -128,6 +129,26 @@ struct PreparedPublishedHistory {
     has_pull_request_marker: bool,
 }
 
+/// Structurally checked version which still owns exact acquisition provenance.
+struct SourcedPreparedVersion {
+    head: ObjectId,
+    source_ref: Box<str>,
+}
+
+struct SourcedPreparedPublishedHistory {
+    first: SourcedPreparedVersion,
+    later: Box<[SourcedPreparedVersion]>,
+    owned_base: ObjectId,
+    has_pull_request_marker: bool,
+}
+
+/// One raw history after structural preflight and before provenance is split
+/// from the history facts used by validation.
+struct SourcedPreparedHistory {
+    id: GherritPrId,
+    published: Option<SourcedPreparedPublishedHistory>,
+}
+
 impl PreparedPublishedHistory {
     fn len(&self) -> usize {
         1 + self.later.len()
@@ -170,19 +191,56 @@ impl PreparedPublishedHistory {
     }
 }
 
-/// One raw history after complete structural preflight but before resolution.
+/// Provenance-free history facts ready for object-database resolution.
 struct PreparedHistory {
     id: GherritPrId,
     published: Option<PreparedPublishedHistory>,
 }
 
-impl PreparedHistory {
-    fn from_raw(raw: &RawExactLocalChange) -> Result<Self> {
-        let id = raw.id().clone();
-        let candidate_head = raw.candidate_head();
-        let owned_base = raw.owned_base();
-        let version_count = raw.versions().len();
-        let marker_target = raw.pull_request_marker();
+impl SourcedPreparedHistory {
+    fn from_raw(raw: RawExactLocalChange) -> Result<Self> {
+        let RawExactLocalChangeParts {
+            id,
+            candidate_head,
+            owned_base,
+            versions,
+            pull_request_marker: marker_target,
+        } = raw.into_parts();
+        let versions = versions.into_vec().into_iter().map(|version| {
+            let (number, head, source_ref) = version.into_parts();
+            (number, SourcedPreparedVersion { head, source_ref })
+        });
+        Self::from_parts(id, candidate_head, owned_base, versions, marker_target)
+    }
+
+    #[cfg(test)]
+    fn from_raw_ref(raw: &RawExactLocalChange) -> Result<Self> {
+        let versions = raw.versions().map(|version| {
+            (
+                version.version(),
+                SourcedPreparedVersion {
+                    head: version.object_id(),
+                    source_ref: version.source_ref().into(),
+                },
+            )
+        });
+        Self::from_parts(
+            raw.id().clone(),
+            raw.candidate_head(),
+            raw.owned_base(),
+            versions,
+            raw.pull_request_marker(),
+        )
+    }
+
+    fn from_parts(
+        id: GherritPrId,
+        candidate_head: Option<ObjectId>,
+        owned_base: Option<ObjectId>,
+        versions: impl ExactSizeIterator<Item = (Version, SourcedPreparedVersion)>,
+        marker_target: Option<ObjectId>,
+    ) -> Result<Self> {
+        let version_count = versions.len();
 
         if version_count == 0 && marker_target.is_some() {
             bail!(
@@ -213,24 +271,22 @@ impl PreparedHistory {
             }
         }
 
-        let slots = raw
-            .versions()
+        let slots = versions
             .enumerate()
-            .map(|(index, raw_version)| {
+            .map(|(index, (actual, prepared_version))| {
                 let expected = Version::from_history_index(index).ok_or_else(|| {
                     eyre!("Remote GHerrit change '{}' has too many versions", id.as_str())
                 })?;
-                let actual = raw_version.version();
                 if actual != expected {
                     bail!(
                         "Remote GHerrit change '{}' has noncontiguous version tags: expected v{expected}, observed v{actual}",
                         id.as_str()
                     );
                 }
-                Ok(raw_version.object_id())
+                Ok(prepared_version)
             })
             .collect::<Result<Vec<_>>>()?;
-        let latest_head = *slots.last().expect("a complete published shape is nonempty");
+        let latest_head = slots.last().expect("a complete published shape is nonempty").head;
         if candidate_head != Some(latest_head) {
             bail!(
                 "Remote GHerrit change '{}' head does not match its latest version tag",
@@ -239,7 +295,7 @@ impl PreparedHistory {
         }
         let has_pull_request_marker = marker_target
             .map(|target| {
-                if !slots.contains(&target) {
+                if !slots.iter().any(|version| version.head == target) {
                     bail!(
                         "Pull-request marker for GHerrit change '{}' does not target a published version head",
                         id.as_str()
@@ -252,7 +308,7 @@ impl PreparedHistory {
 
         let mut slots = slots.into_iter();
         let first = slots.next().expect("a complete published shape is nonempty");
-        let published = PreparedPublishedHistory {
+        let published = SourcedPreparedPublishedHistory {
             first,
             later: slots.collect(),
             owned_base: owned_base.expect("the complete shape has an owned base"),
@@ -261,14 +317,55 @@ impl PreparedHistory {
         Ok(Self { id, published: Some(published) })
     }
 
+    #[cfg(test)]
     fn version_heads(&self) -> impl Iterator<Item = ObjectId> + '_ {
-        self.published.iter().flat_map(PreparedPublishedHistory::iter)
+        self.published
+            .iter()
+            .flat_map(|published| std::iter::once(&published.first).chain(&published.later))
+            .map(|version| version.head)
     }
 
-    fn external_version_heads(&self, proposal: ObjectId) -> impl Iterator<Item = ObjectId> + '_ {
-        self.version_heads().filter(move |head| *head != proposal)
+    /// Consumes every source ref while producing provenance-free history.
+    fn into_prepared(self, mut consume_source: impl FnMut(ObjectId, Box<str>)) -> PreparedHistory {
+        let Self { id, published } = self;
+        let published = published.map(|published| {
+            let SourcedPreparedPublishedHistory {
+                first,
+                later,
+                owned_base,
+                has_pull_request_marker,
+            } = published;
+            let mut heads = std::iter::once(first).chain(later.into_vec()).map(|version| {
+                let SourcedPreparedVersion { head, source_ref } = version;
+                consume_source(head, source_ref);
+                head
+            });
+            let first = heads.next().expect("a sourced prepared history is nonempty");
+            PreparedPublishedHistory {
+                first,
+                later: heads.collect(),
+                owned_base,
+                has_pull_request_marker,
+            }
+        });
+        PreparedHistory { id, published }
     }
 
+    #[cfg(test)]
+    fn normalize_for_test(
+        repository: &util::Repo,
+        raw: &RawExactLocalChange,
+    ) -> Result<(GherritPrId, Option<PublishedHistory>)> {
+        let sourced = Self::from_raw_ref(raw)?;
+        let roots = sourced.version_heads().collect::<Vec<_>>();
+        let prepared = sourced.into_prepared(|_, _| {});
+        let graph =
+            CommitGraphEvidence::load_for_test(repository, roots).map_err(graph_load_report)?;
+        prepared.resolve_remote_for_test(&graph)
+    }
+}
+
+impl PreparedHistory {
     fn resolve(self, local: &LocalChange, graph: &CommitGraphEvidence) -> Result<ChangeHistory> {
         let Self { id, published } = self;
         let proposed = Revision::from_local(local);
@@ -293,71 +390,158 @@ impl PreparedHistory {
             .transpose()?;
         Ok((id, published))
     }
+}
+
+/// One distinct external graph root and its nonempty exact advertised aliases.
+#[derive(Debug)]
+pub(super) struct ExternalGraphRoot {
+    oid: ObjectId,
+    first_source_ref: Box<str>,
+    later_source_refs: Box<[Box<str>]>,
+}
+
+impl ExternalGraphRoot {
+    pub(super) fn oid(&self) -> ObjectId {
+        self.oid
+    }
+
+    pub(super) fn source_refs(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.first_source_ref.as_ref())
+            .chain(self.later_source_refs.iter().map(Box::as_ref))
+    }
 
     #[cfg(test)]
-    fn normalize_for_test(
-        repository: &util::Repo,
-        raw: &RawExactLocalChange,
-    ) -> Result<(GherritPrId, Option<PublishedHistory>)> {
-        let prepared = Self::from_raw(raw)?;
-        let roots = prepared.version_heads().collect::<Vec<_>>();
-        let graph = CommitGraphEvidence::load(repository, roots).map_err(graph_load_report)?;
-        prepared.resolve_remote_for_test(&graph)
+    pub(super) fn for_test(oid: ObjectId, first: &str, later: &[&str]) -> Self {
+        Self {
+            oid,
+            first_source_ref: first.into(),
+            later_source_refs: later.iter().map(|source_ref| Box::from(*source_ref)).collect(),
+        }
     }
 }
 
 /// Whole-set structural proof which keeps exact acquisition provenance alive.
-///
-/// #374 can borrow `observation()` and its retained `RawVersionRef::source_ref`
-/// values if graph loading reports a missing object. No source ref or fetchable
-/// object set is reconstructed here.
-pub(super) struct PreparedExactLocalHistories<'a> {
-    observation: &'a RawExactLocalObservation,
-    local: &'a LocalStack,
-    prepared: Box<[PreparedHistory]>,
+pub(super) struct PreparedExactLocalHistories<'local, 'repository> {
+    repository: &'repository util::Repo,
+    histories: StructurallyPreparedHistories<'local>,
 }
 
-impl<'a> PreparedExactLocalHistories<'a> {
+struct StructurallyPreparedHistories<'local> {
+    local: &'local LocalStack,
+    prepared: Box<[PreparedHistory]>,
+    roots: Box<[ExternalGraphRoot]>,
+}
+
+impl<'local, 'repository> PreparedExactLocalHistories<'local, 'repository> {
     pub(super) fn prepare(
-        observation: &'a RawExactLocalObservation,
-        local: &'a LocalStack,
+        observation: RawExactLocalObservation,
+        local: &'local LocalStack,
+        repository: &'repository util::Repo,
     ) -> Result<Self> {
-        // Collecting the whole iterator first is the authority boundary: every
-        // raw structural error precedes every object database access.
-        let prepared =
-            observation.iter().map(PreparedHistory::from_raw).collect::<Result<Box<[_]>>>()?;
-        if observation.default_branch() != local.default_branch() {
-            bail!("Exact local Git observation does not match the local stack's default branch");
-        }
-        if prepared.len() != local.len()
-            || prepared.iter().zip(local.iter()).any(|(history, change)| history.id != *change.id())
-        {
-            bail!("Exact local Git histories do not match the ordered local stack");
-        }
-        Ok(Self { observation, local, prepared })
+        let histories = StructurallyPreparedHistories::prepare(observation, local)?;
+        Ok(Self { repository, histories })
     }
 
-    pub(super) fn observation(&self) -> &RawExactLocalObservation {
-        self.observation
-    }
-
-    pub(super) fn graph_roots(&self) -> Box<[ObjectId]> {
-        let mut seen = HashSet::new();
-        // Failure precedence is semantic and stable: local-stack order, then
-        // version order. Only a slot external to its own sealed proposal is a
-        // root. An OID equal to another change's proposal remains external.
-        self.local
-            .iter()
-            .zip(&self.prepared)
-            .flat_map(|(local, prepared)| prepared.external_version_heads(local.head()))
-            .filter(|oid| seen.insert(*oid))
-            .collect()
+    /// Loads from the repository sealed into this preparation only.
+    pub(super) fn load_graph(
+        &self,
+    ) -> std::result::Result<CommitGraphEvidence, GraphLoadError<'_>> {
+        CommitGraphEvidence::load(self.repository, &self.histories.roots)
     }
 
     pub(super) fn validate(
         self,
         graph: &CommitGraphEvidence,
     ) -> Result<Box<[ValidatedChangeHistory]>> {
+        self.histories.validate(graph)
+    }
+}
+
+impl<'local> StructurallyPreparedHistories<'local> {
+    fn prepare(observation: RawExactLocalObservation, local: &'local LocalStack) -> Result<Self> {
+        let (default_branch, changes) = observation.into_parts();
+        let sourced = changes.into_vec().into_iter().map(SourcedPreparedHistory::from_raw);
+        Self::finish(&default_branch, sourced, local)
+    }
+
+    #[cfg(test)]
+    fn prepare_raw(
+        observation: &RawExactLocalObservation,
+        local: &'local LocalStack,
+    ) -> Result<Self> {
+        Self::finish(
+            observation.default_branch(),
+            observation.iter().map(SourcedPreparedHistory::from_raw_ref),
+            local,
+        )
+    }
+
+    fn finish(
+        default_branch: &DefaultBranch,
+        sourced: impl Iterator<Item = Result<SourcedPreparedHistory>>,
+        local: &'local LocalStack,
+    ) -> Result<Self> {
+        // Collecting the whole iterator first is the authority boundary: every
+        // raw structural error precedes every object database access.
+        let sourced = sourced.collect::<Result<Box<[_]>>>()?;
+        if default_branch != local.default_branch() {
+            bail!("Exact local Git observation does not match the local stack's default branch");
+        }
+        if sourced.len() != local.len()
+            || sourced.iter().zip(local.iter()).any(|(history, change)| history.id != *change.id())
+        {
+            bail!("Exact local Git histories do not match the ordered local stack");
+        }
+
+        let mut root_indexes = HashMap::<ObjectId, usize>::new();
+        let mut roots = Vec::<(ObjectId, Box<str>, Vec<Box<str>>)>::new();
+        let prepared = sourced
+            .into_vec()
+            .into_iter()
+            .zip(local.iter())
+            .map(|(sourced, local)| {
+                let proposal = local.head();
+                sourced.into_prepared(|head, source_ref| {
+                    // Failure precedence and acquisition order are semantic:
+                    // local-stack order, then immutable version order. A
+                    // proposal-equal slot contributes neither a root nor an
+                    // alias. The same OID may remain external to another
+                    // change and then owns that external slot's source ref.
+                    if head == proposal {
+                        return;
+                    }
+                    match root_indexes.get(&head).copied() {
+                        Some(index) => roots[index].2.push(source_ref),
+                        None => {
+                            root_indexes.insert(head, roots.len());
+                            roots.push((head, source_ref, Vec::new()));
+                        }
+                    }
+                })
+            })
+            .collect::<Box<[_]>>();
+        let roots = roots
+            .into_iter()
+            .map(|(oid, first_source_ref, later_source_refs)| ExternalGraphRoot {
+                oid,
+                first_source_ref,
+                later_source_refs: later_source_refs.into_boxed_slice(),
+            })
+            .collect();
+        Ok(Self { local, prepared, roots })
+    }
+
+    #[cfg(test)]
+    pub(super) fn graph_roots(&self) -> Box<[ObjectId]> {
+        self.roots.iter().map(ExternalGraphRoot::oid).collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn external_roots(&self) -> impl ExactSizeIterator<Item = &ExternalGraphRoot> {
+        self.roots.iter()
+    }
+
+    fn validate(self, graph: &CommitGraphEvidence) -> Result<Box<[ValidatedChangeHistory]>> {
         let histories = self
             .prepared
             .into_vec()
@@ -529,35 +713,110 @@ pub(super) struct CommitGraphEvidence {
     commits: HashMap<ObjectId, CommitFacts>,
 }
 
-/// Separates an acquirable missing object from invalid local graph evidence.
+/// Separates exact acquisition capabilities from invalid local graph evidence.
 #[derive(Debug)]
-pub(super) enum GraphLoadError {
-    MissingObject { oid: ObjectId },
+pub(super) enum GraphLoadError<'root> {
+    MissingAdvertisedRoot(MissingAdvertisedRoot<'root>),
+    MissingAncestor(MissingAncestor<'root>),
     Invalid(Report),
 }
 
-impl fmt::Display for GraphLoadError {
+#[derive(Debug)]
+pub(super) struct MissingAdvertisedRoot<'root> {
+    root: &'root ExternalGraphRoot,
+}
+
+impl<'root> MissingAdvertisedRoot<'root> {
+    pub(super) fn root(&self) -> &'root ExternalGraphRoot {
+        self.root
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct MissingAncestor<'root> {
+    oid: ObjectId,
+    root: &'root ExternalGraphRoot,
+}
+
+impl<'root> MissingAncestor<'root> {
+    pub(super) fn oid(&self) -> ObjectId {
+        self.oid
+    }
+
+    pub(super) fn root(&self) -> &'root ExternalGraphRoot {
+        self.root
+    }
+}
+
+impl fmt::Display for GraphLoadError<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingObject { oid } => write!(formatter, "Commit object {oid} is missing"),
+            Self::MissingAdvertisedRoot(missing) => {
+                write!(formatter, "Advertised graph-root commit {} is missing", missing.root.oid())
+            }
+            Self::MissingAncestor(missing) => write!(
+                formatter,
+                "Commit {} in ancestry of advertised graph root {} is missing",
+                missing.oid,
+                missing.root.oid()
+            ),
             Self::Invalid(error) => error.fmt(formatter),
         }
     }
 }
 
-impl std::error::Error for GraphLoadError {
+impl std::error::Error for GraphLoadError<'_> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::MissingObject { .. } => None,
+            Self::MissingAdvertisedRoot(_) | Self::MissingAncestor(_) => None,
             Self::Invalid(error) => error.source(),
         }
     }
 }
 
-fn graph_load_report(error: GraphLoadError) -> Report {
+impl GraphLoadError<'_> {
+    pub(super) fn into_report(self) -> Report {
+        match self {
+            Self::Invalid(error) => error,
+            error => eyre!(error.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+enum TestGraphLoadError {
+    MissingAdvertisedRoot { root: ObjectId },
+    MissingAncestor { oid: ObjectId, root: ObjectId },
+    Invalid(Report),
+}
+
+#[cfg(test)]
+impl fmt::Display for TestGraphLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingAdvertisedRoot { root } => {
+                write!(formatter, "Advertised graph-root commit {root} is missing")
+            }
+            Self::MissingAncestor { oid, root } => write!(
+                formatter,
+                "Commit {oid} in ancestry of advertised graph root {root} is missing"
+            ),
+            Self::Invalid(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(test)]
+fn graph_load_report(error: TestGraphLoadError) -> Report {
     match error {
-        GraphLoadError::Invalid(error) => error,
-        error @ GraphLoadError::MissingObject { .. } => Report::new(error),
+        TestGraphLoadError::Invalid(error) => error,
+        TestGraphLoadError::MissingAdvertisedRoot { root } => {
+            eyre!("Advertised graph-root commit {root} is missing")
+        }
+        TestGraphLoadError::MissingAncestor { oid, root } => {
+            eyre!("Commit {oid} in ancestry of advertised graph root {root} is missing")
+        }
     }
 }
 
@@ -565,16 +824,19 @@ impl CommitGraphEvidence {
     /// Loads and fully decodes each reachable commit once breadth-first: all
     /// direct roots precede ancestry, while roots and each commit's declared
     /// parents retain their supplied order.
-    pub(super) fn load(
+    fn load<'root>(
         repository: &util::Repo,
-        roots: impl IntoIterator<Item = ObjectId>,
-    ) -> std::result::Result<Self, GraphLoadError> {
+        roots: &'root [ExternalGraphRoot],
+    ) -> std::result::Result<Self, GraphLoadError<'root>> {
         let mut scheduled = HashSet::new();
-        let mut pending =
-            roots.into_iter().filter(|oid| scheduled.insert(*oid)).collect::<VecDeque<_>>();
+        let mut pending = roots
+            .iter()
+            .filter(|root| scheduled.insert(root.oid()))
+            .map(|root| (root.oid(), root))
+            .collect::<VecDeque<_>>();
         let mut commits = HashMap::new();
 
-        while let Some(oid) = pending.pop_front() {
+        while let Some((oid, causal_root)) = pending.pop_front() {
             let object = repository
                 .try_find_object(oid)
                 .map_err(|error| {
@@ -582,7 +844,15 @@ impl CommitGraphEvidence {
                         Report::new(error).wrap_err(format!("Failed to read object {oid}")),
                     )
                 })?
-                .ok_or(GraphLoadError::MissingObject { oid })?;
+                .ok_or_else(|| {
+                    if oid == causal_root.oid() {
+                        GraphLoadError::MissingAdvertisedRoot(MissingAdvertisedRoot {
+                            root: causal_root,
+                        })
+                    } else {
+                        GraphLoadError::MissingAncestor(MissingAncestor { oid, root: causal_root })
+                    }
+                })?;
             if object.kind != gix::object::Kind::Commit {
                 return Err(GraphLoadError::Invalid(eyre!(
                     "Object {oid} is {}, not a commit",
@@ -610,11 +880,42 @@ impl CommitGraphEvidence {
                     })
                 })
                 .collect::<std::result::Result<Box<[_]>, _>>()?;
-            pending.extend(parents.iter().copied().filter(|parent| scheduled.insert(*parent)));
+            pending.extend(
+                parents
+                    .iter()
+                    .copied()
+                    .filter(|parent| scheduled.insert(*parent))
+                    .map(|parent| (parent, causal_root)),
+            );
             assert!(commits.insert(oid, CommitFacts { parents, identities }).is_none());
         }
 
         Ok(Self { commits })
+    }
+
+    #[cfg(test)]
+    fn load_for_test(
+        repository: &util::Repo,
+        roots: impl IntoIterator<Item = ObjectId>,
+    ) -> std::result::Result<Self, TestGraphLoadError> {
+        let roots = roots
+            .into_iter()
+            .map(|oid| ExternalGraphRoot {
+                oid,
+                first_source_ref: "refs/tags/gherrit/Test/v1".into(),
+                later_source_refs: Box::new([]),
+            })
+            .collect::<Vec<_>>();
+        Self::load(repository, &roots).map_err(|error| match error {
+            GraphLoadError::MissingAdvertisedRoot(missing) => {
+                TestGraphLoadError::MissingAdvertisedRoot { root: missing.root().oid() }
+            }
+            GraphLoadError::MissingAncestor(missing) => TestGraphLoadError::MissingAncestor {
+                oid: missing.oid(),
+                root: missing.root().oid(),
+            },
+            GraphLoadError::Invalid(error) => TestGraphLoadError::Invalid(error),
+        })
     }
 
     fn revision(&self, head: ObjectId) -> Result<Revision> {
@@ -670,7 +971,7 @@ mod tests {
     use super::*;
     use crate::pre_push::{
         destination::DefaultBranch,
-        remote::{ExactLocalQueryPlan, RawExactLocalObservation},
+        remote::{RawExactLocalObservation, decode_for_test},
     };
 
     struct TestRepository {
@@ -765,10 +1066,7 @@ mod tests {
         if let Some(target) = marker_target {
             output.push_str(&format!("{target}\trefs/tags/gherrit/{}/pr\n", id.as_str()));
         }
-        ExactLocalQueryPlan::new(default, std::slice::from_ref(id))
-            .unwrap()
-            .decode([output.as_bytes()])
-            .unwrap()
+        decode_for_test(default, std::slice::from_ref(id), [output.as_bytes()]).unwrap()
     }
 
     fn observe_many(
@@ -785,7 +1083,7 @@ mod tests {
         records: impl fmt::Display,
     ) -> RawExactLocalObservation {
         let output = format!("{}\trefs/heads/{}\n{records}", default.tip(), default.name());
-        ExactLocalQueryPlan::new(default, ids).unwrap().decode([output.as_bytes()]).unwrap()
+        decode_for_test(default, ids, [output.as_bytes()]).unwrap()
     }
 
     fn external_history(
@@ -816,7 +1114,10 @@ mod tests {
     ) -> Result<(GherritPrId, Option<PublishedHistory>)> {
         let observed =
             observe(id, default_tip, candidate_head, owned_base, versions, marker_target);
-        PreparedHistory::normalize_for_test(&repository.open(), observed.iter().next().unwrap())
+        SourcedPreparedHistory::normalize_for_test(
+            &repository.open(),
+            observed.iter().next().unwrap(),
+        )
     }
 
     #[test]
@@ -1004,7 +1305,7 @@ mod tests {
         .unwrap_err();
         assert!(marker.to_string().contains("does not target a published version head"));
 
-        let graph = CommitGraphEvidence::load(&repository.open(), [a, a, b, a]).unwrap();
+        let graph = CommitGraphEvidence::load_for_test(&repository.open(), [a, a, b, a]).unwrap();
         let resolved =
             [a, a, b, a].into_iter().map(|head| graph.revision(head).unwrap()).collect::<Vec<_>>();
         assert_eq!(
@@ -1106,12 +1407,17 @@ mod tests {
     fn distinguishes_absent_objects_from_object_database_failures() {
         let repository = TestRepository::new();
         let missing = ObjectId::from_bytes_or_panic(&[0x68; 20]);
-        let missing_error = CommitGraphEvidence::load(&repository.open(), [missing]).unwrap_err();
-        assert_eq!(missing_error.to_string(), format!("Commit object {missing} is missing"));
+        let missing_error =
+            CommitGraphEvidence::load_for_test(&repository.open(), [missing]).unwrap_err();
+        assert_eq!(
+            missing_error.to_string(),
+            format!("Advertised graph-root commit {missing} is missing")
+        );
 
         let corrupt = ObjectId::from_bytes_or_panic(&[0x69; 20]);
         repository.corrupt_loose_object(corrupt);
-        let read_error = CommitGraphEvidence::load(&repository.open(), [corrupt]).unwrap_err();
+        let read_error =
+            CommitGraphEvidence::load_for_test(&repository.open(), [corrupt]).unwrap_err();
         assert_eq!(read_error.to_string(), format!("Failed to read object {corrupt}"));
         assert!(!format!("{read_error:?}").contains("Commit object {corrupt} is missing"));
     }
@@ -1239,8 +1545,10 @@ mod tests {
             let head = repository.commit(message, &[root]);
             let observed = observe(&requested, root, Some(head), Some(root), &[(1, head)], None);
             let raw = observed.iter().next().unwrap();
-            let first = PreparedHistory::normalize_for_test(&repository.open(), raw).unwrap();
-            let second = PreparedHistory::normalize_for_test(&repository.open(), raw).unwrap();
+            let first =
+                SourcedPreparedHistory::normalize_for_test(&repository.open(), raw).unwrap();
+            let second =
+                SourcedPreparedHistory::normalize_for_test(&repository.open(), raw).unwrap();
             assert_eq!(first.0, requested);
             assert_eq!(second.0, requested);
             assert_eq!(raw.id(), &requested, "normalization must borrow raw evidence");
@@ -1248,7 +1556,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_retains_provenance_and_exposes_only_whole_validated_history() {
+    fn aggregate_retains_root_aliases_and_exposes_only_whole_validated_history() {
         let repository = TestRepository::new();
         let root = repository.commit("root", &[]);
         let published = repository.commit("published\n\ngherrit-pr-id: Gone\n", &[root]);
@@ -1267,15 +1575,15 @@ mod tests {
             Some(published),
         );
 
-        let prepared = PreparedExactLocalHistories::prepare(&observation, &local).unwrap();
-        assert!(std::ptr::eq(prepared.observation(), &observation));
-        assert_eq!(
-            prepared.observation().iter().next().unwrap().versions().next().unwrap().source_ref(),
-            "refs/tags/gherrit/Gone/v1"
-        );
+        let prepared = StructurallyPreparedHistories::prepare_raw(&observation, &local).unwrap();
         assert_eq!(prepared.graph_roots().as_ref(), [published]);
+        assert_eq!(
+            prepared.external_roots().next().unwrap().source_refs().collect::<Vec<_>>(),
+            ["refs/tags/gherrit/Gone/v1"]
+        );
 
-        let graph = CommitGraphEvidence::load(&repository.open(), prepared.graph_roots()).unwrap();
+        let graph =
+            CommitGraphEvidence::load_for_test(&repository.open(), prepared.graph_roots()).unwrap();
         let mut histories = prepared.validate(&graph).unwrap().into_vec();
         let validated = histories.pop().unwrap();
 
@@ -1329,8 +1637,9 @@ mod tests {
         );
         let observation =
             observe(&change_id, root, Some(published), Some(root), &[(1, published)], None);
-        let prepared = PreparedExactLocalHistories::prepare(&observation, &local).unwrap();
-        let unrelated_graph = CommitGraphEvidence::load(&repository.open(), [unrelated]).unwrap();
+        let prepared = StructurallyPreparedHistories::prepare_raw(&observation, &local).unwrap();
+        let unrelated_graph =
+            CommitGraphEvidence::load_for_test(&repository.open(), [unrelated]).unwrap();
 
         let error = prepared.validate(&unrelated_graph).unwrap_err();
         let causes = error.chain().map(ToString::to_string).collect::<Vec<_>>();
@@ -1352,10 +1661,10 @@ mod tests {
         );
 
         let absent = observe(&change_id, root, None, None, &[], None);
-        let absent = PreparedExactLocalHistories::prepare(&absent, &local).unwrap();
+        let absent = StructurallyPreparedHistories::prepare_raw(&absent, &local).unwrap();
         assert!(absent.graph_roots().is_empty());
         let empty_graph =
-            CommitGraphEvidence::load(&repository.open(), absent.graph_roots()).unwrap();
+            CommitGraphEvidence::load_for_test(&repository.open(), absent.graph_roots()).unwrap();
         let mut histories = absent.validate(&empty_graph).unwrap().into_vec();
         let absent = histories.pop().unwrap();
         assert!(absent.needs_publication());
@@ -1367,9 +1676,10 @@ mod tests {
 
         let repeated =
             observe(&change_id, root, Some(a), Some(root), &[(1, a), (2, b), (3, a)], None);
-        let repeated = PreparedExactLocalHistories::prepare(&repeated, &local).unwrap();
+        let repeated = StructurallyPreparedHistories::prepare_raw(&repeated, &local).unwrap();
         assert_eq!(repeated.graph_roots().as_ref(), [b]);
-        let graph = CommitGraphEvidence::load(&repository.open(), repeated.graph_roots()).unwrap();
+        let graph =
+            CommitGraphEvidence::load_for_test(&repository.open(), repeated.graph_roots()).unwrap();
         let mut histories = repeated.validate(&graph).unwrap().into_vec();
         let repeated = histories.pop().unwrap();
 
@@ -1417,7 +1727,7 @@ mod tests {
         );
         let observation = observe_many(&ids, root, records);
 
-        let error = PreparedExactLocalHistories::prepare(&observation, &local)
+        let error = StructurallyPreparedHistories::prepare_raw(&observation, &local)
             .err()
             .expect("the later raw history has a structural gap");
 
@@ -1440,14 +1750,14 @@ mod tests {
         for observed_default in [default_branch("main", other_tip), default_branch("trunk", root)] {
             let observation =
                 observe_many_on(observed_default, std::slice::from_ref(&change_id), "");
-            let error = PreparedExactLocalHistories::prepare(&observation, &local)
+            let error = StructurallyPreparedHistories::prepare_raw(&observation, &local)
                 .err()
                 .expect("the exact default path origin differs");
             assert!(error.to_string().contains("does not match the local stack's default branch"));
         }
 
         let observation = observe_many_on(local_default, std::slice::from_ref(&change_id), "");
-        PreparedExactLocalHistories::prepare(&observation, &local)
+        StructurallyPreparedHistories::prepare_raw(&observation, &local)
             .expect("the exact same default path origin is accepted");
     }
 
@@ -1466,43 +1776,64 @@ mod tests {
             [(ids[0].clone(), proposal_a, root), (ids[1].clone(), proposal_b, proposal_a)],
         );
         let records = format!(
-            "{published_a2}\trefs/heads/A\n\
-             {root}\trefs/heads/gherrit-bases/A\n\
+            "{proposal_b}\trefs/heads/A\n\
+             {proposal_a}\trefs/heads/gherrit-bases/A\n\
              {published_a1}\trefs/tags/gherrit/A/v1\n\
              {published_a2}\trefs/tags/gherrit/A/v2\n\
+             {published_a1}\trefs/tags/gherrit/A/v3\n\
              {published_b}\trefs/heads/B\n\
              {proposal_a}\trefs/heads/gherrit-bases/B\n\
              {published_b}\trefs/tags/gherrit/B/v1\n"
         );
         let observation = observe_many(&ids, root, records);
-        let prepared = PreparedExactLocalHistories::prepare(&observation, &local).unwrap();
+        let prepared = StructurallyPreparedHistories::prepare_raw(&observation, &local).unwrap();
 
         assert_eq!(prepared.graph_roots().as_ref(), [proposal_b, published_a2]);
+        let roots = prepared.external_roots().collect::<Vec<_>>();
+        assert_eq!(
+            roots[0].source_refs().collect::<Vec<_>>(),
+            ["refs/tags/gherrit/A/v1", "refs/tags/gherrit/A/v3"]
+        );
+        assert_eq!(roots[1].source_refs().collect::<Vec<_>>(), ["refs/tags/gherrit/A/v2"]);
 
         let first_missing = ObjectId::from_bytes_or_panic(&[0xc1; 20]);
         let second_missing = ObjectId::from_bytes_or_panic(&[0xc2; 20]);
         assert!(matches!(
-            CommitGraphEvidence::load(&repository.open(), [first_missing, second_missing]),
-            Err(GraphLoadError::MissingObject { oid }) if oid == first_missing
+            CommitGraphEvidence::load_for_test(&repository.open(), [first_missing, second_missing]),
+            Err(TestGraphLoadError::MissingAdvertisedRoot { root }) if root == first_missing
         ));
 
         let first_parent = ObjectId::from_bytes_or_panic(&[0xd1; 20]);
         let second_parent = ObjectId::from_bytes_or_panic(&[0xd2; 20]);
         let merge = repository.commit("merge", &[first_parent, second_parent]);
         assert!(matches!(
-            CommitGraphEvidence::load(&repository.open(), [merge]),
-            Err(GraphLoadError::MissingObject { oid }) if oid == first_parent
+            CommitGraphEvidence::load_for_test(&repository.open(), [merge]),
+            Err(TestGraphLoadError::MissingAncestor { oid, root })
+                if oid == first_parent && root == merge
+        ));
+
+        let shared_missing = ObjectId::from_bytes_or_panic(&[0xd5; 20]);
+        let first_causal_root = repository.commit("first causal root", &[shared_missing]);
+        let second_causal_root = repository.commit("second causal root", &[shared_missing]);
+        assert!(matches!(
+            CommitGraphEvidence::load_for_test(
+                &repository.open(),
+                [first_causal_root, second_causal_root],
+            ),
+            Err(TestGraphLoadError::MissingAncestor { oid, root })
+                if oid == shared_missing && root == first_causal_root
         ));
 
         let missing_parent = ObjectId::from_bytes_or_panic(&[0xd3; 20]);
         let root_with_missing_parent = repository.commit("root before ancestry", &[missing_parent]);
         let missing_later_root = ObjectId::from_bytes_or_panic(&[0xd4; 20]);
         assert!(matches!(
-            CommitGraphEvidence::load(
+            CommitGraphEvidence::load_for_test(
                 &repository.open(),
                 [root_with_missing_parent, missing_later_root],
             ),
-            Err(GraphLoadError::MissingObject { oid }) if oid == missing_later_root
+            Err(TestGraphLoadError::MissingAdvertisedRoot { root })
+                if root == missing_later_root
         ));
     }
 
@@ -1532,7 +1863,8 @@ mod tests {
             .iter()
             .map(|(message, _)| repository.commit_bytes(message, &[root]))
             .collect::<Vec<_>>();
-        let graph = CommitGraphEvidence::load(&repository.open(), commits.iter().copied()).unwrap();
+        let graph = CommitGraphEvidence::load_for_test(&repository.open(), commits.iter().copied())
+            .unwrap();
         let proposal = repository.commit("proposal\n\ngherrit-pr-id: Gone\n", &[root]);
         let proposed = Revision { head: proposal, first_parent: root };
 
@@ -1550,7 +1882,7 @@ mod tests {
         let malformed = repository.commit("ancestor\n\ngherrit-pr-id:Gone\n", &[root]);
         let published = repository.commit("published\n\ngherrit-pr-id: Gone\n", &[malformed]);
         let proposal = repository.commit("proposal\n\ngherrit-pr-id: Gone\n", &[root]);
-        let graph = CommitGraphEvidence::load(&repository.open(), [published]).unwrap();
+        let graph = CommitGraphEvidence::load_for_test(&repository.open(), [published]).unwrap();
         let proposed = Revision { head: proposal, first_parent: root };
 
         external_history(&graph, &id("Gone"), published, proposed).validate(&graph).unwrap();
@@ -1572,10 +1904,12 @@ mod tests {
         for (head, owned_base) in [(first_parent_head, proposal), (merge_head, root)] {
             let observation =
                 observe(&change_id, root, Some(head), Some(owned_base), &[(1, head)], None);
-            let prepared = PreparedExactLocalHistories::prepare(&observation, &local).unwrap();
+            let prepared =
+                StructurallyPreparedHistories::prepare_raw(&observation, &local).unwrap();
             assert_eq!(prepared.graph_roots().as_ref(), [head]);
             let graph =
-                CommitGraphEvidence::load(&repository.open(), prepared.graph_roots()).unwrap();
+                CommitGraphEvidence::load_for_test(&repository.open(), prepared.graph_roots())
+                    .unwrap();
             let error = prepared.validate(&graph).unwrap_err();
             assert!(error.to_string().contains("Proper ancestry"), "head={head}");
             assert!(error.to_string().contains(&proposal.to_string()));
@@ -1596,9 +1930,10 @@ mod tests {
         );
         let observation =
             observe(&change_id, root, Some(wrong), Some(duplicate), &[(1, wrong)], None);
-        let prepared = PreparedExactLocalHistories::prepare(&observation, &local).unwrap();
+        let prepared = StructurallyPreparedHistories::prepare_raw(&observation, &local).unwrap();
         assert_eq!(prepared.graph_roots().as_ref(), [wrong]);
-        let graph = CommitGraphEvidence::load(&repository.open(), prepared.graph_roots()).unwrap();
+        let graph =
+            CommitGraphEvidence::load_for_test(&repository.open(), prepared.graph_roots()).unwrap();
         let error = prepared.validate(&graph).unwrap_err();
 
         assert!(error.to_string().contains("must have exactly one"));
