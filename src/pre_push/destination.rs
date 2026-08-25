@@ -9,6 +9,7 @@
 use std::{
     borrow::Cow,
     env,
+    path::PathBuf,
     process::{Command, Stdio},
     str,
 };
@@ -39,12 +40,92 @@ struct ResolvedDestination {
     coordinates: RepositoryCoordinates,
 }
 
+/// The exact local repository context for every destination-bound Git child.
+///
+/// Git's repository-selection environment can override a command's current
+/// directory. Retaining the paths selected by `Repo::open` and applying them
+/// to every child prevents destination resolution, observation, acquisition,
+/// and publication from silently operating in another repository.
+#[derive(Clone, Eq, PartialEq)]
+struct RepositoryBinding {
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    work_tree: Option<PathBuf>,
+    current_dir: PathBuf,
+}
+
+impl RepositoryBinding {
+    fn new(repository: &util::Repo) -> Result<Self> {
+        if repository.namespace().is_some() {
+            bail!("GHerrit does not support publishing from a namespaced Git repository");
+        }
+
+        let opened_from = std::path::absolute(repository.current_dir())
+            .wrap_err("Failed to make the Git repository's opening directory absolute")?;
+        let absolute = |path: &std::path::Path| {
+            Ok::<_, color_eyre::Report>(if path.is_absolute() {
+                path.to_owned()
+            } else {
+                opened_from.join(path)
+            })
+        };
+        let git_dir = absolute(repository.path())?;
+        let common_dir = absolute(repository.common_dir())?;
+        let work_tree = repository.workdir().map(absolute).transpose()?;
+        let current_dir = work_tree.clone().unwrap_or_else(|| git_dir.clone());
+        Ok(Self { git_dir, common_dir, work_tree, current_dir })
+    }
+
+    fn bind(&self, command: &mut Command) {
+        // These values can select a different repository, worktree, common
+        // ref store, or ref namespace even when `current_dir` is exact.
+        for variable in [
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_WORK_TREE",
+            "GIT_IMPLICIT_WORK_TREE",
+            "GIT_NAMESPACE",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        ] {
+            command.env_remove(variable);
+        }
+        command
+            .env("GIT_DIR", &self.git_dir)
+            .env("GIT_COMMON_DIR", &self.common_dir)
+            .current_dir(&self.current_dir);
+        if let Some(work_tree) = &self.work_tree {
+            command.env("GIT_WORK_TREE", work_tree);
+        }
+    }
+}
+
 /// A validated GitHub repository identity derived from the exact push
 /// destination.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct RepositoryCoordinates {
     owner: String,
     repository: String,
+}
+
+/// The exact local repository and remote Git destination represented by a
+/// publication client or executable action.
+///
+/// This value deliberately has no `Debug` implementation: its repository
+/// paths and destination literal may be private. Equality is used only to
+/// prevent evidence or effects prepared for one target from being relabelled
+/// as authority for another target with the same GitHub coordinates.
+#[derive(Clone, Eq, PartialEq)]
+pub(super) struct PublicationTarget {
+    repository: RepositoryBinding,
+    literal: String,
+    coordinates: RepositoryCoordinates,
+}
+
+impl PublicationTarget {
+    pub(super) fn coordinates(&self) -> &RepositoryCoordinates {
+        &self.coordinates
+    }
 }
 
 impl RepositoryCoordinates {
@@ -76,6 +157,7 @@ impl RepositoryCoordinates {
 /// destination to Git or use its derived repository identity, but must not log
 /// it.
 pub(super) struct PushDestination {
+    repository: RepositoryBinding,
     resolved: ResolvedDestination,
     internal_remote: String,
 }
@@ -92,13 +174,27 @@ pub(super) enum ExactObjectFetchMode {
 impl PushDestination {
     #[cfg(test)]
     pub(super) fn for_test() -> Self {
+        let repository = util::Repo::open(".").expect("tests run inside the GHerrit repository");
+        Self::for_test_in(&repository)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test_in(repository: &util::Repo) -> Self {
+        Self::for_test_url_in(repository, "https://github.com/owner/repo.git")
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test_url_in(repository: &util::Repo, url: &str) -> Self {
         let configured_remote = util::RemoteName::from_config(b"origin").unwrap();
-        let resolved = ResolvedDestination::from_git_output(
-            configured_remote,
-            b"https://github.com/owner/repo.git\n",
-        )
-        .unwrap();
-        Self { resolved, internal_remote: INTERNAL_REMOTE_STEM.to_owned() }
+        let resolved =
+            ResolvedDestination::from_git_output(configured_remote, format!("{url}\n").as_bytes())
+                .unwrap();
+        Self {
+            repository: RepositoryBinding::new(repository)
+                .expect("test repositories use a supported repository context"),
+            resolved,
+            internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
+        }
     }
 
     /// Resolves the one exact destination Git would use for pushing.
@@ -107,16 +203,21 @@ impl PushDestination {
     /// decoded and validated exactly once per publication attempt. `--` is
     /// required because Git permits manually configured remote names beginning
     /// with a hyphen.
-    pub(super) fn resolve(configured_remote: util::RemoteName) -> Result<Self> {
+    pub(super) fn resolve(
+        repository: &util::Repo,
+        configured_remote: util::RemoteName,
+    ) -> Result<Self> {
         // The private adapter below depends on `--config-env`, introduced in
         // Git 2.31. Check explicitly instead of letting an older Git reject an
         // otherwise opaque internal command later in the attempt.
         util::require_git_config_env()?;
 
+        let repository = RepositoryBinding::new(repository)?;
         let mut command = util::cmd(
             "git",
             ["remote", "get-url", "--push", "--all", "--", configured_remote.as_str()],
         );
+        repository.bind(&mut command);
         clear_git_transport_diagnostics(&mut command);
         let output = command.output().wrap_err_with(|| {
             format!(
@@ -139,12 +240,12 @@ impl PushDestination {
         // the resolved destination. Use a throwaway, proved-absent remote to
         // activate that complete finite configuration before selecting the
         // remote used for network commands.
-        let baseline = resolved.inspect_baseline_configuration()?;
+        let baseline = resolved.inspect_baseline_configuration(&repository)?;
         let probe_remote = select_absent_remote(PROBE_REMOTE_STEM, &baseline);
-        let active = resolved.inspect_configuration_with_remote(&probe_remote)?;
+        let active = resolved.inspect_configuration_with_remote(&repository, &probe_remote)?;
         let internal_remote = select_absent_remote(INTERNAL_REMOTE_STEM, &active);
 
-        let destination = Self { resolved, internal_remote };
+        let destination = Self { repository, resolved, internal_remote };
         destination.inspect_internal_remote_configuration()?;
         destination.ensure_rewrite_fixed_point()?;
         destination.ensure_http_redirects_disabled()?;
@@ -303,7 +404,7 @@ impl PushDestination {
     /// private local path. Exactly one URL and push URL are added; no empty
     /// reset values or Git-version-dependent additive behavior participate.
     fn adapter_command(&self, arguments: impl IntoIterator<Item = String>) -> Command {
-        self.resolved.private_remote_command(&self.internal_remote, arguments)
+        self.resolved.private_remote_command(&self.repository, &self.internal_remote, arguments)
     }
 
     /// Constructs a destination-bearing Git command with redirects disabled.
@@ -410,6 +511,28 @@ impl PushDestination {
         &self.resolved.coordinates
     }
 
+    pub(super) fn publication_target(&self) -> PublicationTarget {
+        PublicationTarget {
+            repository: self.repository.clone(),
+            literal: self.resolved.literal.clone(),
+            coordinates: self.resolved.coordinates.clone(),
+        }
+    }
+
+    /// Whether the Git destination belongs to the public GitHub forge used by
+    /// the production API endpoint.
+    ///
+    /// Test-driver runtimes pair an explicit fake API with a local Git remote,
+    /// so this is enforced when the GitHub client selects its production
+    /// endpoint rather than while resolving the destination.
+    pub(super) fn supports_production_github(&self) -> bool {
+        is_github_com_destination(&self.resolved.literal)
+    }
+
+    pub(super) fn belongs_to(&self, repository: &util::Repo) -> Result<bool> {
+        Ok(self.repository == RepositoryBinding::new(repository)?)
+    }
+
     pub(super) fn pr_url(&self, pr_number: u64) -> String {
         format!(
             "https://github.com/{}/{}/pull/{pr_number}",
@@ -487,8 +610,12 @@ impl ResolvedDestination {
     }
 
     /// Reads configuration which is active before GHerrit adds any remote.
-    fn inspect_baseline_configuration(&self) -> Result<Vec<Vec<u8>>> {
+    fn inspect_baseline_configuration(
+        &self,
+        repository: &RepositoryBinding,
+    ) -> Result<Vec<Vec<u8>>> {
         let mut command = util::cmd("git", ["config", "--null", "--name-only", "--list"]);
+        repository.bind(&mut command);
         clear_git_transport_diagnostics(&mut command);
         let output = command.output().wrap_err_with(|| {
             format!(
@@ -501,9 +628,14 @@ impl ResolvedDestination {
 
     /// Reads configuration after the destination has activated URL-conditioned
     /// includes under a throwaway, proved-absent remote name.
-    fn inspect_configuration_with_remote(&self, remote: &str) -> Result<Vec<Vec<u8>>> {
+    fn inspect_configuration_with_remote(
+        &self,
+        repository: &RepositoryBinding,
+        remote: &str,
+    ) -> Result<Vec<Vec<u8>>> {
         let output = self
             .private_remote_command(
+                repository,
                 remote,
                 ["config", "--null", "--name-only", "--list"].map(str::to_owned),
             )
@@ -524,6 +656,7 @@ impl ResolvedDestination {
     /// Adds exactly one private URL and push URL for a proved-absent name.
     fn private_remote_command(
         &self,
+        repository: &RepositoryBinding,
         remote: &str,
         arguments: impl IntoIterator<Item = String>,
     ) -> Command {
@@ -536,6 +669,7 @@ impl ResolvedDestination {
         .into_iter()
         .chain(arguments);
         let mut command = util::cmd("git", arguments);
+        repository.bind(&mut command);
         command.env(DESTINATION_ENV, &self.literal);
         clear_git_transport_diagnostics(&mut command);
         command
@@ -811,6 +945,31 @@ fn repository_identity(destination: &str) -> Option<RepositoryCoordinates> {
     RepositoryCoordinates::new((*owner).to_owned(), repository.to_owned())
 }
 
+/// Recognizes the URI and SCP authorities which name `github.com` itself.
+/// Local paths, aliases, ports, subdomains, and unrelated forges are not the
+/// repository served by GHerrit's fixed production GitHub API endpoint.
+fn is_github_com_destination(destination: &str) -> bool {
+    if let Some((scheme, rest)) = destination.split_once("://") {
+        if !valid_scheme(scheme) || scheme.eq_ignore_ascii_case("file") {
+            return false;
+        }
+        let Some((authority, _)) = rest.split_once('/') else {
+            return false;
+        };
+        return authority.eq_ignore_ascii_case("github.com");
+    }
+
+    if is_scp_form(destination) {
+        let Some((authority, _)) = destination.split_once(':') else {
+            return false;
+        };
+        return authority.eq_ignore_ascii_case("git@github.com")
+            || authority.eq_ignore_ascii_case("github.com");
+    }
+
+    false
+}
+
 fn valid_scheme(scheme: &str) -> bool {
     !scheme.is_empty()
         && scheme.bytes().enumerate().all(|(index, byte)| {
@@ -927,7 +1086,7 @@ pub(super) fn git_output_records(output: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
+    use std::{ffi::OsStr, path::Path};
 
     use super::*;
 
@@ -945,6 +1104,122 @@ mod tests {
 
     fn arguments(command: &Command) -> Vec<&OsStr> {
         command.get_args().collect()
+    }
+
+    fn environment<'command>(
+        command: &'command Command,
+        name: &str,
+    ) -> Option<Option<&'command OsStr>> {
+        command
+            .get_envs()
+            .find(|(candidate, _)| *candidate == OsStr::new(name))
+            .map(|(_, value)| value)
+    }
+
+    fn assert_repository_binding(
+        binding: &RepositoryBinding,
+        expected_current: &Path,
+        expected_work_tree: Option<&Path>,
+    ) {
+        let mut command = Command::new("git");
+        for variable in [
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_WORK_TREE",
+            "GIT_IMPLICIT_WORK_TREE",
+            "GIT_NAMESPACE",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        ] {
+            command.env(variable, "hostile");
+        }
+
+        binding.bind(&mut command);
+
+        assert_eq!(command.get_current_dir(), Some(expected_current));
+        assert_eq!(environment(&command, "GIT_DIR"), Some(Some(binding.git_dir.as_os_str())));
+        assert_eq!(
+            environment(&command, "GIT_COMMON_DIR"),
+            Some(Some(binding.common_dir.as_os_str()))
+        );
+        assert_eq!(
+            environment(&command, "GIT_WORK_TREE"),
+            Some(expected_work_tree.map(Path::as_os_str))
+        );
+        for variable in [
+            "GIT_IMPLICIT_WORK_TREE",
+            "GIT_NAMESPACE",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        ] {
+            assert_eq!(environment(&command, variable), Some(None), "variable={variable}");
+        }
+    }
+
+    #[test]
+    fn repository_binding_models_normal_linked_and_bare_repositories() {
+        let root = tempfile::tempdir().unwrap();
+        let ordinary = root.path().join("ordinary");
+        let ordinary_git = ordinary.join(".git");
+        assert_repository_binding(
+            &RepositoryBinding {
+                git_dir: ordinary_git.clone(),
+                common_dir: ordinary_git,
+                work_tree: Some(ordinary.clone()),
+                current_dir: ordinary.clone(),
+            },
+            &ordinary,
+            Some(&ordinary),
+        );
+
+        let common = root.path().join("common.git");
+        let linked = root.path().join("linked");
+        assert_repository_binding(
+            &RepositoryBinding {
+                git_dir: common.join("worktrees/linked"),
+                common_dir: common.clone(),
+                work_tree: Some(linked.clone()),
+                current_dir: linked.clone(),
+            },
+            &linked,
+            Some(&linked),
+        );
+
+        let bare = root.path().join("bare.git");
+        assert_repository_binding(
+            &RepositoryBinding {
+                git_dir: bare.clone(),
+                common_dir: bare.clone(),
+                work_tree: None,
+                current_dir: bare.clone(),
+            },
+            &bare,
+            None,
+        );
+    }
+
+    #[test]
+    fn every_destination_command_retains_its_repository_binding() {
+        let destination = destination();
+        for command in [
+            destination.ls_remote(["--quiet".to_owned()], ["HEAD".to_owned()]),
+            destination.exact_object_fetch(ExactObjectFetchMode::Negotiated),
+            destination.push(["--porcelain".to_owned()], ["HEAD:refs/heads/G".to_owned()]),
+        ] {
+            assert_eq!(
+                command.get_current_dir(),
+                Some(destination.repository.current_dir.as_path())
+            );
+            assert_eq!(
+                environment(&command, "GIT_DIR"),
+                Some(Some(destination.repository.git_dir.as_os_str()))
+            );
+            assert_eq!(
+                environment(&command, "GIT_COMMON_DIR"),
+                Some(Some(destination.repository.common_dir.as_os_str()))
+            );
+            assert_eq!(environment(&command, "GIT_NAMESPACE"), Some(None));
+        }
     }
 
     #[test]
@@ -1067,6 +1342,7 @@ mod tests {
         );
 
         let probe = destination.resolved.private_remote_command(
+            &destination.repository,
             PROBE_REMOTE_STEM,
             ["config", "--null", "--name-only", "--list"].map(str::to_owned),
         );
@@ -1288,6 +1564,46 @@ mod tests {
             assert_eq!(destination.coordinates.owner, owner);
             assert_eq!(destination.coordinates.repository, repository);
         }
+    }
+
+    #[test]
+    fn recognizes_only_the_public_github_forge_for_production() {
+        for destination in [
+            "https://github.com/owner/repo.git",
+            "HTTPS://GITHUB.COM/owner/repo",
+            "git://github.com/owner/repo.git",
+            "ssh://github.com/owner/repo.git",
+            "git@github.com:owner/repo.git",
+            "github.com:owner/repo",
+        ] {
+            assert!(is_github_com_destination(destination), "destination={destination:?}");
+        }
+
+        for destination in [
+            "https://evil.example/owner/repo.git",
+            "https://github.com.evil.example/owner/repo.git",
+            "https://github.com:443/owner/repo.git",
+            "git@evil.example:owner/repo.git",
+            "alias:owner/repo.git",
+            "file:///tmp/owner/repo.git",
+            "/tmp/owner/repo.git",
+            "owner/repo.git",
+        ] {
+            assert!(!is_github_com_destination(destination), "destination={destination:?}");
+        }
+    }
+
+    #[test]
+    fn publication_target_retains_repository_and_literal_destination() {
+        let repository = util::Repo::open(".").unwrap();
+        let https =
+            PushDestination::for_test_url_in(&repository, "https://github.com/owner/repo.git");
+        let ssh = PushDestination::for_test_url_in(&repository, "git@github.com:owner/repo.git");
+        let same =
+            PushDestination::for_test_url_in(&repository, "https://github.com/owner/repo.git");
+
+        assert!(https.publication_target() == same.publication_target());
+        assert!(https.publication_target() != ssh.publication_target());
     }
 
     #[cfg(windows)]
