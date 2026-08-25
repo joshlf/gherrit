@@ -18,19 +18,22 @@ use color_eyre::eyre::{Result, bail};
 
 use super::{
     body::{GeneratedBody, StackBodyRecipes},
-    destination::{DefaultBranch, PushDestination},
     github::{
-        BaseKind, CompleteCreateReceipts, CompleteLocalPullRequests, CreatePreparation,
-        CreatePullRequest, Github, LocalPullRequestObservation, ManagedOpenPullRequest,
-        PreparedCreates, PreparedUpdates, PullRequestIdentity, UpdatePullRequest,
+        AbsentPullRequest, BaseKind, CompleteCreateReceipts, CompleteLocalPullRequests,
+        CreatePreparation, CreatePullRequest, Github, LocalPullRequestObservation,
+        ManagedOpenPullRequest, ObservedGithub, PreparedCreates, PreparedUpdates,
+        PullRequestIdentity, UpdatePullRequest,
     },
-    history::ValidatedChangeHistory,
-    local::{GherritPrId, LocalChange, LocalStack},
-    publication::{
+    history::{Revision, ValidatedChangeHistory},
+    refs::{
         MarkerTransition, PreparedPushes, PublicationRevision, TupleTransition,
         prepare_marker_pushes, prepare_tuple_pushes,
     },
     remote::ValidatedPublication,
+};
+use crate::pre_push::{
+    destination::{DefaultBranch, PushDestination},
+    local::{GherritPrId, LocalChange, LocalStack, PullRequestTitle},
 };
 
 /// One complete executable publication plan.
@@ -212,7 +215,7 @@ struct ExistingReality {
 }
 
 struct MissingReality {
-    absence: super::github::AbsentPullRequest,
+    absence: AbsentPullRequest,
     revision: PublicationRevision,
 }
 
@@ -245,12 +248,12 @@ impl BoundProjectionEntry {
 /// Consumes complete exact-local evidence into one immutable publication.
 pub(super) fn plan_publication(
     validated: ValidatedPublication,
-    github: Github,
+    observed: ObservedGithub,
     public_branch: Option<String>,
     stack: LocalStack,
-    pull_requests: CompleteLocalPullRequests,
 ) -> Result<PublicationPlan> {
     let (histories, destination) = validated.into_parts();
+    let (github, pull_requests) = observed.into_parts();
     if github.publication_target() != &destination.publication_target() {
         bail!("GitHub publication client belongs to a different repository or push destination");
     }
@@ -419,7 +422,7 @@ fn tuple_transition(
     }
 }
 
-fn publication_revision(revision: super::history::Revision) -> Result<PublicationRevision> {
+fn publication_revision(revision: Revision) -> Result<PublicationRevision> {
     PublicationRevision::new(revision.head(), revision.first_parent())
 }
 
@@ -615,7 +618,7 @@ fn prepare_final_updates(
 fn final_update(
     index: usize,
     entry: BoundProjectionEntry,
-    title: &super::local::PullRequestTitle,
+    title: &PullRequestTitle,
     body: GeneratedBody,
     default_branch: &str,
 ) -> Result<Option<UpdatePullRequest>> {
