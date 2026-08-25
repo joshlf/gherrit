@@ -3,10 +3,7 @@ mod unmanaged;
 
 #[test]
 fn test_pre_push_ancestry_check() {
-    let ctx = testutil::test_context!().build();
-
-    // Setup: Create a normal history first (common init)
-    ctx.commit("Initial Root");
+    let ctx = testutil::test_context!().with_remote().with_initial_commit().build();
 
     // Create an orphan branch
     ctx.run_git(&["checkout", "--orphan", "lonely-branch"]);

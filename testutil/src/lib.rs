@@ -482,7 +482,7 @@ pub enum FailureKind {
     GraphQl,
     QueryTransport,
     QueryHttp(RetryableHttpStatus),
-    RepositoryIdHttp(RetryableHttpStatus),
+    RepositoryFactsHttp(RetryableHttpStatus),
     CreatePr,
     CreatePrMalformedJson(MalformedJson),
     CreatePrHttp(RetryableHttpStatus),
@@ -598,6 +598,13 @@ impl MockGithub<'_> {
 
     pub fn redirect_trap_requests(&self) -> usize {
         self.context.inspect_mock_state(|state| state.graphql_redirect_trap_requests)
+    }
+
+    /// Overrides GitHub's view of the default branch without changing Git.
+    pub fn set_default_branch(&self, name: &str, object_id: &str) {
+        self.context.mutate_mock_state(|state| {
+            state.github_default_branch = Some((name.to_owned(), object_id.to_owned()));
+        });
     }
 
     pub fn seed_pull_request(&self, seed: PullRequestSeed) {
@@ -1074,7 +1081,7 @@ fn normalize_windows_stderr(stderr: &str) -> String {
     });
     static MISSING_TMP_WARNING_REGEX: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r"(?m)^(?P<prefix>\[gherrit\](?: \[[A-Z]+\])? [^\r\n]*\bStderr: )?bash\.exe: warning: could not find /tmp, please create!(?:\r?\n|$)",
+            r"(?m)^(?P<prefix>\[gherrit\](?: \[[A-Z]+\])? [^\r\n]*\bStderr: )?bash\.exe: warning: could not find (?:/tmp,|<path or URL redacted>) please create!(?:\r?\n|$)",
         )
         .expect("Invalid regex")
     });
@@ -1455,12 +1462,17 @@ mod tests {
             "Usage: gherrit.exe manage\r\n",
             "[gherrit] [WARN] Failed: Command \"git\" failed with status: exit code: 128\r\n",
             "bash.exe: warning: could not find /tmp, please create!\r\n",
+            "bash.exe: warning: could not find <path or URL redacted> please create!\r\n",
             "[gherrit] [WARN] Nested command failed. Stderr: bash.exe: warning: could not find /tmp, please create!\r\n",
             "fatal: repository missing\r\n",
+            "[gherrit] [WARN] Redacted command failed. Stderr: bash.exe: warning: could not find <path or URL redacted> please create!\r\n",
+            "fatal: redacted repository missing\r\n",
             "payload: Usage: gherrit.exe manage\r\n",
             "payload: Command failed with status: exit code: 2\r\n",
             "payload: bash.exe: warning: could not find /tmp, please create!\r\n",
             "payload Stderr: bash.exe: warning: could not find /tmp, please create!\r\n",
+            "payload: bash.exe: warning: could not find <path or URL redacted> please create!\r\n",
+            "payload Stderr: bash.exe: warning: could not find <path or URL redacted> please create!\r\n",
             r#"payload: {"title":"Usage: gherrit.exe","body":"line\n{\"key\":\"value\"}"}"#,
         );
 
@@ -1470,10 +1482,13 @@ mod tests {
                 "Usage: gherrit manage\r\n",
                 "[gherrit] [WARN] Failed: Command \"git\" failed with status: exit status: 128\r\n",
                 "[gherrit] [WARN] Nested command failed. Stderr: fatal: repository missing\r\n",
+                "[gherrit] [WARN] Redacted command failed. Stderr: fatal: redacted repository missing\r\n",
                 "payload: Usage: gherrit.exe manage\r\n",
                 "payload: Command failed with status: exit code: 2\r\n",
                 "payload: bash.exe: warning: could not find /tmp, please create!\r\n",
                 "payload Stderr: bash.exe: warning: could not find /tmp, please create!\r\n",
+                "payload: bash.exe: warning: could not find <path or URL redacted> please create!\r\n",
+                "payload Stderr: bash.exe: warning: could not find <path or URL redacted> please create!\r\n",
                 r#"payload: {"title":"Usage: gherrit.exe","body":"line\n{\"key\":\"value\"}"}"#,
             )
         );
