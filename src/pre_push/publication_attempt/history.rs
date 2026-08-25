@@ -15,14 +15,19 @@ use color_eyre::eyre::{Context as _, Report, Result, bail, eyre};
 use gix::ObjectId;
 
 use super::{
-    destination::DefaultBranch,
-    local::{
-        GHERRIT_ID_TRAILER_FORMAT, GherritPrId, LocalChange, LocalStack, gherrit_id_trailer_value,
-    },
     remote::{RawExactLocalChange, RawExactLocalChangeParts, RawExactLocalObservation},
     version::Version,
 };
-use crate::util::{self, CommandExt as _};
+use crate::{
+    pre_push::{
+        destination::DefaultBranch,
+        local::{
+            GHERRIT_ID_TRAILER_FORMAT, GherritPrId, LocalChange, LocalStack,
+            gherrit_id_trailer_value,
+        },
+    },
+    util::{self, CommandExt as _},
+};
 
 /// One commit and the literal first parent recorded in that commit object.
 ///
@@ -1088,11 +1093,11 @@ mod tests {
     use gix::{ObjectId, prelude::Write as _};
     use tempfile::TempDir;
 
-    use super::*;
-    use crate::pre_push::{
-        destination::DefaultBranch,
-        remote::{RawExactLocalObservation, decode_for_test},
+    use super::{
+        super::remote::{RawExactLocalObservation, decode_for_test},
+        *,
     };
+    use crate::pre_push::destination::DefaultBranch;
 
     struct TestRepository {
         directory: TempDir,
