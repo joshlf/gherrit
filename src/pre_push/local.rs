@@ -15,10 +15,11 @@ use gix::ObjectId;
 use super::{autosquash, body::gherrit_pr_id_re, destination::DefaultBranch};
 use crate::util::{self, CommandExt as _};
 
-/// A nonempty ASCII alphanumeric identifier from a `gherrit-pr-id` trailer.
+/// A nonempty ASCII alphanumeric GHerrit pull request ID.
 ///
-/// Constructing a `GherritPrId` is validation. Code which has one can therefore
-/// use it as a managed ref-name component without repeating trailer checks.
+/// Construction proves the shared trailer and ref-component grammar. The
+/// enclosing stack or remote-ref validation establishes where the value came
+/// from and whether it identifies managed state.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct GherritPrId(
     // INVARIANT: `.0` is non-empty, ASCII, and alphanumeric.
@@ -26,6 +27,17 @@ pub(super) struct GherritPrId(
 );
 
 impl GherritPrId {
+    /// Decodes the same identity grammar from a managed remote ref component.
+    ///
+    /// Unlike a trailer error, this has no local commit to identify. Callers
+    /// add the remote-ref context appropriate to the namespace they parse.
+    pub(super) fn from_ref_component(value: &[u8]) -> Result<Self> {
+        if value.is_empty() || !value.iter().all(u8::is_ascii_alphanumeric) {
+            bail!("invalid GHerrit change ID");
+        }
+        Ok(Self(str::from_utf8(value)?.to_owned()))
+    }
+
     fn from_trailer(commit: ObjectId, value: &[u8]) -> Result<Self> {
         if value.is_empty() {
             bail!("Commit {commit} missing gherrit-pr-id trailer");
@@ -34,7 +46,7 @@ impl GherritPrId {
             bail!("Commit {commit} has invalid gherrit-pr-id trailer");
         }
 
-        Ok(Self(str::from_utf8(value)?.to_owned()))
+        Self::from_ref_component(value)
     }
 
     pub(super) fn as_str(&self) -> &str {
