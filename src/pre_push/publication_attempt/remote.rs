@@ -21,16 +21,20 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::{ObjectId, bstr::ByteSlice as _};
 
 use super::{
-    destination::{DefaultBranch, ExactObjectFetchMode, PushDestination, git_output_records},
     history::{GraphLoadError, PreparedExactLocalHistories, ValidatedChangeHistory},
-    local::{GherritPrId, LocalStack},
-    subprocess::{
-        self, REGULAR_FILE_STDIN_LIMIT, REMOTE_GIT_EXECUTION_TIMEOUT, RegularFileStdin,
-        RegularFileStdinBuilder,
-    },
     version::Version,
 };
-use crate::util;
+use crate::{
+    pre_push::{
+        destination::{DefaultBranch, ExactObjectFetchMode, PushDestination, git_output_records},
+        local::{GherritPrId, LocalStack},
+        subprocess::{
+            self, REGULAR_FILE_STDIN_LIMIT, REMOTE_GIT_EXECUTION_TIMEOUT, RegularFileStdin,
+            RegularFileStdinBuilder,
+        },
+    },
+    util,
+};
 
 // This stays well below Windows' roughly 32-KiB command-line limit and is a
 // conservative bound on POSIX systems. The count includes one terminating
@@ -265,10 +269,16 @@ pub(super) struct ValidatedPublication {
 }
 
 impl ValidatedPublication {
-    pub(in crate::pre_push) fn into_parts(
-        self,
-    ) -> (Box<[ValidatedChangeHistory]>, PushDestination) {
+    pub(super) fn into_parts(self) -> (Box<[ValidatedChangeHistory]>, PushDestination) {
         (self.histories, self.destination)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_plan_test(
+        histories: Box<[ValidatedChangeHistory]>,
+        destination: PushDestination,
+    ) -> Self {
+        Self { histories, destination }
     }
 }
 
@@ -970,7 +980,7 @@ mod tests {
     const REAL_MODE: &str = "GHERRIT_375_REAL_MODE";
     const REAL_REMOTE: &str = "GHERRIT_375_REAL_REMOTE";
     const REAL_ROOT: &str = "GHERRIT_375_REAL_ROOT";
-    const REAL_TEST: &str = "pre_push::remote::tests::real_boundary_reexec";
+    const REAL_TEST: &str = "pre_push::publication_attempt::remote::tests::real_boundary_reexec";
     const REAL_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn id(value: &str) -> GherritPrId {
