@@ -3,7 +3,7 @@ use std::slice;
 use color_eyre::eyre::{Result, eyre};
 use gix::ObjectId;
 
-use super::remote::RemotePublication;
+use super::legacy_remote::RemotePublication;
 
 // Windows command lines are limited to roughly 32 KiB. Each target contributes
 // about 200 characters of branch and tag refspecs, so 80 targets leave ample
