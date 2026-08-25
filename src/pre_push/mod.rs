@@ -14,8 +14,10 @@ mod destination;
 #[cfg(test)]
 mod github;
 mod legacy_github;
+mod legacy_publication;
 mod legacy_remote;
 mod local;
+#[cfg(test)]
 mod publication;
 mod reconcile;
 #[cfg(test)]
@@ -36,9 +38,9 @@ use legacy_github::{
     Repository as GithubRepository, UpdatePullRequest, decode_mutation_batch_response,
     decode_query_batch_response, prepare_mutation_batches, query_batch_document,
 };
+use legacy_publication::{plan_change, plan_push, push_batches};
 use legacy_remote::observe_publications;
 use local::LocalStack;
-use publication::{plan_change, plan_push, push_batches};
 use reconcile::{
     CurrentPr, DesiredPr, PullRequestState, ensure_pull_requests_open, link_stack, plan_update,
 };
@@ -203,7 +205,7 @@ async fn push_to_origin(
 
     for chunk in push_batches(&targets) {
         let plan = plan_push(chunk);
-        let publication::PushPlan { options, refspecs } = plan;
+        let legacy_publication::PushPlan { options, refspecs } = plan;
 
         log::info!("Pushing chunk to remote...");
         let output = subprocess::output(
