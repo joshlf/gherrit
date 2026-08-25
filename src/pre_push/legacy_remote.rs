@@ -6,7 +6,7 @@ use std::{
 use color_eyre::eyre::{Context as _, Result, bail};
 use gix::ObjectId;
 
-use super::{destination::PushDestination, publication::remote_query_batches};
+use super::{destination::PushDestination, legacy_publication::remote_query_batches};
 
 /// Observes the managed branches relevant to the current stack.
 pub(super) fn observe_managed_branches(
