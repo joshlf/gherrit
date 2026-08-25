@@ -1144,6 +1144,12 @@ projects another. A canonical target which is missing or cannot be represented
 as UTF-8 is rejected without rendering the path. `file://` URLs are not
 supported; a local repository must use its native filesystem path.
 
+Production GitHub URI destinations use Git's built-in `http`, `https`, `git`,
+or `ssh` transport spelling exactly in lower case. The `github.com` host name
+is compared without ASCII case distinctions. This prevents a case-variant
+scheme from selecting a custom `git-remote-*` helper while the API client acts
+on the production GitHub repository.
+
 The implementation uses a command-scoped internal remote rather than placing
 the destination literal in an argument vector constructed by GHerrit or
 writing it to repository configuration. This requires Git 2.31 or newer,
