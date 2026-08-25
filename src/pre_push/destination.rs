@@ -595,7 +595,7 @@ fn is_git_transport_diagnostic(name: &[u8]) -> bool {
 }
 
 /// One repository default branch, including the exact commit it names.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DefaultBranch {
     name: String,
     tip: ObjectId,
