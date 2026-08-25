@@ -83,6 +83,18 @@ impl ObservedPullRequestMarker {
     pub(super) fn v1(self) -> ObjectId {
         self.v1
     }
+
+    /// Constructs internally consistent marker evidence for planner tests.
+    ///
+    /// The synthetic tag ID is derived from, but cannot equal, the v1 commit
+    /// ID. Tests which only consume validated history therefore retain both
+    /// identities without rebuilding an annotated Git tag object.
+    #[cfg(test)]
+    pub(super) fn for_plan_test(v1: ObjectId) -> Self {
+        let mut tag = v1.as_bytes().to_owned();
+        tag[0] ^= u8::MAX;
+        Self { tag: ObjectId::from_bytes_or_panic(&tag), v1 }
+    }
 }
 
 impl PublishedHistory {
@@ -715,13 +727,36 @@ impl ValidatedChangeHistory {
         published: &[(ObjectId, ObjectId)],
         proposal: (ObjectId, ObjectId),
     ) -> Self {
+        Self::for_plan_test(id, published, proposal, None)
+    }
+
+    /// Constructs trusted synthetic planning facts after history validation
+    /// has been tested at its own boundary.
+    #[cfg(test)]
+    pub(super) fn for_plan_test(
+        id: GherritPrId,
+        published: &[(ObjectId, ObjectId)],
+        proposal: (ObjectId, ObjectId),
+        pull_request_marker: Option<ObservedPullRequestMarker>,
+    ) -> Self {
+        assert!(
+            pull_request_marker.is_none() || !published.is_empty(),
+            "a pull request marker requires published history"
+        );
+        if let Some(marker) = pull_request_marker {
+            assert_eq!(
+                Some(marker.v1()),
+                published.first().map(|(head, _)| *head),
+                "a pull request marker must name the v1 commit"
+            );
+        }
         let published = published.split_first().map(|(first, later)| PublishedHistory {
             first: Revision { head: first.0, first_parent: first.1 },
             later: later
                 .iter()
                 .map(|(head, first_parent)| Revision { head: *head, first_parent: *first_parent })
                 .collect(),
-            pull_request_marker: None,
+            pull_request_marker,
         });
         Self(ChangeHistory {
             id,
