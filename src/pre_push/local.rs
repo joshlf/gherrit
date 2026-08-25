@@ -15,6 +15,9 @@ use gix::ObjectId;
 use super::{autosquash, body::gherrit_pr_id_re, destination::DefaultBranch};
 use crate::util::{self, CommandExt as _};
 
+pub(super) const GHERRIT_ID_TRAILER_FORMAT: &str =
+    "--format=tformat:%H%x00%(trailers:key=gherrit-pr-id,only,unfold)";
+
 /// A nonempty ASCII alphanumeric GHerrit pull request ID.
 ///
 /// Construction proves the shared trailer and ref-component grammar. The
@@ -77,9 +80,7 @@ impl LocalChange {
             .transpose()
             .wrap_err_with(|| format!("Commit {} has a non-UTF-8 message body", commit.id))?
             .unwrap_or("");
-        let mut ids = trailers
-            .split(|byte| *byte == b'\n')
-            .filter_map(|line| line.strip_prefix(b"gherrit-pr-id: "));
+        let mut ids = trailers.split(|byte| *byte == b'\n').filter_map(gherrit_id_trailer_value);
         let id = ids
             .next()
             .ok_or_else(|| eyre!("Commit {} missing gherrit-pr-id trailer", commit.id))?;
@@ -122,6 +123,7 @@ impl LocalChange {
 /// An ordered, validated first-parent path from the default branch to `HEAD`.
 #[derive(Debug)]
 pub(super) struct LocalStack {
+    default_branch: DefaultBranch,
     changes: Vec<LocalChange>,
 }
 
@@ -145,7 +147,9 @@ impl LocalStack {
             );
         }
         if head == default_ref {
-            return Self::new(default_ref.detach(), default_branch.name(), Vec::new());
+            let stack = Self::new(default_branch.clone(), Vec::new())?;
+            debug_assert_eq!(stack.default_branch(), default_branch);
+            return Ok(stack);
         }
 
         repo.ensure_publishable_history()?;
@@ -178,29 +182,33 @@ impl LocalStack {
             default_branch.name(),
         )?;
 
-        let trailers = read_commit_trailers(&commits)?;
+        let trailers = read_commit_trailers(repo, &commits)?;
         let changes = commits
             .into_iter()
             .zip(trailers)
             .map(|((commit, title), trailers)| LocalChange::from_commit(commit, title, &trailers))
             .collect::<Result<Vec<_>>>()?;
 
-        let stack = Self::new(default_ref.detach(), default_branch.name(), changes)?;
-        ensure_change_ids_unique_in_head_ancestry(&stack, head.detach())?;
+        let stack = Self::new(default_branch.clone(), changes)?;
+        debug_assert_eq!(stack.default_branch(), default_branch);
+        ensure_change_ids_unique_in_head_ancestry(repo, &stack, head.detach())?;
         Ok(stack)
     }
 
-    fn new(default_tip: ObjectId, default_branch: &str, changes: Vec<LocalChange>) -> Result<Self> {
+    fn new(default_branch: DefaultBranch, changes: Vec<LocalChange>) -> Result<Self> {
         let ids = changes.iter().map(|change| change.id.as_str());
         ensure_unique_change_ids(ids)?;
-        if let Some(change) = changes.iter().find(|change| change.id.as_str() == default_branch) {
+        if let Some(change) =
+            changes.iter().find(|change| change.id.as_str() == default_branch.name())
+        {
             bail!(
-                "Commit {} has gherrit-pr-id '{default_branch}', which conflicts with the repository default branch",
-                change.head
+                "Commit {} has gherrit-pr-id '{}', which conflicts with the repository default branch",
+                change.head,
+                default_branch.name()
             );
         }
 
-        let mut expected_parent = default_tip;
+        let mut expected_parent = default_branch.tip();
         for change in &changes {
             if change.first_parent() != expected_parent {
                 bail!(
@@ -211,7 +219,29 @@ impl LocalStack {
             expected_parent = change.head;
         }
 
-        Ok(Self { changes })
+        Ok(Self { default_branch, changes })
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_history_test(
+        default_branch: DefaultBranch,
+        changes: impl IntoIterator<Item = (GherritPrId, ObjectId, ObjectId)>,
+    ) -> Self {
+        let changes = changes
+            .into_iter()
+            .map(|(id, head, first_parent)| LocalChange {
+                id,
+                head,
+                first_parent,
+                title: String::new(),
+                body: String::new(),
+            })
+            .collect();
+        Self::new(default_branch, changes).expect("valid history-test local stack")
+    }
+
+    pub(super) fn default_branch(&self) -> &DefaultBranch {
+        &self.default_branch
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -231,20 +261,22 @@ impl LocalStack {
     }
 }
 
-fn read_commit_trailers(commits: &[(gix::Commit<'_>, String)]) -> Result<Vec<Vec<u8>>> {
+fn read_commit_trailers(
+    repo: &util::Repo,
+    commits: &[(gix::Commit<'_>, String)],
+) -> Result<Vec<Vec<u8>>> {
     const QUERY_BATCH_LEN: usize = 120;
-    const FORMAT: &str = "--format=tformat:%H%x00%(trailers:only,unfold)";
 
     commits.chunks(QUERY_BATCH_LEN).try_fold(
         Vec::with_capacity(commits.len()),
         |mut parsed, chunk| {
-            let arguments = ["log", "--no-walk=unsorted", "-z", FORMAT]
+            let arguments = ["log", "--no-walk=unsorted", "-z", GHERRIT_ID_TRAILER_FORMAT]
                 .into_iter()
                 .map(ToString::to_string)
                 .chain(chunk.iter().map(|(commit, _)| commit.id.to_string()));
-            let output = util::cmd("git", arguments)
-                .checked_output()
-                .wrap_err("Failed to parse commit trailers")?;
+            let mut command = util::cmd("git", arguments);
+            command.current_dir(repo.workdir().unwrap_or(repo.path()));
+            let output = command.checked_output().wrap_err("Failed to parse commit trailers")?;
             let mut fields = output.stdout.split(|byte| *byte == 0);
 
             chunk.iter().try_for_each(|(commit, _)| {
@@ -279,15 +311,27 @@ fn ensure_unique_change_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Resul
     Ok(())
 }
 
+pub(super) fn gherrit_id_trailer_value(line: &[u8]) -> Option<&[u8]> {
+    let colon = line.iter().position(|byte| *byte == b':')?;
+    if !line[..colon].eq_ignore_ascii_case(b"gherrit-pr-id")
+        || line.get(colon..colon + 2) != Some(b": ")
+    {
+        return None;
+    }
+    Some(&line[colon + 2..])
+}
+
 /// Requires each active change ID to identify exactly one reachable commit.
 ///
 /// Stack order follows first parents, so commits reachable only through a
 /// merge are not published as changes. They are nevertheless part of every
 /// proposed head which contains the merge. Reusing an active ID anywhere in
 /// that complete ancestry would make the ID describe two different commits.
-fn ensure_change_ids_unique_in_head_ancestry(stack: &LocalStack, head: ObjectId) -> Result<()> {
-    const FORMAT: &str = "--format=tformat:%H%x00%(trailers:only,unfold)";
-
+fn ensure_change_ids_unique_in_head_ancestry(
+    repo: &util::Repo,
+    stack: &LocalStack,
+    head: ObjectId,
+) -> Result<()> {
     if stack.is_empty() {
         return Ok(());
     }
@@ -297,7 +341,7 @@ fn ensure_change_ids_unique_in_head_ancestry(stack: &LocalStack, head: ObjectId)
         .map(|change| (change.id().as_str().as_bytes(), (change.id().as_str(), change.head())))
         .collect::<HashMap<_, _>>();
     let head = head.to_string();
-    let output = util::cmd(
+    let mut command = util::cmd(
         "git",
         [
             "log",
@@ -306,12 +350,14 @@ fn ensure_change_ids_unique_in_head_ancestry(stack: &LocalStack, head: ObjectId)
             "--no-notes",
             "--no-decorate",
             "-z",
-            FORMAT,
+            GHERRIT_ID_TRAILER_FORMAT,
             &head,
         ],
-    )
-    .checked_output()
-    .wrap_err("Failed to inspect commit identities in HEAD ancestry")?;
+    );
+    command.current_dir(repo.workdir().unwrap_or(repo.path()));
+    let output = command
+        .checked_output()
+        .wrap_err("Failed to inspect commit identities in HEAD ancestry")?;
     let mut fields = output.stdout.split(|byte| *byte == 0);
     let mut observed = HashSet::with_capacity(stack.len());
 
@@ -329,10 +375,7 @@ fn ensure_change_ids_unique_in_head_ancestry(stack: &LocalStack, head: ObjectId)
         let trailers =
             fields.next().ok_or_else(|| eyre!("Git omitted trailer data for commit {commit}"))?;
 
-        for id in trailers
-            .split(|byte| *byte == b'\n')
-            .filter_map(|line| line.strip_prefix(b"gherrit-pr-id: "))
-        {
+        for id in trailers.split(|byte| *byte == b'\n').filter_map(gherrit_id_trailer_value) {
             let Some((id, expected_head)) = expected_heads.get(id) else {
                 continue;
             };
@@ -387,6 +430,10 @@ mod tests {
         ObjectId::from_bytes_or_panic(&[byte; 20])
     }
 
+    fn default_branch(name: &str, tip: u8) -> DefaultBranch {
+        DefaultBranch::new(name.to_owned(), object_id(tip)).unwrap()
+    }
+
     fn change(id: &str, head: u8, first_parent: u8) -> LocalChange {
         LocalChange {
             id: GherritPrId::from_trailer(object_id(head), id.as_bytes()).unwrap(),
@@ -409,14 +456,16 @@ mod tests {
         for id in [b"".as_slice(), b"with-dash", b"with space", "snowman-☃".as_bytes()] {
             assert!(GherritPrId::from_trailer(object_id(1), id).is_err(), "id={id:?}");
         }
+
+        assert_eq!(gherrit_id_trailer_value(b"Gherrit-Pr-Id: Gone"), Some(b"Gone".as_slice()));
+        assert_eq!(gherrit_id_trailer_value(b"gherrit-pr-id:Gone"), None);
     }
 
     #[test]
     fn stacks_require_unique_change_ids() {
         let error = LocalStack::new(
-            object_id(0),
-            "main",
-            vec![change("Gsame", 1, 0), change("Gsame", 2, 1)],
+            default_branch("main", 10),
+            vec![change("Gsame", 1, 10), change("Gsame", 2, 1)],
         )
         .unwrap_err();
 
@@ -426,9 +475,8 @@ mod tests {
     #[test]
     fn stacks_require_one_contiguous_first_parent_path() {
         let stack = LocalStack::new(
-            object_id(0),
-            "main",
-            vec![change("Gone", 1, 0), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
+            default_branch("main", 10),
+            vec![change("Gone", 1, 10), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
         )
         .unwrap();
 
@@ -437,9 +485,11 @@ mod tests {
             ["Gone", "Gtwo", "Gthree"]
         );
 
-        let error =
-            LocalStack::new(object_id(0), "main", vec![change("Gone", 1, 0), change("Gtwo", 2, 0)])
-                .unwrap_err();
+        let error = LocalStack::new(
+            default_branch("main", 10),
+            vec![change("Gone", 1, 10), change("Gtwo", 2, 10)],
+        )
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
             format!(
@@ -470,9 +520,8 @@ mod tests {
     #[test]
     fn stack_order_derives_root_parent_and_child_positions() {
         let stack = LocalStack::new(
-            object_id(0),
-            "main",
-            vec![change("Gone", 1, 0), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
+            default_branch("main", 10),
+            vec![change("Gone", 1, 10), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
         )
         .unwrap();
         let ids = stack.iter().map(|change| change.id().as_str()).collect::<Vec<_>>();
@@ -487,7 +536,8 @@ mod tests {
 
     #[test]
     fn stack_ids_cannot_name_the_default_branch() {
-        let error = LocalStack::new(object_id(0), "main", vec![change("main", 1, 0)]).unwrap_err();
+        let error =
+            LocalStack::new(default_branch("main", 10), vec![change("main", 1, 10)]).unwrap_err();
 
         assert_eq!(
             error.to_string(),
@@ -499,6 +549,16 @@ mod tests {
     }
 
     #[test]
+    fn stacks_retain_the_exact_default_path_origin() {
+        let default = default_branch("trunk", 10);
+        let stack = LocalStack::new(default.clone(), vec![change("Gone", 1, 10)]).unwrap();
+
+        assert_eq!(stack.default_branch(), &default);
+        assert_eq!(stack.iter().next().unwrap().head(), object_id(1));
+        assert_eq!(stack.iter().next().unwrap().first_parent(), default.tip());
+    }
+
+    #[test]
     fn strips_only_the_matching_trailer_from_the_final_trailer_block() {
         let body = "Summary\n\ngherrit-pr-id: Gexample\n\nNotes\n\ngherrit-pr-id: Greal\n";
 
@@ -507,5 +567,6 @@ mod tests {
             "Summary\n\ngherrit-pr-id: Gexample\n\nNotes\n\n\n"
         );
         assert_eq!(strip_gherrit_id(body, "Gmissing"), body);
+        assert_eq!(strip_gherrit_id("Gherrit-Pr-Id: Greal\n", "Greal"), "\n");
     }
 }

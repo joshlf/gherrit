@@ -96,7 +96,8 @@ this document says otherwise.
 
 Each managed commit has exactly one `gherrit-pr-id` trailer. Its value is a
 nonempty ASCII alphanumeric string and is the change ID. The same grammar is
-used in managed ref names.
+used in managed ref names. Git trailer keys are case-insensitive, so GHerrit
+accepts case variants of the key while preserving the exact value grammar.
 
 The local stack is the ordered first-parent path after the remote default
 branch and through `HEAD`. It is valid only when:
@@ -259,8 +260,8 @@ For a nonempty stack, the complete logical observation contains:
   every local change ID;
 - one fully paginated all-state pull request connection for every local change
   ID;
-- the commit graph rooted at the default tip, local proposals, and local
-  published versions; and
+- the commit graph rooted only at distinct local published-version heads which
+  differ from that change's sealed local proposal, plus their ancestry; and
 - every exact external object needed to validate that graph.
 
 No repository-wide head or pull request collection is part of this
@@ -288,9 +289,16 @@ Each logical request retains its requested IDs, destination capability, and
 exact ref names. Raw maps cannot be relabelled or sliced into a new claim of
 complete coverage.
 
-The local graph contains the default tip, every local proposal, every local
-published version, and their required ancestry. It contains no graph roots
-discovered from unrelated pull requests.
+Before loading an object, GHerrit structurally preflights every requested local
+history as one set and requires its exact default branch name and tip to equal
+the path origin retained by the sealed local stack. Graph roots then preserve
+semantic first-occurrence order: change order from the local stack, then
+version order within each change. A published slot equal to its own sealed
+proposal uses the local revision directly and is not a graph root. The same OID
+equal to another change's proposal remains external to the first change. Thus
+the local graph is rooted only at distinct external published heads and
+contains all of their declared-parent ancestry. It contains no default-tip,
+local-proposal, or unrelated pull-request root.
 
 If an advertised version object is missing, GHerrit may fetch only the exact
 advertised version-tag refs for the affected local observation. The fetch:
@@ -436,29 +444,34 @@ supported limits.
 For each local change, validation requires:
 
 1. Version tags are lightweight, canonical, contiguous, and immutable.
-2. Every version points to a commit carrying the expected change ID.
+2. Local-stack sealing has already proved the proposal's identity, literal
+   first parent, default descent, and unique occurrence in complete proposal
+   ancestry. Every distinct external published head carries exactly one
+   expected change ID.
 3. The current head equals the latest version head.
 4. The current owned base equals that head's literal first parent.
 5. The optional marker is lightweight and points to a published version head.
-6. Every required commit and first parent is present in the validated graph.
-7. Every published and proposed head is unreachable from every published and
-   proposed first parent for the same change.
+6. Every required revision is present in either the sealed local evidence or
+   the complete external graph, including each literal first parent.
+7. The expected change ID occurs nowhere in the union of the proper ancestry
+   of every distinct external published head, following all parents.
 
 Every contiguous version position is preserved even when two adjacent tags
 name the same literal revision. Publication does not create a new version when
 the proposal already equals the current version, but validation does not infer
 how an existing immutable tag was created or discard it.
 
-The last rule covers old-head/new-base and new-head/old-base combinations that
-GitHub might observe while mutable refs propagate. Checking only the current
-pair is insufficient.
-
-For a change which is or will become root, every published and proposed head
-must also be unreachable from the exact agreed default tip.
-
-The direct reachability checks remain explicit even though unique identity
-ancestry normally implies them. They express the operational safety property
-and defend against mistakes in history decoding.
+The local-stack invariant and last rule together guarantee the operational
+owned-base and default-base safety properties. If an external published head
+were reachable from the proposal's first parent or agreed default tip, it would
+be another occurrence of the active ID in complete proposal ancestry, which
+local-stack sealing rejects. If any managed head were reachable from an
+external published first parent, it would be an expected-ID proper ancestor of
+that external head, which the union walk rejects. A published slot equal to the
+proposal shares its already-sealed local revision. Separate proposal, base, and
+default graph walks cannot reject an additional sealed input, so history
+validation loads external published evidence and performs one union
+proper-ancestry walk over it.
 
 ### Pull request state
 
@@ -639,13 +652,18 @@ for every r and s in R_G: not (H(r) <= P(s))
 An owned-base pull request can therefore observe any historical or proposed
 head/base combination without its head becoming reachable from its base.
 
-For a root, validation separately requires:
+For a root, the same sealed-stack and external-history proof guarantees:
 
 ```text
 for every r in R_G: not (H(r) <= default_tip)
 ```
 
-The default branch is stable by assumption during the attempt.
+This is not a separate graph walk: the proposal strictly descends the agreed
+default tip, so any managed head reachable from that tip would also lie in
+proposal ancestry. A distinct external head would duplicate the active ID
+there, while the proposal itself cannot be reachable from its proper ancestor
+in an acyclic commit graph. The default branch is stable by assumption during
+the attempt.
 
 ### Mutation footprint
 
