@@ -1,9 +1,9 @@
 //! Exact Git ref transitions and their porcelain acknowledgement protocol.
 //!
-//! This module renders already-chosen publication transitions. It does not
-//! decide which local changes need publication, run a subprocess, or grant
-//! authority to mutate a destination. Its output is immutable wire data for a
-//! later execution boundary.
+//! This module renders already-chosen publication transitions as immutable,
+//! destination-bound actions and executes their bounded Git subprocesses. It
+//! does not decide which local changes need publication. A complete, exact
+//! porcelain acknowledgement is the only result which releases the caller.
 //!
 //! A change publication is one indivisible three-ref tuple: candidate head,
 //! owned base, and a new immutable version tag. A pull-request marker is a
@@ -17,10 +17,15 @@ use std::{
     process::ExitStatus,
 };
 
-use color_eyre::eyre::{Result, bail, eyre};
+use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::ObjectId;
 
-use super::{local::GherritPrId, version::Version};
+use super::{
+    destination::{PublicationTarget, PushDestination},
+    local::GherritPrId,
+    subprocess::{self, REMOTE_GIT_EXECUTION_TIMEOUT},
+    version::Version,
+};
 
 // Hook recursion is an execution-boundary concern, not a reason to bypass
 // repository hooks here. Exact leases make `--no-force-if-includes`
@@ -250,51 +255,117 @@ impl AtomicUnit {
     }
 }
 
-/// Fully rendered, bounded push requests with no destination or authority.
-#[derive(Debug)]
+/// Fully rendered, bounded push requests bound to one exact destination.
 pub(super) struct PreparedPushes {
+    target: PublicationTarget,
     batches: Box<[PushBatch]>,
 }
 
 impl PreparedPushes {
+    /// Executes each preflighted atomic batch from the exact repository which
+    /// validated this publication. No command output or partial outcome
+    /// escapes the execution boundary.
+    pub(super) async fn execute(self, destination: &PushDestination) -> Result<()> {
+        if self.target != destination.publication_target() {
+            bail!("Git publication action belongs to a different repository or push destination");
+        }
+        for batch in self.batches.into_vec() {
+            let command =
+                destination.push(batch.options.iter().cloned(), batch.refspecs.iter().cloned());
+            let output = subprocess::output(command, REMOTE_GIT_EXECUTION_TIMEOUT)
+                .await
+                .wrap_err("Git publication process failed; its remote effects are indeterminate")?;
+            let outcome = batch.outcome(output.status(), output.stdout());
+            let diagnostic = match outcome {
+                PushOutcome::Acknowledged => None,
+                PushOutcome::Rejected | PushOutcome::Indeterminate => {
+                    output.child_diagnostic(destination)
+                }
+            };
+            require_acknowledgement(outcome, diagnostic)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(super) fn batches(&self) -> impl ExactSizeIterator<Item = &PushBatch> {
         self.batches.iter()
     }
 
+    #[cfg(test)]
     pub(super) fn into_batches(self) -> Box<[PushBatch]> {
         self.batches
     }
 }
 
+fn require_acknowledgement(outcome: PushOutcome, diagnostic: Option<String>) -> Result<()> {
+    let message = match outcome {
+        PushOutcome::Acknowledged => return Ok(()),
+        PushOutcome::Rejected => {
+            "Git publication was rejected without changing the requested refs; stop this attempt and run GHerrit again after resolving the conflict"
+        }
+        PushOutcome::Indeterminate => {
+            "Git publication acknowledgement is indeterminate; requested refs may or may not have changed, so stop this attempt and run GHerrit again to reobserve them"
+        }
+    };
+    Err(diagnostic.map_or_else(
+        || eyre!(message),
+        |diagnostic| {
+            eyre!(
+                "{message}\n\nInternal push diagnostic (untrusted and not publication evidence):\n{diagnostic}"
+            )
+        },
+    ))
+}
+
 /// Renders complete, indivisible change tuples into bounded atomic batches.
-pub(super) fn prepare_tuple_pushes(transitions: &[TupleTransition]) -> Result<PreparedPushes> {
-    prepare_tuple_pushes_with_budget(transitions, PUSH_VARIABLE_ARGV_BUDGET_BYTES)
+pub(super) fn prepare_tuple_pushes(
+    destination: &PushDestination,
+    transitions: &[TupleTransition],
+) -> Result<PreparedPushes> {
+    prepare_tuple_pushes_with_budget(destination, transitions, PUSH_VARIABLE_ARGV_BUDGET_BYTES)
 }
 
 fn prepare_tuple_pushes_with_budget(
+    destination: &PushDestination,
     transitions: &[TupleTransition],
     budget: usize,
 ) -> Result<PreparedPushes> {
-    prepare_units(transitions.iter().map(AtomicUnit::tuple).collect(), budget, "change tuple")
+    prepare_units(
+        destination,
+        transitions.iter().map(AtomicUnit::tuple).collect(),
+        budget,
+        "change tuple",
+    )
 }
 
 /// Renders create-only marker transitions into bounded atomic batches.
-pub(super) fn prepare_marker_pushes(transitions: &[MarkerTransition]) -> Result<PreparedPushes> {
-    prepare_marker_pushes_with_budget(transitions, PUSH_VARIABLE_ARGV_BUDGET_BYTES)
+pub(super) fn prepare_marker_pushes(
+    destination: &PushDestination,
+    transitions: &[MarkerTransition],
+) -> Result<PreparedPushes> {
+    prepare_marker_pushes_with_budget(destination, transitions, PUSH_VARIABLE_ARGV_BUDGET_BYTES)
 }
 
 fn prepare_marker_pushes_with_budget(
+    destination: &PushDestination,
     transitions: &[MarkerTransition],
     budget: usize,
 ) -> Result<PreparedPushes> {
     prepare_units(
+        destination,
         transitions.iter().map(AtomicUnit::marker).collect(),
         budget,
         "pull-request marker",
     )
 }
 
-fn prepare_units(units: Vec<AtomicUnit>, budget: usize, kind: &str) -> Result<PreparedPushes> {
+fn prepare_units(
+    destination: &PushDestination,
+    units: Vec<AtomicUnit>,
+    budget: usize,
+    kind: &str,
+) -> Result<PreparedPushes> {
     // Render and size every indivisible unit before the first batch exists. A
     // late error can therefore reject only the whole candidate, never return
     // a prefix which an executor could expose.
@@ -330,7 +401,7 @@ fn prepare_units(units: Vec<AtomicUnit>, budget: usize, kind: &str) -> Result<Pr
         .map(PushBatch::from_units)
         .collect::<Result<Vec<_>>>()?
         .into_boxed_slice();
-    Ok(PreparedPushes { batches })
+    Ok(PreparedPushes { target: destination.publication_target(), batches })
 }
 
 fn validate_unique_destinations<'destination>(
@@ -373,10 +444,12 @@ impl PushBatch {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn options(&self) -> impl ExactSizeIterator<Item = &str> {
         self.options.iter().map(String::as_str)
     }
 
+    #[cfg(test)]
     pub(super) fn refspecs(&self) -> impl ExactSizeIterator<Item = &str> {
         self.refspecs.iter().map(String::as_str)
     }
@@ -385,7 +458,7 @@ impl PushBatch {
     /// complete exact porcelain response for this batch. A complete ordinary
     /// nonzero response which claims no ref mutation is a known rejection;
     /// every other result is operationally indeterminate.
-    pub(super) fn outcome(&self, status: &ExitStatus, stdout: &[u8]) -> PushOutcome {
+    fn outcome(&self, status: &ExitStatus, stdout: &[u8]) -> PushOutcome {
         let Some(receipts) = parse_push_receipts(&self.expected, stdout) else {
             return PushOutcome::Indeterminate;
         };
@@ -443,7 +516,7 @@ enum ExpectedRefTransition {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum PushOutcome {
+enum PushOutcome {
     /// Every expected ref reported an allowed success or exact no-op.
     Acknowledged,
     /// A normal nonzero process reported only failures and exact no-ops.
@@ -588,6 +661,8 @@ fn parse_push_receipt_lines<'line>(
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+
     use super::*;
 
     fn object_id(byte: u8) -> ObjectId {
@@ -596,6 +671,10 @@ mod tests {
 
     fn id(value: &str) -> GherritPrId {
         GherritPrId::from_ref_component(value.as_bytes()).unwrap()
+    }
+
+    fn destination() -> PushDestination {
+        PushDestination::for_test()
     }
 
     fn revision(head: u8, base: u8) -> PublicationRevision {
@@ -624,11 +703,21 @@ mod tests {
     }
 
     fn one_tuple_batch(transition: TupleTransition) -> PushBatch {
-        prepare_tuple_pushes(&[transition]).unwrap().into_batches().into_vec().pop().unwrap()
+        prepare_tuple_pushes(&destination(), &[transition])
+            .unwrap()
+            .into_batches()
+            .into_vec()
+            .pop()
+            .unwrap()
     }
 
     fn one_marker_batch(transition: MarkerTransition) -> PushBatch {
-        prepare_marker_pushes(&[transition]).unwrap().into_batches().into_vec().pop().unwrap()
+        prepare_marker_pushes(&destination(), &[transition])
+            .unwrap()
+            .into_batches()
+            .into_vec()
+            .pop()
+            .unwrap()
     }
 
     #[test]
@@ -732,6 +821,7 @@ mod tests {
         let second_bytes = AtomicUnit::tuple(&second).encoded_argv_bytes;
 
         let exact = prepare_tuple_pushes_with_budget(
+            &destination(),
             &[create("Gone", 2, 1), create("Gtwo", 4, 3)],
             first_bytes + second_bytes,
         )
@@ -740,6 +830,7 @@ mod tests {
         assert_eq!(exact.batches().next().unwrap().refspecs().len(), 6);
 
         let split = prepare_tuple_pushes_with_budget(
+            &destination(),
             &[create("Gone", 2, 1), create("Gtwo", 4, 3)],
             first_bytes + second_bytes - 1,
         )
@@ -748,10 +839,16 @@ mod tests {
         assert!(split.batches().all(|batch| batch.refspecs().len() == 3));
 
         let exact_single =
-            prepare_tuple_pushes_with_budget(&[create("Gone", 2, 1)], first_bytes).unwrap();
+            prepare_tuple_pushes_with_budget(&destination(), &[create("Gone", 2, 1)], first_bytes)
+                .unwrap();
         assert_eq!(exact_single.batches().len(), 1);
         assert!(
-            prepare_tuple_pushes_with_budget(&[create("Gone", 2, 1)], first_bytes - 1).is_err()
+            prepare_tuple_pushes_with_budget(
+                &destination(),
+                &[create("Gone", 2, 1)],
+                first_bytes - 1,
+            )
+            .is_err()
         );
     }
 
@@ -761,9 +858,17 @@ mod tests {
         let budget = AtomicUnit::tuple(&first).encoded_argv_bytes;
         let oversized = create(&format!("G{}", "x".repeat(100)), 4, 3);
         assert!(
-            prepare_tuple_pushes_with_budget(&[create("Gone", 2, 1), oversized], budget).is_err()
+            prepare_tuple_pushes_with_budget(
+                &destination(),
+                &[create("Gone", 2, 1), oversized],
+                budget,
+            )
+            .is_err()
         );
-        assert!(prepare_tuple_pushes(&[create("Gone", 2, 1), create("Gone", 4, 3)]).is_err());
+        assert!(
+            prepare_tuple_pushes(&destination(), &[create("Gone", 2, 1), create("Gone", 4, 3)],)
+                .is_err()
+        );
     }
 
     #[test]
@@ -771,19 +876,126 @@ mod tests {
         let first = MarkerTransition::create(id("Gone"), object_id(2)).unwrap();
         let second = MarkerTransition::create(id("Gtwo"), object_id(3)).unwrap();
         let encoded = AtomicUnit::marker(&first).encoded_argv_bytes;
-        let batches = prepare_marker_pushes_with_budget(&[first.clone(), second], encoded).unwrap();
+        let batches =
+            prepare_marker_pushes_with_budget(&destination(), &[first.clone(), second], encoded)
+                .unwrap();
         assert_eq!(batches.batches().len(), 2);
         assert!(batches.batches().all(|batch| batch.refspecs().len() == 1));
         assert!(
-            prepare_marker_pushes_with_budget(std::slice::from_ref(&first), encoded - 1).is_err()
+            prepare_marker_pushes_with_budget(
+                &destination(),
+                std::slice::from_ref(&first),
+                encoded - 1,
+            )
+            .is_err()
         );
-        assert!(prepare_marker_pushes(&[first.clone(), first]).is_err());
+        assert!(prepare_marker_pushes(&destination(), &[first.clone(), first]).is_err());
     }
 
     #[test]
     fn empty_transition_sets_produce_no_batches() {
-        assert_eq!(prepare_tuple_pushes(&[]).unwrap().batches().len(), 0);
-        assert_eq!(prepare_marker_pushes(&[]).unwrap().batches().len(), 0);
+        assert_eq!(prepare_tuple_pushes(&destination(), &[]).unwrap().batches().len(), 0);
+        assert_eq!(prepare_marker_pushes(&destination(), &[]).unwrap().batches().len(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_push_action_crosses_without_starting_git() {
+        let destination = destination();
+        prepare_tuple_pushes(&destination, &[]).unwrap().execute(&destination).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_push_action_cannot_be_relabelled_to_another_destination() {
+        let repository = crate::util::Repo::open(".").unwrap();
+        let https =
+            PushDestination::for_test_url_in(&repository, "https://github.com/owner/repo.git");
+        let ssh = PushDestination::for_test_url_in(&repository, "git@github.com:owner/repo.git");
+        let error = prepare_tuple_pushes(&https, &[]).unwrap().execute(&ssh).await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Git publication action belongs to a different repository or push destination"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_push_action_cannot_be_moved_to_another_local_repository() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        gix::init_bare(first.path()).unwrap();
+        gix::init_bare(second.path()).unwrap();
+        let first = crate::util::Repo::open(first.path().to_str().unwrap()).unwrap();
+        let second = crate::util::Repo::open(second.path().to_str().unwrap()).unwrap();
+        let first = PushDestination::for_test_in(&first);
+        let second = PushDestination::for_test_in(&second);
+
+        let error = prepare_tuple_pushes(&first, &[]).unwrap().execute(&second).await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Git publication action belongs to a different repository or push destination"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_prepared_tuple_executes_against_its_bound_real_repository() {
+        let context = testutil::TestContextBuilder::new(env::current_exe().unwrap())
+            .with_remote()
+            .with_initial_commit()
+            .build();
+        let base = ObjectId::from_hex(context.head_oid().as_bytes()).unwrap();
+        context.commit("publication head");
+        let head = ObjectId::from_hex(context.head_oid().as_bytes()).unwrap();
+        let repository = crate::util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let destination =
+            PushDestination::resolve(&repository, repository.default_remote_name().unwrap())
+                .unwrap();
+
+        prepare_tuple_pushes(
+            &destination,
+            &[TupleTransition::create(
+                id("Gpublication"),
+                PublicationRevision::new(head, base).unwrap(),
+            )],
+        )
+        .unwrap()
+        .execute(&destination)
+        .await
+        .unwrap();
+
+        assert_eq!(context.remote_ref_oid("refs/heads/Gpublication"), Some(head.to_string()));
+        assert_eq!(
+            context.remote_ref_oid("refs/heads/gherrit-bases/Gpublication"),
+            Some(base.to_string())
+        );
+        assert_eq!(
+            context.remote_ref_oid("refs/tags/gherrit/Gpublication/v1"),
+            Some(head.to_string())
+        );
+    }
+
+    #[test]
+    fn only_exact_acknowledgement_releases_the_next_stage() {
+        require_acknowledgement(PushOutcome::Acknowledged, None).unwrap();
+
+        for (outcome, classification) in [
+            (PushOutcome::Rejected, "without changing the requested refs"),
+            (PushOutcome::Indeterminate, "may or may not have changed"),
+        ] {
+            let plain = require_acknowledgement(outcome, None).unwrap_err().to_string();
+            assert!(plain.contains(classification));
+            assert!(!plain.contains("Internal push diagnostic"));
+
+            let diagnostic =
+                require_acknowledgement(outcome, Some("safe local policy explanation".to_owned()))
+                    .unwrap_err()
+                    .to_string();
+            assert!(diagnostic.contains(classification));
+            assert!(diagnostic.contains(
+                "Internal push diagnostic (untrusted and not publication evidence):\n\
+                 safe local policy explanation"
+            ));
+        }
     }
 
     fn expected_receipts(receipts: &[(&str, ObjectId, ExpectedRefTransition)]) -> ExpectedReceipts {
