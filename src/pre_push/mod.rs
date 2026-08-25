@@ -31,7 +31,12 @@ mod legacy_github;
 mod legacy_publication;
 mod legacy_remote;
 mod local;
-#[cfg(test)]
+#[cfg_attr(not(test), expect(dead_code, reason = "the exact planner activates with its executor"))]
+mod plan;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "exact publication activates with the staged planner")
+)]
 mod publication;
 mod reconcile;
 #[cfg_attr(
@@ -44,10 +49,6 @@ mod remote;
     expect(dead_code, reason = "exact history activation must include publication")
 )]
 mod subprocess;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "exact history activation must include publication")
-)]
 mod version;
 
 use batching::{

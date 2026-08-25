@@ -13,11 +13,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    PullRequestIdentity, Repository, RepositoryNodeId, json::UniqueJson,
+    CreatePreparation, PullRequestIdentity, Repository, RepositoryNodeId, json::UniqueJson,
     pull_request::PullRequestIdentityRegistry,
 };
 use crate::pre_push::{
-    destination::{DefaultBranch, RepositoryCoordinates},
+    destination::{DefaultBranch, PushDestination, RepositoryCoordinates},
     local::{GherritPrId, LocalStack},
 };
 
@@ -74,6 +74,11 @@ impl ObservedBase {
 
     pub(in crate::pre_push) fn oid(&self) -> ObjectId {
         self.oid
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push) fn for_plan_test(kind: BaseKind, oid: ObjectId) -> Self {
+        Self { kind, oid }
     }
 }
 
@@ -156,6 +161,27 @@ impl ManagedOpenPullRequest {
     pub(in crate::pre_push) fn has_landing_automation(&self) -> bool {
         self.has_landing_automation
     }
+
+    #[cfg(test)]
+    pub(in crate::pre_push) fn for_plan_test(
+        id: GherritPrId,
+        identity: PullRequestIdentity,
+        head_oid: ObjectId,
+        base: ObservedBase,
+        title: &str,
+        body: &str,
+        has_landing_automation: bool,
+    ) -> Self {
+        Self {
+            id,
+            identity,
+            head_oid,
+            base,
+            title: title.into(),
+            body: body.into(),
+            has_landing_automation,
+        }
+    }
 }
 
 /// Proof that an exhausted exact all-state connection had no same-repository
@@ -172,6 +198,15 @@ impl AbsentPullRequest {
 
     pub(in crate::pre_push) fn id(&self) -> &GherritPrId {
         &self.id
+    }
+
+    pub(super) fn into_id(self) -> GherritPrId {
+        self.id
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push) fn for_plan_test(id: GherritPrId) -> Self {
+        Self::after_exhaustion(id)
     }
 }
 
@@ -210,6 +245,63 @@ impl CompleteLocalPullRequests {
 
     pub(in crate::pre_push) fn local(&self) -> &[LocalPullRequestObservation] {
         &self.local
+    }
+
+    /// Consumes exact-local evidence only after binding its retained
+    /// repository to the selected push destination.
+    pub(in crate::pre_push) fn into_planning_parts_for(
+        self,
+        destination: &PushDestination,
+    ) -> Result<(DefaultBranch, Box<[LocalPullRequestObservation]>, CreatePreparation)> {
+        if self.repository.coordinates() != destination.coordinates() {
+            bail!("GitHub observation belongs to a different push repository");
+        }
+        let (repository_id, default_branch) = self.repository.into_create_parts();
+        Ok((default_branch, self.local, CreatePreparation::new(repository_id, self.identities)))
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push) fn for_plan_test(
+        coordinates: RepositoryCoordinates,
+        default_branch: DefaultBranch,
+        local: Vec<LocalPullRequestObservation>,
+        additional_identities: &[PullRequestIdentity],
+    ) -> Result<Self> {
+        Self::for_plan_test_with_repository_node(
+            coordinates,
+            default_branch,
+            local,
+            additional_identities,
+            "REPOSITORY_NODE",
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push) fn for_plan_test_with_repository_node(
+        coordinates: RepositoryCoordinates,
+        default_branch: DefaultBranch,
+        local: Vec<LocalPullRequestObservation>,
+        additional_identities: &[PullRequestIdentity],
+        repository_node_id: &str,
+    ) -> Result<Self> {
+        let mut identities = PullRequestIdentityRegistry::default();
+        for observation in &local {
+            if let LocalPullRequestObservation::Open(pull_request) = observation {
+                identities.insert_observation(pull_request.identity())?;
+            }
+        }
+        for identity in additional_identities {
+            identities.insert_observation(identity)?;
+        }
+        Ok(Self {
+            repository: Repository::for_plan_test_with_node(
+                coordinates,
+                default_branch,
+                repository_node_id,
+            ),
+            local: local.into_boxed_slice(),
+            identities,
+        })
     }
 }
 

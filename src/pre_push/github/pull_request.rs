@@ -74,6 +74,11 @@ impl PullRequestIdentity {
     pub(super) fn node_id(&self) -> &PullRequestNodeId {
         &self.node_id
     }
+
+    #[cfg(test)]
+    pub(in crate::pre_push) fn for_plan_test(number: u32, node_id: &str) -> Self {
+        Self::new(u64::from(number), node_id.to_owned()).expect("valid plan-test identity")
+    }
 }
 
 /// Both pull request identity namespaces retained for one publication attempt.
