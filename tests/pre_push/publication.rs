@@ -201,7 +201,11 @@ fn test_replacement_ref_is_ignored_even_with_gix_075_false_polarity() {
     let pull_requests = ctx.github().pull_requests();
     assert_eq!(pull_requests.len(), 1);
     assert_eq!(pull_requests[0].title.as_deref(), Some("Literal commit"));
-    assert_eq!(&ctx.recorded_pushes()[0].arguments()[..3], ["git", "--no-replace-objects", "push"]);
+    let pushes = ctx.recorded_pushes();
+    let arguments = pushes[0].arguments();
+    assert_eq!(&arguments[..2], ["git", "--no-replace-objects"]);
+    assert!(arguments.iter().any(|argument| argument == "push"));
+    assert!(!arguments.iter().any(|argument| argument == "--no-verify"));
 }
 
 #[test]

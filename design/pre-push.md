@@ -753,10 +753,22 @@ destination.
 
 The implementation uses a command-scoped internal remote rather than exposing
 the destination literal throughout child argument lists or writing it to
-repository configuration. It sanitizes inherited Git configuration,
-repository-redirection, credential, tracing, object-database, replacement,
-graft, shallow, proxy, and prompt-control environment variables before every
-child command. HTTP redirects are disabled.
+repository configuration. This requires Git 2.31 or newer, whose
+`--config-env` option supplies configuration values without placing those
+values in process arguments. The adapter chooses a remote name absent from all
+configuration activated by the destination, validates that only its exact URL
+and push URL configure that remote, and proves that another `insteadOf` rule
+cannot rewrite it. Destination-bearing children remove `GIT_TRACE*` and
+`GIT_CURL_VERBOSE`; the literal-graph boundary separately removes inherited
+object-database, replacement, graft, and shallow overrides. HTTP redirects are
+disabled. Pushes also disable implicit followed tags and submodule recursion
+and clear inherited push options, so configuration cannot add refs, suppress
+the planned repository push, write submodule remotes, or add server options.
+
+Ordinary credential helpers and credential, proxy, SSH, and prompt-control
+configuration and environment remain available as user-supplied transport
+inputs. GHerrit does not attempt an authentication-preserving environment
+allowlist.
 
 Every network command is bounded by output, execution, and cleanup deadlines.
 Failures include bounded terminal-safe diagnostics without printing the private
