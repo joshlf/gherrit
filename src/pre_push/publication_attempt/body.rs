@@ -1,23 +1,23 @@
 //! Bounded pull-request content frozen from one ordered local stack.
 //!
-//! This module is dormant until the staged planner activates it. The planner
-//! owns pull-request existence and identities. This module owns only the
-//! shared presentation context and ordered per-change facts needed to render
-//! one internally consistent set of provisional or final bodies.
-#![allow(dead_code)]
-
+//! The publication planner owns pull-request existence and identities. This
+//! module owns only the shared presentation context and ordered per-change
+//! facts needed to render one internally consistent set of provisional or
+//! final bodies.
 use std::{collections::HashSet, fmt};
 
 use color_eyre::eyre::{Result, bail};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
-use super::MAX_BODY_SIZE_BYTES;
-use crate::pre_push::{
-    destination::PushDestination,
+use super::{
     github::PullRequestNumber,
     history::{Revision, ValidatedChangeHistory},
-    local::{GherritPrId, LocalChange, LocalStack, PullRequestTitle},
     version::Version,
+};
+use crate::pre_push::{
+    body::MAX_BODY_SIZE_BYTES,
+    destination::PushDestination,
+    local::{GherritPrId, LocalChange, LocalStack, PullRequestTitle},
 };
 
 /// Repository links derived from the selected push destination and an optional
@@ -95,35 +95,35 @@ fn write_public_branch_link(output: &mut impl fmt::Write, branch: &str) -> fmt::
 
 /// A generated body proven to fit GHerrit's product body limit.
 #[derive(Debug, Eq, PartialEq)]
-pub(in crate::pre_push) struct GeneratedBody(Box<str>);
+pub(super) struct GeneratedBody(Box<str>);
 
 impl GeneratedBody {
-    pub(in crate::pre_push) fn as_str(&self) -> &str {
+    pub(super) fn as_str(&self) -> &str {
         &self.0
     }
 
-    pub(in crate::pre_push) fn into_string(self) -> String {
+    pub(super) fn into_string(self) -> String {
         self.0.into()
     }
 }
 
 /// One concrete generated body coupled to its change identity.
 #[derive(Debug, Eq, PartialEq)]
-pub(in crate::pre_push) struct RenderedBody {
+pub(super) struct RenderedBody {
     id: GherritPrId,
     body: GeneratedBody,
 }
 
 impl RenderedBody {
-    pub(in crate::pre_push) fn id(&self) -> &GherritPrId {
+    pub(super) fn id(&self) -> &GherritPrId {
         &self.id
     }
 
-    pub(in crate::pre_push) fn body(&self) -> &GeneratedBody {
+    pub(super) fn body(&self) -> &GeneratedBody {
         &self.body
     }
 
-    pub(in crate::pre_push) fn into_parts(self) -> (GherritPrId, GeneratedBody) {
+    pub(super) fn into_parts(self) -> (GherritPrId, GeneratedBody) {
         (self.id, self.body)
     }
 }
@@ -135,13 +135,13 @@ impl RenderedBody {
 /// derives every stack index, stack size, and navigation sequence from its one
 /// entry collection. Pull-request existence remains solely planner state.
 #[derive(Debug)]
-pub(in crate::pre_push) struct StackBodyRecipes {
+pub(super) struct StackBodyRecipes {
     context: BodyLinkContext,
     entries: Box<[PullRequestRecipe]>,
 }
 
 impl StackBodyRecipes {
-    pub(in crate::pre_push) fn new(
+    pub(super) fn new(
         destination: &PushDestination,
         public_branch: Option<String>,
         stack: LocalStack,
@@ -176,7 +176,7 @@ impl StackBodyRecipes {
         Ok(recipes)
     }
 
-    pub(in crate::pre_push) fn titles(
+    pub(super) fn titles(
         &self,
     ) -> impl DoubleEndedIterator<Item = (&GherritPrId, &PullRequestTitle)> + ExactSizeIterator
     {
@@ -188,7 +188,7 @@ impl StackBodyRecipes {
     /// The planner selects bodies for absent pull requests. Rendering the
     /// complete set here keeps position and shared context derived from one
     /// ordered collection rather than accepting a parallel missing-state map.
-    pub(in crate::pre_push) fn provisional_bodies(&self) -> Box<[RenderedBody]> {
+    pub(super) fn provisional_bodies(&self) -> Box<[RenderedBody]> {
         self.entries
             .iter()
             .enumerate()
@@ -197,7 +197,7 @@ impl StackBodyRecipes {
     }
 
     /// Renders every final body from one complete keyed navigation sequence.
-    pub(in crate::pre_push) fn final_bodies(
+    pub(super) fn final_bodies(
         &self,
         assignments: &[(GherritPrId, PullRequestNumber)],
     ) -> Result<Box<[RenderedBody]>> {
