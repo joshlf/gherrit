@@ -5,27 +5,20 @@
 //! rows are never collected into a second complete representation, and no
 //! correlated value is exposed until every requested connection is exhausted.
 
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    num::NonZeroUsize,
-};
+use std::{collections::HashSet, num::NonZeroUsize};
 
 use color_eyre::eyre::{Result, bail, eyre};
 use gix::ObjectId;
-use serde::{
-    Deserialize, Deserializer,
-    de::{self, MapAccess, SeqAccess, Visitor},
-};
-use serde_json::{Map, Number, Value, json};
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 use super::{
-    PullRequestIdentity, Repository, RepositoryNodeId,
-    pull_request::ExactLocalPullRequestIdentities,
+    PullRequestIdentity, Repository, RepositoryNodeId, json::UniqueJson,
+    pull_request::PullRequestIdentityRegistry,
 };
 use crate::pre_push::{
     destination::{DefaultBranch, RepositoryCoordinates},
-    local::GherritPrId,
+    local::{GherritPrId, LocalStack},
 };
 
 const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 80;
@@ -46,130 +39,11 @@ fn diagnostic_detail(value: &str) -> String {
     rendered
 }
 
-/// A JSON value decoded without collapsing duplicate object members.
-///
-/// The ordinary `serde_json::Value` decoder keeps the final value for a
-/// duplicate key. That behavior is unusable for authority-bearing aliases and
-/// fields, so this visitor checks every object recursively before constructing
-/// the bounded response value consumed by semantic decoding.
-struct UniqueJson(Value);
-
-impl<'de> Deserialize<'de> for UniqueJson {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct UniqueJsonVisitor;
-
-        impl<'de> Visitor<'de> for UniqueJsonVisitor {
-            type Value = UniqueJson;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("one JSON value with unique object members")
-            }
-
-            fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
-                Ok(UniqueJson(Value::Bool(value)))
-            }
-
-            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
-                Ok(UniqueJson(Value::Number(value.into())))
-            }
-
-            fn visit_i128<E>(self, value: i128) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                let deserializer = de::value::I128Deserializer::new(value);
-                Number::deserialize(deserializer).map(|number| UniqueJson(Value::Number(number)))
-            }
-
-            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
-                Ok(UniqueJson(Value::Number(value.into())))
-            }
-
-            fn visit_u128<E>(self, value: u128) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                let deserializer = de::value::U128Deserializer::new(value);
-                Number::deserialize(deserializer).map(|number| UniqueJson(Value::Number(number)))
-            }
-
-            fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                let number = Number::from_f64(value)
-                    .ok_or_else(|| de::Error::custom("non-finite JSON number"))?;
-                Ok(UniqueJson(Value::Number(number)))
-            }
-
-            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                self.visit_string(value.to_owned())
-            }
-
-            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
-                Ok(UniqueJson(Value::String(value)))
-            }
-
-            fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
-                Ok(UniqueJson(Value::Null))
-            }
-
-            fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
-            where
-                D: Deserializer<'de>,
-            {
-                UniqueJson::deserialize(deserializer)
-            }
-
-            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
-                Ok(UniqueJson(Value::Null))
-            }
-
-            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut values = Vec::new();
-                while let Some(UniqueJson(value)) = sequence.next_element::<UniqueJson>()? {
-                    values.push(value);
-                }
-                Ok(UniqueJson(Value::Array(values)))
-            }
-
-            fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut values = Map::new();
-                while let Some(key) = object.next_key::<String>()? {
-                    if values.contains_key(&key) {
-                        return Err(de::Error::custom("duplicate JSON object member"));
-                    }
-                    let UniqueJson(value) = object.next_value::<UniqueJson>()?;
-                    assert!(values.insert(key, value).is_none());
-                }
-                Ok(UniqueJson(Value::Object(values)))
-            }
-        }
-
-        deserializer.deserialize_any(UniqueJsonVisitor)
-    }
-}
-
+#[cfg(test)]
 fn decode_unique_json(response: &[u8]) -> Result<Value> {
-    let mut deserializer = serde_json::Deserializer::from_slice(response);
-    let UniqueJson(value) = UniqueJson::deserialize(&mut deserializer)
-        .map_err(|_| eyre!("GitHub local pull request response contains malformed JSON"))?;
-    deserializer
-        .end()
-        .map_err(|_| eyre!("GitHub local pull request response contains malformed JSON"))?;
-    Ok(value)
+    Ok(UniqueJson::decode(response)
+        .map_err(|_| eyre!("GitHub local pull request response contains malformed JSON"))?
+        .into_value())
 }
 
 /// The lifecycle states which cannot be selected as the current projection.
@@ -326,7 +200,7 @@ impl LocalPullRequestObservation {
 pub(in crate::pre_push) struct CompleteLocalPullRequests {
     repository: Repository,
     local: Box<[LocalPullRequestObservation]>,
-    identities: ExactLocalPullRequestIdentities,
+    identities: PullRequestIdentityRegistry,
 }
 
 impl CompleteLocalPullRequests {
@@ -360,7 +234,7 @@ impl LocalPullRequestQuery {
 }
 
 /// One batch of independently paginated exact local-ID connections.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct LocalPullRequests {
     coordinates: RepositoryCoordinates,
     queries: Vec<LocalPullRequestQuery>,
@@ -422,8 +296,17 @@ impl LocalPullRequests {
 
     /// Decodes one bounded raw response without first collapsing duplicate JSON
     /// members.
+    #[cfg(test)]
     fn decode(self, response: &[u8]) -> Result<LocalPullRequestBatch> {
         self.decode_unique_value(decode_unique_json(response)?)
+    }
+
+    fn decode_unique(self, response: UniqueJson) -> Result<LocalPullRequestBatch> {
+        self.decode_unique_value(response.into_value())
+    }
+
+    fn alias_count(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.queries.len()).expect("a local pull request query is nonempty")
     }
 
     #[cfg(test)]
@@ -869,6 +752,16 @@ struct ConnectionObservation {
     terminal: Option<TerminalSummary>,
 }
 
+/// One local change and the only observation state which can belong to it.
+///
+/// Keeping the ID beside its state preserves local order without a second
+/// membership index whose contents could disagree.
+#[derive(Debug)]
+struct ConnectionSlot {
+    id: GherritPrId,
+    observation: ConnectionObservation,
+}
+
 impl Default for ConnectionObservation {
     fn default() -> Self {
         Self {
@@ -888,13 +781,56 @@ impl Default for ConnectionObservation {
 /// contain its one requested row, an N-ID observation accepts at most N + 99
 /// rows and at most 2N + 99 pages (one final empty page per connection).
 #[derive(Debug)]
-struct LocalPullRequestAccumulator {
+pub(super) struct LocalPullRequestAccumulator {
     coordinates: RepositoryCoordinates,
     repository: Option<Repository>,
-    order: Box<[GherritPrId]>,
-    connections: HashMap<GherritPrId, ConnectionObservation>,
+    connections: Box<[ConnectionSlot]>,
+    alias_limit: NonZeroUsize,
     excess_rows_remaining: usize,
-    identities: ExactLocalPullRequestIdentities,
+    identities: PullRequestIdentityRegistry,
+}
+
+/// The only two outcomes of consuming one exact-local accumulator.
+pub(super) enum ObservationStep {
+    Complete(CompleteLocalPullRequests),
+    Request(PendingObservationRequest),
+}
+
+/// One immutable request inseparably coupled to the accumulator it advances.
+pub(super) struct PendingObservationRequest {
+    accumulator: LocalPullRequestAccumulator,
+    request: LocalPullRequests,
+    slots: Box<[usize]>,
+}
+
+impl PendingObservationRequest {
+    pub(super) fn document(&self) -> String {
+        self.request.document()
+    }
+
+    pub(super) fn alias_count(&self) -> NonZeroUsize {
+        self.request.alias_count()
+    }
+
+    /// Reduces this attempt's persistent alias limit and derives the same
+    /// leading logical pages again without advancing any evidence.
+    pub(super) fn back_off(mut self) -> Result<Self> {
+        let attempted = self.request.alias_count().get();
+        self.accumulator.alias_limit = NonZeroUsize::new(attempted / 2)
+            .ok_or_else(|| eyre!("A one-alias local pull request query cannot be reduced"))?;
+        match self.accumulator.next()? {
+            ObservationStep::Request(request) => Ok(request),
+            ObservationStep::Complete(_) => {
+                unreachable!("discarding a pending request cannot complete observation")
+            }
+        }
+    }
+
+    /// Atomically decodes and records the exact response for this request.
+    pub(super) fn accept(self, response: UniqueJson) -> Result<ObservationStep> {
+        let batch = self.request.decode_unique(response)?;
+        self.accumulator.record_selected_batch(batch, self.slots)?.next()
+    }
 }
 
 impl LocalPullRequestAccumulator {
@@ -902,32 +838,79 @@ impl LocalPullRequestAccumulator {
         coordinates: RepositoryCoordinates,
         ids: impl IntoIterator<Item = GherritPrId>,
     ) -> Result<Self> {
-        let mut order = Vec::new();
-        let mut connections = HashMap::new();
+        let mut connections = Vec::new();
+        let mut seen = HashSet::new();
         for id in ids {
-            if connections.insert(id.clone(), ConnectionObservation::default()).is_some() {
+            if !seen.insert(id.clone()) {
                 let id = diagnostic_detail(id.as_str());
                 bail!("Local pull request observation requested change '{}' more than once", id);
             }
-            order.push(id);
+            connections.push(ConnectionSlot { id, observation: ConnectionObservation::default() });
         }
-        if order.is_empty() {
+        if connections.is_empty() {
             bail!("Local pull request observation requires at least one change");
         }
         Ok(Self {
             coordinates,
             repository: None,
-            order: order.into_boxed_slice(),
-            connections,
+            connections: connections.into_boxed_slice(),
+            alias_limit: NonZeroUsize::new(LocalPullRequests::MAX_ALIASES)
+                .expect("the production alias limit is nonzero"),
             excess_rows_remaining: EXCESS_OBSERVATION_ROWS,
-            identities: ExactLocalPullRequestIdentities::default(),
+            identities: PullRequestIdentityRegistry::default(),
         })
+    }
+
+    pub(super) fn for_stack(
+        coordinates: RepositoryCoordinates,
+        local: &LocalStack,
+    ) -> Result<Self> {
+        Self::new(coordinates, local.iter().map(|change| change.id().clone()))
+    }
+
+    /// Derives the next immutable request from the sole retained cursor state.
+    ///
+    /// The alias limit is part of the consumed observation state, so a caller
+    /// cannot accidentally reset backoff while progressing through pages.
+    pub(super) fn next(self) -> Result<ObservationStep> {
+        let selected = self
+            .connections
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match &slot.observation.progress {
+                Progress::Initial => {
+                    Some(LocalPullRequestQuery { id: slot.id.clone(), after: None })
+                        .map(|query| (index, query))
+                }
+                Progress::Next { cursor, .. } => {
+                    Some(LocalPullRequestQuery { id: slot.id.clone(), after: Some(cursor.clone()) })
+                        .map(|query| (index, query))
+                }
+                Progress::Exhausted => None,
+            })
+            .take(self.alias_limit.get())
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return self.finish().map(ObservationStep::Complete);
+        }
+        let (slots, queries): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
+        let request =
+            LocalPullRequests::new(self.coordinates.clone(), queries, self.repository.is_none())?;
+        Ok(ObservationStep::Request(PendingObservationRequest {
+            accumulator: self,
+            request,
+            slots: slots.into_boxed_slice(),
+        }))
     }
 
     /// Consumes the old accumulator and returns a new one only if every page
     /// in the batch is accepted. An error therefore cannot expose the state
     /// produced by an earlier page in the same batch.
-    fn record_batch(mut self, batch: LocalPullRequestBatch) -> Result<Self> {
+    fn record_selected_batch(
+        mut self,
+        batch: LocalPullRequestBatch,
+        slots: Box<[usize]>,
+    ) -> Result<Self> {
         if batch.coordinates != self.coordinates {
             bail!("Local pull request pages identify different repositories");
         }
@@ -939,19 +922,34 @@ impl LocalPullRequestAccumulator {
             }
             (repository @ Some(_), None) => repository,
         };
-        batch.pages.into_iter().try_fold(self, Self::record_page)
+        if batch.pages.len() != slots.len() {
+            bail!("Local pull request response has an incomplete page set");
+        }
+        slots
+            .into_vec()
+            .into_iter()
+            .zip(batch.pages)
+            .try_fold(self, |accumulator, (slot, page)| accumulator.record_page(slot, page))
     }
 
     /// Consuming page insertion is the atomic adapter boundary. Any mutation
     /// before a validation failure is dropped with `self`.
-    fn record_page(mut self, page: LocalPullRequestPageEvidence) -> Result<Self> {
+    fn record_page(
+        mut self,
+        slot_index: usize,
+        page: LocalPullRequestPageEvidence,
+    ) -> Result<Self> {
         let LocalPullRequestPageEvidence { id, after, end } = page;
-        let mut connection = self.connections.remove(&id).ok_or_else(|| {
-            eyre!(
+        let slot = self.connections.get_mut(slot_index).ok_or_else(|| {
+            eyre!("Local pull request observation returned an unrequested connection")
+        })?;
+        if slot.id != id {
+            bail!(
                 "Local pull request observation returned unrequested change '{}'",
                 diagnostic_detail(id.as_str())
-            )
-        })?;
+            );
+        }
+        let connection = &mut slot.observation;
         if !connection.progress.expects(after.as_deref()) {
             bail!(
                 "Local pull request observation returned an unexpected page cursor for '{}'",
@@ -975,7 +973,7 @@ impl LocalPullRequestAccumulator {
                         )
                     })?;
             }
-            self.identities.insert(row.identity())?;
+            self.identities.insert_observation(row.identity())?;
             match row {
                 DecodedPullRequest::CrossRepository { .. } => {}
                 DecodedPullRequest::Terminal { identity, state } => {
@@ -994,17 +992,44 @@ impl LocalPullRequestAccumulator {
             }
         }
 
-        connection.progress = connection.progress.advance(&id, next_cursor)?;
-        assert!(self.connections.insert(id, connection).is_none());
+        let progress = std::mem::replace(&mut connection.progress, Progress::Exhausted);
+        connection.progress = progress.advance(&id, next_cursor)?;
         Ok(self)
+    }
+
+    /// Unit tests may inject already-decoded pages to exhaustively exercise
+    /// correlation. Production can only record pages through a pending token.
+    #[cfg(test)]
+    fn record_batch(self, batch: LocalPullRequestBatch) -> Result<Self> {
+        let mut selected = HashSet::new();
+        let slots = batch
+            .pages
+            .iter()
+            .map(|page| {
+                let index =
+                    self.connections.iter().position(|slot| slot.id == page.id).ok_or_else(
+                        || {
+                            eyre!(
+                                "Local pull request observation returned unrequested change '{}'",
+                                diagnostic_detail(page.id.as_str())
+                            )
+                        },
+                    )?;
+                if !selected.insert(index) {
+                    bail!("Local pull request observation returned one connection twice");
+                }
+                Ok(index)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.record_selected_batch(batch, slots.into_boxed_slice())
     }
 
     fn finish(self) -> Result<CompleteLocalPullRequests> {
         let mut incomplete = self
             .connections
             .iter()
-            .filter(|(_, connection)| !matches!(connection.progress, Progress::Exhausted))
-            .map(|(id, _)| id.as_str())
+            .filter(|slot| !matches!(slot.observation.progress, Progress::Exhausted))
+            .map(|slot| slot.id.as_str())
             .collect::<Vec<_>>();
         incomplete.sort_unstable();
         if !incomplete.is_empty() {
@@ -1027,13 +1052,11 @@ impl LocalPullRequestAccumulator {
             .repository
             .ok_or_else(|| eyre!("Local pull request observation omitted repository facts"))?;
         let default_branch = repository.default_branch().name();
-        let mut connections = self.connections;
-        let mut local = Vec::with_capacity(self.order.len());
+        let mut local = Vec::with_capacity(self.connections.len());
         let mut terminal_count = 0_usize;
         let mut terminal_representatives = Vec::new();
 
-        for id in self.order.into_vec() {
-            let connection = connections.remove(&id).expect("ordered local ID has connection");
+        for ConnectionSlot { id, observation: connection } in self.connections.into_vec() {
             if let Some(open) = connection.open {
                 local.push(LocalPullRequestObservation::Open(
                     ManagedOpenPullRequest::from_observation(
@@ -1062,8 +1085,6 @@ impl LocalPullRequestAccumulator {
                 ));
             }
         }
-        debug_assert!(connections.is_empty());
-
         if terminal_count != 0 {
             let displayed = terminal_representatives.len();
             let mut message = terminal_representatives
@@ -1261,6 +1282,60 @@ mod tests {
 
         let later = operation(vec![query("Gone", Some("next"))], false).document();
         insta::assert_snapshot!("later_exact_local_query", later);
+    }
+
+    #[test]
+    fn resource_backoff_is_persistent_and_retains_repository_fact_authority() {
+        let ObservationStep::Request(initial) =
+            accumulator([id("A"), id("B"), id("C"), id("D")]).unwrap().next().unwrap()
+        else {
+            panic!("a nonempty observation starts with a request");
+        };
+        assert_eq!(initial.alias_count().get(), 4);
+        assert!(initial.document().contains("defaultBranchRef"));
+
+        let first_half = initial.back_off().unwrap();
+        assert_eq!(first_half.alias_count().get(), 2);
+        assert!(first_half.document().contains("headRefName: \"A\""));
+        assert!(first_half.document().contains("headRefName: \"B\""));
+        assert!(!first_half.document().contains("headRefName: \"C\""));
+        assert!(first_half.document().contains("defaultBranchRef"));
+
+        let first_response = response(
+            true,
+            [
+                ("op0".to_owned(), connection(Vec::new(), false, Value::Null)),
+                ("op1".to_owned(), connection(Vec::new(), false, Value::Null)),
+            ],
+        );
+        let first_response =
+            UniqueJson::decode(&serde_json::to_vec(&first_response).unwrap()).unwrap();
+        let ObservationStep::Request(second_half) = first_half.accept(first_response).unwrap()
+        else {
+            panic!("two local connections remain");
+        };
+        assert_eq!(second_half.alias_count().get(), 2);
+        assert!(second_half.document().contains("headRefName: \"C\""));
+        assert!(second_half.document().contains("headRefName: \"D\""));
+        assert!(!second_half.document().contains("defaultBranchRef"));
+
+        let second_response = response(
+            false,
+            [
+                ("op0".to_owned(), connection(Vec::new(), false, Value::Null)),
+                ("op1".to_owned(), connection(Vec::new(), false, Value::Null)),
+            ],
+        );
+        let second_response =
+            UniqueJson::decode(&serde_json::to_vec(&second_response).unwrap()).unwrap();
+        let ObservationStep::Complete(complete) = second_half.accept(second_response).unwrap()
+        else {
+            panic!("all local connections were exhausted");
+        };
+        assert_eq!(
+            kinds(&complete),
+            [("A", "absent"), ("B", "absent"), ("C", "absent"), ("D", "absent")]
+        );
     }
 
     #[test]
