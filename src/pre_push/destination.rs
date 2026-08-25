@@ -1709,6 +1709,7 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(parameters.ends_with(&redirect_parameter));
+        assert!(push.get_envs().all(|(name, _)| name != OsStr::new("LC_ALL")));
         assert_eq!(
             push.get_envs()
                 .find(|(name, _)| *name == OsStr::new(INTERNAL_PRE_PUSH_REMOTE_ENV))
