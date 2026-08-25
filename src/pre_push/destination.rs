@@ -350,6 +350,10 @@ impl PushDestination {
         .chain(refspecs);
         let mut command = self.adapter_command(arguments);
         command
+            // The porcelain status records are machine-readable, but Git's
+            // header and footer are translated. Fix their message locale so
+            // receipt framing never depends on the invoking user's locale.
+            .env("LC_ALL", "C")
             .env(INTERNAL_PRE_PUSH_REMOTE_ENV, &self.internal_remote)
             .env(INTERNAL_PRE_PUSH_GIT_DIR_ENV, git_dir.as_os_str());
         command
@@ -1673,6 +1677,12 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(parameters.ends_with(&redirect_parameter));
+        assert_eq!(
+            push.get_envs()
+                .find(|(name, _)| *name == OsStr::new("LC_ALL"))
+                .and_then(|(_, value)| value),
+            Some(OsStr::new("C"))
+        );
         assert_eq!(
             push.get_envs()
                 .find(|(name, _)| *name == OsStr::new(INTERNAL_PRE_PUSH_REMOTE_ENV))
