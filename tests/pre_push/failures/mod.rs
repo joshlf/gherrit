@@ -60,6 +60,18 @@ fn unpublished_managed_commit(branch: &str) -> testutil::TestContext {
     ctx
 }
 
+fn configured_remote_url(ctx: &testutil::TestContext, remote: &str) -> String {
+    let output = ctx
+        .git_cmd()
+        .args(["remote", "get-url", remote])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output).unwrap().trim_end().to_owned()
+}
+
 fn assert_identity_failure_before_external_io(ctx: testutil::TestContext, diagnostic: &str) {
     ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(diagnostic));
 
@@ -191,6 +203,67 @@ fn test_duplicate_stack_ids_fail_before_external_io() {
 }
 
 #[test]
+fn test_stack_id_cannot_be_a_ref_path_ancestor_of_a_nested_default_branch() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    let default_branch = "release/main";
+    let default_ref = format!("refs/heads/{default_branch}");
+    let default_tip = ctx.remote_ref_oid("refs/heads/main").unwrap();
+    ctx.run_git(&["branch", "--move", "main", default_branch]);
+    ctx.remote_git_cmd().args(["update-ref", &default_ref, "refs/heads/main"]).assert().success();
+    ctx.remote_git_cmd().args(["symbolic-ref", "HEAD", &default_ref]).assert().success();
+    ctx.remote_git_cmd().args(["update-ref", "-d", "refs/heads/main"]).assert().success();
+    ctx.checkout_managed_private("nested-default-collision");
+    ctx.commit_with_explicit_gherrit_id("Do not occupy a default-branch ancestor", "release");
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "managed branch 'refs/heads/release' conflicts with repository default branch 'refs/heads/release/main'",
+        ));
+
+    assert!(ctx.github().requests().is_empty());
+    assert!(ctx.recorded_pushes().is_empty());
+    assert_eq!(ctx.remote_ref_oid(&default_ref).as_deref(), Some(default_tip.as_str()));
+    assert_eq!(ctx.remote_ref_oid("refs/heads/release"), None);
+}
+
+#[test]
+fn test_autosquash_guidance_uses_the_validated_local_ref_with_split_destinations() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    let push_destination = configured_remote_url(&ctx, "origin");
+    let fetch_repository = ctx.dir.path().join("fetch-only.git");
+    ctx.init_bare_repo(&fetch_repository);
+    let fetch_destination =
+        fetch_repository.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    ctx.set_config("remote.origin.url", Some(&fetch_destination));
+    ctx.set_config("remote.origin.pushurl", Some(&push_destination));
+    ctx.run_git(&["update-ref", "refs/remotes/origin/main", "refs/heads/main"]);
+    ctx.checkout_managed_private("split-destination-autosquash");
+    ctx.commit_with_explicit_gherrit_id("fixup! pending work", "Gpending");
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("git rebase -i --autosquash refs/heads/main"))
+        .stderr(predicate::str::contains("origin/main").not())
+        .stderr(predicate::str::contains("refs/remotes/origin/main").not());
+
+    assert!(ctx.github().requests().is_empty());
+    assert!(ctx.recorded_pushes().is_empty());
+}
+
+#[test]
 fn test_replacement_cannot_hide_a_stack_id_duplicated_through_a_merge() {
     let ctx = testutil::test_context!()
         .with_remote()
@@ -311,6 +384,8 @@ fn test_default_branch_must_be_on_the_first_parent_stack_path() {
 
     ctx.run_git(&["checkout", "main"]);
     ctx.commit("Advance the default branch");
+    ctx.run_git(&["push", "--quiet", "--no-verify", "origin", "refs/heads/main:refs/heads/main"]);
+    let fixture_pushes = ctx.recorded_pushes();
     ctx.run_git(&["checkout", "first-parent"]);
     ctx.run_git(&["merge", "--no-ff", "main", "-m", "Merge the default branch"]);
 
@@ -320,7 +395,7 @@ fn test_default_branch_must_be_on_the_first_parent_stack_path() {
         .stderr(predicate::str::contains("does not descend from 'main' on its first-parent path"));
 
     assert!(ctx.github().requests().is_empty());
-    assert!(ctx.recorded_pushes().is_empty());
+    assert_eq!(ctx.recorded_pushes(), fixture_pushes);
 }
 
 #[test]
@@ -590,7 +665,7 @@ fn test_pre_push_ls_remote_failure() {
     assert_eq!(ctx.remote_refs("refs"), refs_before);
     assert!(ctx.recorded_pushes().is_empty());
     assert!(ctx.github().pull_requests().is_empty());
-    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]]);
+    assert!(ctx.github().requests().is_empty());
 }
 
 #[test]
@@ -656,7 +731,6 @@ fn test_pre_push_pr_list_retries_a_transient_http_failure() {
         [
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::CreatePr],
             vec![testutil::GraphQlOperation::UpdatePr],
         ]
@@ -698,7 +772,6 @@ fn test_pre_push_pr_list_retries_a_response_transport_failure() {
         [
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::CreatePr],
             vec![testutil::GraphQlOperation::UpdatePr],
         ]
@@ -719,9 +792,9 @@ fn test_pre_push_pr_list_stops_after_three_response_transport_retries() {
 }
 
 #[test]
-fn test_repository_id_query_retries_a_transient_http_failure() {
-    let ctx = unpublished_managed_commit("feature-repository-id-transient");
-    ctx.inject_failure(testutil::FailureKind::RepositoryIdHttp(
+fn test_repository_facts_query_retries_a_transient_http_failure() {
+    let ctx = unpublished_managed_commit("feature-repository-facts-transient");
+    ctx.inject_failure(testutil::FailureKind::RepositoryFactsHttp(
         testutil::RetryableHttpStatus::TooManyRequests,
     ));
 
@@ -733,7 +806,6 @@ fn test_repository_id_query_retries_a_transient_http_failure() {
         [
             vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
             vec![testutil::GraphQlOperation::CreatePr],
             vec![testutil::GraphQlOperation::UpdatePr],
         ]
@@ -742,24 +814,22 @@ fn test_repository_id_query_retries_a_transient_http_failure() {
 }
 
 #[test]
-fn test_repository_id_query_stops_after_three_transient_http_retries() {
-    let ctx = unpublished_managed_commit("feature-repository-id-retries-exhausted");
+fn test_repository_facts_query_stops_after_three_transient_http_retries() {
+    let ctx = unpublished_managed_commit("feature-repository-facts-retries-exhausted");
     (0..=3).for_each(|_| {
-        ctx.inject_failure(testutil::FailureKind::RepositoryIdHttp(
+        ctx.inject_failure(testutil::FailureKind::RepositoryFactsHttp(
             testutil::RetryableHttpStatus::ServiceUnavailable,
         ));
     });
 
-    ctx.gherrit_cmd()
-        .args(["hook", "pre-push"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Injected RepositoryIdHttp(ServiceUnavailable) failure"));
+    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().failure().stderr(
+        predicate::str::contains("Injected RepositoryFactsHttp(ServiceUnavailable) failure"),
+    );
 
     ctx.assert_failure_consumed();
-    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]; 5]);
+    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]; 4]);
     assert!(ctx.github().pull_requests().is_empty());
-    assert_eq!(ctx.recorded_pushes().iter().filter(|push| push.succeeded()).count(), 1);
+    assert!(ctx.recorded_pushes().is_empty());
 }
 
 #[test]
@@ -784,11 +854,7 @@ fn test_pre_push_pr_create_failure() {
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),
-        [
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::CreatePr],
-        ],
+        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::CreatePr],],
         "an indeterminate create response must stop without replay or continuation"
     );
     assert!(ctx.github().pull_requests().is_empty());
@@ -818,11 +884,7 @@ fn test_pre_push_pr_create_service_unavailable_is_not_replayed() {
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),
-        [
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::CreatePr],
-        ],
+        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::CreatePr],],
         "a retryable HTTP response must not replay a mutation request"
     );
     assert!(ctx.github().pull_requests().is_empty());
