@@ -4,12 +4,14 @@
 //! compiled by its adapter tests while the exact-local model is introduced in
 //! reviewable slices.
 
-use color_eyre::eyre::{Result, bail, eyre};
-use serde::Deserialize;
+use color_eyre::eyre::{Result, bail};
 
 use super::destination::{DefaultBranch, RepositoryCoordinates};
 
 mod observation;
+mod pull_request;
+
+pub(in crate::pre_push) use pull_request::PullRequestIdentity;
 
 /// A nonempty GitHub node ID for one repository.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -28,54 +30,24 @@ impl RepositoryNodeId {
     }
 }
 
-/// GitHub's coupled numeric and GraphQL identities for one pull request.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct PullRequestIdentity {
-    pub(super) number: u64,
-    pub(super) node_id: Box<str>,
-}
-
-impl PullRequestIdentity {
-    pub(super) fn new(number: u64, node_id: String) -> Result<Self> {
-        let number = (1..=i32::MAX as u64)
-            .contains(&number)
-            .then_some(number)
-            .ok_or_else(|| eyre!("GitHub reported an invalid pull request number {number}"))?;
-        if node_id.is_empty() {
-            bail!("GitHub reported an empty pull request node ID");
-        }
-        Ok(Self { number, node_id: node_id.into_boxed_str() })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(super) enum PullRequestState {
-    Open,
-    Closed,
-    Merged,
-}
-
-/// Every selected field for one row in an exact local-head connection.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ObservedPullRequest {
-    pub(super) identity: PullRequestIdentity,
-    pub(super) title: String,
-    pub(super) body: String,
-    pub(super) base_branch: String,
-    pub(super) base_oid: gix::ObjectId,
-    pub(super) head_branch: String,
-    pub(super) head_oid: gix::ObjectId,
-    pub(super) state: PullRequestState,
-    pub(super) is_cross_repository: bool,
-    pub(super) has_auto_merge_request: bool,
-    pub(super) is_in_merge_queue: bool,
-}
-
 /// Repository facts retained once for one complete exact-local observation.
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct Repository {
-    pub(super) coordinates: RepositoryCoordinates,
-    pub(super) node_id: RepositoryNodeId,
-    pub(super) default_branch: DefaultBranch,
+    coordinates: RepositoryCoordinates,
+    node_id: RepositoryNodeId,
+    default_branch: DefaultBranch,
+}
+
+impl Repository {
+    pub(super) fn coordinates(&self) -> &RepositoryCoordinates {
+        &self.coordinates
+    }
+
+    pub(super) fn node_id(&self) -> &RepositoryNodeId {
+        &self.node_id
+    }
+
+    pub(super) fn default_branch(&self) -> &DefaultBranch {
+        &self.default_branch
+    }
 }

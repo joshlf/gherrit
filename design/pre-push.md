@@ -313,7 +313,7 @@ the exact head name and all lifecycle states:
 pullRequests(
   headRefName: "G"
   states: [OPEN, CLOSED, MERGED]
-  first: PAGE_SIZE
+  first: 1
   after: CURSOR
 ) {
   nodes {
@@ -336,9 +336,21 @@ pullRequests(
 
 Connections for several IDs are aliased in one document when request limits
 permit. The request token retains each alias's ID and input cursor. A response
-must contain exactly the requested aliases. Each alias advances only its own
-cursor, a repeated cursor is invalid, and no observation is exposed until
-every requested connection is exhausted.
+must contain exactly the requested aliases. Duplicate JSON object members are
+invalid at every depth and are rejected before they can collapse into one
+value. Each alias advances only its own cursor, a repeated cursor is invalid,
+an advancing page must contain its one requested row, and no observation is
+exposed until every requested connection is exhausted.
+
+The page size is always one. Each local ID has a budget for its first returned
+row, and the entire observation has a shared budget for exactly 99 additional
+rows. An unused first-row budget belongs only to its ID, so a large local stack
+cannot donate rows to one pathological head. An observation of `N` local IDs
+therefore accepts at most `N + 99` rows and `2N + 99` pages, including one
+possible final empty page per connection. This deliberately spends more round
+trips on unusually long histories in exchange for bounded backend work and a
+simple resource proof. Normal connections still fit in one page, and aliases
+batch independent connections into the same request.
 
 The first request also obtains the repository node ID and GitHub default
 branch. Later pagination requests contain only the repository connection
@@ -346,8 +358,9 @@ fields required for their exact pages.
 
 Cross-repository rows do not describe the local branch and are ignored after
 their response shape and requested head name are validated. Pagination still
-continues past them. Same-repository rows are classified only after the exact
-connection is exhausted:
+continues past them. Every row's identity is registered and its relevant state
+is folded as the pages arrive, but the correlated result remains unavailable
+until the exact connection is exhausted:
 
 - more than one OPEN row is ambiguous and rejects the observation;
 - exactly one OPEN row yields `Open`, even when older terminal rows also
@@ -364,17 +377,20 @@ request. `Absent` means only that the exact all-state connection was exhausted
 without a same-repository row; it does not assert snapshot isolation or
 timeless absence.
 
-Pull request numbers and node IDs are validated and must be unique across the
-relevant local observation. They are retained together as one identity.
-Unrelated repository identities are neither downloaded nor placed in a global
-collision registry.
+Every row validates its coupled pull request number and node ID. Both component
+namespaces are then retained independently across the relevant local
+observation, so a later create receipt cannot reuse either component. An OPEN
+row additionally retains its coupled pair with its projection fields. Terminal
+and cross-repository rows discard their other fields. No repository-wide
+identity collection is downloaded or placed in a collision registry.
 
 Any GraphQL response with substantive errors is unusable, even when it also
 contains partial data. A response which contains only a recognized resource
-limit error and no data may cause the same logical page to be rebuilt with a
-smaller alias batch or page size. Missing or extra aliases, malformed rows,
-invalid object IDs, null required fields, and pagination contradictions fail
-the attempt before a write.
+limit error and no data may cause the same logical pages to be rebuilt with a
+smaller alias batch. Page size is fixed and never backs off. Duplicate JSON
+members, missing or extra aliases, malformed rows, invalid object IDs, null
+required fields, and pagination contradictions fail the attempt before a
+write.
 
 Read-only transport failures may be retried with bounded delays. Mutation
 requests are never retried in the same attempt.
@@ -818,8 +834,9 @@ security boundary.
 
 Read-only GraphQL requests have bounded serialized documents, response bodies,
 connection and total-attempt timeouts, and a finite transient retry schedule.
-Recognized resource-limit failures may reduce query dimensions without
-advancing an input cursor.
+Recognized resource-limit failures may reduce the number of aliases without
+advancing an input cursor. The fixed one-row connection page is not another
+backoff dimension.
 
 The all-state local-ID accumulator owns completeness. It accepts a page only
 when the response alias, requested ID, input cursor, returned head name, and
@@ -904,10 +921,10 @@ observation, nonlocal object acquisition, marker confirmation query, rollback,
 or same-attempt re-observation.
 
 Independent local connections and effects are batched to reduce round trips.
-Batch and page sizes back off only when request, response, or backend resource
-limits require it. Expensive graph work is shared across local histories, and
-duplicate object IDs are loaded once without collapsing distinct version
-positions.
+Alias batches back off when request, response, or backend resource limits
+require it. Connection pages remain fixed at one row. Expensive graph work is
+shared across local histories, and duplicate object IDs are loaded once
+without collapsing distinct version positions.
 
 ## Testing obligations
 
