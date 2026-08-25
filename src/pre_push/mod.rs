@@ -13,11 +13,15 @@ mod body;
 mod destination;
 mod github;
 mod json;
+mod legacy_remote;
 mod local;
 mod publication;
 mod reconcile;
+#[cfg(test)]
 mod remote;
 mod subprocess;
+#[cfg(test)]
+mod version;
 
 use batching::{
     BatchPlan, INITIAL_QUERY_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
@@ -32,12 +36,12 @@ use github::{
     decode_query_batch_response, prepare_mutation_batches, query_batch_document,
 };
 use json::UniqueJson;
+use legacy_remote::observe_publications;
 use local::LocalStack;
 use publication::{plan_change, plan_push, push_batches};
 use reconcile::{
     CurrentPr, DesiredPr, PullRequestState, ensure_pull_requests_open, link_stack, plan_update,
 };
-use remote::observe_publications;
 
 const INDETERMINATE_GRAPHQL_MUTATION: &str = "GraphQL mutation acknowledgement is indeterminate; stop this publication attempt and retry the push to reobserve GitHub state";
 const INTERNAL_PRE_PUSH_GIT_DIR_ENV: &str = "GHERRIT_INTERNAL_PRE_PUSH_GIT_DIR";
