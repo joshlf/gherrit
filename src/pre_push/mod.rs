@@ -33,10 +33,6 @@ mod legacy_remote;
 mod local;
 #[cfg_attr(not(test), expect(dead_code, reason = "the exact planner activates with its executor"))]
 mod plan;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "exact publication activates with the staged planner")
-)]
 mod publication;
 mod reconcile;
 #[cfg_attr(
@@ -148,7 +144,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
 
     let configured_remote =
         repo.default_remote_name().wrap_err("Failed to read the configured GHerrit remote")?;
-    let destination = PushDestination::resolve(configured_remote)?;
+    let destination = PushDestination::resolve(repo, configured_remote)?;
     let git_default_branch = destination.observe_default_branch().await?;
     let commits =
         LocalStack::collect(repo, &git_default_branch).wrap_err("Failed to collect commits")?;
