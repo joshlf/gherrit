@@ -17,10 +17,11 @@ use crate::util::{self, CommandExt as _};
 
 const MAX_GHERRIT_PR_ID_BYTES: usize = 128;
 
-/// An ASCII alphanumeric `gherrit-pr-id` of 1 through 128 bytes.
+/// An ASCII alphanumeric GHerrit pull request ID of 1 through 128 bytes.
 ///
-/// Constructing a `GherritPrId` is validation. Code which has one can therefore
-/// use it as a managed ref-name component without repeating trailer checks.
+/// Construction proves the shared trailer and ref-component grammar. The
+/// enclosing stack or remote-ref validation establishes where the value came
+/// from and whether it identifies managed state.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct GherritPrId(
     // INVARIANT: `.0` is nonempty, ASCII alphanumeric, and at most
@@ -29,6 +30,20 @@ pub(super) struct GherritPrId(
 );
 
 impl GherritPrId {
+    /// Decodes the same identity grammar from a managed remote ref component.
+    ///
+    /// Unlike a trailer error, this has no local commit to identify. Callers
+    /// add the remote-ref context appropriate to the namespace they parse.
+    pub(super) fn from_ref_component(value: &[u8]) -> Result<Self> {
+        if value.is_empty()
+            || value.len() > MAX_GHERRIT_PR_ID_BYTES
+            || !value.iter().all(u8::is_ascii_alphanumeric)
+        {
+            bail!("invalid GHerrit change ID");
+        }
+        Ok(Self(str::from_utf8(value)?.to_owned()))
+    }
+
     fn from_trailer(commit: ObjectId, value: &[u8]) -> Result<Self> {
         if value.is_empty() {
             bail!("Commit {commit} missing gherrit-pr-id trailer");
@@ -42,7 +57,7 @@ impl GherritPrId {
             bail!("Commit {commit} has invalid gherrit-pr-id trailer");
         }
 
-        Ok(Self(str::from_utf8(value)?.to_owned()))
+        Self::from_ref_component(value)
     }
 
     pub(super) fn as_str(&self) -> &str {
@@ -416,10 +431,12 @@ mod tests {
             GherritPrId::from_trailer(object_id(1), maximum.as_bytes()).unwrap().as_str(),
             maximum
         );
+        assert!(GherritPrId::from_ref_component(maximum.as_bytes()).is_ok());
 
         let too_long = "G".repeat(MAX_GHERRIT_PR_ID_BYTES + 1);
         let error = GherritPrId::from_trailer(object_id(1), too_long.as_bytes()).unwrap_err();
         assert!(error.to_string().contains("longer than the 128-byte limit"));
+        assert!(GherritPrId::from_ref_component(too_long.as_bytes()).is_err());
 
         assert_eq!(gherrit_id_trailer_value(b"Gherrit-Pr-Id: Gone"), Some(b"Gone".as_slice()));
         assert_eq!(gherrit_id_trailer_value(b"gherrit-pr-id:Gone"), None);
