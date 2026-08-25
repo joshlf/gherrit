@@ -16,11 +16,49 @@ mod observation;
 mod pull_request;
 mod transport;
 
+#[cfg(test)]
+pub(in crate::pre_push) use mutation::CompleteCreateReceipts;
+pub(in crate::pre_push) use mutation::{
+    CreatePullRequest, PreparedCreates, PreparedUpdates, UpdatePullRequest,
+};
+#[cfg(test)]
+pub(in crate::pre_push) use observation::ObservedBase;
+pub(in crate::pre_push) use observation::{
+    AbsentPullRequest, BaseKind, CompleteLocalPullRequests, LocalPullRequestObservation,
+    ManagedOpenPullRequest,
+};
 pub(in crate::pre_push) use pull_request::PullRequestIdentity;
 #[allow(unused_imports, reason = "the exact planner activates in a later commit")]
 pub(in crate::pre_push) use pull_request::PullRequestNumber;
 #[allow(unused_imports, reason = "the exact adapter activates in a later atomic switch")]
 pub(in crate::pre_push) use transport::Github;
+
+/// One-use authority to preflight creates against the repository and identity
+/// namespaces retained by an exact-local observation.
+///
+/// Keeping these values together prevents a planner from replacing the
+/// observed repository node or starting create-receipt collision checks from
+/// an unrelated empty registry.
+pub(in crate::pre_push) struct CreatePreparation {
+    repository_id: RepositoryNodeId,
+    identities: pull_request::PullRequestIdentityRegistry,
+}
+
+impl CreatePreparation {
+    fn new(
+        repository_id: RepositoryNodeId,
+        identities: pull_request::PullRequestIdentityRegistry,
+    ) -> Self {
+        Self { repository_id, identities }
+    }
+
+    pub(in crate::pre_push) fn prepare(
+        self,
+        operations: Vec<CreatePullRequest>,
+    ) -> Result<PreparedCreates> {
+        PreparedCreates::new(self.repository_id, operations, self.identities)
+    }
+}
 
 /// A nonempty GitHub node ID for one repository.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -58,5 +96,23 @@ impl Repository {
 
     pub(super) fn default_branch(&self) -> &DefaultBranch {
         &self.default_branch
+    }
+
+    fn into_create_parts(self) -> (RepositoryNodeId, DefaultBranch) {
+        (self.node_id, self.default_branch)
+    }
+
+    #[cfg(test)]
+    fn for_plan_test_with_node(
+        coordinates: RepositoryCoordinates,
+        default_branch: DefaultBranch,
+        node_id: &str,
+    ) -> Self {
+        Self {
+            coordinates,
+            node_id: RepositoryNodeId::new(node_id.to_owned())
+                .expect("the plan-test repository node ID is valid"),
+            default_branch,
+        }
     }
 }
