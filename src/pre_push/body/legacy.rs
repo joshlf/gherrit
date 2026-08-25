@@ -1,11 +1,13 @@
 use std::fmt::{self, Write};
 
-// Per https://github.com/orgs/community/discussions/27190#discussioncomment-3254953,
-// GitHub stores PR bodies in a `mediumblob` with a 262,144-byte limit. Use half
-// of that limit as a safety factor.
-pub(super) const MAX_BODY_SIZE_BYTES: usize = 131_072;
+use super::MAX_BODY_SIZE_BYTES;
 
-pub(super) struct PrBody<'a> {
+/// Renderer for the legacy publication orchestration.
+///
+/// That orchestration cannot supply validated literal first-parent history,
+/// so it retains its original inputs instead of constructing
+/// [`super::StackBodyRecipes`].
+pub(in crate::pre_push) struct PrBody<'a> {
     pub commit_body: &'a str,
     pub repo_url: &'a str,
     pub public_branch: Option<&'a str>,
