@@ -16,7 +16,7 @@ use super::{
 };
 use crate::pre_push::{
     GithubEndpoint,
-    destination::{PushDestination, RepositoryCoordinates},
+    destination::{PublicationTarget, PushDestination},
     json::UniqueJson,
     local::LocalStack,
 };
@@ -145,7 +145,7 @@ impl Timeouts {
 /// A GitHub client bound to the selected push repository for one attempt.
 pub(in crate::pre_push) struct Github {
     http: Octocrab,
-    coordinates: RepositoryCoordinates,
+    target: PublicationTarget,
     timeouts: Timeouts,
 }
 
@@ -158,18 +158,25 @@ impl Github {
         if endpoint.is_disabled() {
             bail!("Cannot construct a GitHub client while GitHub is disabled");
         }
+        if endpoint.custom_url().is_none() && !destination.supports_production_github() {
+            bail!("The selected Git destination is not hosted by the production GitHub endpoint");
+        }
         Self::with_timeouts(
             token,
             endpoint.custom_url(),
-            destination.coordinates().clone(),
+            destination.publication_target(),
             Timeouts::PRODUCTION,
         )
+    }
+
+    pub(in crate::pre_push) fn publication_target(&self) -> &PublicationTarget {
+        &self.target
     }
 
     fn with_timeouts(
         token: String,
         api_url: Option<&str>,
-        coordinates: RepositoryCoordinates,
+        target: PublicationTarget,
         timeouts: Timeouts,
     ) -> Result<Self> {
         let mut builder = Octocrab::builder()
@@ -180,7 +187,7 @@ impl Github {
         if let Some(api_url) = api_url {
             builder = builder.base_uri(api_url)?;
         }
-        Ok(Self { http: builder.build()?, coordinates, timeouts })
+        Ok(Self { http: builder.build()?, target, timeouts })
     }
 
     /// Observes every lifecycle state for each change in the sealed stack.
@@ -200,7 +207,8 @@ impl Github {
         &self,
         local: &LocalStack,
     ) -> Result<CompleteLocalPullRequests> {
-        let accumulator = LocalPullRequestAccumulator::for_stack(self.coordinates.clone(), local)?;
+        let accumulator =
+            LocalPullRequestAccumulator::for_stack(self.target.coordinates().clone(), local)?;
         let mut step = accumulator.next()?;
         loop {
             let mut pending = match step {
@@ -711,13 +719,29 @@ mod tests {
     }
 
     fn test_github(api_url: &str, timeouts: Timeouts) -> Github {
+        let destination = PushDestination::for_test();
         Github::with_timeouts(
             "token".to_owned(),
             Some(api_url),
-            RepositoryCoordinates::for_test("owner", "repo"),
+            destination.publication_target(),
             timeouts,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn production_client_rejects_a_different_forge_with_matching_coordinates() {
+        let repository = crate::util::Repo::open(".").unwrap();
+        let other =
+            PushDestination::for_test_url_in(&repository, "https://evil.example/owner/repo.git");
+
+        let error = Github::new("token".to_owned(), &GithubEndpoint::Production, &other)
+            .err()
+            .expect("an unrelated forge must fail before client construction");
+        assert_eq!(
+            error.to_string(),
+            "The selected Git destination is not hosted by the production GitHub endpoint"
+        );
     }
 
     fn test_update(number: u32) -> TestUpdate {
