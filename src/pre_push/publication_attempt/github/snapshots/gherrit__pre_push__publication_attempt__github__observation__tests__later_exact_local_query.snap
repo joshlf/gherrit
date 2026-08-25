@@ -1,5 +1,5 @@
 ---
-source: src/pre_push/github/observation.rs
+source: src/pre_push/publication_attempt/github/observation.rs
 expression: later
 ---
 query { repository(owner: "owner", name: "repository") { op0: pullRequests(headRefName: "Gone", first: 1, after: "next", states: [OPEN, CLOSED, MERGED]) { nodes { number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isDraft, isCrossRepository, autoMergeRequest { enabledAt }, isInMergeQueue } pageInfo { hasNextPage, endCursor } } } }

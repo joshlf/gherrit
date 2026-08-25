@@ -11,14 +11,18 @@ use octocrab::Octocrab;
 use serde_json::Value;
 
 use super::{
+    ObservedGithub,
     mutation::MutationRequest,
     observation::{CompleteLocalPullRequests, LocalPullRequestAccumulator, ObservationStep},
 };
-use crate::pre_push::{
-    GithubEndpoint,
-    destination::{PublicationTarget, PushDestination},
-    json::UniqueJson,
-    local::LocalStack,
+use crate::{
+    pre_push::{
+        GithubEndpoint,
+        destination::{PublicationTarget, PushDestination},
+        json::UniqueJson,
+        local::LocalStack,
+    },
+    util,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -143,15 +147,18 @@ impl Timeouts {
 }
 
 /// A GitHub client bound to the selected push repository for one attempt.
-pub(in crate::pre_push) struct Github {
+pub(in crate::pre_push::publication_attempt) struct Github {
     http: Octocrab,
     target: PublicationTarget,
     timeouts: Timeouts,
 }
 
 impl Github {
-    pub(in crate::pre_push) fn new(
-        token: String,
+    /// Validates the endpoint pairing before asking `gh` for credentials.
+    ///
+    /// An unsupported Git destination therefore reports the destination
+    /// error even when no GitHub credentials are configured.
+    pub(in crate::pre_push::publication_attempt) fn new(
         endpoint: &GithubEndpoint,
         destination: &PushDestination,
     ) -> Result<Self> {
@@ -160,15 +167,30 @@ impl Github {
         }
         endpoint.validate_destination(destination)?;
         Self::with_timeouts(
-            token,
+            util::get_github_token()?,
             endpoint.custom_url(),
             destination.publication_target(),
             Timeouts::PRODUCTION,
         )
     }
 
-    pub(in crate::pre_push) fn publication_target(&self) -> &PublicationTarget {
+    pub(in crate::pre_push::publication_attempt) fn publication_target(
+        &self,
+    ) -> &PublicationTarget {
         &self.target
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn for_plan_test(
+        destination: &PushDestination,
+    ) -> Self {
+        Self::with_timeouts(
+            "token".to_owned(),
+            Some("http://127.0.0.1:1"),
+            destination.publication_target(),
+            Timeouts::PRODUCTION,
+        )
+        .expect("the fixed test endpoint is valid")
     }
 
     fn with_timeouts(
@@ -189,16 +211,17 @@ impl Github {
     }
 
     /// Observes every lifecycle state for each change in the sealed stack.
-    pub(in crate::pre_push) async fn observe_local_pull_requests(
-        &self,
+    pub(in crate::pre_push::publication_attempt) async fn observe_local_pull_requests(
+        self,
         local: &LocalStack,
-    ) -> Result<CompleteLocalPullRequests> {
-        tokio::time::timeout(
+    ) -> Result<ObservedGithub> {
+        let pull_requests = tokio::time::timeout(
             self.timeouts.observation,
             self.observe_local_pull_requests_inner(local),
         )
         .await
-        .map_err(|_| eyre!("GitHub exact-local observation exceeded its total deadline"))?
+        .map_err(|_| eyre!("GitHub exact-local observation exceeded its total deadline"))??;
+        Ok(ObservedGithub::new(self, pull_requests))
     }
 
     async fn observe_local_pull_requests_inner(
@@ -442,17 +465,17 @@ mod tests {
         task::JoinHandle,
     };
 
-    use super::*;
-    use crate::pre_push::{
-        batching::MAX_MUTATION_REQUEST_BYTES,
-        destination::DefaultBranch,
-        github::{
+    use super::{
+        super::{
             PullRequestIdentity,
             mutation::{PreparedCreates, PreparedUpdates, TestCreate, TestUpdate},
             observation::LocalPullRequestObservation,
             pull_request::PullRequestIdentityRegistry,
         },
-        local::GherritPrId,
+        *,
+    };
+    use crate::pre_push::{
+        batching::MAX_MUTATION_REQUEST_BYTES, destination::DefaultBranch, local::GherritPrId,
     };
 
     const SERVER_STEP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -737,7 +760,7 @@ mod tests {
             "HTTPS://github.com/owner/repo.git",
         ] {
             let other = PushDestination::for_test_url_in(&repository, destination);
-            let error = Github::new("token".to_owned(), &GithubEndpoint::Production, &other)
+            let error = Github::new(&GithubEndpoint::Production, &other)
                 .err()
                 .expect("a non-built-in GitHub transport must fail before client construction");
             assert_eq!(
@@ -919,6 +942,7 @@ mod tests {
             .observe_local_pull_requests(&local(&["A", "B"]))
             .await
             .unwrap();
+        let (_, complete) = complete.into_parts();
         let requests = finish_peer(server).await;
 
         assert_eq!(requests.len(), 2);
@@ -962,6 +986,7 @@ mod tests {
             .observe_local_pull_requests(&local(&["A", "B", "C", "D"]))
             .await
             .unwrap();
+        let (_, complete) = complete.into_parts();
         let requests = finish_peer(server).await;
 
         assert_eq!(requests.len(), 3);
@@ -1058,6 +1083,7 @@ mod tests {
             .observe_local_pull_requests(&local(&["A", "B"]))
             .await
             .unwrap();
+        let (_, complete) = complete.into_parts();
         let requests = finish_peer(server).await;
 
         assert_eq!(requests.len(), 4);
