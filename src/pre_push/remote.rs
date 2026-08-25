@@ -22,7 +22,7 @@ use gix::{ObjectId, bstr::ByteSlice as _};
 
 use super::{
     destination::{DefaultBranch, git_output_records},
-    local::GherritPrId,
+    local::{GherritPrId, LocalStack},
     version::Version,
 };
 
@@ -45,6 +45,14 @@ pub(super) struct ExactLocalQueryPlan {
 }
 
 impl ExactLocalQueryPlan {
+    /// Binds exact remote acquisition to the path origin and ordered IDs
+    /// already proved by the sealed local stack.
+    pub(super) fn for_stack(stack: &LocalStack) -> Result<Self> {
+        let ids = stack.iter().map(|change| change.id().clone()).collect::<Vec<_>>();
+        Self::with_budget(stack.default_branch().clone(), &ids, QUERY_ARGV_BUDGET_BYTES)
+    }
+
+    #[cfg(test)]
     pub(super) fn new(default_branch: DefaultBranch, ids: &[GherritPrId]) -> Result<Self> {
         Self::with_budget(default_branch, ids, QUERY_ARGV_BUDGET_BYTES)
     }
@@ -658,6 +666,28 @@ mod tests {
                 "refs/tags/gherrit/B/*",
             ]
         );
+    }
+
+    #[test]
+    fn stack_bound_plan_reuses_the_exact_path_origin_and_ordered_ids() {
+        let default = default_branch();
+        let a = id("A");
+        let b = id("B");
+        let a_head = ObjectId::from_hex(HEAD.as_bytes()).unwrap();
+        let b_head = ObjectId::from_hex(BASE.as_bytes()).unwrap();
+        let stack = LocalStack::for_history_test(
+            default.clone(),
+            [(a, a_head, default.tip()), (b, b_head, a_head)],
+        );
+
+        let patterns =
+            ExactLocalQueryPlan::for_stack(&stack).unwrap().patterns().collect::<Vec<_>>();
+
+        assert_eq!(stack.default_branch(), &default);
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0][0], default.full_ref_name());
+        assert_eq!(patterns[0][1], "refs/heads/A");
+        assert_eq!(patterns[0][5], "refs/heads/B");
     }
 
     #[test]
