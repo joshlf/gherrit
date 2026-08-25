@@ -113,11 +113,16 @@ pub(super) enum ExactObjectFetchMode {
 impl PushDestination {
     #[cfg(test)]
     pub(super) fn for_test() -> Self {
+        Self::for_test_url("https://github.com/owner/repo.git", Path::new("."))
+    }
+
+    #[cfg(test)]
+    fn for_test_url(url: &str, current_dir: &Path) -> Self {
         let configured_remote = util::RemoteName::from_config(b"origin").unwrap();
         let resolved = ResolvedDestination::from_git_output(
             configured_remote,
-            b"https://github.com/owner/repo.git\n",
-            Path::new("."),
+            format!("{url}\n").as_bytes(),
+            current_dir,
         )
         .unwrap();
         Self {
@@ -2000,6 +2005,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn exact_object_fetch_ignores_configured_refmaps() {
+        const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        const SOURCE: &str = "refs/tags/gherrit/Local/v1";
+        const SENTINEL: &str = "refs/gherrit-test/refmap-sentinel";
+
+        let context =
+            testutil::TestContextBuilder::new("unused").with_remote().with_initial_commit().build();
+        let remote = context.dir.path().join("owner/repo.git");
+        let destination = PushDestination::for_test_url(
+            remote.to_str().expect("test paths must be UTF-8"),
+            &context.repo_path,
+        );
+        let remote_only = context
+            .remote_git_cmd()
+            .args(["commit-tree", EMPTY_TREE, "-p", "refs/heads/main", "-m", "remote only"])
+            .output()
+            .unwrap();
+        assert!(remote_only.status.success(), "{remote_only:?}");
+        let remote_only = str::from_utf8(&remote_only.stdout).unwrap().trim();
+        context.remote_git_cmd().args(["update-ref", SOURCE, remote_only]).assert().success();
+        context.git_cmd().args(["cat-file", "-e", remote_only]).assert().failure();
+        context.git_cmd().args(["show-ref", "--verify", "--quiet", SENTINEL]).assert().failure();
+
+        let mut command = destination.exact_object_fetch(ExactObjectFetchMode::Negotiated);
+        command
+            .current_dir(&context.repo_path)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "remote.gherrit-publication.fetch")
+            .env("GIT_CONFIG_VALUE_0", format!("+{SOURCE}:{SENTINEL}"))
+            .stdin(process::Stdio::piped())
+            .stdout(process::Stdio::piped())
+            .stderr(process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .expect("fetch stdin must be piped")
+            .write_all(format!("{SOURCE}\n").as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        assert!(output.status.success(), "{output:?}");
+        context.git_cmd().args(["cat-file", "-e", remote_only]).assert().success();
+        context.git_cmd().args(["show-ref", "--verify", "--quiet", SENTINEL]).assert().failure();
     }
 
     #[test]
