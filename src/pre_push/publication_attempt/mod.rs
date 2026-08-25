@@ -1,44 +1,106 @@
-//! Pure planning for one exact-local publication attempt.
+//! One exact-local publication attempt.
 //!
-//! The planner consumes the complete local stack, its validated literal Git
-//! histories, and the exhausted GitHub observations for those same changes.
-//! It freezes every action which can be known before a write. Later actions
-//! remain inside private consuming stages, so an executor cannot cross a
-//! durable-effect barrier without the exact acknowledgement required by the
-//! preceding stage.
+//! [`run`] is the only operation visible to the parent pre-push module. It
+//! derives the destination and local stack, observes Git and GitHub, plans the
+//! complete publication, and consumes every effect stage before returning.
+//! No observation, client, action, receipt, or continuation crosses this
+//! module boundary.
 
 #![cfg_attr(
     test,
-    allow(dead_code, reason = "the production executor remains dormant until activation")
+    allow(dead_code, reason = "the complete exact workflow remains dormant until activation")
 )]
+
+mod body;
+mod github;
+mod history;
+mod refs;
+mod remote;
+mod subprocess;
+mod version;
 
 use std::borrow::Cow;
 
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre::{Context as _, Result, bail};
+use owo_colors::OwoColorize as _;
 
-use super::{
+use self::{
     body::{GeneratedBody, StackBodyRecipes},
-    destination::{DefaultBranch, PushDestination},
     github::{
-        BaseKind, CompleteCreateReceipts, CompleteLocalPullRequests, CreatePreparation,
-        CreatePullRequest, Github, LocalPullRequestObservation, ManagedOpenPullRequest,
-        PreparedCreates, PreparedUpdates, PullRequestIdentity, UpdatePullRequest,
+        AbsentPullRequest, BaseKind, CompleteCreateReceipts, CompleteLocalPullRequests,
+        CreatePreparation, CreatePullRequest, Github, LocalPullRequestObservation,
+        ManagedOpenPullRequest, ObservedGithub, PreparedCreates, PreparedUpdates,
+        PullRequestIdentity, UpdatePullRequest,
     },
-    history::ValidatedChangeHistory,
-    local::{GherritPrId, LocalChange, LocalStack},
-    publication::{
+    history::{Revision, ValidatedChangeHistory},
+    refs::{
         MarkerTransition, PreparedPushes, PublicationRevision, TupleTransition,
         prepare_marker_pushes, prepare_tuple_pushes,
     },
     remote::ValidatedPublication,
 };
+use super::{
+    GithubEndpoint, batching, destination,
+    destination::{DefaultBranch, PushDestination},
+    local,
+    local::{GherritPrId, LocalChange, LocalStack},
+};
+use crate::util::{self, HeadState};
+
+/// Runs the complete publication protocol behind one private boundary.
+///
+/// Callers cannot assemble a destination, observation, client, plan, or
+/// effect. This function derives each value from the supplied repository and
+/// consumes the complete attempt before returning.
+pub(super) async fn run(repository: &util::Repo, endpoint: &GithubEndpoint) -> Result<()> {
+    let branch_name = match repository.current_branch() {
+        HeadState::Attached(name) | HeadState::Pending(name) => name,
+        HeadState::Detached => bail!("Cannot push from detached HEAD"),
+    };
+
+    if !repository.is_managed(branch_name)? {
+        log::info!("Branch {} is UNMANAGED. Allowing standard push.", branch_name.yellow());
+        return Ok(());
+    }
+    log::info!("Branch {} is MANAGED. Publishing stack...", branch_name.yellow());
+
+    let configured_remote = repository
+        .default_remote_name()
+        .wrap_err("Failed to read the configured GHerrit remote")?;
+    let destination = PushDestination::resolve(repository, configured_remote)?;
+    let default_branch = destination.observe_default_branch()?;
+    let stack = LocalStack::collect(repository, &default_branch, destination.configured_remote())
+        .wrap_err("Failed to collect commits")?;
+
+    if stack.is_empty() {
+        log::info!("No commits to publish.");
+        return Ok(());
+    }
+    if endpoint.is_disabled() {
+        bail!("The GHerrit test driver cannot sync PRs without a configured GitHub endpoint");
+    }
+    if let Some(api_url) = endpoint.custom_url() {
+        log::warn!("Using custom GitHub API URL: {api_url}");
+    }
+
+    let github = Github::new(endpoint, &destination)?;
+    let public_branch = super::public_stack_branch(repository, branch_name);
+    let (validated, observed) = tokio::try_join!(
+        remote::observe_and_validate_histories(&stack, repository, destination),
+        github.observe_local_pull_requests(&stack),
+    )?;
+    let count = stack.len();
+    plan_publication(validated, observed, public_branch, stack)?.execute().await?;
+    log::info!("Successfully published {count} commits.");
+    Ok(())
+}
 
 /// One complete executable publication plan.
 ///
 /// Planning consumes the validated Git provenance, destination, and GitHub
 /// client. The plan retains its stages privately, and execution consumes this
 /// value as one workflow.
-pub(super) struct PublicationPlan {
+struct PublicationPlan {
     destination: PushDestination,
     github: Github,
     effects: PlannedPublication,
@@ -48,7 +110,7 @@ impl PublicationPlan {
     /// Executes the one fixed publication sequence without reobservation or
     /// retry. Every later effect remains inaccessible until its preceding
     /// durable acknowledgement has completed.
-    pub(super) async fn execute(self) -> Result<()> {
+    async fn execute(self) -> Result<()> {
         let Self { destination, github, effects } = self;
         let PlannedPublication { tuple_pushes, after_tuples } = effects;
         tuple_pushes.execute(&destination).await?;
@@ -212,7 +274,7 @@ struct ExistingReality {
 }
 
 struct MissingReality {
-    absence: super::github::AbsentPullRequest,
+    absence: AbsentPullRequest,
     revision: PublicationRevision,
 }
 
@@ -243,14 +305,14 @@ impl BoundProjectionEntry {
 }
 
 /// Consumes complete exact-local evidence into one immutable publication.
-pub(super) fn plan_publication(
+fn plan_publication(
     validated: ValidatedPublication,
-    github: Github,
+    observed: ObservedGithub,
     public_branch: Option<String>,
     stack: LocalStack,
-    pull_requests: CompleteLocalPullRequests,
 ) -> Result<PublicationPlan> {
     let (histories, destination) = validated.into_parts();
+    let (github, pull_requests) = observed.into_parts();
     if github.publication_target() != &destination.publication_target() {
         bail!("GitHub publication client belongs to a different repository or push destination");
     }
@@ -420,7 +482,7 @@ fn tuple_transition(
     }
 }
 
-fn publication_revision(revision: super::history::Revision) -> Result<PublicationRevision> {
+fn publication_revision(revision: Revision) -> Result<PublicationRevision> {
     PublicationRevision::new(revision.head(), revision.first_parent())
 }
 

@@ -29,7 +29,7 @@ const REEXEC_LIFETIME: &str = "GHERRIT_SUBPROCESS_TEST_LIFETIME";
 const REEXEC_READY: &str = "GHERRIT_SUBPROCESS_TEST_READY";
 #[cfg(unix)]
 const REEXEC_TARGET_PROCESS_GROUP: &str = "GHERRIT_SUBPROCESS_TEST_TARGET_PROCESS_GROUP";
-const REEXEC_TEST: &str = "pre_push::subprocess::tests::reexec_helper";
+const REEXEC_TEST: &str = "pre_push::publication_attempt::subprocess::tests::reexec_helper";
 
 fn reexec(mode: &str) -> Command {
     let mut command = Command::new(env::current_exe().unwrap());

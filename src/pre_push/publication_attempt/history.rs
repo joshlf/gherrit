@@ -1088,10 +1088,12 @@ mod tests {
     use gix::{ObjectId, prelude::Write as _};
     use tempfile::TempDir;
 
-    use super::*;
-    use crate::pre_push::{
-        destination::DefaultBranch,
-        remote::{RawExactLocalObservation, decode_for_test},
+    use super::{
+        super::{
+            destination::DefaultBranch,
+            remote::{RawExactLocalObservation, decode_for_test},
+        },
+        *,
     };
 
     struct TestRepository {

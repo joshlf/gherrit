@@ -13,12 +13,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    CreatePreparation, PullRequestIdentity, Repository, RepositoryNodeId, json::UniqueJson,
+    super::{
+        destination::{DefaultBranch, PushDestination, RepositoryCoordinates},
+        local::{GherritPrId, LocalStack},
+    },
+    CreatePreparation, PullRequestIdentity, Repository, RepositoryNodeId,
+    json::UniqueJson,
     pull_request::PullRequestIdentityRegistry,
-};
-use crate::pre_push::{
-    destination::{DefaultBranch, PushDestination, RepositoryCoordinates},
-    local::{GherritPrId, LocalStack},
 };
 
 const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 80;
@@ -55,29 +56,32 @@ enum TerminalState {
 
 /// The only base kinds supported by a managed OPEN pull request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::pre_push) enum BaseKind {
+pub(in crate::pre_push::publication_attempt) enum BaseKind {
     Default,
     Owned,
 }
 
 /// A classified base name coupled to the object GitHub observed for it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::pre_push) struct ObservedBase {
+pub(in crate::pre_push::publication_attempt) struct ObservedBase {
     kind: BaseKind,
     oid: ObjectId,
 }
 
 impl ObservedBase {
-    pub(in crate::pre_push) fn kind(&self) -> BaseKind {
+    pub(in crate::pre_push::publication_attempt) fn kind(&self) -> BaseKind {
         self.kind
     }
 
-    pub(in crate::pre_push) fn oid(&self) -> ObjectId {
+    pub(in crate::pre_push::publication_attempt) fn oid(&self) -> ObjectId {
         self.oid
     }
 
     #[cfg(test)]
-    pub(in crate::pre_push) fn for_plan_test(kind: BaseKind, oid: ObjectId) -> Self {
+    pub(in crate::pre_push::publication_attempt) fn for_plan_test(
+        kind: BaseKind,
+        oid: ObjectId,
+    ) -> Self {
         Self { kind, oid }
     }
 }
@@ -88,7 +92,7 @@ impl ObservedBase {
 /// again would make disagreement representable. Construction remains private
 /// to this observation boundary.
 #[derive(Debug)]
-pub(in crate::pre_push) struct ManagedOpenPullRequest {
+pub(in crate::pre_push::publication_attempt) struct ManagedOpenPullRequest {
     id: GherritPrId,
     identity: PullRequestIdentity,
     head_oid: ObjectId,
@@ -134,36 +138,36 @@ impl ManagedOpenPullRequest {
         })
     }
 
-    pub(in crate::pre_push) fn id(&self) -> &GherritPrId {
+    pub(in crate::pre_push::publication_attempt) fn id(&self) -> &GherritPrId {
         &self.id
     }
 
-    pub(in crate::pre_push) fn identity(&self) -> &PullRequestIdentity {
+    pub(in crate::pre_push::publication_attempt) fn identity(&self) -> &PullRequestIdentity {
         &self.identity
     }
 
-    pub(in crate::pre_push) fn head_oid(&self) -> ObjectId {
+    pub(in crate::pre_push::publication_attempt) fn head_oid(&self) -> ObjectId {
         self.head_oid
     }
 
-    pub(in crate::pre_push) fn base(&self) -> ObservedBase {
+    pub(in crate::pre_push::publication_attempt) fn base(&self) -> ObservedBase {
         self.base
     }
 
-    pub(in crate::pre_push) fn title(&self) -> &str {
+    pub(in crate::pre_push::publication_attempt) fn title(&self) -> &str {
         &self.title
     }
 
-    pub(in crate::pre_push) fn body(&self) -> &str {
+    pub(in crate::pre_push::publication_attempt) fn body(&self) -> &str {
         &self.body
     }
 
-    pub(in crate::pre_push) fn has_landing_automation(&self) -> bool {
+    pub(in crate::pre_push::publication_attempt) fn has_landing_automation(&self) -> bool {
         self.has_landing_automation
     }
 
     #[cfg(test)]
-    pub(in crate::pre_push) fn for_plan_test(
+    pub(in crate::pre_push::publication_attempt) fn for_plan_test(
         id: GherritPrId,
         identity: PullRequestIdentity,
         head_oid: ObjectId,
@@ -187,7 +191,7 @@ impl ManagedOpenPullRequest {
 /// Proof that an exhausted exact all-state connection had no same-repository
 /// row. Cross-repository rows do not prevent this conclusion.
 #[derive(Debug)]
-pub(in crate::pre_push) struct AbsentPullRequest {
+pub(in crate::pre_push::publication_attempt) struct AbsentPullRequest {
     id: GherritPrId,
 }
 
@@ -196,7 +200,7 @@ impl AbsentPullRequest {
         Self { id }
     }
 
-    pub(in crate::pre_push) fn id(&self) -> &GherritPrId {
+    pub(in crate::pre_push::publication_attempt) fn id(&self) -> &GherritPrId {
         &self.id
     }
 
@@ -205,20 +209,20 @@ impl AbsentPullRequest {
     }
 
     #[cfg(test)]
-    pub(in crate::pre_push) fn for_plan_test(id: GherritPrId) -> Self {
+    pub(in crate::pre_push::publication_attempt) fn for_plan_test(id: GherritPrId) -> Self {
         Self::after_exhaustion(id)
     }
 }
 
 /// Correlated state for one local change, in exact local stack order.
 #[derive(Debug)]
-pub(in crate::pre_push) enum LocalPullRequestObservation {
+pub(in crate::pre_push::publication_attempt) enum LocalPullRequestObservation {
     Open(ManagedOpenPullRequest),
     Absent(AbsentPullRequest),
 }
 
 impl LocalPullRequestObservation {
-    pub(in crate::pre_push) fn id(&self) -> &GherritPrId {
+    pub(in crate::pre_push::publication_attempt) fn id(&self) -> &GherritPrId {
         match self {
             Self::Open(pull_request) => pull_request.id(),
             Self::Absent(absent) => absent.id(),
@@ -232,24 +236,26 @@ impl LocalPullRequestObservation {
 /// identity registry cannot be detached from or recombined with another local
 /// observation.
 #[derive(Debug)]
-pub(in crate::pre_push) struct CompleteLocalPullRequests {
+pub(in crate::pre_push::publication_attempt) struct CompleteLocalPullRequests {
     repository: Repository,
     local: Box<[LocalPullRequestObservation]>,
     identities: PullRequestIdentityRegistry,
 }
 
 impl CompleteLocalPullRequests {
-    pub(in crate::pre_push) fn repository(&self) -> &Repository {
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn repository(&self) -> &Repository {
         &self.repository
     }
 
-    pub(in crate::pre_push) fn local(&self) -> &[LocalPullRequestObservation] {
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn local(&self) -> &[LocalPullRequestObservation] {
         &self.local
     }
 
     /// Consumes exact-local evidence only after binding its retained
     /// repository to the selected push destination.
-    pub(in crate::pre_push) fn into_planning_parts_for(
+    pub(in crate::pre_push::publication_attempt) fn into_planning_parts_for(
         self,
         destination: &PushDestination,
     ) -> Result<(DefaultBranch, Box<[LocalPullRequestObservation]>, CreatePreparation)> {
@@ -261,7 +267,7 @@ impl CompleteLocalPullRequests {
     }
 
     #[cfg(test)]
-    pub(in crate::pre_push) fn for_plan_test(
+    pub(in crate::pre_push::publication_attempt) fn for_plan_test(
         coordinates: RepositoryCoordinates,
         default_branch: DefaultBranch,
         local: Vec<LocalPullRequestObservation>,
@@ -277,7 +283,7 @@ impl CompleteLocalPullRequests {
     }
 
     #[cfg(test)]
-    pub(in crate::pre_push) fn for_plan_test_with_repository_node(
+    pub(in crate::pre_push::publication_attempt) fn for_plan_test_with_repository_node(
         coordinates: RepositoryCoordinates,
         default_branch: DefaultBranch,
         local: Vec<LocalPullRequestObservation>,

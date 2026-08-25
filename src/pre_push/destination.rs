@@ -162,9 +162,7 @@ pub(super) struct PushDestination {
     internal_remote: String,
 }
 
-// Exact history acquisition is staged behind the exact-local test boundary
-// until the orchestration slice routes it from `pre_push::run`.
-#[allow(dead_code)]
+/// The one acquisition behavior selected from exact graph-load evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ExactObjectFetchMode {
     Negotiated,
