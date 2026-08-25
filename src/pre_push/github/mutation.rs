@@ -687,14 +687,17 @@ impl PreparedUpdates {
 }
 
 impl Github {
-    pub(super) async fn create_pull_requests(
+    pub(in crate::pre_push) async fn create_pull_requests(
         &self,
         creates: PreparedCreates,
     ) -> Result<CompleteCreateReceipts> {
         creates.execute(self).await
     }
 
-    pub(super) async fn update_pull_requests(&self, updates: PreparedUpdates) -> Result<()> {
+    pub(in crate::pre_push) async fn update_pull_requests(
+        &self,
+        updates: PreparedUpdates,
+    ) -> Result<()> {
         updates.execute(self).await
     }
 }
