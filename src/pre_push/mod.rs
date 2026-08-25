@@ -11,37 +11,19 @@ mod autosquash;
 mod batching;
 mod body;
 mod destination;
-// The exact GitHub adapter is activated only when publication and planning
-// switch together. Compile its complete boundary now without running it from
-// the legacy publisher.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "exact GitHub activation must include publication")
-)]
-mod github;
-// Production orchestration still publishes the legacy ref shape, which the
-// exact-history model correctly rejects. Compile each part now, but keep the
-// complete path unused until publication and validation switch together.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "exact history activation must include publication")
-)]
-mod history;
 mod legacy_github;
 mod legacy_publication;
 mod legacy_remote;
 mod local;
-#[cfg_attr(not(test), expect(dead_code, reason = "the exact planner activates with its executor"))]
-mod plan;
-mod publication;
-mod reconcile;
+// The complete exact-local workflow is compiled behind one private boundary.
+// It becomes reachable only when observation and publication switch together.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "exact history activation must include publication")
+    expect(dead_code, reason = "exact publication activates as one complete workflow")
 )]
-mod remote;
+mod publication_attempt;
+mod reconcile;
 mod subprocess;
-mod version;
 
 use batching::{
     BatchPlan, INITIAL_QUERY_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
