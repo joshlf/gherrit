@@ -293,7 +293,7 @@ impl FindPullRequest {
     }
 
     #[cfg(test)]
-    fn decode(&self, response: Value) -> Result<Option<PullRequest>> {
+    pub(super) fn decode(&self, response: Value) -> Result<Option<PullRequest>> {
         <Self as QueryOperation>::decode(self, response).map(|lookup| lookup.pull_request)
     }
 }
