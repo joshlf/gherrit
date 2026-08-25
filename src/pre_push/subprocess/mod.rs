@@ -18,7 +18,8 @@
 use std::sync::mpsc;
 use std::{
     fmt,
-    io::{self, Read},
+    fs::File,
+    io::{self, Read, Seek as _, SeekFrom, Write as _},
     process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
         Arc,
@@ -43,6 +44,7 @@ const SUPERVISOR_GRACE: Duration = Duration::from_secs(1);
 /// fully drained and counted only after acknowledged normal completion, while
 /// failure cleanup closes its read handle.
 const STDOUT_LIMIT: usize = 64 * 1024 * 1024;
+pub(super) const REGULAR_FILE_STDIN_LIMIT: u64 = 64 * 1024 * 1024;
 const PIPE_BUFFER_SIZE: usize = 16 * 1024;
 
 /// One finite execution deadline for destination-bound Git commands.
@@ -70,12 +72,111 @@ pub(super) async fn output(
     output_with_stdout_limit(command, timeout, STDOUT_LIMIT).await
 }
 
+/// Runs one remote Git command with an already-prepared regular file as stdin.
+///
+/// The input file is validated and rewound inside the blocking worker before
+/// the child is started. This deliberately does not admit an arbitrary
+/// [`Stdio`], pipe, or in-memory byte source: a finite seekable file prevents a
+/// producer task from extending the command deadline or surviving cleanup.
+pub(super) async fn output_with_regular_file_stdin(
+    command: Command,
+    input: RegularFileStdin,
+    timeout: Duration,
+) -> Result<CommandOutput, CommandError> {
+    output_with_input(command, CommandInput::RegularFile(input), timeout, STDOUT_LIMIT).await
+}
+
+enum CommandInput {
+    Null,
+    RegularFile(RegularFileStdin),
+}
+
+/// The only construction path for a regular-file command input.
+///
+/// The anonymous file has no path, clone, raw handle, or file accessor. Once
+/// [`finish`](Self::finish) consumes the builder, no caller-side writable alias
+/// remains which could race the subprocess boundary's size revalidation.
+pub(super) struct RegularFileStdinBuilder {
+    file: File,
+    written: u64,
+    limit: u64,
+}
+
+impl RegularFileStdinBuilder {
+    pub(super) fn new() -> Result<Self, CommandError> {
+        Self::with_limit(REGULAR_FILE_STDIN_LIMIT)
+    }
+
+    fn with_limit(limit: u64) -> Result<Self, CommandError> {
+        let file = tempfile::tempfile().map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+        Ok(Self { file, written: 0, limit })
+    }
+
+    /// Flushes and seals the only writable handle.
+    pub(super) fn finish(mut self) -> Result<RegularFileStdin, CommandError> {
+        self.file.flush().map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+        let metadata =
+            self.file.metadata().map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+        if !metadata.is_file() {
+            return Err(CommandError::StdinNotRegular);
+        }
+        if metadata.len() != self.written || self.written > self.limit {
+            return Err(CommandError::StdinChanged);
+        }
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+        Ok(RegularFileStdin { file: self.file, length: self.written, limit: self.limit })
+    }
+}
+
+impl io::Write for RegularFileStdinBuilder {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let requested = u64::try_from(buffer.len())
+            .map_err(|_| io::Error::other("regular-file stdin input length overflowed"))?;
+        self.written.checked_add(requested).filter(|next| *next <= self.limit).ok_or_else(
+            || {
+                io::Error::other(format!(
+                    "regular-file stdin input exceeded the {}-byte limit",
+                    self.limit
+                ))
+            },
+        )?;
+        let written = self.file.write(buffer)?;
+        self.written = self
+            .written
+            .checked_add(u64::try_from(written).expect("a write length fits in u64"))
+            .expect("the preflighted regular-file stdin length cannot overflow");
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// A sealed anonymous regular file with no caller-side writable alias.
+pub(super) struct RegularFileStdin {
+    file: File,
+    length: u64,
+    limit: u64,
+}
+
 async fn output_with_stdout_limit(
     command: Command,
     timeout: Duration,
     stdout_limit: usize,
 ) -> Result<CommandOutput, CommandError> {
-    output_with_faults(command, timeout, stdout_limit, Faults::NONE).await
+    output_with_input(command, CommandInput::Null, timeout, stdout_limit).await
+}
+
+async fn output_with_input(
+    command: Command,
+    input: CommandInput,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<CommandOutput, CommandError> {
+    output_with_input_and_faults(command, input, timeout, stdout_limit, Faults::NONE).await
 }
 
 #[cfg(test)]
@@ -98,6 +199,16 @@ async fn output_with_faults(
     stdout_limit: usize,
     faults: Faults,
 ) -> Result<CommandOutput, CommandError> {
+    output_with_input_and_faults(command, CommandInput::Null, timeout, stdout_limit, faults).await
+}
+
+async fn output_with_input_and_faults(
+    command: Command,
+    input: CommandInput,
+    timeout: Duration,
+    stdout_limit: usize,
+    faults: Faults,
+) -> Result<CommandOutput, CommandError> {
     let started = Instant::now();
     let deadline_at = started.checked_add(timeout).ok_or(CommandError::InvalidTimeout)?;
     let supervisor_deadline = deadline_at
@@ -110,7 +221,7 @@ async fn output_with_faults(
 
     let worker_cancelled = Arc::clone(&cancelled);
     let mut worker = tokio::task::spawn_blocking(move || {
-        output_blocking(command, deadline, stdout_limit, faults, &worker_cancelled)
+        output_blocking(command, input, deadline, stdout_limit, faults, &worker_cancelled)
     });
 
     let result =
@@ -434,6 +545,8 @@ impl fmt::Debug for CommandOutput {
 pub(super) enum CommandError {
     InvalidTimeout,
     TimedOut,
+    StdinNotRegular,
+    StdinChanged,
     StdoutTooLarge { limit: usize },
     CleanupTimedOut,
     WorkerUnavailable,
@@ -442,6 +555,7 @@ pub(super) enum CommandError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum IoStage {
+    PrepareInput,
     Start,
     Monitor,
     Terminate,
@@ -456,6 +570,12 @@ impl fmt::Display for CommandError {
         match self {
             Self::InvalidTimeout => formatter.write_str("remote Git command timeout is invalid"),
             Self::TimedOut => formatter.write_str("remote Git command timed out"),
+            Self::StdinNotRegular => {
+                formatter.write_str("remote Git command stdin is not a regular file")
+            }
+            Self::StdinChanged => {
+                formatter.write_str("remote Git command stdin changed after it was sealed")
+            }
             Self::StdoutTooLarge { limit } => {
                 write!(formatter, "remote Git command stdout exceeded the {limit}-byte limit")
             }
@@ -475,6 +595,7 @@ impl std::error::Error for CommandError {}
 impl fmt::Display for IoStage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::PrepareInput => "input preparation",
             Self::Start => "startup",
             Self::Monitor => "execution",
             Self::Terminate => "termination",
@@ -516,6 +637,7 @@ impl Drop for CancellationGuard {
 
 fn output_blocking(
     mut command: Command,
+    input: CommandInput,
     deadline: Deadline,
     stdout_limit: usize,
     faults: Faults,
@@ -526,7 +648,13 @@ fn output_blocking(
     }
     deadline.check()?;
 
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let stdin = prepare_input(input)?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CommandError::CleanupTimedOut);
+    }
+    deadline.check()?;
+
+    command.stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     let started = spawn_owned(&mut command);
     #[cfg(windows)]
@@ -701,6 +829,25 @@ fn output_blocking(
         Stopped::Cancelled => Err(CommandError::CleanupTimedOut),
         Stopped::Monitor(error) => Err(error),
         Stopped::Reader(error) => Err(error),
+    }
+}
+
+fn prepare_input(input: CommandInput) -> Result<Stdio, CommandError> {
+    match input {
+        CommandInput::Null => Ok(Stdio::null()),
+        CommandInput::RegularFile(RegularFileStdin { mut file, length, limit }) => {
+            let metadata =
+                file.metadata().map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+            if !metadata.is_file() {
+                return Err(CommandError::StdinNotRegular);
+            }
+            if metadata.len() != length || length > limit {
+                return Err(CommandError::StdinChanged);
+            }
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+            Ok(Stdio::from(file))
+        }
     }
 }
 

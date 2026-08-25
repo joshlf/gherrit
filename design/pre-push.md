@@ -285,9 +285,10 @@ each requested tag namespace. A successful response which omits
 rejects a result outside the exact requested name or namespace even when Git's
 pattern matching could return a name with a coincidental suffix.
 
-Each logical request retains its requested IDs, destination capability, and
-exact ref names. Raw maps cannot be relabelled or sliced into a new claim of
-complete coverage.
+Each logical request retains the exact sealed local stack which authorized it,
+the repository and destination capabilities used to execute it, and its exact
+ref names. Raw maps cannot be relabelled, sliced into a new claim of complete
+coverage, or validated against a different stack with coincidentally equal IDs.
 
 Before loading an object, GHerrit structurally preflights every requested local
 history as one set and requires its exact default branch name and tip to equal
@@ -300,17 +301,38 @@ the local graph is rooted only at distinct external published heads and
 contains all of their declared-parent ancestry. It contains no default-tip,
 local-proposal, or unrelated pull-request root.
 
-If an advertised version object is missing, GHerrit may fetch only the exact
-advertised version-tag refs for the affected local observation. The fetch:
+Every distinct external graph root retains the nonempty list of exact version
+tag refs which advertised it, in local-change and version order. Graph loading
+checks roots in that same order and breadth-first ancestry preserves the first
+root which caused each missing object to be required. Only that deterministic
+causal root can authorize acquisition.
 
-- uses source-only refspecs;
+A missing advertised root permits one ordinary negotiated fetch. A missing
+ancestor permits no network request in an ordinary repository, where it is an
+integrity failure. In a repository already configured with a promisor object
+source, a missing ancestor instead permits one direct `--refetch`. Either
+request contains all and only the causal root's retained version-tag aliases;
+it never includes another root merely because that root is also missing. The
+single fetch process:
+
+- reads source-only refspecs, one per line, from a sealed anonymous regular
+  file on standard input;
 - writes no local ref or `FETCH_HEAD`;
-- disables tags, submodules, and automatic maintenance;
+- disables progress, shallow-file updates, filters, configured bundle-URI
+  acquisition, tags, submodules, and automatic maintenance;
+- uses an explicitly empty ref map so configured fetch mappings cannot create
+  a destination ref;
 - does not fetch a raw object ID; and
-- reloads the graph after the bounded acquisition attempt.
+- receives no destination literal or source ref in its process arguments.
 
-An existing promisor repository may receive one additional `--refetch`
-attempt. There is no unbounded acquisition loop or incidental lazy fetch.
+Complete or otherwise invalid initial graph evidence performs no acquisition.
+After one successful fetch, GHerrit performs exactly one authoritative graph
+reload. A failed fetch performs no reload, and a remaining or different hole
+on the final reload is returned without another request. Transport may bring
+objects adjacent to the named refs and thereby fill more than the first hole;
+if it does not, a fresh hook invocation can reobserve and select its own first
+remaining causal root. There is no ordinary-fetch-then-refetch wave, unbounded
+acquisition loop, or incidental lazy fetch.
 
 ### Exact local GitHub evidence
 
@@ -792,8 +814,10 @@ repository configuration. This requires Git 2.31 or newer, whose
 values in process arguments. The adapter chooses a remote name absent from all
 configuration activated by the destination, validates that only its exact URL
 and push URL configure that remote, and proves that another `insteadOf` rule
-cannot rewrite it. Destination-bearing children remove `GIT_TRACE*` and
-`GIT_CURL_VERBOSE`; the literal-graph boundary separately removes inherited
+cannot rewrite it. Destination-bearing children remove inherited `GIT_TRACE*`
+and `GIT_CURL_VERBOSE` values and explicitly disable all three Trace2 target
+families, including system or global targets which ignore command-line
+configuration; the literal-graph boundary separately removes inherited
 object-database, replacement, graft, and shallow overrides. HTTP redirects are
 disabled. Pushes also disable implicit followed tags and submodule recursion
 and clear inherited push options, so configuration cannot add refs, suppress
@@ -826,7 +850,9 @@ use a conservative variable-argument budget. Batching never splits a tuple or
 marker operation.
 
 Observation and acquisition do not update local branches, tags,
-remote-tracking refs, `FETCH_HEAD`, or Git configuration.
+remote-tracking refs, `FETCH_HEAD`, or Git configuration. A successful
+acquisition can add ordinary Git object data to the repository object
+database; that is its only intended local side effect.
 
 ### Git publication acknowledgements
 
@@ -930,6 +956,8 @@ A normal nonempty attempt performs:
 
 - one small symbolic remote `HEAD` observation;
 - byte-bounded exact Git reads for the default and local change namespaces;
+- at most one exact object-acquisition process and one final graph reload, only
+  when the initial graph load reports an authorized missing object;
 - one logical GraphQL observation containing aliased all-state connections for
   the local IDs; and
 - only the mutation and push stages which have actual work.
@@ -950,6 +978,13 @@ without collapsing distinct version positions.
 lowest faithful layer. At minimum, coverage proves:
 
 - exact local Git ref and tag observation, including authoritative absence;
+- deterministic causal-root provenance and exact source-ref acquisition
+  payloads;
+- no acquisition for complete or invalid graphs, or for missing ancestry in an
+  ordinary repository;
+- one negotiated acquisition for a missing advertised root, one direct
+  refetch for missing ancestry in a promisor repository, and no second request
+  after the authoritative reload;
 - empty-stack completion before GitHub token access or requests;
 - pending-autosquash rejection before trailer validation or remote
   observation;
