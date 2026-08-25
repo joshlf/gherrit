@@ -11,7 +11,13 @@ mod autosquash;
 mod batching;
 mod body;
 mod destination;
-#[cfg(test)]
+// The exact GitHub adapter is activated only when publication and planning
+// switch together. Compile its complete boundary now without running it from
+// the legacy publisher.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "exact GitHub activation must include publication")
+)]
 mod github;
 // Production orchestration still publishes the legacy ref shape, which the
 // exact-history model correctly rejects. Compile each part now, but keep the
