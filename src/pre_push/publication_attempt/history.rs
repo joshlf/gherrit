@@ -15,12 +15,16 @@ use color_eyre::eyre::{Context as _, Report, Result, bail, eyre};
 use gix::ObjectId;
 
 use super::{
-    destination::DefaultBranch,
-    local::{GherritIdTrailer, GherritPrId, LocalChange, LocalStack, gherrit_id_trailers},
     remote::{RawExactLocalChange, RawExactLocalChangeParts, RawExactLocalObservation},
     version::Version,
 };
-use crate::util;
+use crate::{
+    pre_push::{
+        destination::DefaultBranch,
+        local::{GherritIdTrailer, GherritPrId, LocalChange, LocalStack, gherrit_id_trailers},
+    },
+    util,
+};
 
 fn exact_identity_value(identity: &GherritIdTrailer) -> Option<&[u8]> {
     match identity {
@@ -1011,11 +1015,11 @@ mod tests {
     use gix::{ObjectId, prelude::Write as _};
     use tempfile::TempDir;
 
-    use super::*;
-    use crate::pre_push::{
-        destination::DefaultBranch,
-        remote::{RawExactLocalObservation, decode_for_test},
+    use super::{
+        super::remote::{RawExactLocalObservation, decode_for_test},
+        *,
     };
+    use crate::pre_push::destination::DefaultBranch;
 
     struct TestRepository {
         directory: TempDir,
