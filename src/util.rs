@@ -132,6 +132,10 @@ pub struct Repo {
 pub(crate) struct GitDirIdentity(PathBuf);
 
 impl GitDirIdentity {
+    pub(crate) fn as_path(&self) -> &Path {
+        &self.0
+    }
+
     pub(crate) fn as_os_str(&self) -> &OsStr {
         self.0.as_os_str()
     }
