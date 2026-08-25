@@ -69,6 +69,17 @@ pub(super) struct RepositoryCoordinates {
 }
 
 impl RepositoryCoordinates {
+    fn new(owner: String, repository: String) -> Option<Self> {
+        (valid_repository_component(&owner) && valid_repository_component(&repository))
+            .then_some(Self { owner, repository })
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(owner: &str, repository: &str) -> Self {
+        Self::new(owner.to_owned(), repository.to_owned())
+            .expect("test repository coordinates must be valid")
+    }
+
     pub(super) fn owner(&self) -> &str {
         &self.owner
     }
@@ -598,7 +609,7 @@ impl ResolvedDestination {
         })?;
         let parsed = parse_destination(&literal);
         let supports_production_github = parsed.as_ref().is_some_and(targets_production_github);
-        let (owner, repository) = match parsed {
+        let coordinates = match parsed {
             Some(ParsedDestination::Local { path }) => {
                 let path = if path.is_absolute() { path } else { current_dir.join(path) };
                 let canonical = dunce::canonicalize(path).map_err(|_| {
@@ -656,7 +667,6 @@ impl ResolvedDestination {
             )
         })?;
 
-        let coordinates = RepositoryCoordinates { owner, repository };
         let http_redirect_parameters = command_scope_http_redirect_parameters(
             &literal,
             env::var_os(GIT_CONFIG_PARAMETERS_ENV).as_deref(),
@@ -1208,7 +1218,7 @@ fn split_scp_destination(destination: &str) -> ScpDestination<'_> {
     }
 }
 
-fn slash_repository_identity(path: &str) -> Option<(String, String)> {
+fn slash_repository_identity(path: &str) -> Option<RepositoryCoordinates> {
     if path.ends_with('/') || path.contains('\\') {
         return None;
     }
@@ -1219,18 +1229,15 @@ fn slash_repository_identity(path: &str) -> Option<(String, String)> {
     repository_components(owner, repository)
 }
 
-fn local_repository_identity(path: &Path) -> Option<(String, String)> {
+fn local_repository_identity(path: &Path) -> Option<RepositoryCoordinates> {
     let repository = path.file_name()?.to_str()?;
     let owner = path.parent()?.file_name()?.to_str()?;
     repository_components(owner, repository)
 }
 
-fn repository_components(owner: &str, repository: &str) -> Option<(String, String)> {
+fn repository_components(owner: &str, repository: &str) -> Option<RepositoryCoordinates> {
     let repository = repository.strip_suffix(".git").unwrap_or(repository);
-    if !valid_repository_component(owner) || !valid_repository_component(repository) {
-        return None;
-    }
-    Some((owner.to_owned(), repository.to_owned()))
+    RepositoryCoordinates::new(owner.to_owned(), repository.to_owned())
 }
 
 /// Whether one parsed destination uses a supported authenticated push
