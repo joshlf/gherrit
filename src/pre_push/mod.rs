@@ -13,6 +13,8 @@ mod body;
 mod destination;
 #[cfg(test)]
 mod github;
+#[cfg(test)]
+mod history;
 mod legacy_github;
 mod legacy_publication;
 mod legacy_remote;
