@@ -279,7 +279,13 @@ impl Repo {
         })
     }
 
-    fn has_promisor_remote(&self) -> Result<bool> {
+    /// Returns whether repository configuration declares a promisor object
+    /// source, either through partial-clone configuration or a promisor remote.
+    ///
+    /// History validation and repository preflight use the same interpretation
+    /// when deciding whether missing ancestry may be repaired with an explicit
+    /// refetch.
+    pub(crate) fn has_promisor_remote(&self) -> Result<bool> {
         let config = self.inner.config_snapshot();
         if config.string("extensions.partialClone").is_some() {
             return Ok(true);
