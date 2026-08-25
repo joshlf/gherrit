@@ -40,7 +40,12 @@ mod local;
     expect(dead_code, reason = "exact history activation must include publication")
 )]
 mod marker;
-#[cfg(test)]
+#[cfg_attr(not(test), expect(dead_code, reason = "the exact planner activates with its executor"))]
+mod plan;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "exact publication activates with the staged planner")
+)]
 mod publication;
 mod reconcile;
 #[cfg_attr(
@@ -49,10 +54,6 @@ mod reconcile;
 )]
 mod remote;
 mod subprocess;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "exact history activation must include publication")
-)]
 mod version;
 
 use batching::{
