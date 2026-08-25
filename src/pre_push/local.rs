@@ -276,18 +276,32 @@ impl LocalStack {
         default_branch: DefaultBranch,
         changes: impl IntoIterator<Item = (GherritPrId, ObjectId, ObjectId)>,
     ) -> Self {
+        Self::for_plan_test(
+            default_branch,
+            changes.into_iter().map(|(id, head, first_parent)| {
+                (id, head, first_parent, "Test change".to_owned(), String::new())
+            }),
+        )
+    }
+
+    /// Constructs a synthetic stack with distinct presentation content after
+    /// local collection and validation have been tested at their own boundary.
+    #[cfg(test)]
+    pub(super) fn for_plan_test(
+        default_branch: DefaultBranch,
+        changes: impl IntoIterator<Item = (GherritPrId, ObjectId, ObjectId, String, String)>,
+    ) -> Self {
         let changes = changes
             .into_iter()
-            .map(|(id, head, first_parent)| LocalChange {
+            .map(|(id, head, first_parent, title, body)| LocalChange {
                 id,
                 head,
                 first_parent,
-                title: PullRequestTitle::new("Test change".to_owned())
-                    .expect("history-test title is valid"),
-                body: String::new(),
+                title: PullRequestTitle::new(title).expect("plan-test title is valid"),
+                body,
             })
             .collect();
-        Self::new(default_branch, changes).expect("valid history-test local stack")
+        Self::new(default_branch, changes).expect("valid plan-test local stack")
     }
 
     pub(super) fn default_branch(&self) -> &DefaultBranch {
