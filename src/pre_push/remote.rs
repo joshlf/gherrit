@@ -21,10 +21,16 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::{ObjectId, bstr::ByteSlice as _};
 
 use super::{
-    destination::{DefaultBranch, git_output_records},
+    destination::{DefaultBranch, ExactObjectFetchMode, PushDestination, git_output_records},
+    history::{GraphLoadError, PreparedExactLocalHistories, ValidatedChangeHistory},
     local::{GherritPrId, LocalStack},
+    subprocess::{
+        self, REGULAR_FILE_STDIN_LIMIT, REMOTE_GIT_EXECUTION_TIMEOUT, RegularFileStdin,
+        RegularFileStdinBuilder,
+    },
     version::Version,
 };
+use crate::util;
 
 // This stays well below Windows' roughly 32-KiB command-line limit and is a
 // conservative bound on POSIX systems. The count includes one terminating
@@ -39,19 +45,18 @@ const MANAGED_TAG_PREFIX: &[u8] = b"refs/tags/gherrit/";
 ///
 /// Construction validates all request arguments before any caller can execute
 /// the first query. Responses must later be decoded in this same order.
-pub(super) struct ExactLocalQueryPlan {
+struct QueryPlan {
     default_branch: DefaultBranch,
     queries: Vec<Query>,
 }
 
-impl ExactLocalQueryPlan {
-    /// Binds exact remote acquisition to the path origin and ordered IDs
-    /// already proved by the sealed local stack.
-    pub(super) fn for_stack(stack: &LocalStack) -> Result<Self> {
-        let ids = stack.iter().map(|change| change.id().clone()).collect::<Vec<_>>();
-        Self::with_budget(stack.default_branch().clone(), &ids, QUERY_ARGV_BUDGET_BYTES)
-    }
+/// Exact request plan bound to the sealed stack which authorized it.
+pub(super) struct ExactLocalQueryPlan<'local> {
+    local: &'local LocalStack,
+    plan: QueryPlan,
+}
 
+impl QueryPlan {
     #[cfg(test)]
     pub(super) fn new(default_branch: DefaultBranch, ids: &[GherritPrId]) -> Result<Self> {
         Self::with_budget(default_branch, ids, QUERY_ARGV_BUDGET_BYTES)
@@ -86,7 +91,8 @@ impl ExactLocalQueryPlan {
     /// Only the first query repeats the default branch. Every other argument
     /// names a requested change's candidate head, owned base, or complete
     /// managed-tag namespace, including its pull-request marker.
-    pub(super) fn patterns(&self) -> impl ExactSizeIterator<Item = Vec<String>> + '_ {
+    #[cfg(test)]
+    fn patterns(&self) -> impl ExactSizeIterator<Item = Vec<String>> + '_ {
         self.queries
             .iter()
             .enumerate()
@@ -98,6 +104,7 @@ impl ExactLocalQueryPlan {
     /// Process success is intentionally not represented here. The eventual
     /// command boundary must admit only stdout from a successful query before
     /// calling this pure decoder.
+    #[cfg(test)]
     pub(super) fn decode<'output>(
         self,
         outputs: impl IntoIterator<Item = &'output [u8]>,
@@ -121,6 +128,238 @@ impl ExactLocalQueryPlan {
     }
 }
 
+#[cfg(test)]
+pub(super) fn decode_for_test<'output>(
+    default_branch: DefaultBranch,
+    ids: &[GherritPrId],
+    outputs: impl IntoIterator<Item = &'output [u8]>,
+) -> Result<RawExactLocalObservation> {
+    QueryPlan::new(default_branch, ids)?.decode(outputs)
+}
+
+impl<'local> ExactLocalQueryPlan<'local> {
+    /// Binds exact remote acquisition to the path origin and ordered IDs
+    /// already proved by the sealed local stack.
+    pub(super) fn for_stack(stack: &'local LocalStack) -> Result<Self> {
+        let ids = stack.iter().map(|change| change.id().clone()).collect::<Vec<_>>();
+        let plan =
+            QueryPlan::with_budget(stack.default_branch().clone(), &ids, QUERY_ARGV_BUDGET_BYTES)?;
+        Ok(Self { local: stack, plan })
+    }
+
+    #[cfg(test)]
+    pub(super) fn patterns(&self) -> impl ExactSizeIterator<Item = Vec<String>> + '_ {
+        self.plan.patterns()
+    }
+
+    /// Runs every preplanned exact query sequentially and seals its stack,
+    /// repository, and destination into the resulting acquisition authority.
+    #[allow(dead_code)]
+    pub(super) async fn observe<'repository, 'destination>(
+        self,
+        repository: &'repository util::Repo,
+        destination: &'destination PushDestination,
+    ) -> Result<ExactLocalObservation<'local, 'repository, 'destination>> {
+        let QueryPlan { default_branch, queries } = self.plan;
+        let mut changes = Vec::new();
+        for (index, query) in queries.iter().enumerate() {
+            let expected_default = (index == 0).then_some(&default_branch);
+            let patterns = query.patterns(expected_default);
+            let output =
+                destination.observe_refs_from(repository, patterns).await.wrap_err_with(|| {
+                    format!(
+                        "Failed to observe exact Git state for GHerrit remote '{}'",
+                        destination.configured_remote()
+                    )
+                })?;
+            if !output.status().success() {
+                return Err(remote_command_failure(
+                    format!(
+                        "Exact Git observation failed for GHerrit remote '{}'",
+                        destination.configured_remote()
+                    ),
+                    &output,
+                    destination,
+                ));
+            }
+            changes.extend(parse_query(output.stdout(), query.ids(), expected_default)?);
+        }
+        let raw = RawExactLocalObservation { default_branch, changes: changes.into_boxed_slice() };
+        Ok(ExactLocalObservation { local: self.local, repository, destination, raw })
+    }
+}
+
+/// Exact ref evidence bound to the stack, repository, and destination which
+/// produced it.
+///
+/// None of the borrows has an accessor. The only production transition loads,
+/// optionally acquires, reloads, and validates histories through those exact
+/// capabilities.
+pub(super) struct ExactLocalObservation<'local, 'repository, 'destination> {
+    local: &'local LocalStack,
+    repository: &'repository util::Repo,
+    destination: &'destination PushDestination,
+    raw: RawExactLocalObservation,
+}
+
+impl ExactLocalObservation<'_, '_, '_> {
+    /// Consumes this exact observation through one straight-line graph load.
+    ///
+    /// Complete and invalid evidence return without constructing acquisition
+    /// input. Missing advertised state negotiates one bounded payload of all
+    /// exact external-history aliases and marker refs. A missing ancestor uses
+    /// the same payload in refetch mode only for a repository which was already
+    /// promisor; an ordinary repository fails before network I/O. One
+    /// successful fetch permits exactly one authoritative final reload.
+    pub(super) async fn validate_histories(self) -> Result<Box<[ValidatedChangeHistory]>> {
+        let Self { local, repository, destination, raw } = self;
+        let prepared = PreparedExactLocalHistories::prepare(raw, local, repository)?;
+        let request = match prepared.load_graph() {
+            Ok(graph) => return prepared.validate(&graph),
+            Err(GraphLoadError::Invalid(error)) => return Err(error),
+            Err(GraphLoadError::MissingAdvertisedRoot(missing)) => {
+                let _ = missing;
+                ExactAcquisition::Negotiated
+            }
+            Err(GraphLoadError::MissingAncestor(missing)) => {
+                if !repository.has_promisor_remote()? {
+                    bail!(
+                        "The ordinary local Git object database is incomplete or corrupt: commit {} is missing from ancestry of advertised graph root {}; ordinary fetch negotiation cannot repair missing ancestry",
+                        missing.oid(),
+                        missing.root().oid()
+                    );
+                }
+                ExactAcquisition::Refetch
+            }
+            Err(GraphLoadError::MissingMarkerObject(_)) => {
+                // Every marker ref is already part of the same bounded input,
+                // so marker-only absence uses the ordinary negotiation path.
+                ExactAcquisition::Negotiated
+            }
+        };
+
+        acquire(repository, destination, request, &prepared).await?;
+        // This second and final load is authoritative. There is deliberately
+        // no loop or reclassification after the one acquisition attempt.
+        let graph = prepared.load_graph().map_err(GraphLoadError::into_report)?;
+        prepared.validate(&graph)
+    }
+}
+
+async fn acquire(
+    repository: &util::Repo,
+    destination: &PushDestination,
+    request: ExactAcquisition,
+    prepared: &PreparedExactLocalHistories<'_, '_>,
+) -> Result<()> {
+    let mode = request.into_mode();
+    let input = prepare_fetch_input(prepared.acquisition_source_refs())?;
+    let mut command = destination.exact_object_fetch(mode);
+    command.current_dir(repository.workdir().unwrap_or(repository.path()));
+    let output =
+        subprocess::output_with_regular_file_stdin(command, input, REMOTE_GIT_EXECUTION_TIMEOUT)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "Failed to acquire exact Git history for GHerrit remote '{}'",
+                    destination.configured_remote()
+                )
+            })?;
+    if !output.status().success() {
+        return Err(remote_command_failure(
+            format!(
+                "Exact Git history acquisition failed for GHerrit remote '{}'",
+                destination.configured_remote()
+            ),
+            &output,
+            destination,
+        ));
+    }
+    Ok(())
+}
+
+/// Produces the only caller-visible form of a remote Git child failure.
+///
+/// Process status is evidence that the operation failed, but child output is
+/// neither trustworthy nor publication evidence. The subprocess boundary
+/// retains only a bounded suffix, and the destination applies conservative
+/// redaction and terminal escaping before this function can display it.
+fn remote_command_failure(
+    message: String,
+    output: &subprocess::CommandOutput,
+    destination: &PushDestination,
+) -> color_eyre::Report {
+    output.child_diagnostic(destination).map_or_else(
+        || eyre!(message.clone()),
+        |diagnostic| {
+            eyre!(
+                "{message}\n\nRemote Git diagnostic (untrusted and not publication evidence):\n{diagnostic}"
+            )
+        },
+    )
+}
+
+enum ExactAcquisition {
+    Negotiated,
+    Refetch,
+}
+
+impl ExactAcquisition {
+    fn into_mode(self) -> ExactObjectFetchMode {
+        match self {
+            Self::Negotiated => ExactObjectFetchMode::Negotiated,
+            Self::Refetch => ExactObjectFetchMode::Refetch,
+        }
+    }
+}
+
+fn prepare_fetch_input<'a>(source_refs: impl Iterator<Item = &'a str>) -> Result<RegularFileStdin> {
+    let source_refs = source_refs.collect::<Vec<_>>();
+    checked_payload_length(
+        source_refs.iter().map(|source_ref| {
+            u64::try_from(source_ref.len())
+                .map_err(|_| eyre!("Exact acquisition source-ref length overflowed"))
+        }),
+        REGULAR_FILE_STDIN_LIMIT,
+    )?;
+
+    // Validate the total size before creating or writing the named temporary
+    // file. The builder owns GHerrit's writable handle and removes the name
+    // before ownership crosses the subprocess boundary.
+    let mut input = RegularFileStdinBuilder::new()?;
+    write_fetch_payload(source_refs, &mut input)
+        .wrap_err("Failed to prepare bounded exact Git acquisition input")?;
+    input.finish().map_err(Into::into)
+}
+
+fn write_fetch_payload(
+    source_refs: impl IntoIterator<Item = impl AsRef<str>>,
+    output: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    for source_ref in source_refs {
+        output.write_all(source_ref.as_ref().as_bytes())?;
+        output.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn checked_payload_length(
+    lengths: impl IntoIterator<Item = Result<u64>>,
+    limit: u64,
+) -> Result<u64> {
+    let mut total = 0_u64;
+    for length in lengths {
+        total = total
+            .checked_add(length?)
+            .and_then(|total| total.checked_add(1))
+            .ok_or_else(|| eyre!("Exact acquisition stdin length overflowed"))?;
+        if total > limit {
+            bail!("Exact acquisition stdin exceeds the {limit}-byte limit");
+        }
+    }
+    Ok(total)
+}
+
 /// Exact remote ref evidence for the requested local IDs, in request order.
 #[derive(Debug)]
 pub(super) struct RawExactLocalObservation {
@@ -129,10 +368,16 @@ pub(super) struct RawExactLocalObservation {
 }
 
 impl RawExactLocalObservation {
+    pub(super) fn into_parts(self) -> (DefaultBranch, Box<[RawExactLocalChange]>) {
+        (self.default_branch, self.changes)
+    }
+
+    #[cfg(test)]
     pub(super) fn default_branch(&self) -> &DefaultBranch {
         &self.default_branch
     }
 
+    #[cfg(test)]
     pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = &RawExactLocalChange> {
         self.changes.iter()
     }
@@ -151,47 +396,78 @@ pub(super) struct RawExactLocalChange {
     pull_request_marker: Option<RawPullRequestMarker>,
 }
 
+/// The components of one consumed raw exact-local change.
+pub(super) struct RawExactLocalChangeParts {
+    pub(super) id: GherritPrId,
+    pub(super) candidate_head: Option<ObjectId>,
+    pub(super) owned_base: Option<ObjectId>,
+    pub(super) versions: Box<[RawVersionRef]>,
+    pub(super) pull_request_marker: Option<RawPullRequestMarker>,
+}
+
 impl RawExactLocalChange {
+    pub(super) fn into_parts(self) -> RawExactLocalChangeParts {
+        RawExactLocalChangeParts {
+            id: self.id,
+            candidate_head: self.candidate_head,
+            owned_base: self.owned_base,
+            versions: self.versions,
+            pull_request_marker: self.pull_request_marker,
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn id(&self) -> &GherritPrId {
         &self.id
     }
 
+    #[cfg(test)]
     pub(super) fn candidate_head(&self) -> Option<ObjectId> {
         self.candidate_head
     }
 
+    #[cfg(test)]
     pub(super) fn owned_base(&self) -> Option<ObjectId> {
         self.owned_base
     }
 
+    #[cfg(test)]
     pub(super) fn versions(&self) -> impl ExactSizeIterator<Item = &RawVersionRef> {
         self.versions.iter()
     }
 
+    #[cfg(test)]
     pub(super) fn pull_request_marker(&self) -> Option<&RawPullRequestMarker> {
         self.pull_request_marker.as_ref()
     }
 }
 
 /// Exact annotated-tag evidence for the immutable pull-request marker.
-///
-/// Git advertises an annotated tag as two records: the tag object itself and
-/// the commit to which it peels. Keeping them together prevents either a
-/// lightweight marker or a lone peeled record from masquerading as the
-/// protocol marker.
 #[derive(Debug)]
 pub(super) struct RawPullRequestMarker {
     tag: ObjectId,
     v1: ObjectId,
+    source_ref: Box<str>,
 }
 
 impl RawPullRequestMarker {
+    pub(super) fn into_parts(self) -> (ObjectId, ObjectId, Box<str>) {
+        (self.tag, self.v1, self.source_ref)
+    }
+
+    #[cfg(test)]
     pub(super) fn tag(&self) -> ObjectId {
         self.tag
     }
 
+    #[cfg(test)]
     pub(super) fn v1(&self) -> ObjectId {
         self.v1
+    }
+
+    #[cfg(test)]
+    pub(super) fn source_ref(&self) -> &str {
+        &self.source_ref
     }
 }
 
@@ -204,14 +480,21 @@ pub(super) struct RawVersionRef {
 }
 
 impl RawVersionRef {
+    pub(super) fn into_parts(self) -> (Version, ObjectId, Box<str>) {
+        (self.version, self.object_id, self.source_ref)
+    }
+
+    #[cfg(test)]
     pub(super) fn version(&self) -> Version {
         self.version
     }
 
+    #[cfg(test)]
     pub(super) fn object_id(&self) -> ObjectId {
         self.object_id
     }
 
+    #[cfg(test)]
     pub(super) fn source_ref(&self) -> &str {
         &self.source_ref
     }
@@ -450,7 +733,11 @@ fn parse_query<'id>(
                 pending.pull_request_marker.v1,
             ) {
                 (None, None) => None,
-                (Some(tag), Some(v1)) => Some(RawPullRequestMarker { tag, v1 }),
+                (Some(tag), Some(v1)) => Some(RawPullRequestMarker {
+                    tag,
+                    v1,
+                    source_ref: format!("refs/tags/gherrit/{}/pr", id.as_str()).into(),
+                }),
                 (Some(_), None) => bail!(
                     "remote pull-request marker for GHerrit change '{}' is lightweight or omitted its peeled v1 commit",
                     id.as_str()
@@ -625,12 +912,70 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn exact_acquisition_payload_contains_only_the_requested_source_refs() {
+        let refs = ["refs/tags/gherrit/A/v1", "refs/tags/gherrit/A/v3"];
+        let mut payload = Vec::new();
+
+        write_fetch_payload(refs, &mut payload).unwrap();
+
+        assert_eq!(payload, b"refs/tags/gherrit/A/v1\nrefs/tags/gherrit/A/v3\n");
+        assert!(!payload.windows(HEAD.len()).any(|bytes| bytes == HEAD.as_bytes()));
+        assert!(
+            !payload
+                .windows(b"refs/tags/gherrit/B/v1".len())
+                .any(|bytes| { bytes == b"refs/tags/gherrit/B/v1" })
+        );
+        let _sealed = prepare_fetch_input(refs.iter().copied()).unwrap();
+    }
+
+    #[test]
+    fn exact_acquisition_payload_length_is_checked_before_file_creation() {
+        let ok = |length| Ok::<u64, color_eyre::Report>(length);
+
+        assert_eq!(checked_payload_length([ok(3), ok(4)], 9).unwrap(), 9);
+        assert!(checked_payload_length([ok(3), ok(4)], 8).is_err());
+        assert!(checked_payload_length([ok(u64::MAX)], u64::MAX).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consuming_complete_observation_uses_its_sealed_stack_without_acquisition() {
+        let directory = tempfile::tempdir().unwrap();
+        gix::init_bare(directory.path()).unwrap();
+        let repository = util::Repo::open(directory.path().to_str().unwrap()).unwrap();
+        let destination = PushDestination::for_test();
+        let change_id = id("Absent");
+        let default = default_branch();
+        let proposal = ObjectId::from_hex(HEAD.as_bytes()).unwrap();
+        let local = LocalStack::for_history_test(
+            default.clone(),
+            [(change_id.clone(), proposal, default.tip())],
+        );
+        let output = format!("{DEFAULT}\trefs/heads/main\n");
+        let raw = QueryPlan::new(default, std::slice::from_ref(&change_id))
+            .unwrap()
+            .decode([output.as_bytes()])
+            .unwrap();
+        let observation = ExactLocalObservation {
+            local: &local,
+            repository: &repository,
+            destination: &destination,
+            raw,
+        };
+
+        let histories = observation.validate_histories().await.unwrap();
+
+        assert_eq!(histories.len(), 1);
+        assert_eq!(histories[0].id(), &change_id);
+        assert!(histories[0].needs_publication());
+    }
+
     fn decode<'output>(
         ids: &[GherritPrId],
         outputs: impl IntoIterator<Item = &'output [u8]>,
     ) -> Result<RawExactLocalObservation> {
         let default = default_branch();
-        ExactLocalQueryPlan::new(default, ids)?.decode(outputs)
+        QueryPlan::new(default, ids)?.decode(outputs)
     }
 
     fn full_output() -> String {
@@ -648,7 +993,7 @@ mod tests {
     fn plans_only_exact_local_namespaces_and_rechecks_default_once() {
         let default = default_branch();
         let ids = [id("A"), id("B")];
-        let plan = ExactLocalQueryPlan::new(default, &ids).unwrap();
+        let plan = QueryPlan::new(default, &ids).unwrap();
         let patterns = plan.patterns().collect::<Vec<_>>();
 
         assert_eq!(patterns.len(), 1);
@@ -680,8 +1025,9 @@ mod tests {
             [(a, a_head, default.tip()), (b, b_head, a_head)],
         );
 
-        let patterns =
-            ExactLocalQueryPlan::for_stack(&stack).unwrap().patterns().collect::<Vec<_>>();
+        let plan = ExactLocalQueryPlan::for_stack(&stack).unwrap();
+        assert!(std::ptr::eq(plan.local, &stack));
+        let patterns = plan.patterns().collect::<Vec<_>>();
 
         assert_eq!(stack.default_branch(), &default);
         assert_eq!(patterns.len(), 1);
@@ -697,23 +1043,18 @@ mod tests {
         let b = id("B");
         let per_query_budget = local_pattern_bytes(&a) + local_pattern_bytes(&b) - 1;
         let total_budget = default.full_ref_name().len() + 1 + per_query_budget;
-        let plan =
-            ExactLocalQueryPlan::with_budget(default, &[a.clone(), b], total_budget).unwrap();
+        let plan = QueryPlan::with_budget(default, &[a.clone(), b], total_budget).unwrap();
         let patterns = plan.patterns().collect::<Vec<_>>();
         assert_eq!(patterns.len(), 2);
         assert_eq!(patterns[0][0], "refs/heads/main");
         assert!(!patterns[1].iter().any(|pattern| pattern == "refs/heads/main"));
 
-        assert!(ExactLocalQueryPlan::new(default_branch(), &[]).is_err());
-        assert!(ExactLocalQueryPlan::new(default_branch(), &[a.clone(), a]).is_err());
-        assert!(ExactLocalQueryPlan::new(default_branch(), &[id("main")]).is_err());
+        assert!(QueryPlan::new(default_branch(), &[]).is_err());
+        assert!(QueryPlan::new(default_branch(), &[a.clone(), a]).is_err());
+        assert!(QueryPlan::new(default_branch(), &[id("main")]).is_err());
         assert!(
-            ExactLocalQueryPlan::with_budget(
-                default_branch(),
-                &[id("A")],
-                total_budget - per_query_budget
-            )
-            .is_err()
+            QueryPlan::with_budget(default_branch(), &[id("A")], total_budget - per_query_budget)
+                .is_err()
         );
     }
 
@@ -740,9 +1081,8 @@ mod tests {
         );
         assert_eq!(changes[0].owned_base().unwrap().to_string(), BASE);
         assert_eq!(changes[1].candidate_head().unwrap().to_string(), HEAD);
-        let marker = changes[1].pull_request_marker().unwrap();
-        assert_eq!(marker.tag().to_string(), MARKER);
-        assert_eq!(marker.v1().to_string(), BASE);
+        assert_eq!(changes[1].pull_request_marker().unwrap().tag().to_string(), MARKER);
+        assert_eq!(changes[1].pull_request_marker().unwrap().v1().to_string(), BASE);
         assert_eq!(
             changes[1]
                 .versions()
@@ -787,20 +1127,20 @@ mod tests {
         let first = format!("{DEFAULT}\trefs/heads/main\n{HEAD}\trefs/heads/A\n");
         let second = format!("{BASE}\trefs/heads/B\n");
 
-        let observed = ExactLocalQueryPlan::with_budget(default, &[a.clone(), b.clone()], budget)
+        let observed = QueryPlan::with_budget(default, &[a.clone(), b.clone()], budget)
             .unwrap()
             .decode([first.as_bytes(), second.as_bytes()])
             .unwrap();
         assert_eq!(observed.iter().map(|change| change.id()).collect::<Vec<_>>(), [&a, &b]);
 
         assert!(
-            ExactLocalQueryPlan::with_budget(default_branch(), &[a.clone(), b.clone()], budget)
+            QueryPlan::with_budget(default_branch(), &[a.clone(), b.clone()], budget)
                 .unwrap()
                 .decode([first.as_bytes()])
                 .is_err()
         );
         assert!(
-            ExactLocalQueryPlan::with_budget(default_branch(), &[a, b], budget)
+            QueryPlan::with_budget(default_branch(), &[a, b], budget)
                 .unwrap()
                 .decode([first.as_bytes(), second.as_bytes(), b"".as_slice()])
                 .is_err()
@@ -817,7 +1157,7 @@ mod tests {
         let first = format!("{DEFAULT}\trefs/heads/main\n");
         let second = format!("{DEFAULT}\trefs/heads/main\n");
         assert!(
-            ExactLocalQueryPlan::with_budget(default, &[a, b], budget)
+            QueryPlan::with_budget(default, &[a, b], budget)
                 .unwrap()
                 .decode([first.as_bytes(), second.as_bytes()])
                 .is_err()
@@ -879,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_refs_and_all_peeled_owned_refs() {
+    fn rejects_duplicate_refs_and_peeled_non_marker_refs() {
         let ids = [id("Gone")];
         for records in [
             format!("{HEAD}\trefs/heads/Gone\n{BASE}\trefs/heads/Gone\n"),
@@ -912,11 +1252,25 @@ mod tests {
 
         let unpeeled_only =
             format!("{DEFAULT}\trefs/heads/main\n{MARKER}\trefs/tags/gherrit/Gone/pr\n");
-        assert!(decode(&ids, [unpeeled_only.as_bytes()]).is_err());
+        assert_eq!(
+            decode(&ids, [unpeeled_only.as_bytes()]).unwrap_err().to_string(),
+            "remote pull-request marker for GHerrit change 'Gone' is lightweight or omitted its peeled v1 commit"
+        );
 
         let peeled_only =
             format!("{DEFAULT}\trefs/heads/main\n{HEAD}\trefs/tags/gherrit/Gone/pr^{{}}\n");
-        assert!(decode(&ids, [peeled_only.as_bytes()]).is_err());
+        assert_eq!(
+            decode(&ids, [peeled_only.as_bytes()]).unwrap_err().to_string(),
+            "remote pull-request marker for GHerrit change 'Gone' omitted its unpeeled annotated tag object"
+        );
+
+        let duplicate_peeled = format!(
+            "{DEFAULT}\trefs/heads/main\n{MARKER}\trefs/tags/gherrit/Gone/pr\n{HEAD}\trefs/tags/gherrit/Gone/pr^{{}}\n{BASE}\trefs/tags/gherrit/Gone/pr^{{}}\n"
+        );
+        assert_eq!(
+            decode(&ids, [duplicate_peeled.as_bytes()]).unwrap_err().to_string(),
+            "exact local observation returned the same remote ref record more than once"
+        );
     }
 
     #[test]
@@ -973,9 +1327,8 @@ mod tests {
         assert_eq!(change.candidate_head().unwrap().to_string(), HEAD);
         assert_eq!(change.owned_base(), None);
         assert_eq!(change.versions().next().unwrap().version().get(), 3);
-        let marker = change.pull_request_marker().unwrap();
-        assert_eq!(marker.tag().to_string(), MARKER);
-        assert_eq!(marker.v1().to_string(), HEAD);
+        assert_eq!(change.pull_request_marker().unwrap().tag().to_string(), MARKER);
+        assert_eq!(change.pull_request_marker().unwrap().v1().to_string(), HEAD);
     }
 
     #[test]
