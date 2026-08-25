@@ -525,7 +525,7 @@ fn reject_nonempty_history_file(path: &Path, description: &str, reason: &str) ->
     }
 }
 
-fn parse_git_version(output: &[u8]) -> Result<(u64, u64)> {
+pub(crate) fn parse_git_version(output: &[u8]) -> Result<(u64, u64)> {
     let version = str::from_utf8(output)?
         .trim()
         .strip_prefix("git version ")

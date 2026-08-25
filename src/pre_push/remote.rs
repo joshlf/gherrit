@@ -828,13 +828,27 @@ fn parse_version(suffix: &[u8]) -> Result<Version> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
+
     use super::*;
+    use crate::util;
 
     const DEFAULT: &str = "1111111111111111111111111111111111111111";
     const HEAD: &str = "2222222222222222222222222222222222222222";
     const BASE: &str = "3333333333333333333333333333333333333333";
     const MARKER: &str = "4444444444444444444444444444444444444444";
     const SHA256: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+
+    const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    const REAL_MODE: &str = "GHERRIT_375_REAL_MODE";
+    const REAL_REMOTE: &str = "GHERRIT_375_REAL_REMOTE";
+    const REAL_ROOT: &str = "GHERRIT_375_REAL_ROOT";
+    const REAL_TEST: &str = "pre_push::remote::tests::real_boundary_reexec";
+    const REAL_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn id(value: &str) -> GherritPrId {
         GherritPrId::from_ref_component(value.as_bytes()).unwrap()
@@ -843,6 +857,488 @@ mod tests {
     fn default_branch() -> DefaultBranch {
         DefaultBranch::new("main".to_owned(), ObjectId::from_hex(DEFAULT.as_bytes()).unwrap())
             .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum RealMode {
+        Complete,
+        Negotiated,
+        Refetch,
+        Ordinary,
+    }
+
+    impl RealMode {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Complete => "complete",
+                Self::Negotiated => "negotiated",
+                Self::Refetch => "refetch",
+                Self::Ordinary => "ordinary",
+            }
+        }
+
+        fn parse(value: &str) -> Self {
+            match value {
+                "complete" => Self::Complete,
+                "negotiated" => Self::Negotiated,
+                "refetch" => Self::Refetch,
+                "ordinary" => Self::Ordinary,
+                other => panic!("unknown real-Git boundary mode {other}"),
+            }
+        }
+    }
+
+    fn git_output(
+        context: &testutil::TestContext,
+        args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+    ) -> std::process::Output {
+        let args = args.into_iter().map(|arg| arg.as_ref().to_owned()).collect::<Vec<_>>();
+        let output = context.git_cmd().args(&args).output().unwrap();
+        assert!(output.status.success(), "git failed with args {args:?}: {output:?}");
+        output
+    }
+
+    fn run_git(
+        context: &testutil::TestContext,
+        args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+    ) {
+        let _ = git_output(context, args);
+    }
+
+    fn git_stdout(
+        context: &testutil::TestContext,
+        args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+    ) -> String {
+        String::from_utf8(git_output(context, args).stdout).unwrap().trim().to_owned()
+    }
+
+    fn commit(
+        context: &testutil::TestContext,
+        directory: &Path,
+        parent: ObjectId,
+        message: &str,
+    ) -> ObjectId {
+        let arguments = vec![
+            "-C".to_owned(),
+            directory.to_string_lossy().into_owned(),
+            "commit-tree".to_owned(),
+            EMPTY_TREE.to_owned(),
+            "-p".to_owned(),
+            parent.to_string(),
+            "-m".to_owned(),
+            message.to_owned(),
+        ];
+        ObjectId::from_hex(git_stdout(context, arguments).as_bytes()).unwrap()
+    }
+
+    struct RealFixture {
+        context: testutil::TestContext,
+        remote: PathBuf,
+        seed: PathBuf,
+        external_parent: ObjectId,
+        external: ObjectId,
+    }
+
+    fn real_fixture() -> RealFixture {
+        let context = testutil::TestContextBuilder::new(env::current_exe().unwrap())
+            .with_remote()
+            .with_initial_commit()
+            .build();
+        let remote = PathBuf::from(git_stdout(&context, ["remote", "get-url", "origin"]));
+        let base = ObjectId::from_hex(context.head_oid().as_bytes()).unwrap();
+        let proposal =
+            commit(&context, &context.repo_path, base, "proposal\n\ngherrit-pr-id: Local\n");
+        run_git(
+            &context,
+            ["update-ref".to_owned(), "refs/heads/proposal".to_owned(), proposal.to_string()],
+        );
+
+        let seed = context.dir.path().join("seed");
+        run_git(
+            &context,
+            [
+                "clone".to_owned(),
+                remote.to_string_lossy().into_owned(),
+                seed.to_string_lossy().into_owned(),
+            ],
+        );
+        let external_parent = commit(&context, &seed, base, "external parent\n");
+        let external =
+            commit(&context, &seed, external_parent, "external\n\ngherrit-pr-id: Local\n");
+        let unrelated_external =
+            commit(&context, &seed, external, "unrelated external\n\ngherrit-pr-id: Second\n");
+        run_git(
+            &context,
+            [
+                "-C".to_owned(),
+                seed.to_string_lossy().into_owned(),
+                "push".to_owned(),
+                "origin".to_owned(),
+                format!("{external}:refs/heads/Local"),
+                format!("{external_parent}:refs/heads/gherrit-bases/Local"),
+                format!("{external}:refs/tags/gherrit/Local/v1"),
+                format!("{unrelated_external}:refs/heads/Second"),
+                format!("{external}:refs/heads/gherrit-bases/Second"),
+                format!("{unrelated_external}:refs/tags/gherrit/Second/v1"),
+            ],
+        );
+
+        RealFixture { context, remote, seed, external_parent, external }
+    }
+
+    fn git_config_value(path: &Path) -> String {
+        format!("\"{}\"", path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    struct HostileConfig {
+        system: PathBuf,
+        global: PathBuf,
+        bundle: PathBuf,
+        bundle_object: ObjectId,
+        traces: [PathBuf; 3],
+        system_contents: Vec<u8>,
+        global_contents: Vec<u8>,
+        bundle_contents: Vec<u8>,
+    }
+
+    fn write_hostile_config(fixture: &RealFixture) -> HostileConfig {
+        let root = fixture.context.dir.path();
+        let system = root.join("system.config");
+        let global = root.join("global.config");
+        let bundle = root.join("configured.bundle");
+        let traces = [root.join("event.trace"), root.join("normal.trace"), root.join("perf.trace")];
+
+        // This commit exists only in a valid configured bundle. If the exact
+        // fetch accidentally honors fetch.bundleURI, Git imports the commit
+        // even though no requested remote ref can reach it.
+        let bundle_object =
+            commit(&fixture.context, &fixture.seed, fixture.external, "configured bundle only\n");
+        run_git(
+            &fixture.context,
+            [
+                "-C".to_owned(),
+                fixture.seed.to_string_lossy().into_owned(),
+                "update-ref".to_owned(),
+                "refs/heads/configured-bundle-only".to_owned(),
+                bundle_object.to_string(),
+            ],
+        );
+        run_git(
+            &fixture.context,
+            [
+                "-C".to_owned(),
+                fixture.seed.to_string_lossy().into_owned(),
+                "bundle".to_owned(),
+                "create".to_owned(),
+                bundle.to_string_lossy().into_owned(),
+                "refs/heads/configured-bundle-only".to_owned(),
+            ],
+        );
+        let bundle_contents = fs::read(&bundle).unwrap();
+        assert!(!bundle_contents.is_empty());
+        assert!(!object_exists(&fixture.context, bundle_object));
+
+        let system_contents = format!(
+            "[fetch]\n\tbundleURI = {}\n[trace2]\n\teventTarget = {}\n",
+            git_config_value(&bundle),
+            git_config_value(&traces[0])
+        )
+        .into_bytes();
+        let global_contents = format!(
+            "[trace2]\n\tnormalTarget = {}\n\tperfTarget = {}\n",
+            git_config_value(&traces[1]),
+            git_config_value(&traces[2])
+        )
+        .into_bytes();
+        fs::write(&system, &system_contents).unwrap();
+        fs::write(&global, &global_contents).unwrap();
+        assert!(traces.iter().all(|trace| !trace.exists()));
+        HostileConfig {
+            system,
+            global,
+            bundle,
+            bundle_object,
+            traces,
+            system_contents,
+            global_contents,
+            bundle_contents,
+        }
+    }
+
+    /// Every local Git surface which observation and acquisition promise not
+    /// to change. The object database is deliberately absent: acquisition may
+    /// add the requested history and transport-adjacent objects.
+    #[derive(Debug, Eq, PartialEq)]
+    struct LocalGitState {
+        refs: Vec<u8>,
+        head: Vec<u8>,
+        config: Vec<u8>,
+        worktree_config: Option<Vec<u8>>,
+        fetch_head: Option<Vec<u8>>,
+        shallow: Option<Vec<u8>>,
+    }
+
+    fn file_state(path: impl AsRef<Path>) -> Option<Vec<u8>> {
+        let path = path.as_ref();
+        match fs::read(path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("failed to snapshot {path:?}: {error}"),
+        }
+    }
+
+    fn git_dir(context: &testutil::TestContext) -> PathBuf {
+        PathBuf::from(git_stdout(context, ["rev-parse", "--absolute-git-dir"]))
+    }
+
+    fn local_git_state(context: &testutil::TestContext) -> LocalGitState {
+        let git_dir = git_dir(context);
+        LocalGitState {
+            refs: git_output(context, ["for-each-ref", "--format=%(refname)%00%(objectname)"])
+                .stdout,
+            head: git_output(context, ["symbolic-ref", "HEAD"]).stdout,
+            config: fs::read(git_dir.join("config")).unwrap(),
+            worktree_config: file_state(git_dir.join("config.worktree")),
+            fetch_head: file_state(git_dir.join("FETCH_HEAD")),
+            shallow: file_state(git_dir.join("shallow")),
+        }
+    }
+
+    fn object_exists(context: &testutil::TestContext, oid: ObjectId) -> bool {
+        // `git cat-file` may lazily contact a configured promisor remote for a
+        // missing object. Inspect the local object database directly so this
+        // assertion cannot repair the very absence it is meant to observe.
+        util::Repo::open(context.repo_path.to_str().unwrap())
+            .unwrap()
+            .try_find_object(oid)
+            .unwrap()
+            .is_some()
+    }
+
+    fn prime_complete_graph(fixture: &RealFixture) {
+        run_git(
+            &fixture.context,
+            [
+                "fetch",
+                "--quiet",
+                "--no-progress",
+                "--no-write-fetch-head",
+                "--no-tags",
+                "origin",
+                "refs/tags/gherrit/Local/v1",
+            ],
+        );
+        assert!(object_exists(&fixture.context, fixture.external));
+        assert!(object_exists(&fixture.context, fixture.external_parent));
+    }
+
+    fn prime_missing_ancestor(fixture: &RealFixture) {
+        run_git(
+            &fixture.context,
+            [
+                "fetch",
+                "--quiet",
+                "--no-progress",
+                "--no-write-fetch-head",
+                "--no-tags",
+                "--depth=1",
+                "origin",
+                "refs/tags/gherrit/Local/v1",
+            ],
+        );
+        // Removing the boundary turns the intentionally shallow fixture into
+        // an ordinary object database containing the root but not its parent.
+        fs::remove_file(git_dir(&fixture.context).join("shallow")).unwrap();
+        assert!(object_exists(&fixture.context, fixture.external));
+        assert!(!object_exists(&fixture.context, fixture.external_parent));
+    }
+
+    fn write_fetch_head_sentinel(context: &testutil::TestContext) {
+        fs::write(git_dir(context).join("FETCH_HEAD"), b"preexisting FETCH_HEAD bytes\n").unwrap();
+    }
+
+    fn invoke_real(fixture: &RealFixture, mode: RealMode, hostile: &HostileConfig) {
+        let mut command = fixture.context.gherrit_cmd();
+        command
+            .args(["--exact", REAL_TEST, "--nocapture"])
+            .env(REAL_MODE, mode.as_str())
+            .env(REAL_ROOT, fixture.context.dir.path())
+            .env(REAL_REMOTE, &fixture.remote)
+            // TestContext normally suppresses the machine's system config.
+            // This explicit false value makes only our hostile fixture visible.
+            .env("GIT_CONFIG_NOSYSTEM", "0")
+            .env("GIT_CONFIG_SYSTEM", &hostile.system)
+            .env("GIT_CONFIG_GLOBAL", &hostile.global)
+            .timeout(REAL_TEST_TIMEOUT);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "real boundary child failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn real_boundary_reexec() {
+        let Ok(mode) = env::var(REAL_MODE) else { return };
+        let mode = RealMode::parse(&mode);
+        let root = PathBuf::from(env::var_os(REAL_ROOT).unwrap());
+        let remote = PathBuf::from(env::var_os(REAL_REMOTE).unwrap());
+        let local = env::current_dir().unwrap();
+        let repository = crate::util::Repo::open(local.to_str().unwrap()).unwrap();
+        let default = repository.rev_parse_single("refs/heads/main").unwrap().detach();
+        let proposal = repository.rev_parse_single("refs/heads/proposal").unwrap().detach();
+        let changes = [(id("Local"), proposal, default)];
+        let stack = LocalStack::for_history_test(
+            DefaultBranch::new("main".to_owned(), default).unwrap(),
+            changes,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        // This bounded local command proves that the hostile Trace2 config is
+        // active. Destination-bearing commands must suppress the same targets.
+        let mut trace_probe = util::cmd("git", ["rev-parse", "--git-dir"]);
+        trace_probe.current_dir(&local);
+        let probe = runtime.block_on(subprocess::output(trace_probe, REAL_TEST_TIMEOUT)).unwrap();
+        assert!(probe.status().success());
+
+        let destination =
+            PushDestination::resolve(util::RemoteName::from_config(b"origin").unwrap()).unwrap();
+        let observed = runtime
+            .block_on(
+                ExactLocalQueryPlan::for_stack(&stack).unwrap().observe(&repository, &destination),
+            )
+            .unwrap();
+        if matches!(mode, RealMode::Complete | RealMode::Ordinary) {
+            fs::rename(&remote, root.join("remote.unavailable")).unwrap();
+        }
+        let result = runtime.block_on(observed.validate_histories());
+        match mode {
+            RealMode::Complete => {
+                assert!(result.is_ok(), "complete graph unexpectedly acquired: {result:?}")
+            }
+            RealMode::Negotiated | RealMode::Refetch => {
+                assert!(result.is_ok(), "acquisition failed: {result:?}")
+            }
+            RealMode::Ordinary => {
+                let error = format!("{:?}", result.unwrap_err());
+                assert!(error.contains("ordinary local Git object database is incomplete"));
+                assert!(error.contains("ordinary fetch negotiation cannot repair"));
+            }
+        }
+    }
+
+    fn assert_path_absent(text: &str, path: &Path) {
+        let native = path.to_string_lossy();
+        for spelling in
+            [native.to_string(), native.replace('\\', "/"), native.replace('\\', "\\\\")]
+        {
+            assert!(!text.contains(&spelling), "trace exposed private path {spelling:?}: {text}");
+        }
+    }
+
+    fn assert_hostile_state(fixture: &RealFixture, hostile: &HostileConfig) {
+        assert_eq!(fs::read(&hostile.system).unwrap(), hostile.system_contents);
+        assert_eq!(fs::read(&hostile.global).unwrap(), hostile.global_contents);
+        assert_eq!(
+            fs::read(&hostile.bundle).unwrap(),
+            hostile.bundle_contents,
+            "configured bundle source was changed"
+        );
+        assert!(
+            !object_exists(&fixture.context, hostile.bundle_object),
+            "exact fetch consumed the configured secondary object source"
+        );
+        for trace in &hostile.traces {
+            let bytes = fs::read(trace).expect("the local probe must activate every Trace2 target");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("rev-parse"), "Trace2 fixture was not active: {text}");
+            assert!(!text.contains("fetch"), "destination-bearing fetch reached Trace2: {text}");
+            assert!(!text.contains("ls-remote"), "destination observation reached Trace2: {text}");
+            assert!(!text.contains("GHERRIT_PRIVATE_PUSH_DESTINATION"), "{text}");
+            assert_path_absent(&text, &fixture.remote);
+            assert_path_absent(&text, &hostile.bundle);
+        }
+    }
+
+    fn assert_local_state_unchanged(
+        fixture: &RealFixture,
+        before: &LocalGitState,
+        hostile: &HostileConfig,
+    ) {
+        assert_hostile_state(fixture, hostile);
+        assert_eq!(
+            &local_git_state(&fixture.context),
+            before,
+            "observation or acquisition changed refs, HEAD, config, FETCH_HEAD, or shallow state"
+        );
+    }
+
+    #[test]
+    fn real_complete_graph_skips_acquisition() {
+        let fixture = real_fixture();
+        prime_complete_graph(&fixture);
+        write_fetch_head_sentinel(&fixture.context);
+        let before = local_git_state(&fixture.context);
+        let hostile = write_hostile_config(&fixture);
+
+        invoke_real(&fixture, RealMode::Complete, &hostile);
+
+        assert_local_state_unchanged(&fixture, &before, &hostile);
+        assert!(object_exists(&fixture.context, fixture.external));
+        assert!(object_exists(&fixture.context, fixture.external_parent));
+    }
+
+    #[test]
+    fn real_missing_root_negotiates_without_ref_side_effects() {
+        let fixture = real_fixture();
+        assert!(!object_exists(&fixture.context, fixture.external));
+        assert!(!object_exists(&fixture.context, fixture.external_parent));
+        write_fetch_head_sentinel(&fixture.context);
+        let before = local_git_state(&fixture.context);
+        let hostile = write_hostile_config(&fixture);
+
+        invoke_real(&fixture, RealMode::Negotiated, &hostile);
+
+        assert_local_state_unchanged(&fixture, &before, &hostile);
+        assert!(object_exists(&fixture.context, fixture.external));
+        assert!(object_exists(&fixture.context, fixture.external_parent));
+    }
+
+    #[test]
+    fn real_promisor_missing_ancestor_refetches_without_ref_side_effects() {
+        let fixture = real_fixture();
+        let version = git_output(&fixture.context, ["--version"]);
+        if util::parse_git_version(&version.stdout).unwrap() < (2, 45) {
+            return;
+        }
+        prime_missing_ancestor(&fixture);
+        run_git(&fixture.context, ["config", "remote.origin.promisor", "true"]);
+        write_fetch_head_sentinel(&fixture.context);
+        let before = local_git_state(&fixture.context);
+        let hostile = write_hostile_config(&fixture);
+
+        invoke_real(&fixture, RealMode::Refetch, &hostile);
+
+        assert_local_state_unchanged(&fixture, &before, &hostile);
+        assert!(object_exists(&fixture.context, fixture.external));
+        assert!(object_exists(&fixture.context, fixture.external_parent));
+    }
+
+    #[test]
+    fn real_ordinary_missing_ancestor_fails_before_acquisition() {
+        let fixture = real_fixture();
+        prime_missing_ancestor(&fixture);
+        write_fetch_head_sentinel(&fixture.context);
+        let before = local_git_state(&fixture.context);
+        let hostile = write_hostile_config(&fixture);
+
+        invoke_real(&fixture, RealMode::Ordinary, &hostile);
+
+        assert_local_state_unchanged(&fixture, &before, &hostile);
+        assert!(object_exists(&fixture.context, fixture.external));
+        assert!(!object_exists(&fixture.context, fixture.external_parent));
     }
 
     #[test]
