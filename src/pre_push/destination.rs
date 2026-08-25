@@ -47,6 +47,17 @@ pub(super) struct RepositoryCoordinates {
 }
 
 impl RepositoryCoordinates {
+    fn new(owner: String, repository: String) -> Option<Self> {
+        (valid_repository_component(&owner) && valid_repository_component(&repository))
+            .then_some(Self { owner, repository })
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(owner: &str, repository: &str) -> Self {
+        Self::new(owner.to_owned(), repository.to_owned())
+            .expect("test repository coordinates must be valid")
+    }
+
     pub(super) fn owner(&self) -> &str {
         &self.owner
     }
@@ -406,14 +417,13 @@ impl ResolvedDestination {
                 configured_remote.as_str()
             );
         }
-        let (owner, repository) = repository_identity(&literal).ok_or_else(|| {
+        let coordinates = repository_identity(&literal).ok_or_else(|| {
             eyre!(
                 "The push destination for GHerrit remote '{}' does not identify a supported GitHub repository",
                 configured_remote.as_str()
             )
         })?;
 
-        let coordinates = RepositoryCoordinates { owner, repository };
         Ok(Self { configured_remote, literal, coordinates })
     }
 
@@ -659,7 +669,7 @@ impl DefaultBranch {
 /// Parses the GitHub owner and repository from deliberately supported Git URL
 /// forms. Query strings, fragments, controls, and ambiguous suffixes are
 /// rejected rather than silently becoming part of repository identity.
-fn repository_identity(destination: &str) -> Option<(String, String)> {
+fn repository_identity(destination: &str) -> Option<RepositoryCoordinates> {
     if destination.is_empty()
         || destination.chars().any(char::is_control)
         || destination.contains(['?', '#'])
@@ -726,11 +736,7 @@ fn repository_identity(destination: &str) -> Option<(String, String)> {
         return None;
     };
     let repository = repository.strip_suffix(".git").unwrap_or(repository);
-    if !valid_repository_component(owner) || !valid_repository_component(repository) {
-        return None;
-    }
-
-    Some(((*owner).to_owned(), repository.to_owned()))
+    RepositoryCoordinates::new((*owner).to_owned(), repository.to_owned())
 }
 
 fn valid_scheme(scheme: &str) -> bool {
