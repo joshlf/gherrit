@@ -156,11 +156,14 @@ impl<'local> ExactLocalQueryPlan<'local> {
 
     /// Runs every preplanned exact query sequentially and seals its stack,
     /// repository, and destination into the resulting acquisition authority.
-    async fn observe<'repository, 'destination>(
+    async fn observe<'repository>(
         self,
         repository: &'repository util::Repo,
-        destination: &'destination PushDestination,
-    ) -> Result<ExactLocalObservation<'local, 'repository, 'destination>> {
+        destination: PushDestination,
+    ) -> Result<ExactLocalObservation<'local, 'repository>> {
+        if !destination.belongs_to(repository)? {
+            bail!("Exact Git observation received a destination from a different repository");
+        }
         let QueryPlan { default_branch, queries } = self.plan;
         let mut changes = Vec::new();
         for (index, query) in queries.iter().enumerate() {
@@ -180,7 +183,7 @@ impl<'local> ExactLocalQueryPlan<'local> {
                         destination.configured_remote()
                     ),
                     &output,
-                    destination,
+                    &destination,
                 ));
             }
             changes.extend(parse_query(output.stdout(), query.ids(), expected_default)?);
@@ -196,14 +199,14 @@ impl<'local> ExactLocalQueryPlan<'local> {
 /// None of the borrows has an accessor. The only production transition loads,
 /// optionally acquires, reloads, and validates histories through those exact
 /// capabilities.
-struct ExactLocalObservation<'local, 'repository, 'destination> {
+struct ExactLocalObservation<'local, 'repository> {
     local: &'local LocalStack,
     repository: &'repository util::Repo,
-    destination: &'destination PushDestination,
+    destination: PushDestination,
     raw: RawExactLocalObservation,
 }
 
-impl ExactLocalObservation<'_, '_, '_> {
+impl<'local, 'repository> ExactLocalObservation<'local, 'repository> {
     /// Consumes this exact observation through one straight-line graph load.
     ///
     /// Complete and invalid evidence return without constructing acquisition
@@ -211,11 +214,14 @@ impl ExactLocalObservation<'_, '_, '_> {
     /// missing ancestor refetches that causal root only for a repository which
     /// was already promisor; an ordinary repository fails before network I/O.
     /// One successful fetch permits exactly one authoritative final reload.
-    async fn validate_histories(self) -> Result<Box<[ValidatedChangeHistory]>> {
+    async fn validate_histories(self) -> Result<ValidatedPublication> {
         let Self { local, repository, destination, raw } = self;
         let prepared = PreparedExactLocalHistories::prepare(raw, local, repository)?;
         let request = match prepared.load_graph() {
-            Ok(graph) => return prepared.validate(&graph),
+            Ok(graph) => {
+                let histories = prepared.validate(&graph)?;
+                return Ok(ValidatedPublication { histories, destination });
+            }
             Err(GraphLoadError::Invalid(error)) => return Err(error),
             Err(GraphLoadError::MissingAdvertisedRoot(missing)) => {
                 ExactAcquisition::Negotiated(missing.root())
@@ -232,11 +238,32 @@ impl ExactLocalObservation<'_, '_, '_> {
             }
         };
 
-        acquire(repository, destination, request).await?;
+        acquire(repository, &destination, request).await?;
         // This second and final load is authoritative. There is deliberately
         // no loop or reclassification after the one acquisition attempt.
         let graph = prepared.load_graph().map_err(GraphLoadError::into_report)?;
-        prepared.validate(&graph)
+        let histories = prepared.validate(&graph)?;
+        Ok(ValidatedPublication { histories, destination })
+    }
+}
+
+/// Exact histories together with the only destination which established
+/// them. The destination itself owns the exact local repository binding used
+/// by every Git child.
+///
+/// This has no production accessors. Planning consumes it so a later executor
+/// cannot relabel remote evidence observed from one working tree or push
+/// destination as authority for another.
+pub(super) struct ValidatedPublication {
+    histories: Box<[ValidatedChangeHistory]>,
+    destination: PushDestination,
+}
+
+impl ValidatedPublication {
+    pub(in crate::pre_push) fn into_parts(
+        self,
+    ) -> (Box<[ValidatedChangeHistory]>, PushDestination) {
+        (self.histories, self.destination)
     }
 }
 
@@ -251,8 +278,8 @@ impl ExactLocalObservation<'_, '_, '_> {
 pub(super) async fn observe_and_validate_histories(
     local: &LocalStack,
     repository: &util::Repo,
-    destination: &PushDestination,
-) -> Result<Box<[ValidatedChangeHistory]>> {
+    destination: PushDestination,
+) -> Result<ValidatedPublication> {
     ExactLocalQueryPlan::for_stack(local)?
         .observe(repository, destination)
         .await?
@@ -267,8 +294,10 @@ async fn acquire(
 ) -> Result<()> {
     let (root, mode) = request.into_parts();
     let input = prepare_fetch_input(root)?;
-    let mut command = destination.exact_object_fetch(mode);
-    command.current_dir(repository.workdir().unwrap_or(repository.path()));
+    if !destination.belongs_to(repository)? {
+        bail!("Exact Git acquisition received a destination from a different repository");
+    }
+    let command = destination.exact_object_fetch(mode);
     let output =
         subprocess::output_with_regular_file_stdin(command, input, REMOTE_GIT_EXECUTION_TIMEOUT)
             .await
@@ -1222,9 +1251,12 @@ mod tests {
         let probe = runtime.block_on(subprocess::output(trace_probe, REAL_TEST_TIMEOUT)).unwrap();
         assert!(probe.status().success());
 
-        let destination =
-            PushDestination::resolve(util::RemoteName::from_config(b"origin").unwrap()).unwrap();
-        let result = match mode {
+        let destination = PushDestination::resolve(
+            &repository,
+            util::RemoteName::from_config(b"origin").unwrap(),
+        )
+        .unwrap();
+        let result = (match mode {
             // Making the remote unavailable after observation proves these
             // paths fail or succeed without attempting acquisition.
             RealMode::Complete | RealMode::Ordinary => {
@@ -1232,7 +1264,7 @@ mod tests {
                     .block_on(
                         ExactLocalQueryPlan::for_stack(&stack)
                             .unwrap()
-                            .observe(&repository, &destination),
+                            .observe(&repository, destination),
                     )
                     .unwrap();
                 fs::rename(&remote, root.join("remote.unavailable")).unwrap();
@@ -1240,9 +1272,10 @@ mod tests {
             }
             // Acquisition paths exercise the single production operation.
             RealMode::Negotiated | RealMode::Refetch => {
-                runtime.block_on(observe_and_validate_histories(&stack, &repository, &destination))
+                runtime.block_on(observe_and_validate_histories(&stack, &repository, destination))
             }
-        };
+        })
+        .map(|_| ());
         match mode {
             RealMode::Complete => {
                 assert!(result.is_ok(), "complete graph unexpectedly acquired: {result:?}")
@@ -1397,11 +1430,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn consuming_complete_observation_uses_its_sealed_stack_without_acquisition() {
+    async fn validated_publication_retains_the_observed_repository_and_destination() {
         let directory = tempfile::tempdir().unwrap();
         gix::init_bare(directory.path()).unwrap();
         let repository = util::Repo::open(directory.path().to_str().unwrap()).unwrap();
-        let destination = PushDestination::for_test();
+        let destination = PushDestination::for_test_in(&repository);
         let change_id = id("Absent");
         let default = default_branch();
         let proposal = ObjectId::from_hex(HEAD.as_bytes()).unwrap();
@@ -1414,18 +1447,41 @@ mod tests {
             .unwrap()
             .decode([output.as_bytes()])
             .unwrap();
-        let observation = ExactLocalObservation {
-            local: &local,
-            repository: &repository,
-            destination: &destination,
-            raw,
-        };
+        let observation =
+            ExactLocalObservation { local: &local, repository: &repository, destination, raw };
 
-        let histories = observation.validate_histories().await.unwrap();
+        let (histories, observed_destination) =
+            observation.validate_histories().await.unwrap().into_parts();
 
         assert_eq!(histories.len(), 1);
         assert_eq!(histories[0].id(), &change_id);
         assert!(histories[0].needs_publication());
+        assert_eq!(observed_destination.configured_remote(), "origin");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_observation_rejects_a_destination_bound_to_another_repository() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        gix::init_bare(first.path()).unwrap();
+        gix::init_bare(second.path()).unwrap();
+        let first = util::Repo::open(first.path().to_str().unwrap()).unwrap();
+        let second = util::Repo::open(second.path().to_str().unwrap()).unwrap();
+        let destination = PushDestination::for_test_in(&first);
+        let default = default_branch();
+        let local = LocalStack::for_history_test(
+            default.clone(),
+            [(id("Gone"), ObjectId::from_hex(HEAD.as_bytes()).unwrap(), default.tip())],
+        );
+
+        let error = ExactLocalQueryPlan::for_stack(&local)
+            .unwrap()
+            .observe(&second, destination)
+            .await
+            .err()
+            .unwrap();
+
+        assert!(error.to_string().contains("destination from a different repository"));
     }
 
     fn decode<'output>(
