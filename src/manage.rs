@@ -52,13 +52,17 @@ struct BranchConfig {
 }
 
 impl BranchConfig {
-    fn expected(state: Option<State>, branch_name: &str, default_remote: &str) -> BranchConfig {
+    fn expected(
+        state: Option<State>,
+        branch_name: &str,
+        default_remote: impl FnOnce() -> Result<util::RemoteName>,
+    ) -> Result<BranchConfig> {
         let self_merge_ref = format!("refs/heads/{branch_name}");
-        BranchConfig {
+        Ok(BranchConfig {
             push_remote: match state {
                 Some(State::Unmanaged) | None => None,
                 Some(State::Private) => Some(".".to_string()),
-                Some(State::Public) => Some(default_remote.to_string()),
+                Some(State::Public) => Some(default_remote()?.as_str().to_string()),
             },
             remote: match state {
                 Some(State::Unmanaged) | None => None,
@@ -68,7 +72,7 @@ impl BranchConfig {
                 Some(State::Unmanaged) | None => None,
                 Some(State::Private | State::Public) => Some(self_merge_ref),
             },
-        }
+        })
     }
 
     fn read_from(repo: &util::Repo, branch_name: &str) -> Result<BranchConfig> {
@@ -209,14 +213,16 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
         }
         TransitionKind::RecordUnmanaged => {}
         TransitionKind::ReconcileConfig => {
-            let default_remote = repo.default_remote_name();
             let current = BranchConfig::read_from(repo, &branch_name)?;
             // Compare against the old state's expected configuration, not the
             // requested state's configuration. Otherwise a transition could
             // silently adopt a user's custom value that happens to match the
             // new state, then treat that value as GHerrit-owned in the future.
-            let expected = BranchConfig::expected(old_state, &branch_name, &default_remote);
-            let desired = BranchConfig::expected(Some(new_state), &branch_name, &default_remote);
+            let expected =
+                BranchConfig::expected(old_state, &branch_name, || repo.default_remote_name())?;
+            let desired = BranchConfig::expected(Some(new_state), &branch_name, || {
+                repo.default_remote_name()
+            })?;
 
             match drift_decision(&current, &expected, force) {
                 DriftDecision::NoDrift => {}
@@ -340,14 +346,19 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         let upstream_merge = repo
             .config_string(&format!("branch.{branch_name}.merge"))
             .wrap_err("Failed to read config")?;
-        let upstream_merge_target = upstream_merge.as_deref().map(|merge| {
-            let merge_branch_name = merge.strip_prefix("refs/heads/").unwrap_or(merge);
-            if repo.is_a_default_branch_on_default_remote(merge_branch_name) {
-                PostCheckoutMergeTarget::DefaultBranch
-            } else {
-                PostCheckoutMergeTarget::OtherBranch
-            }
-        });
+        let upstream_merge_target = upstream_merge
+            .as_deref()
+            .map(|merge| {
+                let merge_branch_name = merge.strip_prefix("refs/heads/").unwrap_or(merge);
+                repo.is_a_default_branch_on_default_remote(merge_branch_name).map(|is_default| {
+                    if is_default {
+                        PostCheckoutMergeTarget::DefaultBranch
+                    } else {
+                        PostCheckoutMergeTarget::OtherBranch
+                    }
+                })
+            })
+            .transpose()?;
 
         PostCheckoutBranchObservation::NewlyCreated {
             has_upstream_remote: upstream_remote.is_some(),
@@ -409,6 +420,10 @@ mod tests {
                     .map(move |merge| branch_config(push_remote, remote, merge))
             })
         })
+    }
+
+    fn default_remote() -> Result<util::RemoteName> {
+        util::RemoteName::from_config(DEFAULT_REMOTE.as_bytes())
     }
 
     fn apply_changes(mut config: BranchConfig, desired: &BranchConfig) -> BranchConfig {
@@ -496,24 +511,39 @@ mod tests {
 
     #[test]
     fn expected_branch_configuration_is_owned_and_state_specific() {
-        assert_eq!(BranchConfig::expected(None, BRANCH, DEFAULT_REMOTE), BranchConfig::default());
+        let unused_remote = || -> Result<util::RemoteName> {
+            panic!("non-public configuration must not resolve a destination")
+        };
         assert_eq!(
-            BranchConfig::expected(Some(State::Unmanaged), BRANCH, DEFAULT_REMOTE),
+            BranchConfig::expected(None, BRANCH, unused_remote).unwrap(),
             BranchConfig::default()
         );
         assert_eq!(
-            BranchConfig::expected(Some(State::Private), BRANCH, DEFAULT_REMOTE),
+            BranchConfig::expected(Some(State::Unmanaged), BRANCH, unused_remote).unwrap(),
+            BranchConfig::default()
+        );
+        assert_eq!(
+            BranchConfig::expected(Some(State::Private), BRANCH, unused_remote).unwrap(),
             branch_config(Some("."), Some("."), Some("refs/heads/feature"))
         );
         assert_eq!(
-            BranchConfig::expected(Some(State::Public), BRANCH, DEFAULT_REMOTE),
+            BranchConfig::expected(Some(State::Public), BRANCH, default_remote).unwrap(),
             branch_config(Some("origin"), Some("."), Some("refs/heads/feature"))
         );
         assert_eq!(
-            BranchConfig::expected(Some(State::Private), BRANCH, "."),
-            BranchConfig::expected(Some(State::Public), BRANCH, "."),
+            BranchConfig::expected(Some(State::Private), BRANCH, unused_remote).unwrap(),
+            BranchConfig::expected(Some(State::Public), BRANCH, || {
+                util::RemoteName::from_config(b".")
+            })
+            .unwrap(),
             "private and public config may coincide for an unusual remote name"
         );
+
+        let error = BranchConfig::expected(Some(State::Public), BRANCH, || {
+            util::RemoteName::from_config(b"")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("remote is empty"));
     }
 
     #[test]
@@ -536,7 +566,10 @@ mod tests {
 
     #[test]
     fn config_drift_decision_has_exactly_three_outcomes() {
-        let expected = BranchConfig::expected(Some(State::Private), BRANCH, DEFAULT_REMOTE);
+        let expected = BranchConfig::expected(Some(State::Private), BRANCH, || {
+            panic!("private configuration must not resolve a destination")
+        })
+        .unwrap();
         let drifted = branch_config(Some("custom"), Some("."), Some("refs/heads/feature"));
 
         assert_eq!(drift_decision(&expected, &expected, false), DriftDecision::NoDrift);
@@ -559,8 +592,12 @@ mod tests {
 
     #[test]
     fn transition_does_not_adopt_config_owned_by_the_user() {
-        let expected_private = BranchConfig::expected(Some(State::Private), BRANCH, DEFAULT_REMOTE);
-        let already_public = BranchConfig::expected(Some(State::Public), BRANCH, DEFAULT_REMOTE);
+        let expected_private = BranchConfig::expected(Some(State::Private), BRANCH, || {
+            panic!("private configuration must not resolve a destination")
+        })
+        .unwrap();
+        let already_public =
+            BranchConfig::expected(Some(State::Public), BRANCH, default_remote).unwrap();
 
         assert_eq!(drift_decision(&already_public, &expected_private, false), DriftDecision::Block);
         assert_eq!(
