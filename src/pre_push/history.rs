@@ -753,13 +753,29 @@ impl ValidatedChangeHistory {
         published: &[(ObjectId, ObjectId)],
         proposal: (ObjectId, ObjectId),
     ) -> Self {
+        Self::for_plan_test(id, published, proposal, None)
+    }
+
+    /// Constructs trusted synthetic planning facts after history validation
+    /// has been tested at its own boundary.
+    #[cfg(test)]
+    pub(super) fn for_plan_test(
+        id: GherritPrId,
+        published: &[(ObjectId, ObjectId)],
+        proposal: (ObjectId, ObjectId),
+        pull_request_number: Option<super::github::PullRequestNumber>,
+    ) -> Self {
+        assert!(
+            pull_request_number.is_none() || !published.is_empty(),
+            "a pull request marker requires published history"
+        );
         let published = published.split_first().map(|(first, later)| PublishedHistory {
             first: Revision { head: first.0, first_parent: first.1 },
             later: later
                 .iter()
                 .map(|(head, first_parent)| Revision { head: *head, first_parent: *first_parent })
                 .collect(),
-            pull_request_marker: None,
+            pull_request_marker: pull_request_number.map(PullRequestMarker::new),
         });
         Self(ChangeHistory {
             id,
