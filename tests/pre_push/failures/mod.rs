@@ -214,6 +214,28 @@ fn test_stack_id_duplicated_in_default_history_fails_before_github_or_writes() {
 }
 
 #[test]
+fn test_case_variant_id_in_default_history_is_still_a_duplicate() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.commit("Default-branch history\n\nGherrit-Pr-Id: Gduplicate");
+    ctx.run_git(&["push", "--quiet", "--no-verify", "origin", "refs/heads/main:refs/heads/main"]);
+    let fixture_pushes = ctx.recorded_pushes();
+    ctx.checkout_managed_private("case-variant-duplicate-default-id");
+    ctx.commit_with_explicit_gherrit_id("Stack change", "Gduplicate");
+
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
+        "HEAD ancestry contains multiple commits with gherrit-pr-id 'Gduplicate'",
+    ));
+
+    assert!(ctx.github().requests().is_empty());
+    assert_eq!(ctx.recorded_pushes(), fixture_pushes);
+}
+
+#[test]
 fn test_default_branch_must_be_on_the_first_parent_stack_path() {
     let ctx = testutil::test_context!()
         .with_remote()
