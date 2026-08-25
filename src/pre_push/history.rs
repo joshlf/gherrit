@@ -1,27 +1,33 @@
-//! Literal revisions and structurally normalized publication history.
+//! Literal commit graph evidence and complete local change histories.
 //!
-//! Exact remote refs can describe either no state at all or one complete,
-//! nonempty publication history. This module rejects every partial shape and
-//! replaces each version target with facts read from that literal commit
-//! object. It deliberately does not inspect commit messages or traverse
-//! ancestry. Complete graph and change-identity validation belongs to #373;
-//! #374 later owns acquisition when one of those required graph objects is
-//! missing.
+//! Every raw history is structurally checked before the object database is
+//! touched. Sealed local evidence supplies proposals directly; one shared graph
+//! resolves only published commits external to each proposal. Complete history
+//! validation consumes that coupled value, and only the resulting newtype
+//! exposes revisions to later planning.
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    fmt,
+};
 
-use color_eyre::eyre::{Context as _, Result, bail, eyre};
+use color_eyre::eyre::{Context as _, Report, Result, bail, eyre};
 use gix::ObjectId;
 
-use super::{local::GherritPrId, remote::RawExactLocalChange, version::Version};
-use crate::util;
+use super::{
+    local::{
+        GHERRIT_ID_TRAILER_FORMAT, GherritPrId, LocalChange, LocalStack, gherrit_id_trailer_value,
+    },
+    remote::{RawExactLocalChange, RawExactLocalObservation},
+    version::Version,
+};
+use crate::util::{self, CommandExt as _};
 
 /// One commit and the literal first parent recorded in that commit object.
 ///
-/// The fields are private because an arbitrary pair is not literal commit
-/// evidence. This boundary intentionally does not require the parent object
-/// itself: complete graph validation and missing-object acquisition are later
-/// concerns.
+/// Only sealed [`LocalChange`] evidence or [`CommitGraphEvidence`] can
+/// construct this pair. Validation therefore never needs a second,
+/// potentially conflicting proof of its fields.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct Revision {
     head: ObjectId,
@@ -29,22 +35,8 @@ pub(super) struct Revision {
 }
 
 impl Revision {
-    fn from_literal_commit(repository: &util::Repo, head: ObjectId) -> Result<Self> {
-        let object = repository
-            .try_find_object(head)
-            .wrap_err_with(|| format!("Failed to read object {head}"))?
-            .ok_or_else(|| eyre!("Commit object {head} is missing"))?;
-        if object.kind != gix::object::Kind::Commit {
-            bail!("Object {head} is {}, not a commit", object.kind);
-        }
-        let commit = object.try_into_commit().map_err(|error| eyre!(error))?;
-        let decoded =
-            commit.decode().wrap_err_with(|| format!("Commit {head} has malformed encoding"))?;
-        let first_parent =
-            decoded.parents.first().ok_or_else(|| eyre!("Commit {head} has no first parent"))?;
-        let first_parent = ObjectId::from_hex(first_parent)
-            .wrap_err_with(|| format!("Commit {head} has an invalid first parent"))?;
-        Ok(Self { head, first_parent })
+    fn from_local(change: &LocalChange) -> Self {
+        Self { head: change.head(), first_parent: change.first_parent() }
     }
 
     pub(super) fn head(self) -> ObjectId {
@@ -56,28 +48,6 @@ impl Revision {
     }
 }
 
-/// Resolves each distinct head once while replaying every immutable slot.
-///
-/// This cache is deliberately scoped to one normalized change. #373 can lift
-/// literal evidence across changes after it owns the complete graph.
-fn resolve_version_slots(
-    slots: &[(Version, ObjectId)],
-    mut load: impl FnMut(Version, ObjectId) -> Result<Revision>,
-) -> Result<Vec<Revision>> {
-    let mut cache = HashMap::new();
-    slots
-        .iter()
-        .map(|(version, head)| {
-            if let Some(revision) = cache.get(head) {
-                return Ok(*revision);
-            }
-            let revision = load(*version, *head)?;
-            cache.insert(*head, revision);
-            Ok(revision)
-        })
-        .collect()
-}
-
 /// A structurally nonempty sequence of literal published revisions.
 ///
 /// Version numbers are derived from positions: `first` is v1 and position
@@ -86,24 +56,26 @@ fn resolve_version_slots(
 /// reduced to presence because its particular historical head has no later
 /// semantic meaning.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct PublishedHistory {
+struct PublishedHistory {
     first: Revision,
     later: Box<[Revision]>,
     has_pull_request_marker: bool,
 }
 
 impl PublishedHistory {
-    pub(super) fn len(&self) -> usize {
+    fn len(&self) -> usize {
         1 + self.later.len()
     }
 
-    pub(super) fn iter(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = Revision> + ExactSizeIterator + '_ {
-        (0..self.len()).map(|index| if index == 0 { self.first } else { self.later[index - 1] })
+    fn iter(&self) -> impl DoubleEndedIterator<Item = Revision> + ExactSizeIterator + '_ {
+        (0..self.len()).map(|index| self.at(index))
     }
 
-    pub(super) fn versioned(
+    fn at(&self, index: usize) -> Revision {
+        if index == 0 { self.first } else { self.later[index - 1] }
+    }
+
+    fn versioned(
         &self,
     ) -> impl DoubleEndedIterator<Item = (Version, Revision)> + ExactSizeIterator + '_ {
         self.iter().enumerate().map(|(index, revision)| {
@@ -113,34 +85,94 @@ impl PublishedHistory {
         })
     }
 
-    pub(super) fn current(&self) -> (Version, Revision) {
+    fn current(&self) -> CurrentVersion {
         let index = self.len() - 1;
-        let version = Version::from_history_index(index)
+        let number = Version::from_history_index(index)
             .expect("an in-memory history position always fits in u64");
         let revision = self.later.last().copied().unwrap_or(self.first);
-        (version, revision)
+        CurrentVersion { number, revision }
     }
 
-    pub(super) fn has_pull_request_marker(&self) -> bool {
+    fn has_pull_request_marker(&self) -> bool {
         self.has_pull_request_marker
     }
 }
 
-/// One request-bound remote history after structural normalization.
-///
-/// `None` means the requested head, owned base, version namespace, and marker
-/// were all absent. `Some` is necessarily nonempty and complete. The ID is
-/// copied from the exact request-derived raw observation rather than inferred
-/// from any commit message.
-#[derive(Debug, Eq, PartialEq)]
-pub(super) struct NormalizedHistory {
-    id: GherritPrId,
-    published: Option<PublishedHistory>,
+/// The current entry in one nonempty published or projected history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CurrentVersion {
+    number: Version,
+    revision: Revision,
 }
 
-impl NormalizedHistory {
-    /// Borrows and normalizes all raw facts for one exactly requested change.
-    pub(super) fn normalize(repository: &util::Repo, raw: &RawExactLocalChange) -> Result<Self> {
+impl CurrentVersion {
+    pub(super) fn number(self) -> Version {
+        self.number
+    }
+
+    pub(super) fn revision(self) -> Revision {
+        self.revision
+    }
+}
+
+/// Positional history which has passed every check not requiring the ODB.
+struct PreparedPublishedHistory {
+    first: ObjectId,
+    later: Box<[ObjectId]>,
+    owned_base: ObjectId,
+    has_pull_request_marker: bool,
+}
+
+impl PreparedPublishedHistory {
+    fn len(&self) -> usize {
+        1 + self.later.len()
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = ObjectId> + ExactSizeIterator + '_ {
+        (0..self.len()).map(|index| if index == 0 { self.first } else { self.later[index - 1] })
+    }
+
+    fn resolve_with(
+        self,
+        id: &GherritPrId,
+        mut resolve: impl FnMut(ObjectId) -> Result<Revision>,
+    ) -> Result<PublishedHistory> {
+        let mut revisions = self
+            .iter()
+            .enumerate()
+            .map(|(index, head)| {
+                let version = Version::from_history_index(index)
+                    .expect("a prepared history position fits in u64");
+                resolve(head).wrap_err_with(|| {
+                    format!(
+                        "Version v{version} of GHerrit change '{}' is not a complete literal revision",
+                        id.as_str()
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter();
+        let first = revisions.next().expect("a prepared published history is nonempty");
+        let later = revisions.collect::<Box<[_]>>();
+        let latest = later.last().copied().unwrap_or(first);
+        if self.owned_base != latest.first_parent() {
+            bail!(
+                "Remote GHerrit change '{}' owned base does not match the latest version's first parent",
+                id.as_str()
+            );
+        }
+        Ok(PublishedHistory { first, later, has_pull_request_marker: self.has_pull_request_marker })
+    }
+}
+
+/// One raw history after complete structural preflight but before resolution.
+struct PreparedHistory {
+    id: GherritPrId,
+    published: Option<PreparedPublishedHistory>,
+}
+
+impl PreparedHistory {
+    fn from_raw(raw: &RawExactLocalChange) -> Result<Self> {
         let id = raw.id().clone();
         let candidate_head = raw.candidate_head();
         let owned_base = raw.owned_base();
@@ -190,11 +222,10 @@ impl NormalizedHistory {
                         id.as_str()
                     );
                 }
-                Ok((expected, raw_version.object_id()))
+                Ok(raw_version.object_id())
             })
             .collect::<Result<Vec<_>>>()?;
-        let latest_head =
-            slots.last().expect("a complete published shape has at least one version").1;
+        let latest_head = *slots.last().expect("a complete published shape is nonempty");
         if candidate_head != Some(latest_head) {
             bail!(
                 "Remote GHerrit change '{}' head does not match its latest version tag",
@@ -203,7 +234,7 @@ impl NormalizedHistory {
         }
         let has_pull_request_marker = marker_target
             .map(|target| {
-                if !slots.iter().any(|(_, head)| *head == target) {
+                if !slots.contains(&target) {
                     bail!(
                         "Pull-request marker for GHerrit change '{}' does not target a published version head",
                         id.as_str()
@@ -214,36 +245,498 @@ impl NormalizedHistory {
             .transpose()?
             .unwrap_or(false);
 
-        let mut revisions = resolve_version_slots(&slots, |version, head| {
-            Revision::from_literal_commit(repository, head).wrap_err_with(|| {
-                format!(
-                    "Version v{version} of GHerrit change '{}' is not a complete literal revision",
-                    id.as_str()
-                )
-            })
-        })?
-        .into_iter();
-        let first = revisions.next().expect("a complete published shape has at least one version");
-        let later = revisions.collect::<Box<[_]>>();
-        let latest = later.last().copied().unwrap_or(first);
-        if owned_base != Some(latest.first_parent()) {
-            bail!(
-                "Remote GHerrit change '{}' owned base does not match the latest version's first parent",
-                id.as_str()
-            );
-        }
-
-        let published = PublishedHistory { first, later, has_pull_request_marker };
+        let mut slots = slots.into_iter();
+        let first = slots.next().expect("a complete published shape is nonempty");
+        let published = PreparedPublishedHistory {
+            first,
+            later: slots.collect(),
+            owned_base: owned_base.expect("the complete shape has an owned base"),
+            has_pull_request_marker,
+        };
         Ok(Self { id, published: Some(published) })
     }
 
-    pub(super) fn id(&self) -> &GherritPrId {
-        &self.id
+    fn version_heads(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        self.published.iter().flat_map(PreparedPublishedHistory::iter)
     }
 
-    pub(super) fn published(&self) -> Option<&PublishedHistory> {
-        self.published.as_ref()
+    fn external_version_heads(&self, proposal: ObjectId) -> impl Iterator<Item = ObjectId> + '_ {
+        self.version_heads().filter(move |head| *head != proposal)
     }
+
+    fn resolve(self, local: &LocalChange, graph: &CommitGraphEvidence) -> Result<ChangeHistory> {
+        let Self { id, published } = self;
+        let proposed = Revision::from_local(local);
+        let published = published
+            .map(|history| {
+                history.resolve_with(&id, |head| {
+                    if head == proposed.head() { Ok(proposed) } else { graph.revision(head) }
+                })
+            })
+            .transpose()?;
+        Ok(ChangeHistory { id, published, proposed })
+    }
+
+    #[cfg(test)]
+    fn resolve_remote_for_test(
+        self,
+        graph: &CommitGraphEvidence,
+    ) -> Result<(GherritPrId, Option<PublishedHistory>)> {
+        let Self { id, published } = self;
+        let published = published
+            .map(|history| history.resolve_with(&id, |head| graph.revision(head)))
+            .transpose()?;
+        Ok((id, published))
+    }
+
+    #[cfg(test)]
+    fn normalize_for_test(
+        repository: &util::Repo,
+        raw: &RawExactLocalChange,
+    ) -> Result<(GherritPrId, Option<PublishedHistory>)> {
+        let prepared = Self::from_raw(raw)?;
+        let roots = prepared.version_heads().collect::<Vec<_>>();
+        let graph = CommitGraphEvidence::load(repository, roots).map_err(graph_load_report)?;
+        prepared.resolve_remote_for_test(&graph)
+    }
+}
+
+/// Whole-set structural proof which keeps exact acquisition provenance alive.
+///
+/// #374 can borrow `observation()` and its retained `RawVersionRef::source_ref`
+/// values if graph loading reports a missing object. No source ref or fetchable
+/// object set is reconstructed here.
+pub(super) struct PreparedExactLocalHistories<'a> {
+    observation: &'a RawExactLocalObservation,
+    local: &'a LocalStack,
+    prepared: Box<[PreparedHistory]>,
+}
+
+impl<'a> PreparedExactLocalHistories<'a> {
+    pub(super) fn prepare(
+        observation: &'a RawExactLocalObservation,
+        local: &'a LocalStack,
+    ) -> Result<Self> {
+        // Collecting the whole iterator first is the authority boundary: every
+        // raw structural error precedes every object database access.
+        let prepared =
+            observation.iter().map(PreparedHistory::from_raw).collect::<Result<Box<[_]>>>()?;
+        if observation.default_branch() != local.default_branch() {
+            bail!("Exact local Git observation does not match the local stack's default branch");
+        }
+        if prepared.len() != local.len()
+            || prepared.iter().zip(local.iter()).any(|(history, change)| history.id != *change.id())
+        {
+            bail!("Exact local Git histories do not match the ordered local stack");
+        }
+        Ok(Self { observation, local, prepared })
+    }
+
+    pub(super) fn observation(&self) -> &RawExactLocalObservation {
+        self.observation
+    }
+
+    pub(super) fn graph_roots(&self) -> Box<[ObjectId]> {
+        let mut seen = HashSet::new();
+        // Failure precedence is semantic and stable: local-stack order, then
+        // version order. Only a slot external to its own sealed proposal is a
+        // root. An OID equal to another change's proposal remains external.
+        self.local
+            .iter()
+            .zip(&self.prepared)
+            .flat_map(|(local, prepared)| prepared.external_version_heads(local.head()))
+            .filter(|oid| seen.insert(*oid))
+            .collect()
+    }
+
+    pub(super) fn validate(
+        self,
+        graph: &CommitGraphEvidence,
+    ) -> Result<Box<[ValidatedChangeHistory]>> {
+        let histories = self
+            .prepared
+            .into_vec()
+            .into_iter()
+            .zip(self.local.iter())
+            .map(|(prepared, local)| prepared.resolve(local, graph))
+            .collect::<Result<Vec<_>>>()?;
+        histories.into_iter().map(|history| history.validate(graph)).collect()
+    }
+}
+
+/// Complete, unvalidated history for exactly one local change.
+///
+/// There is no inspection surface. The entire value must be consumed by
+/// [`ChangeHistory::validate`] before later planning can see a revision.
+#[derive(Debug)]
+struct ChangeHistory {
+    id: GherritPrId,
+    published: Option<PublishedHistory>,
+    proposed: Revision,
+}
+
+impl ChangeHistory {
+    fn external_published_revisions(&self) -> impl Iterator<Item = Revision> + '_ {
+        self.published
+            .iter()
+            .flat_map(PublishedHistory::iter)
+            .filter(|revision| revision.head() != self.proposed.head())
+    }
+
+    fn validate(self, graph: &CommitGraphEvidence) -> Result<ValidatedChangeHistory> {
+        let mut heads = Vec::new();
+        let mut head_set = HashSet::new();
+        for revision in self.external_published_revisions() {
+            if head_set.insert(revision.head()) {
+                heads.push(revision.head());
+            }
+        }
+
+        let expected = self.id.as_str().as_bytes();
+        for head in &heads {
+            let identities = graph.canonical_ids(*head);
+            if identities.len() != 1 || identities[0].as_ref() != expected {
+                bail!(
+                    "Head commit {head} must have exactly one gherrit-pr-id trailer equal to '{}'",
+                    self.id.as_str()
+                );
+            }
+        }
+
+        // LocalStack already proves the proposal's exact identity, literal
+        // first parent, default descent, and absence of this active ID from
+        // every other commit in complete proposal ancestry. For external
+        // published heads, exact own-ID checks plus this one all-parent union
+        // walk supply the complementary proof. Together those invariants imply
+        // owned-base and default-base safety without loading either local root.
+        let proper_ancestry =
+            heads.iter().flat_map(|head| graph.parents(*head).iter().copied()).collect::<Vec<_>>();
+        if let Some(duplicate) = graph.first_reachable(proper_ancestry, |oid| {
+            graph.canonical_ids(oid).iter().any(|identity| identity.as_ref() == expected)
+        }) {
+            bail!(
+                "Proper ancestry of GHerrit change '{}' repeats its gherrit-pr-id at commit {duplicate}",
+                self.id.as_str()
+            );
+        }
+
+        Ok(ValidatedChangeHistory(self))
+    }
+}
+
+/// Complete history evidence safe for planning to inspect.
+///
+/// This newtype owns the entire validated input and delegates read-only views;
+/// it has no decomposition or dereference escape hatch.
+#[derive(Debug)]
+pub(super) struct ValidatedChangeHistory(ChangeHistory);
+
+impl ValidatedChangeHistory {
+    pub(super) fn id(&self) -> &GherritPrId {
+        &self.0.id
+    }
+
+    pub(super) fn published_len(&self) -> usize {
+        self.0.published.as_ref().map_or(0, PublishedHistory::len)
+    }
+
+    pub(super) fn published_versions(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (Version, Revision)> + ExactSizeIterator + '_ {
+        (0..self.published_len()).map(|index| {
+            let history =
+                self.0.published.as_ref().expect("a positive published length has a history");
+            let version = Version::from_history_index(index)
+                .expect("an in-memory history position always fits in u64");
+            (version, history.at(index))
+        })
+    }
+
+    pub(super) fn published_current(&self) -> Option<CurrentVersion> {
+        self.0.published.as_ref().map(PublishedHistory::current)
+    }
+
+    pub(super) fn has_pull_request_marker(&self) -> bool {
+        self.0.published.as_ref().is_some_and(PublishedHistory::has_pull_request_marker)
+    }
+
+    pub(super) fn proposed(&self) -> Revision {
+        self.0.proposed
+    }
+
+    pub(super) fn needs_publication(&self) -> bool {
+        self.published_current().is_none_or(|current| current.revision() != self.proposed())
+    }
+
+    pub(super) fn projected_versions(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (Version, Revision)> + ExactSizeIterator + '_ {
+        let published_len = self.published_len();
+        let projected_len = published_len + usize::from(self.needs_publication());
+        (0..projected_len).map(move |index| {
+            let version = Version::from_history_index(index)
+                .expect("an in-memory projected position always fits in u64");
+            let revision = if index < published_len {
+                self.0.published.as_ref().expect("a published position has a history").at(index)
+            } else {
+                self.proposed()
+            };
+            (version, revision)
+        })
+    }
+
+    pub(super) fn projected_current(&self) -> CurrentVersion {
+        if self.needs_publication() {
+            let number = Version::from_history_index(self.published_len())
+                .expect("an in-memory projected position always fits in u64");
+            CurrentVersion { number, revision: self.proposed() }
+        } else {
+            self.published_current().expect("only a published revision can equal the proposal")
+        }
+    }
+
+    pub(super) fn contains_published_head(&self, head: ObjectId) -> bool {
+        self.published_versions().any(|(_, revision)| revision.head() == head)
+    }
+
+    pub(super) fn contains_published_first_parent(&self, first_parent: ObjectId) -> bool {
+        self.published_versions().any(|(_, revision)| revision.first_parent() == first_parent)
+    }
+}
+
+#[derive(Debug)]
+struct CommitFacts {
+    parents: Box<[ObjectId]>,
+}
+
+type CanonicalIdsByCommit = HashMap<ObjectId, Box<[Box<[u8]>]>>;
+const CANONICAL_ID_QUERY_BATCH_LEN: usize = 120;
+
+/// Complete literal all-parent graph shared by every exact local history.
+#[derive(Debug)]
+pub(super) struct CommitGraphEvidence {
+    commits: HashMap<ObjectId, CommitFacts>,
+    canonical_ids: CanonicalIdsByCommit,
+}
+
+/// Separates an acquirable missing object from invalid local graph evidence.
+#[derive(Debug)]
+pub(super) enum GraphLoadError {
+    MissingObject { oid: ObjectId },
+    Invalid(Report),
+}
+
+impl fmt::Display for GraphLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingObject { oid } => write!(formatter, "Commit object {oid} is missing"),
+            Self::Invalid(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for GraphLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MissingObject { .. } => None,
+            Self::Invalid(error) => error.source(),
+        }
+    }
+}
+
+fn graph_load_report(error: GraphLoadError) -> Report {
+    match error {
+        GraphLoadError::Invalid(error) => error,
+        error @ GraphLoadError::MissingObject { .. } => Report::new(error),
+    }
+}
+
+impl CommitGraphEvidence {
+    /// Loads and fully decodes each reachable commit once breadth-first: all
+    /// direct roots precede ancestry, while roots and each commit's declared
+    /// parents retain their supplied order.
+    pub(super) fn load(
+        repository: &util::Repo,
+        roots: impl IntoIterator<Item = ObjectId>,
+    ) -> std::result::Result<Self, GraphLoadError> {
+        let mut scheduled = HashSet::new();
+        let mut pending =
+            roots.into_iter().filter(|oid| scheduled.insert(*oid)).collect::<VecDeque<_>>();
+        let mut commits = HashMap::new();
+        let mut trailer_candidates = Vec::new();
+
+        while let Some(oid) = pending.pop_front() {
+            let object = repository
+                .try_find_object(oid)
+                .map_err(|error| {
+                    GraphLoadError::Invalid(
+                        Report::new(error).wrap_err(format!("Failed to read object {oid}")),
+                    )
+                })?
+                .ok_or(GraphLoadError::MissingObject { oid })?;
+            if object.kind != gix::object::Kind::Commit {
+                return Err(GraphLoadError::Invalid(eyre!(
+                    "Object {oid} is {}, not a commit",
+                    object.kind
+                )));
+            }
+            let commit = object
+                .try_into_commit()
+                .map_err(|error| GraphLoadError::Invalid(Report::new(error)))?;
+            let decoded = commit.decode().map_err(|error| {
+                GraphLoadError::Invalid(
+                    Report::new(error).wrap_err(format!("Commit {oid} has malformed encoding")),
+                )
+            })?;
+            if message_may_contain_identity(decoded.message) {
+                trailer_candidates.push(oid);
+            }
+            let parents = decoded
+                .parents
+                .iter()
+                .map(|parent| {
+                    ObjectId::from_hex(parent).map_err(|error| {
+                        GraphLoadError::Invalid(
+                            Report::new(error)
+                                .wrap_err(format!("Commit {oid} has an invalid parent ID")),
+                        )
+                    })
+                })
+                .collect::<std::result::Result<Box<[_]>, _>>()?;
+            pending.extend(parents.iter().copied().filter(|parent| scheduled.insert(*parent)));
+            assert!(commits.insert(oid, CommitFacts { parents }).is_none());
+        }
+
+        let canonical_ids =
+            read_canonical_ids(repository, trailer_candidates).map_err(GraphLoadError::Invalid)?;
+        Ok(Self { commits, canonical_ids })
+    }
+
+    fn revision(&self, head: ObjectId) -> Result<Revision> {
+        let commit = self
+            .commits
+            .get(&head)
+            .ok_or_else(|| eyre!("Commit {head} is absent from complete graph evidence"))?;
+        let first_parent = commit
+            .parents
+            .first()
+            .copied()
+            .ok_or_else(|| eyre!("Commit {head} has no first parent"))?;
+        Ok(Revision { head, first_parent })
+    }
+
+    fn parents(&self, oid: ObjectId) -> &[ObjectId] {
+        &self.commits.get(&oid).expect("complete graph contains every revision").parents
+    }
+
+    fn canonical_ids(&self, oid: ObjectId) -> &[Box<[u8]>] {
+        self.canonical_ids.get(&oid).map(Box::as_ref).unwrap_or_default()
+    }
+
+    fn first_reachable(
+        &self,
+        roots: impl IntoIterator<Item = ObjectId>,
+        mut target: impl FnMut(ObjectId) -> bool,
+    ) -> Option<ObjectId> {
+        let mut pending = VecDeque::from_iter(roots);
+        let mut visited = HashSet::new();
+        while let Some(oid) = pending.pop_front() {
+            if !visited.insert(oid) {
+                continue;
+            }
+            let commit = self
+                .commits
+                .get(&oid)
+                .expect("graph traversal starts within the loaded transitive closure");
+            if target(oid) {
+                return Some(oid);
+            }
+            pending.extend(commit.parents.iter().copied());
+        }
+        None
+    }
+}
+
+fn message_may_contain_identity(message: &[u8]) -> bool {
+    const KEY: &[u8] = b"gherrit-pr-id";
+    message.windows(KEY.len()).any(|window| window.eq_ignore_ascii_case(KEY))
+}
+
+fn read_canonical_ids(
+    repository: &util::Repo,
+    commits: impl IntoIterator<Item = ObjectId>,
+) -> Result<CanonicalIdsByCommit> {
+    read_canonical_ids_with(commits, |batch| {
+        let arguments = [
+            "log",
+            "--no-walk=unsorted",
+            "--no-show-signature",
+            "--no-notes",
+            "--no-decorate",
+            "-z",
+            GHERRIT_ID_TRAILER_FORMAT,
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .chain(batch.iter().map(ObjectId::to_string));
+        let mut command = util::cmd("git", arguments);
+        command.current_dir(repository.workdir().unwrap_or(repository.path()));
+        Ok(command.checked_output().wrap_err("Failed to parse commit trailers")?.stdout)
+    })
+}
+
+fn read_canonical_ids_with(
+    commits: impl IntoIterator<Item = ObjectId>,
+    mut query: impl FnMut(&[ObjectId]) -> Result<Vec<u8>>,
+) -> Result<CanonicalIdsByCommit> {
+    let commits = commits.into_iter().collect::<Vec<_>>();
+    if commits.iter().copied().collect::<HashSet<_>>().len() != commits.len() {
+        bail!("Canonical trailer query contains duplicate commits");
+    }
+    let mut observed = HashMap::with_capacity(commits.len());
+    for batch in commits.chunks(CANONICAL_ID_QUERY_BATCH_LEN) {
+        let output = query(batch)?;
+        for (oid, identities) in decode_canonical_ids(&output, batch)? {
+            assert!(observed.insert(oid, identities).is_none());
+        }
+    }
+    Ok(observed)
+}
+
+fn decode_canonical_ids(output: &[u8], requested: &[ObjectId]) -> Result<CanonicalIdsByCommit> {
+    let expected = requested.iter().copied().collect::<HashSet<_>>();
+    if expected.len() != requested.len() {
+        bail!("Canonical trailer query contains duplicate commits");
+    }
+    let mut observed = HashMap::with_capacity(requested.len());
+    let mut fields = output.split(|byte| *byte == 0);
+    loop {
+        let oid = fields.next().ok_or_else(|| eyre!("Git returned malformed trailer data"))?;
+        if oid.is_empty() {
+            if fields.next().is_some() {
+                bail!("Git returned trailing fields after commit trailer data");
+            }
+            break;
+        }
+        let oid = ObjectId::from_hex(oid).wrap_err("Git returned an invalid trailer object ID")?;
+        if !expected.contains(&oid) {
+            bail!("Git returned trailer data for unrequested commit {oid}");
+        }
+        let trailers =
+            fields.next().ok_or_else(|| eyre!("Git omitted trailer data for commit {oid}"))?;
+        let identities = trailers
+            .split(|byte| *byte == b'\n')
+            .filter_map(gherrit_id_trailer_value)
+            .map(|identity| identity.to_vec().into_boxed_slice())
+            .collect::<Box<[_]>>();
+        if observed.insert(oid, identities).is_some() {
+            bail!("Git returned duplicate trailer data for commit {oid}");
+        }
+    }
+    if observed.len() != expected.len() {
+        bail!("Git omitted trailer data for one or more requested commits");
+    }
+    Ok(observed)
 }
 
 #[cfg(test)]
@@ -309,10 +802,38 @@ mod tests {
             util::Repo::open(self.directory.path().to_str().expect("UTF-8 test path"))
                 .expect("open test repository")
         }
+
+        fn trailer_output(
+            &self,
+            format: &str,
+            commits: impl IntoIterator<Item = ObjectId>,
+        ) -> Vec<u8> {
+            let arguments = [
+                "log",
+                "--no-walk=unsorted",
+                "--no-show-signature",
+                "--no-notes",
+                "--no-decorate",
+                "-z",
+                format,
+            ]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .chain(commits.into_iter().map(|oid| oid.to_string()));
+            let mut command = util::cmd("git", arguments);
+            command.current_dir(self.directory.path());
+            let output = command.output().expect("run Git trailer formatter");
+            assert!(output.status.success(), "Git trailer formatter failed");
+            output.stdout
+        }
     }
 
     fn id(value: &str) -> GherritPrId {
         GherritPrId::from_ref_component(value.as_bytes()).expect("valid test change ID")
+    }
+
+    fn default_branch(name: &str, tip: ObjectId) -> DefaultBranch {
+        DefaultBranch::new(name.to_owned(), tip).unwrap()
     }
 
     fn version(value: u64) -> Version {
@@ -327,7 +848,7 @@ mod tests {
         versions: &[(u64, ObjectId)],
         marker_target: Option<ObjectId>,
     ) -> RawExactLocalObservation {
-        let default = DefaultBranch::new("main".to_owned(), default_tip).unwrap();
+        let default = default_branch("main", default_tip);
         let mut output = format!("{default_tip}\trefs/heads/main\n");
         if let Some(head) = candidate_head {
             output.push_str(&format!("{head}\trefs/heads/{}\n", id.as_str()));
@@ -347,6 +868,40 @@ mod tests {
             .unwrap()
     }
 
+    fn observe_many(
+        ids: &[GherritPrId],
+        default_tip: ObjectId,
+        records: impl fmt::Display,
+    ) -> RawExactLocalObservation {
+        observe_many_on(default_branch("main", default_tip), ids, records)
+    }
+
+    fn observe_many_on(
+        default: DefaultBranch,
+        ids: &[GherritPrId],
+        records: impl fmt::Display,
+    ) -> RawExactLocalObservation {
+        let output = format!("{}\trefs/heads/{}\n{records}", default.tip(), default.name());
+        ExactLocalQueryPlan::new(default, ids).unwrap().decode([output.as_bytes()]).unwrap()
+    }
+
+    fn external_history(
+        graph: &CommitGraphEvidence,
+        change_id: &GherritPrId,
+        published: ObjectId,
+        proposed: Revision,
+    ) -> ChangeHistory {
+        ChangeHistory {
+            id: change_id.clone(),
+            published: Some(PublishedHistory {
+                first: graph.revision(published).expect("external test head is a revision"),
+                later: Box::new([]),
+                has_pull_request_marker: false,
+            }),
+            proposed,
+        }
+    }
+
     fn normalize(
         repository: &TestRepository,
         id: &GherritPrId,
@@ -355,10 +910,10 @@ mod tests {
         owned_base: Option<ObjectId>,
         versions: &[(u64, ObjectId)],
         marker_target: Option<ObjectId>,
-    ) -> Result<NormalizedHistory> {
+    ) -> Result<(GherritPrId, Option<PublishedHistory>)> {
         let observed =
             observe(id, default_tip, candidate_head, owned_base, versions, marker_target);
-        NormalizedHistory::normalize(&repository.open(), observed.iter().next().unwrap())
+        PreparedHistory::normalize_for_test(&repository.open(), observed.iter().next().unwrap())
     }
 
     #[test]
@@ -397,9 +952,9 @@ mod tests {
                         );
                         if valid {
                             let normalized = result.unwrap();
-                            assert_eq!(normalized.id(), &change_id);
-                            assert_eq!(normalized.published().is_some(), has_versions);
-                            if let Some(history) = normalized.published() {
+                            assert_eq!(normalized.0, change_id);
+                            assert_eq!(normalized.1.is_some(), has_versions);
+                            if let Some(history) = normalized.1.as_ref() {
                                 assert_eq!(history.has_pull_request_marker(), has_marker);
                             }
                         }
@@ -433,7 +988,7 @@ mod tests {
                 None,
             )
             .expect("repeated literal history is valid");
-            let history = normalized.published().unwrap();
+            let history = normalized.1.unwrap();
             assert_eq!(history.iter().len(), expected.len());
             assert_eq!(history.versioned().len(), expected.len());
             assert_eq!(
@@ -447,9 +1002,9 @@ mod tests {
                     .map(|(index, head)| ((index + 1) as u64, *head))
                     .collect::<Vec<_>>()
             );
-            let (current_version, current_revision) = history.current();
-            assert_eq!(current_version.get(), expected.len() as u64);
-            assert_eq!(current_revision.head(), *expected.last().unwrap());
+            let current = history.current();
+            assert_eq!(current.number().get(), expected.len() as u64);
+            assert_eq!(current.revision().head(), *expected.last().unwrap());
             assert_eq!(
                 history.iter().rev().map(Revision::head).collect::<Vec<_>>(),
                 expected.iter().rev().copied().collect::<Vec<_>>()
@@ -546,18 +1101,14 @@ mod tests {
         .unwrap_err();
         assert!(marker.to_string().contains("does not target a published version head"));
 
-        let slots = [(version(1), a), (version(2), a), (version(3), b), (version(4), a)];
-        let mut loads = HashMap::<ObjectId, usize>::new();
-        let resolved = resolve_version_slots(&slots, |_, head| {
-            *loads.entry(head).or_default() += 1;
-            Ok(Revision { head, first_parent: root })
-        })
-        .unwrap();
+        let graph = CommitGraphEvidence::load(&repository.open(), [a, a, b, a]).unwrap();
+        let resolved =
+            [a, a, b, a].into_iter().map(|head| graph.revision(head).unwrap()).collect::<Vec<_>>();
         assert_eq!(
             resolved.iter().map(|revision| revision.head()).collect::<Vec<_>>(),
             [a, a, b, a]
         );
-        assert_eq!(loads, HashMap::from([(a, 1), (b, 1)]));
+        assert_eq!(graph.commits.len(), 3, "A, B, and their shared root load once");
     }
 
     #[test]
@@ -583,8 +1134,8 @@ mod tests {
         let normalized =
             normalize(&repository, &change_id, root, Some(head), Some(root), &versions, None)
                 .unwrap();
-        let history = normalized.published().unwrap();
-        assert_eq!(history.current().1, Revision { head, first_parent: root });
+        let history = normalized.1.unwrap();
+        assert_eq!(history.current().revision(), Revision { head, first_parent: root });
     }
 
     #[test]
@@ -609,7 +1160,7 @@ mod tests {
                 Some(marker),
             )
             .expect("marker names a published head");
-            assert!(normalized.published().unwrap().has_pull_request_marker());
+            assert!(normalized.1.unwrap().has_pull_request_marker());
         }
         for marker in [root, unrelated, missing] {
             let error = normalize(
@@ -652,12 +1203,12 @@ mod tests {
     fn distinguishes_absent_objects_from_object_database_failures() {
         let repository = TestRepository::new();
         let missing = ObjectId::from_bytes_or_panic(&[0x68; 20]);
-        let missing_error = Revision::from_literal_commit(&repository.open(), missing).unwrap_err();
+        let missing_error = CommitGraphEvidence::load(&repository.open(), [missing]).unwrap_err();
         assert_eq!(missing_error.to_string(), format!("Commit object {missing} is missing"));
 
         let corrupt = ObjectId::from_bytes_or_panic(&[0x69; 20]);
         repository.corrupt_loose_object(corrupt);
-        let read_error = Revision::from_literal_commit(&repository.open(), corrupt).unwrap_err();
+        let read_error = CommitGraphEvidence::load(&repository.open(), [corrupt]).unwrap_err();
         assert_eq!(read_error.to_string(), format!("Failed to read object {corrupt}"));
         assert!(!format!("{read_error:?}").contains("Commit object {corrupt} is missing"));
     }
@@ -699,13 +1250,13 @@ mod tests {
     }
 
     #[test]
-    fn reads_only_the_literal_head_without_traversing_its_parent() {
+    fn complete_graph_loading_requires_the_literal_parent() {
         let repository = TestRepository::new();
         let default_tip = repository.commit("default", &[]);
         let missing_parent = ObjectId::from_bytes_or_panic(&[0x77; 20]);
         let head = repository.commit("head", &[missing_parent]);
         let change_id = id("Gone");
-        let normalized = normalize(
+        let error = normalize(
             &repository,
             &change_id,
             default_tip,
@@ -714,8 +1265,8 @@ mod tests {
             &[(1, head)],
             None,
         )
-        .expect("graph completeness belongs to later validation");
-        assert_eq!(normalized.published().unwrap().current().1.first_parent(), missing_parent);
+        .expect_err("complete graph evidence must include the literal parent");
+        assert!(error.to_string().contains(&missing_parent.to_string()));
     }
 
     #[test]
@@ -738,7 +1289,7 @@ mod tests {
         )
         .expect("each version retains its own literal parent");
         assert_eq!(
-            normalized.published().unwrap().iter().map(Revision::first_parent).collect::<Vec<_>>(),
+            normalized.1.unwrap().iter().map(Revision::first_parent).collect::<Vec<_>>(),
             [root, rebased_parent]
         );
 
@@ -785,11 +1336,520 @@ mod tests {
             let head = repository.commit(message, &[root]);
             let observed = observe(&requested, root, Some(head), Some(root), &[(1, head)], None);
             let raw = observed.iter().next().unwrap();
-            let first = NormalizedHistory::normalize(&repository.open(), raw).unwrap();
-            let second = NormalizedHistory::normalize(&repository.open(), raw).unwrap();
-            assert_eq!(first.id(), &requested);
-            assert_eq!(second.id(), &requested);
+            let first = PreparedHistory::normalize_for_test(&repository.open(), raw).unwrap();
+            let second = PreparedHistory::normalize_for_test(&repository.open(), raw).unwrap();
+            assert_eq!(first.0, requested);
+            assert_eq!(second.0, requested);
             assert_eq!(raw.id(), &requested, "normalization must borrow raw evidence");
+        }
+    }
+
+    #[test]
+    fn aggregate_retains_provenance_and_exposes_only_whole_validated_history() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[]);
+        let published = repository.commit("published\n\ngherrit-pr-id: Gone\n", &[root]);
+        let proposal = repository.commit("proposal\n\ngherrit-pr-id: Gone\n", &[root]);
+        let change_id = id("Gone");
+        let local = LocalStack::for_history_test(
+            default_branch("main", root),
+            [(change_id.clone(), proposal, root)],
+        );
+        let observation = observe(
+            &change_id,
+            root,
+            Some(published),
+            Some(root),
+            &[(1, published)],
+            Some(published),
+        );
+
+        let prepared = PreparedExactLocalHistories::prepare(&observation, &local).unwrap();
+        assert!(std::ptr::eq(prepared.observation(), &observation));
+        assert_eq!(
+            prepared.observation().iter().next().unwrap().versions().next().unwrap().source_ref(),
+            "refs/tags/gherrit/Gone/v1"
+        );
+        assert_eq!(prepared.graph_roots().as_ref(), [published]);
+
+        let graph = CommitGraphEvidence::load(&repository.open(), prepared.graph_roots()).unwrap();
+        let mut histories = prepared.validate(&graph).unwrap().into_vec();
+        let validated = histories.pop().unwrap();
+
+        assert!(histories.is_empty());
+        assert_eq!(validated.id(), &change_id);
+        assert_eq!(validated.published_len(), 1);
+        assert_eq!(
+            validated.published_versions().collect::<Vec<_>>(),
+            [(version(1), Revision { head: published, first_parent: root })]
+        );
+        assert_eq!(
+            validated.published_current(),
+            Some(CurrentVersion {
+                number: version(1),
+                revision: Revision { head: published, first_parent: root },
+            })
+        );
+        assert!(validated.has_pull_request_marker());
+        assert_eq!(validated.proposed(), Revision { head: proposal, first_parent: root });
+        assert!(validated.needs_publication());
+        assert_eq!(
+            validated.projected_versions().collect::<Vec<_>>(),
+            [
+                (version(1), Revision { head: published, first_parent: root }),
+                (version(2), Revision { head: proposal, first_parent: root }),
+            ]
+        );
+        assert_eq!(
+            validated.projected_current(),
+            CurrentVersion {
+                number: version(2),
+                revision: Revision { head: proposal, first_parent: root },
+            }
+        );
+        assert!(validated.contains_published_head(published));
+        assert!(!validated.contains_published_head(proposal));
+        assert!(validated.contains_published_first_parent(root));
+    }
+
+    #[test]
+    fn aggregate_rejects_an_unrelated_complete_graph_without_panicking() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[]);
+        let unrelated = repository.commit("unrelated", &[root]);
+        let published = repository.commit("published\n\ngherrit-pr-id: Gone\n", &[root]);
+        let proposal = repository.commit("proposal\n\ngherrit-pr-id: Gone\n", &[root]);
+        let change_id = id("Gone");
+        let local = LocalStack::for_history_test(
+            default_branch("main", root),
+            [(change_id.clone(), proposal, root)],
+        );
+        let observation =
+            observe(&change_id, root, Some(published), Some(root), &[(1, published)], None);
+        let prepared = PreparedExactLocalHistories::prepare(&observation, &local).unwrap();
+        let unrelated_graph = CommitGraphEvidence::load(&repository.open(), [unrelated]).unwrap();
+
+        let error = prepared.validate(&unrelated_graph).unwrap_err();
+        let causes = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+
+        assert!(causes.iter().any(|cause| cause.contains(&published.to_string())));
+        assert!(causes.iter().any(|cause| cause.contains("absent from complete graph evidence")));
+    }
+
+    #[test]
+    fn validated_projection_covers_absent_v1_and_repeated_a_b_a_no_op() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[]);
+        let a = repository.commit("A\n\ngherrit-pr-id: Gone\n", &[root]);
+        let b = repository.commit("B\n\ngherrit-pr-id: Gone\n", &[root]);
+        let change_id = id("Gone");
+        let local = LocalStack::for_history_test(
+            default_branch("main", root),
+            [(change_id.clone(), a, root)],
+        );
+
+        let absent = observe(&change_id, root, None, None, &[], None);
+        let absent = PreparedExactLocalHistories::prepare(&absent, &local).unwrap();
+        assert!(absent.graph_roots().is_empty());
+        let empty_graph =
+            CommitGraphEvidence::load(&repository.open(), absent.graph_roots()).unwrap();
+        let mut histories = absent.validate(&empty_graph).unwrap().into_vec();
+        let absent = histories.pop().unwrap();
+        assert!(absent.needs_publication());
+        assert_eq!(
+            absent.projected_versions().collect::<Vec<_>>(),
+            [(version(1), Revision { head: a, first_parent: root })]
+        );
+        assert_eq!(absent.projected_current().number(), version(1));
+
+        let repeated =
+            observe(&change_id, root, Some(a), Some(root), &[(1, a), (2, b), (3, a)], None);
+        let repeated = PreparedExactLocalHistories::prepare(&repeated, &local).unwrap();
+        assert_eq!(repeated.graph_roots().as_ref(), [b]);
+        let graph = CommitGraphEvidence::load(&repository.open(), repeated.graph_roots()).unwrap();
+        let mut histories = repeated.validate(&graph).unwrap().into_vec();
+        let repeated = histories.pop().unwrap();
+
+        assert!(!repeated.needs_publication());
+        assert_eq!(repeated.published_len(), 3);
+        assert_eq!(
+            repeated.projected_versions().collect::<Vec<_>>(),
+            [
+                (version(1), Revision { head: a, first_parent: root }),
+                (version(2), Revision { head: b, first_parent: root }),
+                (version(3), Revision { head: a, first_parent: root }),
+            ]
+        );
+        assert_eq!(
+            repeated.projected_current(),
+            CurrentVersion {
+                number: version(3),
+                revision: Revision { head: a, first_parent: root },
+            }
+        );
+    }
+
+    #[test]
+    fn whole_set_structural_preflight_precedes_any_object_loading() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[]);
+        let proposal_a = repository.commit("proposal A\n\ngherrit-pr-id: A\n", &[root]);
+        let proposal_b = repository.commit("proposal B\n\ngherrit-pr-id: B\n", &[proposal_a]);
+        let missing_a = ObjectId::from_bytes_or_panic(&[0xa1; 20]);
+        let missing_b1 = ObjectId::from_bytes_or_panic(&[0xb1; 20]);
+        let missing_b3 = ObjectId::from_bytes_or_panic(&[0xb3; 20]);
+        let ids = [id("A"), id("B")];
+        let local = LocalStack::for_history_test(
+            default_branch("main", root),
+            [(ids[0].clone(), proposal_a, root), (ids[1].clone(), proposal_b, proposal_a)],
+        );
+        let records = format!(
+            "{missing_a}\trefs/heads/A\n\
+             {root}\trefs/heads/gherrit-bases/A\n\
+             {missing_a}\trefs/tags/gherrit/A/v1\n\
+             {missing_b3}\trefs/heads/B\n\
+             {proposal_a}\trefs/heads/gherrit-bases/B\n\
+             {missing_b1}\trefs/tags/gherrit/B/v1\n\
+             {missing_b3}\trefs/tags/gherrit/B/v3\n"
+        );
+        let observation = observe_many(&ids, root, records);
+
+        let error = PreparedExactLocalHistories::prepare(&observation, &local)
+            .err()
+            .expect("the later raw history has a structural gap");
+
+        assert!(error.to_string().contains("'B'"));
+        assert!(error.to_string().contains("noncontiguous version tags"));
+    }
+
+    #[test]
+    fn aggregate_rejects_default_name_or_tip_mismatch_before_graph_loading() {
+        let root = ObjectId::from_bytes_or_panic(&[0x31; 20]);
+        let other_tip = ObjectId::from_bytes_or_panic(&[0x32; 20]);
+        let proposal = ObjectId::from_bytes_or_panic(&[0x33; 20]);
+        let change_id = id("Gone");
+        let local_default = default_branch("main", root);
+        let local = LocalStack::for_history_test(
+            local_default.clone(),
+            [(change_id.clone(), proposal, root)],
+        );
+
+        for observed_default in [default_branch("main", other_tip), default_branch("trunk", root)] {
+            let observation =
+                observe_many_on(observed_default, std::slice::from_ref(&change_id), "");
+            let error = PreparedExactLocalHistories::prepare(&observation, &local)
+                .err()
+                .expect("the exact default path origin differs");
+            assert!(error.to_string().contains("does not match the local stack's default branch"));
+        }
+
+        let observation = observe_many_on(local_default, std::slice::from_ref(&change_id), "");
+        PreparedExactLocalHistories::prepare(&observation, &local)
+            .expect("the exact same default path origin is accepted");
+    }
+
+    #[test]
+    fn graph_roots_and_missing_errors_follow_semantic_discovery_order() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[]);
+        let proposal_a = repository.commit("proposal A\n\ngherrit-pr-id: A\n", &[root]);
+        let proposal_b = repository.commit("proposal B\n\ngherrit-pr-id: B\n", &[proposal_a]);
+        let published_a2 = repository.commit("published A2\n\ngherrit-pr-id: A\n", &[root]);
+        let published_a1 = proposal_b;
+        let published_b = proposal_b;
+        let ids = [id("A"), id("B")];
+        let local = LocalStack::for_history_test(
+            default_branch("main", root),
+            [(ids[0].clone(), proposal_a, root), (ids[1].clone(), proposal_b, proposal_a)],
+        );
+        let records = format!(
+            "{published_a2}\trefs/heads/A\n\
+             {root}\trefs/heads/gherrit-bases/A\n\
+             {published_a1}\trefs/tags/gherrit/A/v1\n\
+             {published_a2}\trefs/tags/gherrit/A/v2\n\
+             {published_b}\trefs/heads/B\n\
+             {proposal_a}\trefs/heads/gherrit-bases/B\n\
+             {published_b}\trefs/tags/gherrit/B/v1\n"
+        );
+        let observation = observe_many(&ids, root, records);
+        let prepared = PreparedExactLocalHistories::prepare(&observation, &local).unwrap();
+
+        assert_eq!(prepared.graph_roots().as_ref(), [proposal_b, published_a2]);
+
+        let first_missing = ObjectId::from_bytes_or_panic(&[0xc1; 20]);
+        let second_missing = ObjectId::from_bytes_or_panic(&[0xc2; 20]);
+        assert!(matches!(
+            CommitGraphEvidence::load(&repository.open(), [first_missing, second_missing]),
+            Err(GraphLoadError::MissingObject { oid }) if oid == first_missing
+        ));
+
+        let first_parent = ObjectId::from_bytes_or_panic(&[0xd1; 20]);
+        let second_parent = ObjectId::from_bytes_or_panic(&[0xd2; 20]);
+        let merge = repository.commit("merge", &[first_parent, second_parent]);
+        assert!(matches!(
+            CommitGraphEvidence::load(&repository.open(), [merge]),
+            Err(GraphLoadError::MissingObject { oid }) if oid == first_parent
+        ));
+
+        let missing_parent = ObjectId::from_bytes_or_panic(&[0xd3; 20]);
+        let root_with_missing_parent = repository.commit("root before ancestry", &[missing_parent]);
+        let missing_later_root = ObjectId::from_bytes_or_panic(&[0xd4; 20]);
+        assert!(matches!(
+            CommitGraphEvidence::load(
+                &repository.open(),
+                [root_with_missing_parent, missing_later_root],
+            ),
+            Err(GraphLoadError::MissingObject { oid }) if oid == missing_later_root
+        ));
+    }
+
+    #[test]
+    fn sparse_keyed_trailer_loading_matches_unfiltered_git_formatting() {
+        const UNFILTERED_FORMAT: &str = "--format=tformat:%H%x00%(trailers:only,unfold)";
+
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[]);
+        let messages = [
+            "subject\n\ngherrit-pr-id: Gone\n",
+            "subject\n\ngherrit-pr-id: Other\n",
+            "subject\n\nGherrit-Pr-Id: Gone\n",
+            "subject\n\ngherrit-pr-id: Gone\n continuation\n",
+            "subject\n\ngherrit-pr-id: Gone\n\nbody after the trailer-looking line\n",
+            "subject\n\nReviewed-by: Person <person@example.com>\n",
+            "subject\n\nNote: mentions gherrit-pr-id in an unrelated value\n",
+            "subject\n\ngherrit-pr-id: Gone\ngherrit-pr-id: Gone\n",
+            "subject\n\nReviewed-by: Person <person@example.com>\ngherrit-pr-id: Gone\n",
+        ];
+        let commits =
+            messages.iter().map(|message| repository.commit(message, &[root])).collect::<Vec<_>>();
+        let unfiltered = decode_canonical_ids(
+            &repository.trailer_output(UNFILTERED_FORMAT, commits.iter().copied()),
+            &commits,
+        )
+        .unwrap();
+        let keyed = read_canonical_ids(&repository.open(), commits.iter().copied()).unwrap();
+        let graph = CommitGraphEvidence::load(&repository.open(), commits.iter().copied()).unwrap();
+        let proposal = repository.commit("proposal\n\ngherrit-pr-id: Gone\n", &[root]);
+        let proposed = Revision { head: proposal, first_parent: root };
+
+        for commit in &commits {
+            assert_eq!(keyed.get(commit), unfiltered.get(commit), "commit={commit}");
+            assert_eq!(graph.canonical_ids(*commit), unfiltered[commit].as_ref());
+        }
+        assert!(message_may_contain_identity(messages[2].as_bytes()));
+        assert!(graph.canonical_ids.contains_key(&commits[2]));
+        assert!(!message_may_contain_identity(messages[5].as_bytes()));
+        assert!(!graph.canonical_ids.contains_key(&commits[5]));
+
+        let change_id = id("Gone");
+        let accepted = [true, false, true, false, false, false, false, false, true];
+        for (commit, accepted) in commits.iter().zip(accepted) {
+            let result = external_history(&graph, &change_id, *commit, proposed).validate(&graph);
+            assert_eq!(result.is_ok(), accepted, "commit={commit}");
+        }
+    }
+
+    #[test]
+    fn canonical_trailer_queries_cover_zero_one_and_batch_boundaries() {
+        let commits =
+            (1..=121).map(|byte| ObjectId::from_bytes_or_panic(&[byte; 20])).collect::<Vec<_>>();
+
+        for count in [0, 1, 120, 121] {
+            let mut calls = Vec::new();
+            let observed = read_canonical_ids_with(commits[..count].iter().copied(), |batch| {
+                calls.push(batch.to_vec());
+                Ok(batch
+                    .iter()
+                    .map(|oid| format!("{oid}\0gherrit-pr-id: Batch\n\0"))
+                    .collect::<String>()
+                    .into_bytes())
+            })
+            .unwrap();
+            let expected_calls = commits[..count]
+                .chunks(CANONICAL_ID_QUERY_BATCH_LEN)
+                .map(<[ObjectId]>::to_vec)
+                .collect::<Vec<_>>();
+
+            assert_eq!(calls, expected_calls);
+            assert_eq!(observed.len(), count);
+            for commit in &commits[..count] {
+                assert_eq!(observed[commit].len(), 1);
+                assert_eq!(observed[commit][0].as_ref(), b"Batch");
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_trailer_decoder_requires_exact_nul_framing_and_coverage() {
+        let a = ObjectId::from_bytes_or_panic(&[0xe1; 20]);
+        let b = ObjectId::from_bytes_or_panic(&[0xe2; 20]);
+        let valid = format!("{a}\0gherrit-pr-id: A\nOther: ignored\n\0{b}\0\0");
+        let decoded = decode_canonical_ids(valid.as_bytes(), &[a, b]).unwrap();
+        assert_eq!(decoded[&a].len(), 1);
+        assert_eq!(decoded[&a][0].as_ref(), b"A");
+        assert!(decoded[&b].is_empty());
+
+        let duplicate = format!("{a}\0\0{a}\0\0");
+        assert!(
+            decode_canonical_ids(duplicate.as_bytes(), &[a])
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate trailer data")
+        );
+        assert!(
+            decode_canonical_ids(valid.as_bytes(), &[a])
+                .unwrap_err()
+                .to_string()
+                .contains("unrequested commit")
+        );
+        assert!(
+            decode_canonical_ids(format!("{a}\0\0").as_bytes(), &[a, b])
+                .unwrap_err()
+                .to_string()
+                .contains("omitted trailer data")
+        );
+        assert!(
+            decode_canonical_ids(format!("{a}\0\0\0").as_bytes(), &[a])
+                .unwrap_err()
+                .to_string()
+                .contains("trailing fields")
+        );
+        assert!(
+            decode_canonical_ids(a.to_string().as_bytes(), &[a])
+                .unwrap_err()
+                .to_string()
+                .contains("omitted trailer data")
+        );
+        assert!(decode_canonical_ids(b"not-an-oid\0\0", &[a]).is_err());
+        assert!(
+            decode_canonical_ids(format!("{a}\0\0").as_bytes(), &[a, a])
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate commits")
+        );
+    }
+
+    #[test]
+    fn validation_checks_proper_ancestry_through_every_parent() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[]);
+        let proposal = repository.commit("proposal\n\ngherrit-pr-id: Gone\n", &[root]);
+        let first_parent_head = repository.commit("head\n\ngherrit-pr-id: Gone\n", &[proposal]);
+        let merge_head = repository.commit("merge\n\ngherrit-pr-id: Gone\n", &[root, proposal]);
+        let change_id = id("Gone");
+        let local = LocalStack::for_history_test(
+            default_branch("main", root),
+            [(change_id.clone(), proposal, root)],
+        );
+
+        for (head, owned_base) in [(first_parent_head, proposal), (merge_head, root)] {
+            let observation =
+                observe(&change_id, root, Some(head), Some(owned_base), &[(1, head)], None);
+            let prepared = PreparedExactLocalHistories::prepare(&observation, &local).unwrap();
+            assert_eq!(prepared.graph_roots().as_ref(), [head]);
+            let graph =
+                CommitGraphEvidence::load(&repository.open(), prepared.graph_roots()).unwrap();
+            let error = prepared.validate(&graph).unwrap_err();
+            assert!(error.to_string().contains("Proper ancestry"), "head={head}");
+            assert!(error.to_string().contains(&proposal.to_string()));
+        }
+    }
+
+    #[test]
+    fn direct_external_head_identity_error_precedes_ancestry_error() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[]);
+        let duplicate = repository.commit("ancestor\n\ngherrit-pr-id: Gone\n", &[root]);
+        let wrong = repository.commit("wrong\n\ngherrit-pr-id: Other\n", &[duplicate]);
+        let proposal = repository.commit("proposal\n\ngherrit-pr-id: Gone\n", &[root]);
+        let change_id = id("Gone");
+        let local = LocalStack::for_history_test(
+            default_branch("main", root),
+            [(change_id.clone(), proposal, root)],
+        );
+        let observation =
+            observe(&change_id, root, Some(wrong), Some(duplicate), &[(1, wrong)], None);
+        let prepared = PreparedExactLocalHistories::prepare(&observation, &local).unwrap();
+        assert_eq!(prepared.graph_roots().as_ref(), [wrong]);
+        let graph = CommitGraphEvidence::load(&repository.open(), prepared.graph_roots()).unwrap();
+        let error = prepared.validate(&graph).unwrap_err();
+
+        assert!(error.to_string().contains("must have exactly one"));
+        assert!(error.to_string().contains(&wrong.to_string()));
+        assert!(!error.to_string().contains("Proper ancestry"));
+    }
+
+    #[test]
+    fn union_reachability_matches_all_two_through_five_node_dags() {
+        for node_count in 2_usize..=5 {
+            let nodes = (1..=node_count)
+                .map(|byte| ObjectId::from_bytes_or_panic(&[byte as u8; 20]))
+                .collect::<Vec<_>>();
+            let edge_count = node_count * (node_count - 1) / 2;
+            for edge_mask in 0_usize..1 << edge_count {
+                let mut bit = 0;
+                let mut parent_indices = vec![Vec::new(); node_count];
+                for (child, parents) in parent_indices.iter_mut().enumerate() {
+                    for parent in 0..child {
+                        if edge_mask & (1 << bit) != 0 {
+                            parents.push(parent);
+                        }
+                        bit += 1;
+                    }
+                }
+                let commits = nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, oid)| {
+                        let parents =
+                            parent_indices[index].iter().map(|parent| nodes[*parent]).collect();
+                        (*oid, CommitFacts { parents })
+                    })
+                    .collect();
+                let graph = CommitGraphEvidence { commits, canonical_ids: HashMap::new() };
+
+                let mut closure = vec![vec![false; node_count]; node_count];
+                for index in 0..node_count {
+                    closure[index][index] = true;
+                    for parent in &parent_indices[index] {
+                        closure[index][*parent] = true;
+                    }
+                }
+                for via in 0..node_count {
+                    for source in 0..node_count {
+                        for target in 0..node_count {
+                            closure[source][target] |= closure[source][via] && closure[via][target];
+                        }
+                    }
+                }
+
+                for root_mask in 1_usize..1 << node_count {
+                    let roots = nodes
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| root_mask & (1 << index) != 0)
+                        .map(|(_, oid)| *oid)
+                        .collect::<Vec<_>>();
+                    for target_mask in 0_usize..1 << node_count {
+                        let expected = (0..node_count).any(|source| {
+                            root_mask & (1 << source) != 0
+                                && (0..node_count).any(|target| {
+                                    target_mask & (1 << target) != 0 && closure[source][target]
+                                })
+                        });
+                        let actual = graph
+                            .first_reachable(roots.iter().copied(), |oid| {
+                                let index = nodes.iter().position(|node| *node == oid).unwrap();
+                                target_mask & (1 << index) != 0
+                            })
+                            .is_some();
+                        assert_eq!(
+                            actual, expected,
+                            "nodes={node_count}, edges={edge_mask:b}, roots={root_mask:b}, targets={target_mask:b}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
