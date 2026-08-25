@@ -19,8 +19,10 @@ use super::{
 };
 use crate::pre_push::{
     batching::{MAX_MUTATION_ALIASES, MAX_MUTATION_REQUEST_BYTES},
+    body::GeneratedBody,
     json::UniqueJson,
-    local::GherritPrId,
+    local::{GherritPrId, PullRequestTitle},
+    publication::PublicationRevision,
 };
 
 fn owned_base_name(id: &GherritPrId) -> String {
@@ -97,7 +99,7 @@ enum PullRequestState {
 
 /// Exact wire intent for one stable-key pull request creation.
 #[derive(Debug, Eq, PartialEq)]
-struct CreatePullRequest {
+pub(in crate::pre_push) struct CreatePullRequest {
     id: GherritPrId,
     title: String,
     body: String,
@@ -114,6 +116,23 @@ impl CreatePullRequest {
         base_oid: ObjectId,
     ) -> Self {
         Self { id, title, body, head_oid, base_oid }
+    }
+
+    /// Consumes exact absence and typed local content into one stable-key
+    /// create operation.
+    pub(in crate::pre_push) fn from_absence(
+        absence: super::observation::AbsentPullRequest,
+        title: PullRequestTitle,
+        body: GeneratedBody,
+        revision: PublicationRevision,
+    ) -> Self {
+        Self::new(
+            absence.into_id(),
+            title.as_str().to_owned(),
+            body.into_string(),
+            revision.head(),
+            revision.owned_base(),
+        )
     }
 
     fn document(&self, repository_id: &RepositoryNodeId) -> String {
@@ -133,6 +152,17 @@ impl CreatePullRequest {
         format!(
             "createPullRequest(input: {{ {fields} }}) {{ clientMutationId, pullRequest {{ number, id, state, headRefName, headRefOid, headRepository {{ id }}, baseRefName, baseRefOid, baseRepository {{ id }} }} }}"
         )
+    }
+
+    #[cfg(test)]
+    fn test_view(&self) -> TestCreate {
+        TestCreate {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            body: self.body.clone(),
+            head_oid: self.head_oid,
+            base_oid: self.base_oid,
+        }
     }
 }
 
@@ -313,14 +343,16 @@ fn prepare_create_batches(
 }
 
 /// Every create batch preflighted before the first request can be sent.
-pub(super) struct PreparedCreates {
+pub(in crate::pre_push) struct PreparedCreates {
     repository_id: RepositoryNodeId,
     batches: Box<[PreparedCreateBatch]>,
     identities: PullRequestIdentityRegistry,
+    #[cfg(test)]
+    operations: Box<[TestCreate]>,
 }
 
 impl PreparedCreates {
-    fn new(
+    pub(super) fn new(
         repository_id: RepositoryNodeId,
         operations: Vec<CreatePullRequest>,
         identities: PullRequestIdentityRegistry,
@@ -337,11 +369,19 @@ impl PreparedCreates {
             }
         }
         let batches = prepare_create_batches(&repository_id, &operations)?;
-        Ok(Self { repository_id, batches, identities })
+        #[cfg(test)]
+        let operations = operations.iter().map(CreatePullRequest::test_view).collect();
+        Ok(Self {
+            repository_id,
+            batches,
+            identities,
+            #[cfg(test)]
+            operations,
+        })
     }
 
     async fn execute(self, github: &Github) -> Result<CompleteCreateReceipts> {
-        let Self { repository_id, batches, mut identities } = self;
+        let Self { repository_id, batches, mut identities, .. } = self;
         let operation_count = batches.iter().map(|batch| batch.expected.len()).sum();
         let mut values = Vec::with_capacity(operation_count);
         for batch in batches.into_vec() {
@@ -363,6 +403,11 @@ impl PreparedCreates {
     }
 
     #[cfg(test)]
+    pub(in crate::pre_push) fn operations_for_test(&self) -> &[TestCreate] {
+        &self.operations
+    }
+
+    #[cfg(test)]
     pub(super) fn for_test(
         repository_id: String,
         operations: Vec<TestCreate>,
@@ -377,7 +422,7 @@ impl PreparedCreates {
 }
 
 /// Opaque proof of one exact receipt for every create, in request order.
-pub(super) struct CompleteCreateReceipts {
+pub(in crate::pre_push) struct CompleteCreateReceipts {
     values: Box<[(GherritPrId, PullRequestIdentity)]>,
 }
 
@@ -388,10 +433,22 @@ impl CompleteCreateReceipts {
     ) -> impl ExactSizeIterator<Item = (&GherritPrId, &PullRequestIdentity)> {
         self.values.iter().map(|(id, identity)| (id, identity))
     }
+
+    /// Preserves exact create-request order for the planner's positional join.
+    pub(in crate::pre_push) fn into_values(self) -> Box<[(GherritPrId, PullRequestIdentity)]> {
+        self.values
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push) fn for_plan_test(
+        values: Vec<(GherritPrId, PullRequestIdentity)>,
+    ) -> Self {
+        Self { values: values.into_boxed_slice() }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct UpdatePullRequest {
+pub(in crate::pre_push) struct UpdatePullRequest {
     identity: PullRequestIdentity,
     title: Option<String>,
     body: Option<String>,
@@ -411,6 +468,21 @@ impl UpdatePullRequest {
         Ok(Self { identity, title, body, base_branch })
     }
 
+    /// Converts validated semantic differences into one bounded wire update.
+    pub(in crate::pre_push) fn from_projection(
+        identity: PullRequestIdentity,
+        title: Option<PullRequestTitle>,
+        body: Option<GeneratedBody>,
+        base_branch: Option<String>,
+    ) -> Result<Self> {
+        Self::new(
+            identity,
+            title.map(|title| title.as_str().to_owned()),
+            body.map(GeneratedBody::into_string),
+            base_branch,
+        )
+    }
+
     fn document(&self) -> String {
         let client_mutation_id = update_client_mutation_id(&self.identity);
         let fields = std::iter::once(("pullRequestId", self.identity.node_id().as_str()))
@@ -424,6 +496,16 @@ impl UpdatePullRequest {
         format!(
             "updatePullRequest(input: {{ {fields} }}) {{ clientMutationId, pullRequest {{ number, id, state }} }}"
         )
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push) fn into_test(self) -> TestUpdate {
+        TestUpdate {
+            identity: self.identity,
+            title: self.title,
+            body: self.body,
+            base_branch: self.base_branch,
+        }
     }
 }
 
@@ -542,15 +624,17 @@ fn prepare_update_batches(operations: &[UpdatePullRequest]) -> Result<Box<[Prepa
 }
 
 /// Every update batch preflighted before the first request can be sent.
-pub(super) struct PreparedUpdates {
+///
+/// The empty value is the complete representation of a projection which is
+/// already current; callers do not need a parallel optional-update state.
+pub(in crate::pre_push) struct PreparedUpdates {
     batches: Box<[PreparedUpdateBatch]>,
+    #[cfg(test)]
+    operations: Box<[TestUpdate]>,
 }
 
 impl PreparedUpdates {
-    fn new(operations: Vec<UpdatePullRequest>) -> Result<Self> {
-        if operations.is_empty() {
-            bail!("A prepared update action requires at least one operation");
-        }
+    pub(in crate::pre_push) fn new(operations: Vec<UpdatePullRequest>) -> Result<Self> {
         let mut numbers = HashSet::with_capacity(operations.len());
         let mut node_ids = HashSet::with_capacity(operations.len());
         for (index, operation) in operations.iter().enumerate() {
@@ -565,7 +649,19 @@ impl PreparedUpdates {
                 );
             }
         }
-        Ok(Self { batches: prepare_update_batches(&operations)? })
+        let batches = prepare_update_batches(&operations)?;
+        #[cfg(test)]
+        let operations = operations.into_iter().map(UpdatePullRequest::into_test).collect();
+        Ok(Self {
+            batches,
+            #[cfg(test)]
+            operations,
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push) fn operations_for_test(&self) -> &[TestUpdate] {
+        &self.operations
     }
 
     async fn execute(self, github: &Github) -> Result<()> {
@@ -604,12 +700,13 @@ impl Github {
 }
 
 #[cfg(test)]
-pub(super) struct TestCreate {
-    pub(super) id: GherritPrId,
-    pub(super) title: String,
-    pub(super) body: String,
-    pub(super) head_oid: ObjectId,
-    pub(super) base_oid: ObjectId,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::pre_push) struct TestCreate {
+    pub(in crate::pre_push) id: GherritPrId,
+    pub(in crate::pre_push) title: String,
+    pub(in crate::pre_push) body: String,
+    pub(in crate::pre_push) head_oid: ObjectId,
+    pub(in crate::pre_push) base_oid: ObjectId,
 }
 
 #[cfg(test)]
@@ -620,11 +717,12 @@ impl TestCreate {
 }
 
 #[cfg(test)]
-pub(super) struct TestUpdate {
-    pub(super) identity: PullRequestIdentity,
-    pub(super) title: Option<String>,
-    pub(super) body: Option<String>,
-    pub(super) base_branch: Option<String>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::pre_push) struct TestUpdate {
+    pub(in crate::pre_push) identity: PullRequestIdentity,
+    pub(in crate::pre_push) title: Option<String>,
+    pub(in crate::pre_push) body: Option<String>,
+    pub(in crate::pre_push) base_branch: Option<String>,
 }
 
 #[cfg(test)]
@@ -868,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_preflight_rejects_empty_or_duplicate_actions() {
+    fn mutation_preflight_accepts_empty_updates_and_rejects_invalid_actions() {
         let repository_id = RepositoryNodeId::new("REPOSITORY".to_owned()).unwrap();
         assert!(
             PreparedCreates::new(
@@ -887,7 +985,7 @@ mod tests {
             .is_err()
         );
 
-        assert!(PreparedUpdates::new(Vec::new()).is_err());
+        assert!(PreparedUpdates::new(Vec::new()).unwrap().operations_for_test().is_empty());
         let one = PullRequestIdentity::new(1, "ONE".to_owned()).unwrap();
         assert!(UpdatePullRequest::new(one.clone(), None, None, None).is_err());
         let same_number = PullRequestIdentity::new(1, "TWO".to_owned()).unwrap();
