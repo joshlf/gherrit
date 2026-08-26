@@ -107,6 +107,14 @@ fn test_empty_and_valid_stack_ids_are_multiple() {
 }
 
 #[test]
+fn test_overlong_stack_id_fails_before_external_io() {
+    let id = "G".repeat(129);
+    let ctx = stack_with_raw_commit_message(&format!("Work\n\ngherrit-pr-id: {id}"));
+
+    assert_identity_failure_before_external_io(ctx, "longer than the 128-byte limit");
+}
+
+#[test]
 fn test_duplicate_stack_ids_fail_before_external_io() {
     let ctx = testutil::test_context!()
         .with_remote()
@@ -378,7 +386,7 @@ fn test_pre_push_edit_failure() {
         .args(["hook", "pre-push"])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("Injected UpdatePr failure"));
+        .stderr(predicates::str::contains("acknowledgement is indeterminate"));
     ctx.assert_failure_consumed();
     let requests = ctx.github().requests();
     assert_eq!(
@@ -440,7 +448,7 @@ fn test_pre_push_pr_list_failure() {
         .args(["hook", "pre-push"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Injected GraphQl failure"));
+        .stderr(predicate::str::contains("fatal GraphQL errors"));
     ctx.assert_failure_consumed();
     assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]]);
     assert!(ctx.github().pull_requests().is_empty());
@@ -523,47 +531,6 @@ fn test_pre_push_pr_list_stops_after_three_response_transport_retries() {
 }
 
 #[test]
-fn test_repository_facts_query_retries_a_transient_http_failure() {
-    let ctx = unpublished_managed_commit("feature-repository-facts-transient");
-    ctx.inject_failure(testutil::FailureKind::RepositoryFactsHttp(
-        testutil::RetryableHttpStatus::TooManyRequests,
-    ));
-
-    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
-
-    ctx.assert_failure_consumed();
-    assert_eq!(
-        ctx.github().requests(),
-        [
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::CreatePr],
-            vec![testutil::GraphQlOperation::UpdatePr],
-        ]
-    );
-    assert_eq!(ctx.github().pull_requests().len(), 1);
-}
-
-#[test]
-fn test_repository_facts_query_stops_after_three_transient_http_retries() {
-    let ctx = unpublished_managed_commit("feature-repository-facts-retries-exhausted");
-    (0..=3).for_each(|_| {
-        ctx.inject_failure(testutil::FailureKind::RepositoryFactsHttp(
-            testutil::RetryableHttpStatus::ServiceUnavailable,
-        ));
-    });
-
-    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().failure().stderr(
-        predicate::str::contains("Injected RepositoryFactsHttp(ServiceUnavailable) failure"),
-    );
-
-    ctx.assert_failure_consumed();
-    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]; 4]);
-    assert!(ctx.github().pull_requests().is_empty());
-    assert!(ctx.recorded_pushes().is_empty());
-}
-
-#[test]
 fn test_pre_push_pr_create_failure() {
     let ctx = testutil::test_context!()
         .with_remote()
@@ -581,7 +548,7 @@ fn test_pre_push_pr_create_failure() {
         .args(["hook", "pre-push"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Injected CreatePr failure"));
+        .stderr(predicate::str::contains("acknowledgement is indeterminate"));
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),

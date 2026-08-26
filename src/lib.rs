@@ -4,6 +4,8 @@ mod manage;
 mod pre_push;
 mod util;
 
+use std::ffi::OsString;
+
 use clap::{Parser, Subcommand};
 use eyre::{Result, WrapErr};
 use manage::State;
@@ -53,11 +55,16 @@ enum Commands {
         #[arg(long, short)]
         force: bool,
 
-        /// Configure the branch to be public (`git push` syncs PRs *and* pushes the branch itself).
+        /// Configure the branch to be public.
+        ///
+        /// `git push` publishes PRs and projects the captured tip to a
+        /// same-named remote branch.
         #[arg(long, group = "visibility")]
         public: bool,
 
-        /// Configure the branch to be private (`git push` syncs PRs *only*; does not push the branch itself).
+        /// Configure the branch to be private.
+        ///
+        /// `git push` publishes PRs without a same-named remote projection.
         #[arg(long, group = "visibility")]
         private: bool,
     },
@@ -84,10 +91,10 @@ enum HookCommands {
     PrePush {
         /// Name of the remote being pushed to.
         #[arg(requires = "remote_location")]
-        remote_name: Option<String>,
+        remote_name: Option<OsString>,
         /// Location of the remote being pushed to.
         #[arg(requires = "remote_name")]
-        remote_location: Option<String>,
+        remote_location: Option<OsString>,
     },
     /// Git post-checkout hook.
     PostCheckout { prev: String, new: String, flag: String },
@@ -103,7 +110,9 @@ enum HookCommands {
 ///
 /// This boundary is asynchronous and fallible: it does not install process
 /// hooks, parse process arguments, terminate the process, or create a nested
-/// async runtime. Standalone binaries own those policies.
+/// async runtime. Standalone binaries own those policies. A managed pre-push
+/// invocation from Git reads enough hook input to prove the enclosing push has
+/// no ref update.
 pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
     if let Commands::Hook(HookCommands::PrePush { remote_name, remote_location }) = &cli.command
         && pre_push::is_internal_publication_push(
@@ -118,8 +127,9 @@ pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
 
     match cli.command {
         Commands::Hook(cmd) => match cmd {
-            HookCommands::PrePush { .. } => {
-                pre_push::run(&repo, &runtime.github_endpoint).await?;
+            HookCommands::PrePush { remote_name, remote_location } => {
+                let invocation = pre_push::Invocation::new(remote_name, remote_location)?;
+                pre_push::run(&repo, &runtime.github_endpoint, invocation).await?;
             }
             HookCommands::PostCheckout { prev, new, flag } => {
                 manage::post_checkout(&repo, &prev, &new, &flag)?
