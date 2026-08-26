@@ -33,13 +33,13 @@ use batching::{
 };
 use body::PrBody;
 use destination::{DefaultBranch, PushDestination};
+use json::UniqueJson;
 use legacy_github::{
     CreatePullRequest, CreatedPullRequest, FindPullRequest, MutationOperation,
     PullRequest as PrState, PullRequestNodeId, PullRequestNumber, QueryOperation,
     Repository as GithubRepository, UpdatePullRequest, decode_mutation_batch_response,
     decode_query_batch_response, prepare_mutation_batches, query_batch_document,
 };
-use json::UniqueJson;
 use legacy_publication::{plan_change, plan_push, push_batches};
 use legacy_remote::observe_publications;
 use local::LocalStack;
