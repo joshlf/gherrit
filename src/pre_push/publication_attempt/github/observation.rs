@@ -322,6 +322,7 @@ struct LocalPullRequestQuery {
 }
 
 impl LocalPullRequestQuery {
+    #[cfg(test)]
     fn new(id: GherritPrId, after: Option<String>) -> Result<Self> {
         if after.as_deref() == Some("") {
             bail!("A local pull request query requires a nonempty pagination cursor");

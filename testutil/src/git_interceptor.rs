@@ -1,13 +1,18 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 use axum::{extract::State as AxumState, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::{mock_server::MockState, FailureKind, GitOperation};
+use crate::{mock_server::MockState, FailureKind, GitOperation, TestEnvironment};
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct State {
     pushes: Vec<Push>,
+    remote_ref_updates_before_push: VecDeque<RemoteRefUpdate>,
 }
 
 impl State {
@@ -18,6 +23,24 @@ impl State {
     fn record_push(&mut self, args: Vec<String>, exit_code: i32) {
         self.pushes.push(Push { args, exit_code });
     }
+
+    pub(super) fn update_remote_ref_before_push(&mut self, ref_name: String, target: String) {
+        self.remote_ref_updates_before_push.push_back(RemoteRefUpdate { ref_name, target });
+    }
+
+    fn take_remote_ref_update_before_push(&mut self) -> Option<RemoteRefUpdate> {
+        self.remote_ref_updates_before_push.pop_front()
+    }
+
+    pub(super) fn pending_remote_ref_updates(&self) -> usize {
+        self.remote_ref_updates_before_push.len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteRefUpdate {
+    ref_name: String,
+    target: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +62,9 @@ impl Push {
 #[derive(Clone)]
 struct HandlerState {
     shared: Arc<RwLock<MockState>>,
+    remote_path: PathBuf,
+    system_git: PathBuf,
+    test_environment: TestEnvironment,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +79,12 @@ struct GitResponse {
     exit_code: i32,
     passthrough: bool,
     report_exit_status: bool,
+    push_stdout: Option<PushStdout>,
+}
+
+#[derive(Serialize)]
+enum PushStdout {
+    Replace(&'static str),
 }
 
 #[derive(Deserialize)]
@@ -61,11 +93,16 @@ struct GitCompletion {
     exit_code: i32,
 }
 
-pub(super) fn routes(shared: Arc<RwLock<MockState>>) -> Router {
+pub(super) fn routes(
+    shared: Arc<RwLock<MockState>>,
+    remote_path: PathBuf,
+    system_git: PathBuf,
+    test_environment: TestEnvironment,
+) -> Router {
     Router::new()
         .route("/_internal/git", post(handle_git))
         .route("/_internal/git/complete", post(complete_git))
-        .with_state(HandlerState { shared })
+        .with_state(HandlerState { shared, remote_path, system_git, test_environment })
 }
 
 impl GitOperation {
@@ -113,28 +150,83 @@ fn check_and_apply_failure(
     Some(consumed)
 }
 
+fn check_and_apply_push_stdout(mock_state: &mut MockState) -> Option<PushStdout> {
+    let FailureKind::GitPushOutput { preceding_pushes, stdout: _ } =
+        mock_state.faults.front_mut()?
+    else {
+        return None;
+    };
+    if *preceding_pushes != 0 {
+        *preceding_pushes -= 1;
+        return None;
+    }
+    let FailureKind::GitPushOutput { stdout, .. } = mock_state.faults.pop_front().unwrap() else {
+        unreachable!("the front fault was just matched as a push-output fault")
+    };
+    Some(PushStdout::Replace(stdout))
+}
+
 /// Returns the subcommand from the command shape emitted by GHerrit.
 ///
 /// The harness recognizes the small global-option grammar emitted by
 /// production, but intentionally does not emulate Git's general option
 /// grammar. Direct fixture commands still use the ordinary `git <subcommand>`
 /// shape.
-fn subcommand(args: &[String]) -> Option<&str> {
-    let mut arguments = args.iter().skip(1).map(String::as_str);
-    if arguments.next()? != "--no-replace-objects" {
-        return args.get(1).map(String::as_str).filter(|argument| !argument.starts_with('-'));
+fn subcommand_index(args: &[String]) -> Option<usize> {
+    let first = args.get(1)?;
+    if first != "--no-replace-objects" {
+        return (!first.starts_with('-')).then_some(1);
     }
 
+    let mut index = 2;
     loop {
-        match arguments.next()? {
+        match args.get(index)?.as_str() {
             "-c" => {
-                arguments.next()?;
+                args.get(index + 1)?;
+                index += 2;
             }
-            argument if argument.starts_with("--config-env=") => {}
-            subcommand if !subcommand.starts_with('-') => return Some(subcommand),
+            argument if argument.starts_with("--config-env=") => index += 1,
+            subcommand if !subcommand.starts_with('-') => return Some(index),
             _ => return None,
         }
     }
+}
+
+fn subcommand(args: &[String]) -> Option<&str> {
+    subcommand_index(args).map(|index| args[index].as_str())
+}
+
+/// Recognizes the destination-bound push shape emitted by GHerrit.
+///
+/// Faults scheduled at the publication boundary must not be consumed by a
+/// fixture push or by the user's enclosing push through an installed hook.
+fn is_publication_push(args: &[String]) -> bool {
+    let Some(index) = subcommand_index(args).filter(|index| args[*index] == "push") else {
+        return false;
+    };
+    let tail = &args[index + 1..];
+    let Some(remote) = tail
+        .iter()
+        .position(|argument| argument == "--")
+        .and_then(|separator| tail.get(separator + 1))
+    else {
+        return false;
+    };
+    let Some(suffix) = remote.strip_prefix("gherrit-publication") else {
+        return false;
+    };
+    if !suffix.is_empty()
+        && !suffix.strip_prefix('-').is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return false;
+    }
+
+    let url = format!("--config-env=remote.{remote}.url=");
+    let pushurl = format!("--config-env=remote.{remote}.pushurl=");
+    args[..index].iter().any(|argument| argument.starts_with(&url))
+        && args[..index].iter().any(|argument| argument.starts_with(&pushurl))
 }
 
 async fn handle_git(
@@ -143,6 +235,7 @@ async fn handle_git(
 ) -> Json<GitResponse> {
     let subcommand = subcommand(&request.args);
     let is_push = subcommand == Some("push");
+    let is_publication_push = is_publication_push(&request.args);
 
     let failure = fallible_operation(&request.args).and_then(|operation| {
         check_and_apply_failure(&mut handler.shared.write().unwrap(), operation)
@@ -154,11 +247,32 @@ async fn handle_git(
             exit_code: 1,
             passthrough: false,
             report_exit_status: false,
+            push_stdout: None,
         });
     }
 
     if is_push {
-        let state = handler.shared.read().unwrap();
+        let update = is_publication_push
+            .then(|| handler.shared.write().unwrap().git.take_remote_ref_update_before_push())
+            .flatten();
+        if let Some(RemoteRefUpdate { ref_name, target }) = update {
+            let output = handler
+                .test_environment
+                .command(&handler.system_git)
+                .arg("--git-dir")
+                .arg(&handler.remote_path)
+                .args(["update-ref", &ref_name, &target])
+                .output()
+                .expect("failed to apply scheduled remote ref update");
+            assert!(
+                output.status.success(),
+                "scheduled remote ref update failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let mut state = handler.shared.write().unwrap();
+        let push_stdout =
+            is_publication_push.then(|| check_and_apply_push_stdout(&mut state)).flatten();
         let stderr = format!(
             "remote: \nremote: Create a pull request for 'feature' on GitHub by visiting:\nremote:      https://github.com/{}/{}/pull/new/feature\nremote: \n",
             state.repo_owner, state.repo_name
@@ -169,6 +283,7 @@ async fn handle_git(
             exit_code: 0,
             passthrough: true,
             report_exit_status: true,
+            push_stdout,
         });
     }
 
@@ -178,6 +293,7 @@ async fn handle_git(
         exit_code: 0,
         passthrough: true,
         report_exit_status: false,
+        push_stdout: None,
     })
 }
 
@@ -209,8 +325,13 @@ mod tests {
     }
 
     fn handler_state() -> HandlerState {
+        let temporary = tempfile::tempdir().unwrap();
+        let system_git = PathBuf::from("git");
         HandlerState {
             shared: Arc::new(RwLock::new(MockState::new("owner".to_string(), "repo".to_string()))),
+            remote_path: temporary.path().to_path_buf(),
+            test_environment: TestEnvironment::new(temporary.path(), &system_git),
+            system_git,
         }
     }
 
@@ -249,6 +370,47 @@ mod tests {
     #[test]
     fn does_not_find_push_in_opaque_arguments() {
         assert_eq!(subcommand(&args(&["git", "show", "push"])), Some("show"));
+    }
+
+    #[test]
+    fn publication_faults_match_only_the_destination_bound_internal_push() {
+        let publication = args(&[
+            "git",
+            "--no-replace-objects",
+            "--config-env=remote.gherrit-publication-2.url=DESTINATION",
+            "--config-env=remote.gherrit-publication-2.pushurl=DESTINATION",
+            "-c",
+            "push.followTags=false",
+            "push",
+            "--atomic",
+            "--",
+            "gherrit-publication-2",
+            "HEAD:refs/heads/Gone",
+        ]);
+        assert!(is_publication_push(&publication));
+
+        for ordinary in [
+            args(&["git", "push", "origin", "HEAD:refs/heads/feature"]),
+            args(&[
+                "git",
+                "--no-replace-objects",
+                "--config-env=remote.gherrit-publication-probe.url=DESTINATION",
+                "--config-env=remote.gherrit-publication-probe.pushurl=DESTINATION",
+                "push",
+                "--",
+                "gherrit-publication-probe",
+            ]),
+            args(&[
+                "git",
+                "--no-replace-objects",
+                "--config-env=remote.gherrit-publication.url=DESTINATION",
+                "push",
+                "--",
+                "gherrit-publication",
+            ]),
+        ] {
+            assert!(!is_publication_push(&ordinary), "ordinary push: {ordinary:?}");
+        }
     }
 
     #[test]
