@@ -51,7 +51,7 @@ struct QueryPlan {
 }
 
 /// Exact request plan bound to the sealed stack which authorized it.
-pub(super) struct ExactLocalQueryPlan<'local> {
+struct ExactLocalQueryPlan<'local> {
     local: &'local LocalStack,
     plan: QueryPlan,
 }
@@ -140,7 +140,7 @@ pub(super) fn decode_for_test<'output>(
 impl<'local> ExactLocalQueryPlan<'local> {
     /// Binds exact remote acquisition to the path origin and ordered IDs
     /// already proved by the sealed local stack.
-    pub(super) fn for_stack(stack: &'local LocalStack) -> Result<Self> {
+    fn for_stack(stack: &'local LocalStack) -> Result<Self> {
         let ids = stack.iter().map(|change| change.id().clone()).collect::<Vec<_>>();
         let plan =
             QueryPlan::with_budget(stack.default_branch().clone(), &ids, QUERY_ARGV_BUDGET_BYTES)?;
@@ -154,8 +154,7 @@ impl<'local> ExactLocalQueryPlan<'local> {
 
     /// Runs every preplanned exact query sequentially and seals its stack,
     /// repository, and destination into the resulting acquisition authority.
-    #[allow(dead_code)]
-    pub(super) async fn observe<'repository, 'destination>(
+    async fn observe<'repository, 'destination>(
         self,
         repository: &'repository util::Repo,
         destination: &'destination PushDestination,
@@ -195,7 +194,7 @@ impl<'local> ExactLocalQueryPlan<'local> {
 /// None of the borrows has an accessor. The only production transition loads,
 /// optionally acquires, reloads, and validates histories through those exact
 /// capabilities.
-pub(super) struct ExactLocalObservation<'local, 'repository, 'destination> {
+struct ExactLocalObservation<'local, 'repository, 'destination> {
     local: &'local LocalStack,
     repository: &'repository util::Repo,
     destination: &'destination PushDestination,
@@ -211,7 +210,7 @@ impl ExactLocalObservation<'_, '_, '_> {
     /// the same payload in refetch mode only for a repository which was already
     /// promisor; an ordinary repository fails before network I/O. One
     /// successful fetch permits exactly one authoritative final reload.
-    pub(super) async fn validate_histories(self) -> Result<Box<[ValidatedChangeHistory]>> {
+    async fn validate_histories(self) -> Result<Box<[ValidatedChangeHistory]>> {
         let Self { local, repository, destination, raw } = self;
         let prepared = PreparedExactLocalHistories::prepare(raw, local, repository)?;
         let request = match prepared.load_graph() {
@@ -244,6 +243,26 @@ impl ExactLocalObservation<'_, '_, '_> {
         let graph = prepared.load_graph().map_err(GraphLoadError::into_report)?;
         prepared.validate(&graph)
     }
+}
+
+/// Obtains and validates the complete remote Git history for the local stack.
+///
+/// This is the only operation exposed to production callers. Its private
+/// intermediate types prevent callers from retaining, relabelling, or
+/// combining raw ref evidence from separate observations, or from changing
+/// the authorized stack or destination before validation. If advertised
+/// history is absent locally, this may perform one bounded acquisition which
+/// adds objects but does not update any local ref.
+pub(super) async fn observe_and_validate_histories(
+    local: &LocalStack,
+    repository: &util::Repo,
+    destination: &PushDestination,
+) -> Result<Box<[ValidatedChangeHistory]>> {
+    ExactLocalQueryPlan::for_stack(local)?
+        .observe(repository, destination)
+        .await?
+        .validate_histories()
+        .await
 }
 
 async fn acquire(
@@ -1272,15 +1291,25 @@ mod tests {
 
         let destination =
             PushDestination::resolve(util::RemoteName::from_config(b"origin").unwrap()).unwrap();
-        let observed = runtime
-            .block_on(
-                ExactLocalQueryPlan::for_stack(&stack).unwrap().observe(&repository, &destination),
-            )
-            .unwrap();
-        if matches!(mode, RealMode::Complete | RealMode::Ordinary) {
-            fs::rename(&remote, root.join("remote.unavailable")).unwrap();
-        }
-        let result = runtime.block_on(observed.validate_histories());
+        let result = match mode {
+            // Making the remote unavailable after observation proves these
+            // paths fail or succeed without attempting acquisition.
+            RealMode::Complete | RealMode::Ordinary => {
+                let observed = runtime
+                    .block_on(
+                        ExactLocalQueryPlan::for_stack(&stack)
+                            .unwrap()
+                            .observe(&repository, &destination),
+                    )
+                    .unwrap();
+                fs::rename(&remote, root.join("remote.unavailable")).unwrap();
+                runtime.block_on(observed.validate_histories())
+            }
+            // Acquisition paths exercise the single production operation.
+            RealMode::Negotiated | RealMode::Refetch => {
+                runtime.block_on(observe_and_validate_histories(&stack, &repository, &destination))
+            }
+        };
         match mode {
             RealMode::Complete => {
                 assert!(result.is_ok(), "complete graph unexpectedly acquired: {result:?}")
