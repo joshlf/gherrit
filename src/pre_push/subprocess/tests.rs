@@ -7,7 +7,7 @@
 
 use std::{
     env, fs,
-    io::Write as _,
+    io::{Read as _, Seek as _, Write as _},
     net::{SocketAddr, TcpListener, TcpStream},
     path::Path,
     process,
@@ -111,6 +111,11 @@ fn reexec_helper() {
             };
             process::exit(status);
         }
+        "copy-stdin" => {
+            let mut input = Vec::new();
+            std::io::stdin().read_to_end(&mut input).unwrap();
+            std::io::stdout().write_all(&input).unwrap();
+        }
         "clean-environment" => {
             for (name, _) in env::vars_os() {
                 let allowed = name == REEXEC_MODE;
@@ -202,6 +207,13 @@ fn reexec_helper() {
 
 fn reexec_bytes() -> usize {
     env::var(REEXEC_BYTES).unwrap().parse().unwrap()
+}
+
+fn copy_stdin_output(bytes: &[u8]) -> process::Output {
+    let mut input = tempfile::tempfile().unwrap();
+    input.write_all(bytes).unwrap();
+    input.rewind().unwrap();
+    reexec("copy-stdin").stdin(Stdio::from(input)).output().unwrap()
 }
 
 fn wait_for_marker_blocking(path: &Path) {
@@ -350,6 +362,92 @@ async fn supplies_null_stdin() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn supplies_immediate_eof_from_an_empty_regular_file() {
+    let input = RegularFileStdinBuilder::new().unwrap().finish().unwrap();
+
+    let output =
+        output_with_regular_file_stdin(reexec("null-stdin"), input, TEST_TIMEOUT).await.unwrap();
+
+    assert!(output.status().success());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn regular_file_stdin_is_rewound_and_can_exceed_pipe_capacity() {
+    let bytes = vec![b'i'; 1024 * 1024];
+    let mut input = RegularFileStdinBuilder::new().unwrap();
+    input.write_all(&bytes).unwrap();
+    let input = input.finish().unwrap();
+    let expected = copy_stdin_output(&bytes);
+
+    let output =
+        output_with_regular_file_stdin(reexec("copy-stdin"), input, TEST_TIMEOUT).await.unwrap();
+
+    assert!(output.status().success());
+    assert_eq!(output.stdout(), expected.stdout);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn regular_file_stdin_accepts_the_exact_limit() {
+    let bytes = b"12345678";
+    let mut input = RegularFileStdinBuilder::with_limit(bytes.len() as u64).unwrap();
+    input.write_all(bytes).unwrap();
+
+    let output =
+        output_with_regular_file_stdin(reexec("copy-stdin"), input.finish().unwrap(), TEST_TIMEOUT)
+            .await
+            .unwrap();
+
+    assert!(output.status().success());
+    assert_eq!(output.stdout(), copy_stdin_output(bytes).stdout);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn regular_file_stdin_rejects_overflow_without_writing_it() {
+    let bytes = b"12345678";
+    let mut input = RegularFileStdinBuilder::with_limit(bytes.len() as u64).unwrap();
+    input.write_all(bytes).unwrap();
+
+    let error = input.write_all(b"9").unwrap_err();
+    assert!(error.to_string().contains("8-byte limit"));
+
+    let output =
+        output_with_regular_file_stdin(reexec("copy-stdin"), input.finish().unwrap(), TEST_TIMEOUT)
+            .await
+            .unwrap();
+    assert_eq!(output.stdout(), copy_stdin_output(bytes).stdout);
+}
+
+#[test]
+fn regular_file_stdin_finish_rejects_a_changed_file() {
+    let mut input = RegularFileStdinBuilder::with_limit(8).unwrap();
+    input.write_all(b"input").unwrap();
+    input.file.set_len(0).unwrap();
+
+    let error = match input.finish() {
+        Ok(_) => panic!("accepted a regular-file input whose size changed"),
+        Err(error) => error,
+    };
+    assert_eq!(error, CommandError::StdinChanged);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn regular_file_stdin_is_revalidated_before_the_child_starts() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("started");
+    let mut command = reexec("marker");
+    command.env(REEXEC_MARKER, &marker);
+    let mut input = RegularFileStdinBuilder::with_limit(8).unwrap();
+    input.write_all(b"input").unwrap();
+    let input = input.finish().unwrap();
+    input.file.set_len(0).unwrap();
+
+    let error = output_with_regular_file_stdin(command, input, TEST_TIMEOUT).await.unwrap_err();
+
+    assert_eq!(error, CommandError::StdinChanged);
+    assert!(!marker.exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn reexec_environment_contains_only_documented_bootstrap_values() {
     let output = output(reexec("clean-environment"), TEST_TIMEOUT).await.unwrap();
 
@@ -426,6 +524,23 @@ async fn zero_timeout_does_not_start_the_command() {
     command.env(REEXEC_MARKER, &marker);
 
     let error = output(command, Duration::ZERO).await.unwrap_err();
+
+    assert_eq!(error, CommandError::TimedOut);
+    assert!(!marker.exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn zero_timeout_with_regular_stdin_does_not_start_the_command() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("started");
+    let mut command = reexec("marker");
+    command.env(REEXEC_MARKER, &marker);
+    let mut input = RegularFileStdinBuilder::new().unwrap();
+    input.write_all(b"bounded input").unwrap();
+
+    let error = output_with_regular_file_stdin(command, input.finish().unwrap(), Duration::ZERO)
+        .await
+        .unwrap_err();
 
     assert_eq!(error, CommandError::TimedOut);
     assert!(!marker.exists());
@@ -794,6 +909,31 @@ async fn aborting_the_future_terminates_the_owned_process_boundary() {
         .env(REEXEC_READY, &ready_path)
         .env(REEXEC_MARKER, &marker);
     let task = tokio::spawn(output(command, Duration::from_secs(30)));
+    wait_for_marker(&marker).await;
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    lifetime.wait_closed();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn aborting_a_regular_stdin_command_preserves_cleanup_semantics() {
+    let directory = tempfile::tempdir().unwrap();
+    let lifetime = ProcessProbe::start();
+    let ready_path = directory.path().join("descendant-ready");
+    let marker = directory.path().join("leader-ready");
+    let mut command = reexec("leader-waits-probed");
+    command
+        .env(REEXEC_LIFETIME, lifetime.address().to_string())
+        .env(REEXEC_READY, &ready_path)
+        .env(REEXEC_MARKER, &marker);
+    let mut input = RegularFileStdinBuilder::new().unwrap();
+    input.write_all(b"bounded input").unwrap();
+    let task = tokio::spawn(output_with_regular_file_stdin(
+        command,
+        input.finish().unwrap(),
+        Duration::from_secs(30),
+    ));
     wait_for_marker(&marker).await;
 
     task.abort();
