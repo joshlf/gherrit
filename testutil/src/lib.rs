@@ -476,13 +476,20 @@ pub enum FailureKind {
     GraphQl,
     QueryTransport,
     QueryHttp(RetryableHttpStatus),
-    RepositoryFactsHttp(RetryableHttpStatus),
     CreatePr,
+    CreatePrApplyThenDisconnect,
     CreatePrHttp(RetryableHttpStatus),
     SecondCreatePrHttp(RetryableHttpStatus),
     CreatePrRedirect(RedirectStatus),
     UpdatePr,
+    UpdatePrApplyThenDisconnect,
     Git(GitOperation),
+    /// Replaces stdout after an otherwise real push. `preceding_pushes`
+    /// counts matching pushes to pass through before applying the fault.
+    GitPushOutput {
+        preceding_pushes: usize,
+        stdout: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -613,6 +620,53 @@ impl MockGithub<'_> {
         });
     }
 
+    pub fn seed_cross_repository_pull_request(
+        &self,
+        seed: PullRequestSeed,
+        head_oid: &str,
+        base_oid: &str,
+    ) {
+        for (kind, oid) in [("head", head_oid), ("base", base_oid)] {
+            assert!(
+                oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "cross-repository {kind} object ID must be 40 hexadecimal digits"
+            );
+        }
+        self.context.mutate_mock_state(|state| {
+            let number = seed.number;
+            let mut pr = mock_server::PrEntry::mock(mock_server::MockPrArgs {
+                id: u64::try_from(number).expect("pull request number does not fit in u64"),
+                title: seed.title,
+                body: seed.body,
+                head: seed.head,
+                base: seed.base,
+                repo_owner: &state.repo_owner,
+                repo_name: &state.repo_name,
+            });
+            pr.head.sha = head_oid.to_owned();
+            pr.base.sha = base_oid.to_owned();
+            state.add_pr(pr);
+            state.cross_repository_prs.insert(number);
+        });
+    }
+
+    pub fn set_pull_request_landing_automation(
+        &self,
+        number: usize,
+        auto_merge: bool,
+        in_merge_queue: bool,
+    ) {
+        self.context.mutate_mock_state(|state| {
+            let pr = state
+                .prs
+                .iter_mut()
+                .find(|pr| pr.number == number)
+                .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
+            pr.auto_merge = auto_merge;
+            pr.in_merge_queue = in_merge_queue;
+        });
+    }
+
     pub fn set_pull_request_state(&self, number: usize, new_state: PullRequestState) {
         self.context.mutate_mock_state(|state| {
             let pr = state
@@ -630,17 +684,21 @@ impl Drop for TestContext {
         // Stop the server before fixture directories and state are released.
         drop(self.mock_server.take());
 
-        let (state_poisoned, pending_faults) = self
+        let (state_poisoned, pending_faults, pending_remote_ref_updates) = self
             .mock_server_state
             .as_ref()
             .map(|state| match state.read() {
-                Ok(state) => (false, state.faults.clone()),
-                Err(poisoned) => (true, poisoned.into_inner().faults.clone()),
+                Ok(state) => (false, state.faults.clone(), state.git.pending_remote_ref_updates()),
+                Err(poisoned) => {
+                    let state = poisoned.into_inner();
+                    (true, state.faults.clone(), state.git.pending_remote_ref_updates())
+                }
             })
             .unwrap_or_default();
         if state_poisoned {
             let message = format!(
-                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}"
+                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}; \
+                 unconsumed scheduled remote ref updates: {pending_remote_ref_updates}"
             );
             if thread::panicking() {
                 eprintln!("{message}");
@@ -649,11 +707,17 @@ impl Drop for TestContext {
             }
             return;
         }
-        if !pending_faults.is_empty() {
+        if !pending_faults.is_empty() || pending_remote_ref_updates != 0 {
             if thread::panicking() {
-                eprintln!("Test fixture also has unconsumed faults: {pending_faults:?}");
+                eprintln!(
+                    "Test fixture also has unconsumed faults: {pending_faults:?}; \
+                     unconsumed scheduled remote ref updates: {pending_remote_ref_updates}"
+                );
             } else {
-                panic!("Test fixture has unconsumed faults: {pending_faults:?}");
+                panic!(
+                    "Test fixture has unconsumed faults: {pending_faults:?}; \
+                     unconsumed scheduled remote ref updates: {pending_remote_ref_updates}"
+                );
             }
         }
     }
@@ -747,7 +811,7 @@ impl TestContext {
         id
     }
 
-    /// Creates a commit with a caller-supplied legacy or scenario identity.
+    /// Creates a commit with a caller-supplied scenario identity.
     pub fn commit_with_explicit_gherrit_id(&self, message: &str, id: &str) {
         assert!(
             !message.lines().any(|line| line.starts_with("gherrit-pr-id: ")),
@@ -835,7 +899,7 @@ impl TestContext {
     }
 
     pub fn configure_managed_public(&self, branch_name: &str) {
-        self.configure_managed(branch_name, MANAGED_PUBLIC, "origin");
+        self.configure_managed(branch_name, MANAGED_PUBLIC, ".");
     }
 
     fn configure_managed(&self, branch_name: &str, state: &str, push_remote: &str) {
@@ -848,7 +912,7 @@ impl TestContext {
 
     pub fn inject_failure(&self, kind: FailureKind) {
         match kind {
-            FailureKind::Git(_) => assert!(
+            FailureKind::Git(_) | FailureKind::GitPushOutput { .. } => assert!(
                 self.has_git_interceptor,
                 "missing test capability: .with_git_interceptor()"
             ),
@@ -859,6 +923,16 @@ impl TestContext {
 
     pub fn expect_git_failure(&self, operation: GitOperation) {
         self.inject_failure(FailureKind::Git(operation));
+    }
+
+    /// Schedules one remote ref update after observation and immediately
+    /// before GHerrit's next publication push.
+    pub fn update_remote_ref_before_push(&self, ref_name: &str, target: &str) {
+        assert!(self.has_remote, "missing test capability: .with_remote()");
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        self.mutate_mock_state(|state| {
+            state.git.update_remote_ref_before_push(ref_name.to_owned(), target.to_owned());
+        });
     }
 
     fn enqueue_failure(&self, kind: FailureKind) {
@@ -981,6 +1055,18 @@ impl TestContext {
     pub fn hook_cmd(&self, name: &str) -> TestCommand {
         let mut cmd = self.gherrit_cmd();
         cmd.args(["hook", name]);
+        cmd
+    }
+
+    /// Runs one hook script installed in this fixture with the same hermetic
+    /// environment inherited from a fixture Git process.
+    #[must_use = "command builders do nothing until executed"]
+    pub fn installed_hook_cmd(&self, name: &str) -> TestCommand {
+        let hook = self.repo_path.join(".git/hooks").join(name);
+        assert!(hook.is_file(), "hook {name:?} is not installed");
+        let mut cmd = TestCommand::new(hook);
+        cmd.current_dir(&self.repo_path);
+        self.configure_test_env(&mut cmd);
         cmd
     }
 
@@ -1273,12 +1359,26 @@ fn install_git_interceptor(path: &Path, _gherrit_bin: &Path) {
 fn install_git_interceptor(path: &Path, gherrit_bin: &Path) {
     // `Command::new("git")` resolves native executables without consulting
     // PATHEXT, so a batch-file wrapper named `git.cmd` would be bypassed.
-    fs::copy(gherrit_bin, path.join("git.exe")).unwrap();
+    hard_link_or_copy(gherrit_bin, &path.join("git.exe"));
 }
 
 fn install_gherrit_binary(path: &Path, gherrit_bin: &Path) {
     let gherrit_dst = path.join(if cfg!(windows) { "gherrit.exe" } else { "gherrit" });
-    fs::copy(gherrit_bin, &gherrit_dst).unwrap();
+    hard_link_or_copy(gherrit_bin, &gherrit_dst);
+}
+
+/// Installs a test executable without copying a large Cargo artifact when the
+/// fixture and target directory share a filesystem.
+fn hard_link_or_copy(source: &Path, destination: &Path) {
+    if let Err(link_error) = fs::hard_link(source, destination) {
+        fs::copy(source, destination).unwrap_or_else(|copy_error| {
+            panic!(
+                "failed to install test executable {:?}: hard link failed ({link_error}); \
+                 copy fallback failed ({copy_error})",
+                destination
+            )
+        });
+    }
 }
 
 fn init_git_bare_repo(environment: &TestEnvironment, system_git: &Path, path: &Path) {
@@ -1381,7 +1481,7 @@ mod tests {
 
         ctx.run_git(&["checkout", "main"]);
         ctx.checkout_managed_public("public-stack");
-        assert_state("public-stack", MANAGED_PUBLIC, "origin");
+        assert_state("public-stack", MANAGED_PUBLIC, ".");
     }
 
     #[test]
@@ -1401,6 +1501,28 @@ mod tests {
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .expect("fixture panic must have a string message");
         assert!(message.contains("Git(Var)"), "unexpected teardown panic: {message}");
+    }
+
+    #[test]
+    fn fixture_rejects_an_unconsumed_scheduled_remote_ref_update() {
+        let driver_dir = TempDir::new().unwrap();
+        let driver = driver_dir.path().join("gherrit-test-driver");
+        fs::write(&driver, "test driver placeholder").unwrap();
+
+        let panic = panic::catch_unwind(|| {
+            let ctx = TestContextBuilder::new(&driver).with_remote().with_git_interceptor().build();
+            ctx.update_remote_ref_before_push("refs/tags/race", &"1".repeat(40));
+        })
+        .expect_err("dropping the fixture must reject an unconsumed scheduled update");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("fixture panic must have a string message");
+        assert!(
+            message.contains("unconsumed scheduled remote ref updates: 1"),
+            "unexpected teardown panic: {message}"
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::{ObjectId, bstr::ByteSlice as _};
 
 use super::{INTERNAL_PRE_PUSH_REMOTE_ENV, subprocess};
-use crate::util;
+use crate::{manage::PublicBranchName, util};
 
 const DESTINATION_ENV: &str = "GHERRIT_PRIVATE_PUSH_DESTINATION";
 const GIT_CONFIG_PARAMETERS_ENV: &str = "GIT_CONFIG_PARAMETERS";
@@ -167,6 +167,48 @@ pub(super) struct PushDestination {
     repository: RepositoryBinding,
     resolved: ResolvedDestination,
     internal_remote: String,
+}
+
+/// Exact state of the requested public branch projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RemoteBranchState {
+    Absent,
+    At(ObjectId),
+}
+
+/// The requested public branch and the exact state observed for that same
+/// branch.
+///
+/// Keeping the request identity with its evidence prevents a planner from
+/// accidentally pairing one branch name with another branch's remote state.
+#[derive(Debug)]
+pub(super) struct ObservedPublicBranch {
+    name: PublicBranchName,
+    state: RemoteBranchState,
+}
+
+impl ObservedPublicBranch {
+    pub(super) fn into_parts(self) -> (PublicBranchName, RemoteBranchState) {
+        (self.name, self.state)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(name: PublicBranchName, state: RemoteBranchState) -> Self {
+        Self { name, state }
+    }
+}
+
+/// The complete bounded observation needed before collecting the local stack.
+#[derive(Debug)]
+pub(super) struct InitialRemoteObservation {
+    default_branch: DefaultBranch,
+    public_branch: Option<ObservedPublicBranch>,
+}
+
+impl InitialRemoteObservation {
+    pub(super) fn into_parts(self) -> (DefaultBranch, Option<ObservedPublicBranch>) {
+        (self.default_branch, self.public_branch)
+    }
 }
 
 /// The one acquisition behavior selected from exact graph-load evidence.
@@ -400,7 +442,6 @@ impl PushDestination {
     /// refspecs could update remote-tracking refs even for source-only wants.
     /// An empty bundle URI prevents a configured secondary object source and
     /// its creation-token state from participating in this one fetch.
-    #[allow(dead_code)]
     pub(super) fn exact_object_fetch(&self, mode: ExactObjectFetchMode) -> Command {
         let fixed = [
             "--quiet",
@@ -491,27 +532,35 @@ impl PushDestination {
         Ok(self.repository == RepositoryBinding::new(repository)?)
     }
 
-    pub(super) fn pr_url(&self, pr_number: u64) -> String {
-        format!(
-            "https://github.com/{}/{}/pull/{pr_number}",
-            self.resolved.coordinates.owner, self.resolved.coordinates.repository
-        )
-    }
-
     pub(super) fn repo_url_relative(&self) -> String {
         format!("/{}/{}", self.resolved.coordinates.owner, self.resolved.coordinates.repository)
     }
 
-    /// Observes the symbolic default branch and its exact tip from this
-    /// destination. No local remote-tracking ref participates in the result.
-    pub(super) async fn observe_default_branch(&self) -> Result<DefaultBranch> {
-        observe_default_branch_command(
-            self.ls_remote(["--symref".to_string()], ["HEAD".to_string()]),
+    /// Observes the symbolic default branch and optional exact public branch
+    /// through the shared bounded subprocess adapter. Public mode adds one ref
+    /// pattern without another network request. No local remote-tracking ref
+    /// participates in the result.
+    pub(super) async fn observe_initial(
+        &self,
+        public_branch: Option<PublicBranchName>,
+    ) -> Result<InitialRemoteObservation> {
+        let command = self.initial_observation_command(public_branch.as_ref());
+        observe_initial_command(
+            command,
             self.configured_remote(),
+            public_branch,
             subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
             subprocess::REMOTE_GIT_STDOUT_LIMIT,
         )
         .await
+    }
+
+    fn initial_observation_command(&self, public_branch: Option<&PublicBranchName>) -> Command {
+        self.ls_remote(
+            ["--symref".to_string()],
+            std::iter::once("HEAD".to_string())
+                .chain(public_branch.map(|branch| format!("refs/heads/{}", branch.as_str()))),
+        )
     }
 
     /// Returns bounded, redacted, terminal-safe context from a normally
@@ -525,6 +574,29 @@ impl PushDestination {
         stderr: &[u8],
         stderr_bytes: u64,
     ) -> Option<String> {
+        let retained = u64::try_from(stderr.len()).unwrap_or(u64::MAX);
+        let omitted_before_suffix = stderr_bytes.saturating_sub(retained);
+        let (stderr, omitted) = if omitted_before_suffix == 0 {
+            (stderr, 0)
+        } else if let Some(newline) = stderr.iter().position(|byte| *byte == b'\n') {
+            // The bounded reader retains the end of stderr. If bytes were
+            // dropped, the first retained byte can be in the middle of a
+            // `remote:` line or a private destination. Without its missing
+            // prefix that fragment cannot be classified or safely redacted.
+            // Discard through the first retained newline so filtering starts
+            // at a complete logical line.
+            let discarded = newline.saturating_add(1);
+            (
+                &stderr[discarded..],
+                omitted_before_suffix.saturating_add(u64::try_from(discarded).unwrap_or(u64::MAX)),
+            )
+        } else {
+            // There is no proof that any retained byte belongs to a complete
+            // line. The total byte count is still useful and reveals none of
+            // the untrusted fragment.
+            (&[][..], stderr_bytes)
+        };
+
         // Git prefixes remote-side messages with `remote:`. Those messages
         // are not evidence about a local composite pre-push policy and may
         // contain arbitrary server-private text. Git's own final failure line
@@ -566,8 +638,6 @@ impl PushDestination {
             }
         }
         let safe = safe.trim().to_owned();
-        let retained = u64::try_from(stderr.len()).unwrap_or(u64::MAX);
-        let omitted = stderr_bytes.saturating_sub(retained);
         let has_visible_content = safe
             .chars()
             .any(|character| character.is_alphanumeric() || character.is_ascii_punctuation());
@@ -609,21 +679,22 @@ impl PushDestination {
     }
 }
 
-async fn observe_default_branch_command(
+async fn observe_initial_command(
     command: Command,
     configured_remote: &str,
+    public_branch: Option<PublicBranchName>,
     timeout: Duration,
     stdout_limit: usize,
-) -> Result<DefaultBranch> {
+) -> Result<InitialRemoteObservation> {
     let output = subprocess::output_with_stdout_limit(command, timeout, stdout_limit)
         .await
         .wrap_err_with(|| format!("Failed to observe GHerrit remote '{configured_remote}'"))?;
     if !output.status().success() {
         bail!("`git ls-remote --symref` failed for GHerrit remote '{configured_remote}'");
     }
-    parse_default_branch(output.stdout()).wrap_err_with(|| {
+    parse_initial_remote_observation(output.stdout(), public_branch).wrap_err_with(|| {
         format!(
-            "GHerrit remote '{configured_remote}' did not report one valid symbolic default branch"
+            "GHerrit remote '{configured_remote}' did not report one valid initial ref observation"
         )
     })
 }
@@ -1158,9 +1229,23 @@ fn valid_repository_component(component: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+#[cfg(test)]
 fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
+    let InitialRemoteObservation { default_branch, public_branch } =
+        parse_initial_remote_observation(output, None)?;
+    debug_assert!(public_branch.is_none());
+    Ok(default_branch)
+}
+
+fn parse_initial_remote_observation(
+    output: &[u8],
+    requested_public_branch: Option<PublicBranchName>,
+) -> Result<InitialRemoteObservation> {
     let mut symbolic_head = None;
     let mut direct_head = None;
+    let requested_public_ref =
+        requested_public_branch.as_ref().map(|branch| format!("refs/heads/{}", branch.as_str()));
+    let mut direct_public_branch = None;
 
     for record in git_output_records(output) {
         let mut fields = record.split(|byte| *byte == b'\t');
@@ -1174,6 +1259,9 @@ fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
             if name == b"HEAD" && symbolic_head.replace(target).is_some() {
                 bail!("duplicate symbolic HEAD");
             }
+            if requested_public_ref.as_deref().is_some_and(|expected| name == expected.as_bytes()) {
+                bail!("requested public branch is symbolic");
+            }
         } else {
             validate_direct_advertised_ref_name(name)?;
             let object_id =
@@ -1183,6 +1271,11 @@ fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
             }
             if name == b"HEAD" && direct_head.replace(object_id).is_some() {
                 bail!("duplicate direct HEAD");
+            }
+            if requested_public_ref.as_deref().is_some_and(|expected| name == expected.as_bytes())
+                && direct_public_branch.replace(object_id).is_some()
+            {
+                bail!("duplicate requested public branch");
             }
         }
     }
@@ -1197,7 +1290,12 @@ fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
         .strip_prefix(b"refs/heads/")
         .ok_or_else(|| eyre!("symbolic HEAD does not target a local branch"))?;
     let branch = str::from_utf8(branch).wrap_err("default branch name is not UTF-8")?.to_owned();
-    DefaultBranch::new(branch, direct_head)
+    let default_branch = DefaultBranch::new(branch, direct_head)?;
+    let public_branch = requested_public_branch.map(|name| ObservedPublicBranch {
+        name,
+        state: direct_public_branch.map_or(RemoteBranchState::Absent, RemoteBranchState::At),
+    });
+    Ok(InitialRemoteObservation { default_branch, public_branch })
 }
 
 fn validate_advertised_ref_name(name: &[u8]) -> Result<()> {
@@ -1307,9 +1405,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn initial_observation_hang_is_bounded_off_the_async_runtime() {
         let started = Instant::now();
-        let observation = observe_default_branch_command(
+        let observation = observe_initial_command(
             observation_fixture("hang"),
             "origin",
+            None,
             Duration::from_millis(50),
             1024,
         );
@@ -1328,9 +1427,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn initial_observation_excess_output_enters_bounded_cleanup() {
         let started = Instant::now();
-        let error = observe_default_branch_command(
+        let error = observe_initial_command(
             observation_fixture("overflow"),
             "origin",
+            None,
             Duration::from_secs(2),
             32,
         )
@@ -1725,6 +1825,19 @@ mod tests {
     }
 
     #[test]
+    fn initial_observation_adds_only_the_checked_public_branch() {
+        let destination = destination();
+        let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+        let command = destination.initial_observation_command(Some(&branch));
+        let arguments = arguments(&command);
+
+        assert_eq!(
+            &arguments[arguments.len() - 2..],
+            [OsStr::new("HEAD"), OsStr::new("refs/heads/release-candidate")]
+        );
+    }
+
+    #[test]
     fn exact_object_fetch_has_one_fixed_source_only_stdin_grammar() {
         let destination = destination();
         for (mode, mode_argument) in [
@@ -2103,14 +2216,13 @@ mod tests {
         );
 
         let rendered = destination
-            .render_child_diagnostic(diagnostic.as_bytes(), diagnostic.len() as u64 + 7)
+            .render_child_diagnostic(diagnostic.as_bytes(), diagnostic.len() as u64)
             .unwrap();
 
         assert!(rendered.contains("policy denied publication for <private destination>"));
         assert!(rendered.contains("normalized local destination <private destination>"));
         assert!(rendered.contains("alternate transport <path or URL redacted>"));
         assert!(rendered.contains("\\u{1b}[31m\\r"));
-        assert!(rendered.contains("[7 earlier diagnostic bytes omitted]"));
         for private in [&literal, &canonical, "private-host", "private-owner", "private-repository"]
         {
             assert!(!rendered.contains(private), "rendered diagnostic disclosed {private:?}");
@@ -2121,6 +2233,41 @@ mod tests {
         assert!(!rendered.contains("remote end hung up"));
         assert!(!rendered.contains('\x1b'));
         assert!(!rendered.contains('\r'));
+    }
+
+    #[test]
+    fn truncated_child_diagnostics_discard_the_unclassifiable_first_line() {
+        let destination = destination();
+        let local = "local policy denied https://github.com/owner/repo.git";
+
+        for (first_line, private_fragment) in [
+            ("server-private text whose remote prefix was omitted", "server-private"),
+            ("ner/repo.git whose destination prefix was omitted", "ner/repo.git"),
+        ] {
+            let retained = format!("{first_line}\n{local}\n");
+            let rendered = destination
+                .render_child_diagnostic(
+                    retained.as_bytes(),
+                    u64::try_from(retained.len()).unwrap() + 17,
+                )
+                .unwrap();
+
+            assert_eq!(
+                rendered,
+                format!(
+                    "local policy denied <private destination>\n[{} earlier diagnostic bytes omitted]",
+                    17 + first_line.len() + 1
+                )
+            );
+            assert!(!rendered.contains(private_fragment));
+        }
+
+        let retained = b"ivate/repository.git";
+        let total = u64::try_from(retained.len()).unwrap() + 29;
+        assert_eq!(
+            destination.render_child_diagnostic(retained, total),
+            Some(format!("[{total} earlier diagnostic bytes omitted]"))
+        );
     }
 
     #[test]
@@ -2144,6 +2291,89 @@ mod tests {
                 .unwrap(),
             DefaultBranch::new("master".to_string(), ObjectId::from_hex(oid.as_bytes()).unwrap())
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn initial_observation_reports_exact_public_branch_presence_or_absence() {
+        let head = "1111111111111111111111111111111111111111";
+        let public = "2222222222222222222222222222222222222222";
+        let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+
+        for (extra, expected) in [
+            (String::new(), RemoteBranchState::Absent),
+            (
+                format!("{public}\trefs/heads/release-candidate\n"),
+                RemoteBranchState::At(ObjectId::from_hex(public.as_bytes()).unwrap()),
+            ),
+        ] {
+            let output = format!("ref: refs/heads/main\tHEAD\n{head}\tHEAD\n{extra}");
+            let observation =
+                parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).unwrap();
+            let (default, observed) = observation.into_parts();
+            assert_eq!(default.name(), "main");
+            let (observed_name, observed_state) = observed.unwrap().into_parts();
+            assert_eq!(observed_name, branch);
+            assert_eq!(observed_state, expected);
+        }
+    }
+
+    #[test]
+    fn initial_observation_rejects_ambiguous_public_branch_records() {
+        let oid = "1111111111111111111111111111111111111111";
+        let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+        for extra in [
+            format!("{oid}\trefs/heads/release-candidate\n{oid}\trefs/heads/release-candidate\n"),
+            "ref: refs/heads/other\trefs/heads/release-candidate\n".to_owned(),
+        ] {
+            let output = format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n{extra}");
+            assert!(
+                parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).is_err(),
+                "extra={extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_observation_rejects_malformed_public_branch_records() {
+        let oid = "1111111111111111111111111111111111111111";
+        let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+        for extra in [
+            "not-an-object-id\trefs/heads/release-candidate\n".to_owned(),
+            "0000000000000000000000000000000000000000\trefs/heads/release-candidate\n".to_owned(),
+            format!("{oid}\trefs/heads/invalid..branch\n"),
+        ] {
+            let output = format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n{extra}");
+            assert!(
+                parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).is_err(),
+                "extra={extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_observation_ignores_valid_unrequested_records_in_any_order() {
+        let head = "1111111111111111111111111111111111111111";
+        let public = "2222222222222222222222222222222222222222";
+        let unrelated = "3333333333333333333333333333333333333333";
+        let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+        let output = format!(
+            "{unrelated}\trefs/heads/candidate\n\
+             {public}\trefs/heads/release-candidate\n\
+             {head}\tHEAD\n\
+             ref: refs/heads/other\trefs/remotes/upstream/HEAD\n\
+             ref: refs/heads/main\tHEAD\n"
+        );
+
+        let observation =
+            parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).unwrap();
+        let (default, observed) = observation.into_parts();
+        assert_eq!(default.name(), "main");
+        let (observed_name, observed_state) = observed.unwrap().into_parts();
+        assert_eq!(observed_name, branch);
+        assert_eq!(
+            observed_state,
+            RemoteBranchState::At(ObjectId::from_hex(public.as_bytes()).unwrap())
         );
     }
 
