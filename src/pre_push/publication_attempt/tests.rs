@@ -5,6 +5,7 @@ use super::{
     github::{AbsentPullRequest, ObservedBase},
     history::ValidatedChangeHistory,
     local::{GherritPrId, LocalStack},
+    refs::TestPushEffect,
     *,
 };
 
@@ -29,6 +30,40 @@ fn identity(number: u32, node: &str) -> PullRequestIdentity {
 
 fn default_branch(name: &str, tip: ObjectId) -> DefaultBranch {
     DefaultBranch::new(name.to_owned(), tip).expect("valid test default branch")
+}
+
+#[test]
+fn public_branch_cannot_conflict_with_the_default_branch_ref_path() {
+    for (public, default) in [
+        ("release-v1", "release-v1"),
+        ("release-v1/work", "release-v1"),
+        ("release-v1", "release-v1/stable"),
+    ] {
+        let name = PublicBranchName::new(public.to_owned()).unwrap();
+        assert!(PublicBranch::new(name, &default_branch(default, oid(10))).is_err());
+    }
+
+    let name = PublicBranchName::new("release-v1/work".to_owned()).unwrap();
+    assert!(PublicBranch::new(name, &default_branch("release-v2", oid(10))).is_ok());
+}
+
+#[test]
+fn public_branch_plan_retains_exactly_the_observed_transition_state() {
+    let desired = oid(20);
+    for (remote, needs_transition) in [
+        (RemoteBranchState::Absent, true),
+        (RemoteBranchState::At(desired), false),
+        (RemoteBranchState::At(oid(19)), true),
+    ] {
+        let planned = ObservedPublicBranch {
+            branch: PublicBranch::for_test("release-candidate").unwrap(),
+            remote,
+        }
+        .plan(desired)
+        .unwrap();
+        assert_eq!(planned.branch().as_str(), "release-candidate");
+        assert_eq!(planned.transition().is_some(), needs_transition);
+    }
 }
 
 #[derive(Clone)]
@@ -186,6 +221,14 @@ fn plan_with_public_branch(
     public_branch: Option<String>,
 ) -> Result<PlannedPublication> {
     let Inputs { destination, stack, histories, pull_requests } = inputs(specs);
+    let public_branch = public_branch
+        .map(|name| {
+            PublicBranchName::new(name)
+                .and_then(|name| PublicBranch::new(name, stack.default_branch()))
+                .map(|branch| ObservedPublicBranch { branch, remote: RemoteBranchState::Absent })
+                .and_then(|branch| branch.plan(stack.tip()))
+        })
+        .transpose()?;
     plan_effects(&destination, public_branch, stack, histories, pull_requests)
 }
 
@@ -198,9 +241,11 @@ fn observed_for_plan(
 }
 
 fn tuple_count(pushes: &PreparedPushes) -> usize {
-    let refs = pushes.batches().map(|batch| batch.refspecs().len()).sum::<usize>();
-    assert_eq!(refs % 3, 0);
-    refs / 3
+    pushes
+        .batches()
+        .flat_map(|batch| batch.semantic_effects_for_test())
+        .filter(|effect| matches!(effect, TestPushEffect::Tuple { .. }))
+        .count()
 }
 
 fn marker_destinations(pushes: &PreparedPushes) -> Vec<String> {
@@ -219,16 +264,16 @@ fn tuple_for_test(history: &ValidatedChangeHistory) -> Option<Result<TupleTransi
 }
 
 fn ready(plan: PlannedPublication) -> MarkerStage {
-    match plan.after_tuples {
-        AfterTuples::Ready(stage) => *stage,
-        AfterTuples::Creates(_) => panic!("expected an all-existing projection"),
+    match plan.after_initial_refs {
+        AfterInitialRefs::Ready(stage) => *stage,
+        AfterInitialRefs::Creates(_) => panic!("expected an all-existing projection"),
     }
 }
 
 fn creates(plan: PlannedPublication) -> CreateStage {
-    match plan.after_tuples {
-        AfterTuples::Creates(stage) => *stage,
-        AfterTuples::Ready(_) => panic!("expected a create-dependent projection"),
+    match plan.after_initial_refs {
+        AfterInitialRefs::Creates(stage) => *stage,
+        AfterInitialRefs::Ready(_) => panic!("expected a create-dependent projection"),
     }
 }
 
@@ -290,7 +335,7 @@ fn planner_accepts_exactly_the_four_supported_local_realities() {
         pull_request: PullRequestSpec::Absent,
     }])
     .unwrap();
-    assert_eq!(tuple_count(&fresh.tuple_pushes), 1);
+    assert_eq!(tuple_count(&fresh.initial_pushes), 1);
     let fresh = creates(fresh);
     assert_eq!(fresh.creates.operations_for_test()[0].id, id("Gfresh"));
 
@@ -300,7 +345,7 @@ fn planner_accepts_exactly_the_four_supported_local_realities() {
         pull_request: PullRequestSpec::Absent,
     }])
     .unwrap();
-    assert_eq!(tuple_count(&recovery.tuple_pushes), 0);
+    assert_eq!(tuple_count(&recovery.initial_pushes), 0);
     assert_eq!(creates(recovery).creates.operations_for_test().len(), 1);
 
     let unmarked =
@@ -692,7 +737,7 @@ fn every_new_marker_targets_the_single_desired_revision() {
         pull_request: PullRequestSpec::Open(OpenSpec::new(7, oid(101), BaseKind::Owned, oid(10))),
     };
     let existing = plan(&[existing]).unwrap();
-    assert_eq!(tuple_count(&existing.tuple_pushes), 1);
+    assert_eq!(tuple_count(&existing.initial_pushes), 1);
     assert_eq!(
         marker_refspecs(&ready(existing).marker_pushes),
         [format!("{}:refs/tags/gherrit/Gexisting/pr", oid(20))]
@@ -704,7 +749,7 @@ fn every_new_marker_targets_the_single_desired_revision() {
         pull_request: PullRequestSpec::Absent,
     };
     let absent = plan(&[absent]).unwrap();
-    assert_eq!(tuple_count(&absent.tuple_pushes), 1);
+    assert_eq!(tuple_count(&absent.initial_pushes), 1);
     let absent = creates(absent);
     assert_eq!(absent.creates.operations_for_test()[0].head_oid, oid(20));
     let absent = absent.complete_for_test(receipts(&[("Gabsent", 8, "PR_8")])).unwrap();
@@ -734,8 +779,8 @@ fn mixed_specs() -> [EntrySpec; 4] {
 #[test]
 fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
     let plan =
-        plan_with_public_branch(&mixed_specs(), Some("release/candidate".to_owned())).unwrap();
-    assert_eq!(tuple_count(&plan.tuple_pushes), 1);
+        plan_with_public_branch(&mixed_specs(), Some("release-candidate".to_owned())).unwrap();
+    assert_eq!(tuple_count(&plan.initial_pushes), 1);
     let stage = creates(plan);
     let create_operations = stage.creates.operations_for_test();
     assert_eq!(create_operations.len(), 2);
@@ -751,7 +796,9 @@ fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
     for (operation, expected_id) in create_operations.iter().zip(["Gtwo", "Gfour"]) {
         assert_eq!(operation.title, desired_title(expected_id));
         assert!(operation.body.contains(&desired_body(expected_id)));
-        assert!(operation.body.contains("[release\\/candidate](../tree/release/candidate)"));
+        assert!(
+            operation.body.contains("[release\\-candidate](/owner/repo/tree/release-candidate)")
+        );
         assert!(operation.body.contains(&format!("refs/heads/{expected_id}")));
     }
 
@@ -778,7 +825,7 @@ fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
     for (update, expected_id) in updates.iter().zip(["Gone", "Gtwo", "Gthree", "Gfour"]) {
         let body = update.body.as_deref().unwrap();
         assert!(body.contains(&desired_body(expected_id)));
-        assert!(body.contains("[release\\/candidate](../tree/release/candidate)"));
+        assert!(body.contains("[release\\-candidate](/owner/repo/tree/release-candidate)"));
         assert!(body.contains(&format!("refs/heads/{expected_id}")));
         for other_id in ["Gone", "Gtwo", "Gthree", "Gfour"] {
             assert_eq!(body.contains(&desired_body(other_id)), other_id == expected_id);
@@ -871,11 +918,11 @@ fn exact_update_preflight_after_receipts_still_precedes_marker_release() {
         history: HistorySpec::absent(),
         pull_request: PullRequestSpec::Absent,
     };
-    let oversized_node = "N".repeat(super::batching::MAX_MUTATION_REQUEST_BYTES);
+    let oversized_node = "N".repeat(super::github::MAX_MUTATION_REQUEST_BYTES);
     let receipts =
         CompleteCreateReceipts::for_plan_test(vec![(id("Gone"), identity(1, &oversized_node))]);
     let error = creates(plan(&[spec]).unwrap()).complete_for_test(receipts).err().unwrap();
-    let limit = super::batching::MAX_MUTATION_REQUEST_BYTES;
+    let limit = super::github::MAX_MUTATION_REQUEST_BYTES;
     assert!(error.to_string().contains(&format!("exceeds the {limit}-byte request limit")));
 }
 
@@ -889,7 +936,7 @@ fn every_statically_known_stage_is_preflighted_before_a_tuple_plan_can_escape() 
     let Inputs { destination, stack, histories, pull_requests } = inputs(&[fresh]);
     let (github_default, observations, _) =
         pull_requests.into_planning_parts_for(&destination).unwrap();
-    let oversized_repository = "R".repeat(super::batching::MAX_MUTATION_REQUEST_BYTES);
+    let oversized_repository = "R".repeat(super::github::MAX_MUTATION_REQUEST_BYTES);
     let pull_requests = CompleteLocalPullRequests::for_plan_test_with_repository_node(
         RepositoryCoordinates::for_test("owner", "repo"),
         github_default,
@@ -927,7 +974,7 @@ fn every_statically_known_stage_is_preflighted_before_a_tuple_plan_can_escape() 
     let error = plan(&specs).err().unwrap();
     assert!(error.to_string().contains("Git pull-request marker"));
 
-    let oversized_node = "N".repeat(super::batching::MAX_MUTATION_REQUEST_BYTES);
+    let oversized_node = "N".repeat(super::github::MAX_MUTATION_REQUEST_BYTES);
     let spec = EntrySpec {
         id: "Gupdate",
         history: HistorySpec { published: vec![(oid(101), oid(10))], marker: true },
@@ -943,7 +990,7 @@ fn every_statically_known_stage_is_preflighted_before_a_tuple_plan_can_escape() 
         }),
     };
     let error = plan(&[spec]).err().unwrap();
-    let limit = super::batching::MAX_MUTATION_REQUEST_BYTES;
+    let limit = super::github::MAX_MUTATION_REQUEST_BYTES;
     assert!(error.to_string().contains(&format!("exceeds the {limit}-byte request limit")));
 }
 
@@ -1010,7 +1057,7 @@ fn body_comparison_normalizes_only_crlf_pairs() {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EffectBoundary {
-    Tuples,
+    InitialRefs,
     Creates,
     Markers,
     Updates,
@@ -1020,8 +1067,8 @@ enum EffectBoundary {
 // failed GraphQL mutation acknowledgement is indeterminate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttemptInterruption {
-    TupleRejected,
-    TupleIndeterminate,
+    InitialRefsRejected,
+    InitialRefsIndeterminate,
     CreateIndeterminate,
     MarkerRejected,
     MarkerIndeterminate,
@@ -1031,7 +1078,9 @@ enum AttemptInterruption {
 impl AttemptInterruption {
     fn boundary(self) -> EffectBoundary {
         match self {
-            Self::TupleRejected | Self::TupleIndeterminate => EffectBoundary::Tuples,
+            Self::InitialRefsRejected | Self::InitialRefsIndeterminate => {
+                EffectBoundary::InitialRefs
+            }
             Self::CreateIndeterminate => EffectBoundary::Creates,
             Self::MarkerRejected | Self::MarkerIndeterminate => EffectBoundary::Markers,
             Self::UpdateIndeterminate => EffectBoundary::Updates,
@@ -1065,7 +1114,7 @@ struct UpdateAttempt {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 enum DurableEffectAttempt {
-    Tuples(Box<[GitBatchAttempt]>),
+    InitialRefs(Box<[GitBatchAttempt]>),
     Creates(Box<[CreateAttempt]>),
     Markers(Box<[GitBatchAttempt]>),
     Updates(Box<[UpdateAttempt]>),
@@ -1074,7 +1123,7 @@ enum DurableEffectAttempt {
 impl DurableEffectAttempt {
     fn boundary(&self) -> EffectBoundary {
         match self {
-            Self::Tuples(_) => EffectBoundary::Tuples,
+            Self::InitialRefs(_) => EffectBoundary::InitialRefs,
             Self::Creates(_) => EffectBoundary::Creates,
             Self::Markers(_) => EffectBoundary::Markers,
             Self::Updates(_) => EffectBoundary::Updates,
@@ -1122,12 +1171,12 @@ impl ScriptedEffectDriver {
 }
 
 impl EffectDriver for ScriptedEffectDriver {
-    async fn publish_tuples(&mut self, pushes: PreparedPushes) -> Result<()> {
+    async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()> {
         let attempts = Self::push_attempts(&pushes);
         if attempts.is_empty() {
             Ok(())
         } else {
-            self.record(DurableEffectAttempt::Tuples(attempts))
+            self.record(DurableEffectAttempt::InitialRefs(attempts))
         }
     }
 
@@ -1223,7 +1272,7 @@ async fn durable_effect_barriers_release_only_the_next_reachable_stage() {
     assert_eq!(
         acknowledged.attempts.iter().map(DurableEffectAttempt::boundary).collect::<Vec<_>>(),
         [
-            EffectBoundary::Tuples,
+            EffectBoundary::InitialRefs,
             EffectBoundary::Creates,
             EffectBoundary::Markers,
             EffectBoundary::Updates,
@@ -1232,8 +1281,8 @@ async fn durable_effect_barriers_release_only_the_next_reachable_stage() {
     insta::assert_yaml_snapshot!("acknowledged_publication_effects", acknowledged.attempts);
 
     for interruption in [
-        AttemptInterruption::TupleRejected,
-        AttemptInterruption::TupleIndeterminate,
+        AttemptInterruption::InitialRefsRejected,
+        AttemptInterruption::InitialRefsIndeterminate,
         AttemptInterruption::CreateIndeterminate,
         AttemptInterruption::MarkerRejected,
         AttemptInterruption::MarkerIndeterminate,
@@ -1261,7 +1310,7 @@ async fn all_existing_publication_skips_create_without_reordering_effects() {
     driver.assert_consumed();
     assert_eq!(
         driver.attempts.iter().map(DurableEffectAttempt::boundary).collect::<Vec<_>>(),
-        [EffectBoundary::Tuples, EffectBoundary::Markers, EffectBoundary::Updates]
+        [EffectBoundary::InitialRefs, EffectBoundary::Markers, EffectBoundary::Updates]
     );
     insta::assert_yaml_snapshot!("all_existing_publication_effects", driver.attempts);
 }

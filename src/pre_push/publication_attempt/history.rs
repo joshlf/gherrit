@@ -76,6 +76,7 @@ impl PublishedHistory {
         if index == 0 { self.first } else { self.later[index - 1] }
     }
 
+    #[cfg(test)]
     fn versioned(
         &self,
     ) -> impl DoubleEndedIterator<Item = (Version, Revision)> + ExactSizeIterator + '_ {

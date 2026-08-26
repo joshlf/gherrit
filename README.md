@@ -15,9 +15,11 @@ synchronizes them to GitHub as a chain of dependent Pull Requests.
 ### Prerequisites
 
   * **Rust**: You must have a working Rust toolchain (`cargo`).
-  * **GitHub CLI (`gh`)**: GHerrit uses the `gh` tool to authenticate to GitHub
-    so it can create and manage PRs. Ensure you are authenticated (`gh auth
-    login`).
+  * **Git**: Version 2.31 or newer. Promisor and partial-clone repositories
+    require Git 2.45 or newer.
+  * **GitHub authentication**: Either set `GITHUB_TOKEN` to a token which can
+    read and write pull requests in the destination repository, or authenticate
+    the GitHub CLI with `gh auth login`.
 
 ### Setup
 
@@ -64,13 +66,18 @@ When you are ready to upload your changes, simply push:
 git push
 ```
 
-**GHerrit intercepts this push.** Instead of pushing your local branch directly, it:
+**GHerrit intercepts this push.** Instead of pushing your local branch
+directly, it:
 
 1.  Analyzes your stack of commits.
-2.  Pushes each commit to a dedicated "phantom branch" on GitHub.
-3.  Creates or Updates a Pull Request for each commit.
-4.  Updates the PR bodies to include navigation links.
-5.  Injects a "Patch History" table into the PR description. Because GHerrit
+2.  Atomically publishes each changed commit's head, literal first-parent
+    base, and next immutable version tag.
+3.  For a public stack, reconciles its GHerrit-owned branch projection after
+    those change tuples and before any Pull Request write.
+4.  Creates missing Pull Requests on permanent, change-owned base branches.
+5.  Records each established Pull Request with an immutable Git marker before
+    applying its final base, title, body, and navigation links.
+6.  Injects a "Patch History" table into the PR description. Because GHerrit
     tracks every version of your commit, this table provides direct links to
     view the **diff between versions** (e.g., "Compare v3 vs v2"). This allows
     reviewers to immediately see what changed since their last review.
@@ -109,16 +116,39 @@ until the stack is landed.
 ### Public vs. Private Stacks
 
 By default, GHerrit configures managed branches as **Private Stacks**. On `git
-push`, GHerrit will synchronize your stack to GitHub without actually pushing
+push`, GHerrit will publish your stack to GitHub without actually pushing
 your local branch tip to the remote server. This avoids cluttering the remote
 repository with branches and avoids leaking the names of your local branches to
 remote users.
 
-If you wish to maintain a **Public Stack** (where your local branch is *also*
-pushed to `origin` for backup or collaboration), you can override this:
+If you wish to maintain a **Public Stack**, GHerrit can also project the tip of
+your local branch to the configured push destination:
+
 ```bash
 gherrit manage --public
 ```
+
+A public branch is a GHerrit-owned, force-updated projection. If it must
+change, GHerrit leases it against the exact remote value observed at the start
+of the attempt. A competing value then rejects the containing atomic push. If
+the branch was already at the desired tip, GHerrit performs no redundant write
+or lease. An independently written value which GHerrit has already observed is
+intentionally replaced. Public mode is therefore suitable for backup and
+read-only sharing, not as a bidirectional collaboration branch. Do not update
+the remote branch independently or use it as a stable base for independent
+work or Pull Requests. Changing a branch to private mode or renaming it does
+not delete an earlier public ref.
+
+The first path component of a public branch name must contain at least one
+character other than an ASCII letter or digit, and the name cannot be
+`gherrit-bases` or below that namespace. The public branch also cannot equal or
+be a ref-path ancestor or descendant of the repository default branch. These
+rules keep it disjoint from every branch owned by a GHerrit change and from the
+default branch. Names such as `feature-/work` and `release-candidate` work;
+names such as `feature`, `feature/work`, and `Gchange/backup` do not.
+An unrelated ordinary remote branch which is a ref-path ancestor or descendant
+can still make the public push fail until that ref is removed, the branch is
+renamed, or private mode is used.
 
 ## Design & Architecture
 
@@ -127,7 +157,7 @@ then you can stop reading now.*
 
 ### Core Architecture
 
-#### `gherrit-pr-id` Trailer and Phantom Branches
+#### `gherrit-pr-id` Trailer and Owned Publication Refs
 
 Inspired by Gerrit, each commit managed by GHerrit includes a trailer line in
 its commit message, e.g., `gherrit-pr-id: G847...`.
@@ -137,48 +167,83 @@ merge the contents of one *branch* into another). A branch can contain multiple
 commits, leading to a one-to-many relationship between PRs and commits. In the
 Gerrit style, we want a one-to-one relationship between PRs and commits.
 However, Git commits do not have stable identifiers – commit hashes change on
-rebase, on `git commit --amend`, etc. The `gerrit-pr-id` trailer acts as a
+rebase, on `git commit --amend`, etc. The `gherrit-pr-id` trailer acts as a
 stable key for the commit that survives rebases and other commit changes.
 
-Since the user will have a single branch locally containing multiple commits, a
-normal `git push` would simply result in a single PR for the whole branch.
-Instead, GHerrit pushes changes by synthesizing "phantom" branches: Each commit
-is pushed to a branch whose name matches that commit's `gherrit-pr-id` trailer.
-GHerrit then uses the GitHub API to create or update one PR for each commit,
-setting the base and source branches to the appropriate phantom branches.
+Since the user has one local branch containing multiple commits, a normal
+`git push` would result in one PR for the whole branch. GHerrit instead gives
+each change `G` two owned branches. `refs/heads/G` points to the current
+revision, while `refs/heads/gherrit-bases/G` points to that revision's literal
+first parent. The owned base never points to another change's mutable head
+branch.
+
+Every PR is created with head `G` and base `gherrit-bases/G`. This stable
+creation key does not change when a stack is amended, rebased, reordered, or
+moved between root and nonroot positions. Once the PR's existence is durably
+recorded, the final projection places a root PR on the repository's default
+branch; a nonroot PR remains on its own `gherrit-bases/G` branch.
 
 #### Version Tags
 
-In addition to pushing branches, GHerrit pushes a lightweight tag for every
-version of every commit in the stack, formatted as
-`refs/tags/gherrit/<id>/v<version>`. Normally, force-push workflows destroy the
-history of previous iterations. By tagging every version, GHerrit persists the
-entire evolution of a PR. These version tags can be used to diff any two
-versions of a PR – this is how GHerrit generates the **Patch History Table** in
-the PR description.
+Alongside both owned branches, GHerrit publishes a lightweight tag for every
+version of every change. The three refs form one point-in-time tuple:
 
-#### Optimistic Concurrency Control
+```text
+refs/heads/G                 -> current revision
+refs/heads/gherrit-bases/G   -> current revision's literal first parent
+refs/tags/gherrit/G/vN       -> current revision
+```
 
-GHerrit enforces optimistic locking to prevent race conditions when multiple
-users update the same stack. When pushing a new version tag (e.g., `v2`),
-GHerrit uses the atomic push option:
-`--force-with-lease=refs/tags/gherrit/<id>/v<ver>:`.
+When any member must change, GHerrit publishes the complete tuple atomically.
+It never exposes a head-only or head-and-tag update. Immutable version tags
+preserve earlier iterations for the **Patch History Table** in each PR body.
+The configured push destination, rather than local tags, is the authoritative
+version history, so a fresh clone and an older working copy choose the same
+next version.
 
-The trailing colon (`:`) tells Git to ensure the ref does **not** already exist
-on the remote. If another user has already pushed `v2` in the interim, the
-assertion fails, the push is rejected, and the user is forced to fetch and
-rebase, preserving the integrity of the patch history.
+#### Publication Barriers and Concurrency
+
+Before writing, GHerrit observes the exact default branch, the optional public
+branch, and only the owned Git namespaces and all-state GitHub connections for
+IDs in the local stack. This keeps network and backend work proportional to the
+local stack and its history rather than to unrelated repository state. It
+validates and plans the complete stack before publishing any prefix.
+
+Every planned mutable-ref update is leased against its exact observed object,
+every new tag is leased against absence, and all members of a tuple share one
+atomic push. If another publisher wins a conflicting lease, the entire batch
+is rejected. If it publishes the same desired tuple first, Git's exact
+acknowledgement can accept the tuple as already complete and the current
+attempt continues. A rejected or indeterminate push ends the attempt; a fresh
+invocation then reobserves durable state.
+
+For a public stack, an out-of-date public branch is created or advanced with an
+exact lease in the initial Git stage. A branch already at the desired tip needs
+only its exact initial observation. Any public operation follows every tuple
+operation, and all initial Git batches must be acknowledged before GHerrit
+creates or updates a pull request. An empty public stack still projects its
+branch tip but does not authenticate to GitHub.
+
+Pull-request existence uses a separate immutable marker,
+`refs/tags/gherrit/G/pr`. GHerrit can create this marker only after observing
+the PR or receiving its exact create acknowledgement. The marker is a second
+Git barrier: final GitHub projection is unavailable until the marker push is
+acknowledged. A crash or lost acknowledgement can therefore leave only safe
+states—a complete old or new tuple, a public branch at its prior or desired
+tip, a PR on its permanent owned base, or a completed marker. GHerrit does not
+roll effects back or retry ambiguous writes within the same attempt; the next
+invocation reconstructs authority from Git and exact local PR observations.
 
 #### `pre-push` Hook
 
-GHerrit synchronizes changes with GitHub in a `pre-push` hook. This allows
+GHerrit publishes changes to GitHub in a `pre-push` hook. This allows
 users to use their normal `git push` flow instead of using a bespoke command
 like (hypothetically) `gherrit sync`.
 
 ##### "Loopback" Interception Strategy
 
-By default, GHerrit configures managed branches to treat the local repository as
-its own upstream. It sets:
+GHerrit configures every managed branch, private or public, to treat the local
+repository as its own upstream. It sets:
 
 *   `branch.<name>.pushRemote = .`
 *   `branch.<name>.remote = .`
@@ -186,15 +251,27 @@ its own upstream. It sets:
 
 This configuration has two benefits:
 
-1.  **Interception:** On `git push`, once GHerrit's `pre-push` hook returns
-    (after synchronizing the stack to GitHub), Git will always complete the
-    push. Other than causing `git push` to fail with a user-visible error,
-    there is no way to for the `pre-push` hook to prevent the push from
-    completing. Setting `pushRemote = .` ensures that, when the push is
-    performed, it targets the local repository, which is a no-op.
+1.  **Interception:** On plain `git push`, GHerrit requires Git's hook
+    arguments to identify the `.` destination and requires standard input to
+    contain no ref update. Once GHerrit's acknowledged publication finishes,
+    the enclosing Git process therefore has no remaining remote effect. An
+    external destination or any refspec which would produce an update is
+    rejected. Git does not expose whether the user explicitly supplied `.` or
+    an already-up-to-date refspec, because those have the same no-effect hook
+    shape.
 2.  **UX:** This configuration satisfies Git's upstream requirements, allowing
     users to run `git push` immediately after branch creation without seeing
     "fatal: The current branch has no upstream branch" errors.
+
+Git does not tell a pre-push hook whether the user passed `--dry-run`.
+Consequently, `git push --dry-run` still runs GHerrit's real publication
+protocol even though the enclosing loopback push is a dry run.
+
+An installed or composite hook wrapper must forward both hook arguments
+unchanged and leave standard input connected to GHerrit. Hook success proves
+only that the enclosing Git process has no ref update; another hook or a later
+Git failure can still make the enclosing `git push` fail after GHerrit has
+durably published. Running `git push` again safely reobserves that state.
 
 #### PR Rewriting
 

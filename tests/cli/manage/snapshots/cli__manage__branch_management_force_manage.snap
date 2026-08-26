@@ -13,4 +13,4 @@ STDERR:
 [gherrit] [WARN]   - pushRemote: current='origin', expected='<unset>'
 [gherrit] [WARN] Overwriting manual changes (--force).
 [gherrit] Branch feature-A is now managed by GHerrit in private mode.
-[gherrit]   - 'git push' will sync PRs only, but will not push feature-A itself.
+[gherrit]   - 'git push' will publish the stack without pushing feature-A itself.

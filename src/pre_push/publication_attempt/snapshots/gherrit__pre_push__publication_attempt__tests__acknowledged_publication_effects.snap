@@ -2,7 +2,7 @@
 source: src/pre_push/publication_attempt/tests.rs
 expression: acknowledged.attempts
 ---
-- Tuples:
+- InitialRefs:
     - options:
         - "--porcelain"
         - "--atomic"

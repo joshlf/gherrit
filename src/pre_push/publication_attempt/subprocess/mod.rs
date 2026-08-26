@@ -193,6 +193,7 @@ async fn output_with_injected_stdout_failure(
     .await
 }
 
+#[cfg(test)]
 async fn output_with_faults(
     command: Command,
     timeout: Duration,

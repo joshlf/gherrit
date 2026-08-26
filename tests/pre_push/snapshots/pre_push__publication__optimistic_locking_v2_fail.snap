@@ -1,6 +1,5 @@
 ---
 source: tests/pre_push/publication.rs
-assertion_line: 423
 expression: content
 ---
 EXIT_CODE: 1
@@ -9,7 +8,6 @@ STDOUT:
 (empty)
 
 STDERR:
-[gherrit] Branch feature-conflict is MANAGED. Syncing stack...
+[gherrit] Branch feature-conflict is MANAGED. Publishing stack...
 [gherrit] [WARN] Using custom GitHub API URL: [MOCK_SERVER_URL]
-[gherrit] Pushing chunk to remote...
-[gherrit] [ERROR] `git push` failed for GHerrit remote 'origin'. Its push destination might be ahead or have changed.
+[gherrit] [ERROR] Git publication was rejected without changing the requested refs; stop this attempt and run 'git push' again after resolving the conflict

@@ -147,8 +147,8 @@ fn test_manage_drift_detection() {
     // Assert Success
     ctx.assert_config("branch.drift-feature.gherritManaged", Some(testutil::MANAGED_PUBLIC));
 
-    // Check pushRemote is now origin
-    ctx.assert_config("branch.drift-feature.pushRemote", Some("origin"));
+    // The enclosing push remains a local no-op in both visibility modes.
+    ctx.assert_config("branch.drift-feature.pushRemote", Some("."));
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn test_manage_toggle_visibility() {
         ctx.gherrit_cmd().args(["manage", "--public"]),
         "manage_toggle_switch_public"
     );
-    ctx.assert_config("branch.visibility-feature.pushRemote", Some("origin"));
+    ctx.assert_config("branch.visibility-feature.pushRemote", Some("."));
 
     // 3. Private again
     testutil::assert_success_snapshot!(
@@ -192,6 +192,21 @@ fn test_manage_mutually_exclusive_flags() {
         ctx.gherrit_cmd().args(["manage", "--public", "--private"]),
         "manage_mutually_exclusive",
     );
+}
+
+#[test]
+fn public_management_requires_a_ref_namespace_disjoint_from_change_ids() {
+    for branch in ["feature", "feature/one", "Gchange", "Gchange/child", "gherrit-bases/Gchange"] {
+        let ctx = testutil::test_context!().build();
+        ctx.checkout_new(branch);
+
+        ctx.gherrit_cmd().args(["manage", "--public"]).assert().failure();
+
+        ctx.assert_config(&format!("branch.{branch}.gherritManaged"), None);
+        ctx.assert_config(&format!("branch.{branch}.pushRemote"), None);
+        ctx.assert_config(&format!("branch.{branch}.remote"), None);
+        ctx.assert_config(&format!("branch.{branch}.merge"), None);
+    }
 }
 
 #[test]

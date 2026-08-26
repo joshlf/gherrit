@@ -152,16 +152,13 @@ impl LocalChange {
         self.first_parent
     }
 
+    #[cfg(test)]
     pub(super) fn title(&self) -> &str {
         self.title.as_str()
     }
 
     pub(super) fn into_pull_request_content(self) -> (PullRequestTitle, String) {
         (self.title, self.body)
-    }
-
-    pub(super) fn body(&self) -> &str {
-        &self.body
     }
 }
 
@@ -243,13 +240,18 @@ impl LocalStack {
     fn new(default_branch: DefaultBranch, changes: Vec<LocalChange>) -> Result<Self> {
         let ids = changes.iter().map(|change| change.id.as_str());
         ensure_unique_change_ids(ids)?;
-        if let Some(change) =
-            changes.iter().find(|change| change.id.as_str() == default_branch.name())
-        {
+        if let Some(change) = changes.iter().find(|change| {
+            let id = change.id.as_str();
+            default_branch.name() == id
+                || default_branch
+                    .name()
+                    .strip_prefix(id)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
             bail!(
                 "Commit {} has gherrit-pr-id '{}', which conflicts with the repository default branch",
                 change.head,
-                default_branch.name()
+                change.id.as_str()
             );
         }
 
@@ -302,6 +304,12 @@ impl LocalStack {
 
     pub(super) fn default_branch(&self) -> &DefaultBranch {
         &self.default_branch
+    }
+
+    /// The exact commit named by the checked-out stack branch. An empty stack
+    /// shares the observed default tip; otherwise its final change is HEAD.
+    pub(super) fn tip(&self) -> ObjectId {
+        self.changes.last().map_or(self.default_branch.tip(), LocalChange::head)
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -521,7 +529,13 @@ mod tests {
 
     #[test]
     fn gherrit_pr_ids_accept_exactly_nonempty_ascii_alphanumeric_trailers() {
-        for id in [b"A".as_slice(), b"G123", b"abcDEF012"] {
+        for id in [
+            b"A".as_slice(),
+            b"G123",
+            b"abcDEF012",
+            // Older GHerrit versions emitted hexadecimal IDs of this width.
+            b"G0000000000000000000000000000000000000001",
+        ] {
             assert_eq!(
                 GherritPrId::from_trailer(object_id(1), id).unwrap().as_str(),
                 str::from_utf8(id).unwrap()
@@ -667,17 +681,21 @@ mod tests {
     }
 
     #[test]
-    fn stack_ids_cannot_name_the_default_branch() {
-        let error =
-            LocalStack::new(default_branch("main", 10), vec![change("main", 1, 10)]).unwrap_err();
+    fn stack_ids_cannot_conflict_with_the_default_branch_ref() {
+        for (default, id) in [("main", "main"), ("release/stable", "release")] {
+            let error =
+                LocalStack::new(default_branch(default, 10), vec![change(id, 1, 10)]).unwrap_err();
 
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "Commit {} has gherrit-pr-id 'main', which conflicts with the repository default branch",
-                object_id(1)
-            )
-        );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Commit {} has gherrit-pr-id '{id}', which conflicts with the repository default branch",
+                    object_id(1)
+                )
+            );
+        }
+        LocalStack::new(default_branch("release/stable", 10), vec![change("stable", 1, 10)])
+            .unwrap();
     }
 
     #[test]

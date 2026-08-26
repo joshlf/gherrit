@@ -18,8 +18,9 @@ use color_eyre::eyre::{Result, bail};
 use gix::ObjectId;
 
 use super::{
-    DefaultBranch, EffectDriver, PlannedPublication, PushDestination,
-    destination::RepositoryCoordinates,
+    DefaultBranch, EffectDriver, ObservedPublicBranch, PlannedPublication, PublicBranch,
+    PushDestination,
+    destination::{RemoteBranchState, RepositoryCoordinates},
     github::{
         AbsentPullRequest, BaseKind, CompleteCreateReceipts, CompleteLocalPullRequests,
         LocalPullRequestObservation, ManagedOpenPullRequest, ObservedBase, PreparedCreates,
@@ -178,6 +179,7 @@ struct PublishedChange {
 struct DurableWorld {
     default_tip: ObjectId,
     changes: HashMap<GherritPrId, PublishedChange>,
+    public_branches: HashMap<String, ObjectId>,
     next_identity: u32,
 }
 
@@ -282,7 +284,12 @@ impl DurableWorld {
             }
         }
         assert!(!commits.is_empty(), "a modeled scenario has at least one local change");
-        let world = Self { default_tip, changes: HashMap::new(), next_identity: 100 };
+        let world = Self {
+            default_tip,
+            changes: HashMap::new(),
+            public_branches: HashMap::new(),
+            next_identity: 100,
+        };
         world.assert_well_formed();
         world
     }
@@ -374,6 +381,15 @@ impl DurableWorld {
         intent: &LocalIntent,
         visibility: &QueryVisibility,
     ) -> Result<PlannedPublication> {
+        self.plan_with_public_branch(intent, visibility, None)
+    }
+
+    fn plan_with_public_branch(
+        &self,
+        intent: &LocalIntent,
+        visibility: &QueryVisibility,
+        public_branch: Option<&str>,
+    ) -> Result<PlannedPublication> {
         assert!(
             visibility.open.keys().all(|id| intent.iter().any(|local| &local.id == id)),
             "every query visibility override belongs to the queried intent"
@@ -392,6 +408,20 @@ impl DurableWorld {
                 )
             }),
         );
+        let public_branch = public_branch
+            .map(|name| {
+                let branch = PublicBranch::new(
+                    crate::manage::PublicBranchName::new(name.to_owned())?,
+                    &default,
+                )?;
+                let remote = self
+                    .public_branches
+                    .get(name)
+                    .copied()
+                    .map_or(RemoteBranchState::Absent, RemoteBranchState::At);
+                ObservedPublicBranch { branch, remote }.plan(stack.tip())
+            })
+            .transpose()?;
         let histories = intent
             .iter()
             .map(|local| {
@@ -423,7 +453,7 @@ impl DurableWorld {
             pull_requests,
             &[],
         )?;
-        plan_effects(&destination, None, stack, histories, pull_requests)
+        plan_effects(&destination, public_branch, stack, histories, pull_requests)
     }
 
     async fn run_attempt(
@@ -478,6 +508,10 @@ impl DurableWorld {
     }
 
     fn assert_well_formed(&self) {
+        assert!(
+            self.public_branches.iter().all(|(name, oid)| !name.is_empty() && !oid.is_null()),
+            "every modeled public branch has a name and non-null target"
+        );
         let mut identities = HashSet::new();
         let mut parents = HashMap::<ObjectId, ObjectId>::new();
         for published in self.changes.values() {
@@ -553,6 +587,19 @@ struct TupleEffect {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicBranchEffect {
+    branch: String,
+    expected: Option<ObjectId>,
+    desired: ObjectId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InitialRefEffect {
+    Tuple(TupleEffect),
+    PublicBranch(PublicBranchEffect),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct MarkerEffect {
     id: GherritPrId,
     target: ObjectId,
@@ -589,7 +636,7 @@ enum StopReason {
 
 #[derive(Clone, Debug)]
 enum Interruption {
-    Tuple { batch: usize, applied: bool },
+    InitialRefs { batch: usize, applied: bool },
     Create { batch: usize, applied_aliases: Box<[usize]> },
     Marker { batch: usize, applied: bool },
     Update { batch: usize, applied_aliases: Box<[usize]> },
@@ -603,7 +650,7 @@ struct AttemptReport {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EffectStage {
-    Tuple,
+    InitialRefs,
     Create,
     Marker,
     Update,
@@ -659,8 +706,8 @@ impl<'world> WorldDriver<'world> {
 
     fn take_interruption(&mut self, stage: EffectStage, batch: usize) -> Option<Interruption> {
         let matches = match self.interruption.as_ref() {
-            Some(Interruption::Tuple { batch: stopped, .. }) => {
-                stage == EffectStage::Tuple && *stopped == batch
+            Some(Interruption::InitialRefs { batch: stopped, .. }) => {
+                stage == EffectStage::InitialRefs && *stopped == batch
             }
             Some(Interruption::Create { batch: stopped, .. }) => {
                 stage == EffectStage::Create && *stopped == batch
@@ -777,9 +824,9 @@ impl<'world> InterleavingDriver<'world> {
 }
 
 impl EffectDriver for InterleavingDriver<'_> {
-    async fn publish_tuples(&mut self, pushes: PreparedPushes) -> Result<()> {
-        self.primary.publish_tuples(pushes).await?;
-        self.run_competing_after(EffectStage::Tuple).await
+    async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()> {
+        self.primary.publish_initial_refs(pushes).await?;
+        self.run_competing_after(EffectStage::InitialRefs).await
     }
 
     async fn create_pull_requests(
@@ -842,40 +889,57 @@ fn validated_aliases(aliases: &[usize], batch_len: usize) -> HashSet<usize> {
 }
 
 impl EffectDriver for WorldDriver<'_> {
-    async fn publish_tuples(&mut self, pushes: PreparedPushes) -> Result<()> {
+    async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()> {
         for (index, batch) in pushes.batches().enumerate() {
             let effects = batch
                 .semantic_effects_for_test()
                 .iter()
                 .map(|effect| match effect {
-                    TestPushEffect::Tuple { id, expected, desired, version } => TupleEffect {
-                        id: id.clone(),
-                        expected: expected.map(literal_revision),
-                        desired: literal_revision(*desired),
-                        version: *version,
-                    },
+                    TestPushEffect::PublicBranch { branch, expected, desired } => {
+                        InitialRefEffect::PublicBranch(PublicBranchEffect {
+                            branch: branch.clone(),
+                            expected: *expected,
+                            desired: *desired,
+                        })
+                    }
+                    TestPushEffect::Tuple { id, expected, desired, version } => {
+                        InitialRefEffect::Tuple(TupleEffect {
+                            id: id.clone(),
+                            expected: expected.map(literal_revision),
+                            desired: literal_revision(*desired),
+                            version: *version,
+                        })
+                    }
                     TestPushEffect::Marker { .. } => {
-                        panic!("the tuple stage cannot contain marker effects")
+                        panic!("the initial Git stage cannot contain marker effects")
                     }
                 })
                 .collect::<Box<[_]>>();
-            self.trace.tuples.push(effects.clone());
-            if let Some(Interruption::Tuple { applied, .. }) =
-                self.take_interruption(EffectStage::Tuple, index)
+            self.trace.tuples.push(
+                effects
+                    .iter()
+                    .filter_map(|effect| match effect {
+                        InitialRefEffect::Tuple(effect) => Some(effect.clone()),
+                        InitialRefEffect::PublicBranch(_) => None,
+                    })
+                    .collect(),
+            );
+            if let Some(Interruption::InitialRefs { applied, .. }) =
+                self.take_interruption(EffectStage::InitialRefs, index)
             {
                 if applied
-                    && apply_atomic_git_batch(self.world, &effects, ExternalEffect::Tuple)
+                    && apply_atomic_initial_ref_batch(self.world, &effects)
                         != EffectOutcome::Acknowledged
                 {
                     return self.stop(StopReason::Rejected);
                 }
                 return self.stop(StopReason::Indeterminate);
             }
-            let outcome = apply_atomic_git_batch(self.world, &effects, ExternalEffect::Tuple);
+            let outcome = apply_atomic_initial_ref_batch(self.world, &effects);
             if outcome != EffectOutcome::Acknowledged {
                 return self.stop(outcome.stop_reason());
             }
-            self.run_competing_after_batch(EffectStage::Tuple, index).await?;
+            self.run_competing_after_batch(EffectStage::InitialRefs, index).await?;
         }
         Ok(())
     }
@@ -929,6 +993,9 @@ impl EffectDriver for WorldDriver<'_> {
                     }
                     TestPushEffect::Tuple { .. } => {
                         panic!("the marker stage cannot contain tuple effects")
+                    }
+                    TestPushEffect::PublicBranch { .. } => {
+                        panic!("the marker stage cannot contain public branch effects")
                     }
                 })
                 .collect::<Box<[_]>>();
@@ -1076,6 +1143,37 @@ impl DurableWorld {
                 EffectOutcome::Acknowledged
             }
         }
+    }
+
+    fn apply_public_branch(&mut self, effect: &PublicBranchEffect) -> EffectOutcome {
+        let before = self.clone();
+        let current = self.public_branches.get(&effect.branch).copied();
+        let outcome = if current == Some(effect.desired) {
+            // Git reports an up-to-date source/destination pair as success even
+            // when an earlier absence or old-value lease has become stale.
+            EffectOutcome::Acknowledged
+        } else if current == effect.expected {
+            self.public_branches.insert(effect.branch.clone(), effect.desired);
+            EffectOutcome::Acknowledged
+        } else {
+            EffectOutcome::Rejected
+        };
+
+        if outcome == EffectOutcome::Rejected {
+            assert_eq!(*self, before, "a rejected public branch effect cannot alter state");
+            return outcome;
+        }
+        assert_eq!(self.default_tip, before.default_tip);
+        assert_eq!(self.changes, before.changes);
+        assert_eq!(self.next_identity, before.next_identity);
+        assert_eq!(self.public_branches.get(&effect.branch), Some(&effect.desired));
+        for (branch, oid) in &before.public_branches {
+            if branch != &effect.branch {
+                assert_eq!(self.public_branches.get(branch), Some(oid));
+            }
+        }
+        self.assert_well_formed();
+        outcome
     }
 
     fn apply_create(&mut self, effect: &TestCreate) -> EffectOutcome {
@@ -1255,6 +1353,26 @@ fn apply_atomic_git_batch<T: Clone>(
     EffectOutcome::Acknowledged
 }
 
+fn apply_atomic_initial_ref_batch(
+    world: &mut DurableWorld,
+    batch: &[InitialRefEffect],
+) -> EffectOutcome {
+    let before = world.clone();
+    for effect in batch {
+        let outcome = match effect {
+            InitialRefEffect::Tuple(effect) => {
+                world.apply_effect(&ExternalEffect::Tuple(effect.clone()))
+            }
+            InitialRefEffect::PublicBranch(effect) => world.apply_public_branch(effect),
+        };
+        if outcome != EffectOutcome::Acknowledged {
+            *world = before;
+            return EffectOutcome::Rejected;
+        }
+    }
+    EffectOutcome::Acknowledged
+}
+
 fn flatten<T: Clone>(batches: &[Box<[T]>]) -> Box<[T]> {
     batches.iter().flat_map(|batch| batch.iter().cloned()).collect()
 }
@@ -1422,8 +1540,8 @@ async fn every_small_attempt_prefix_restarts_from_literal_durable_state() {
     assert_eq!(completed, before_misbound);
 
     let interruptions = [
-        Interruption::Tuple { batch: 0, applied: false },
-        Interruption::Tuple { batch: 0, applied: true },
+        Interruption::InitialRefs { batch: 0, applied: false },
+        Interruption::InitialRefs { batch: 0, applied: true },
         Interruption::Create { batch: 0, applied_aliases: Box::new([]) },
         Interruption::Create { batch: 0, applied_aliases: Box::new([0]) },
         Interruption::Create { batch: 0, applied_aliases: Box::new([1]) },
@@ -1473,7 +1591,7 @@ async fn git_restarts_expose_only_complete_atomic_batch_prefixes() {
                 .run_attempt(
                     &tuple_intent,
                     &QueryVisibility::default(),
-                    Some(Interruption::Tuple { batch: stopped_batch, applied }),
+                    Some(Interruption::InitialRefs { batch: stopped_batch, applied }),
                 )
                 .await
                 .unwrap();
@@ -1899,7 +2017,7 @@ async fn competing_publishers_resume_across_every_authority_barrier() {
         &mut world,
         primary,
         competing,
-        EffectStage::Tuple,
+        EffectStage::InitialRefs,
         Some(Interruption::Create { batch: 0, applied_aliases: Box::new([]) }),
     )
     .await
@@ -2013,7 +2131,7 @@ async fn competing_publishers_interleave_between_tuple_batches() {
         &mut world,
         primary,
         competing,
-        EffectStage::Tuple,
+        EffectStage::InitialRefs,
         0,
         Some(Interruption::Create { batch: 0, applied_aliases: Box::new([]) }),
     )
@@ -2242,7 +2360,7 @@ async fn competing_different_marker_targets_release_only_the_winners_projection(
         };
         let mut world = advanced.clone();
         let (primary, competing) =
-            execute_interleaved(&mut world, primary, competing, EffectStage::Tuple, None)
+            execute_interleaved(&mut world, primary, competing, EffectStage::InitialRefs, None)
                 .await
                 .unwrap();
         assert_eq!(competing.outcome, AttemptOutcome::Acknowledged);
@@ -2628,4 +2746,73 @@ async fn stale_nonroot_visibility_can_project_a_root_without_touching_its_old_pa
             .trace
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn public_branch_lease_conflict_rolls_back_its_atomic_tuple_batch() {
+    let default = oid(1);
+    let revision = LiteralRevision { head: oid(2), first_parent: default };
+    let intent = root_intent(default, "Gpublic", revision);
+    let mut world = DurableWorld::for_intents(default, &[&intent]);
+    let plan = world
+        .plan_with_public_branch(&intent, &QueryVisibility::default(), Some("release-candidate"))
+        .unwrap();
+
+    // This write occurs after the plan's exact absence observation. The
+    // public-branch lease must reject, and atomicity must also roll back the
+    // tuple which preceded it in the same batch.
+    world.public_branches.insert("release-candidate".to_owned(), oid(99));
+    let before = world.clone();
+    let report = world.execute_plan(plan, None).await.unwrap();
+
+    assert_eq!(report.outcome, AttemptOutcome::Stopped(StopReason::Rejected));
+    assert_eq!(world, before);
+    assert!(world.published(&id("Gpublic")).is_none());
+    assert!(report.trace.creates.is_none());
+
+    // A fresh attempt observes the winning value and may deliberately replace
+    // it because a managed public branch is a GHerrit-owned projection.
+    let retry = world
+        .plan_with_public_branch(&intent, &QueryVisibility::default(), Some("release-candidate"))
+        .unwrap();
+    assert_eq!(
+        world.execute_plan(retry, None).await.unwrap().outcome,
+        AttemptOutcome::Acknowledged
+    );
+    assert_eq!(world.public_branches["release-candidate"], revision.head);
+}
+
+#[tokio::test]
+async fn lost_initial_ref_acknowledgement_recovers_public_branch_and_tuple_together() {
+    let default = oid(1);
+    let revision = LiteralRevision { head: oid(2), first_parent: default };
+    let intent = root_intent(default, "Gpublic", revision);
+    let mut world = DurableWorld::for_intents(default, &[&intent]);
+    let first = world
+        .plan_with_public_branch(&intent, &QueryVisibility::default(), Some("release-candidate"))
+        .unwrap();
+
+    let interrupted = world
+        .execute_plan(first, Some(Interruption::InitialRefs { batch: 0, applied: true }))
+        .await
+        .unwrap();
+    assert_eq!(interrupted.outcome, AttemptOutcome::Stopped(StopReason::Indeterminate));
+    assert_eq!(world.public_branches["release-candidate"], revision.head);
+    assert_eq!(world.published(&id("Gpublic")).unwrap().history.last(), revision);
+    assert!(world.open_pull_request(&id("Gpublic")).is_none());
+
+    let retry = world
+        .plan_with_public_branch(&intent, &QueryVisibility::default(), Some("release-candidate"))
+        .unwrap();
+    assert_eq!(
+        world.execute_plan(retry, None).await.unwrap().outcome,
+        AttemptOutcome::Acknowledged
+    );
+    assert_eq!(world.public_branches["release-candidate"], revision.head);
+    assert!(world.open_pull_request(&id("Gpublic")).is_some());
+
+    let converged = world
+        .plan_with_public_branch(&intent, &QueryVisibility::default(), Some("release-candidate"))
+        .unwrap();
+    assert!(world.execute_plan(converged, None).await.unwrap().trace.is_empty());
 }

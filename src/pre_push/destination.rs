@@ -10,7 +10,7 @@ use std::{
     borrow::Cow,
     env,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Command, ExitStatus},
     str,
 };
 
@@ -18,7 +18,7 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::{ObjectId, bstr::ByteSlice as _};
 
 use super::INTERNAL_PRE_PUSH_REMOTE_ENV;
-use crate::util;
+use crate::{manage::PublicBranchName, util};
 
 const DESTINATION_ENV: &str = "GHERRIT_PRIVATE_PUSH_DESTINATION";
 const DISABLE_HTTP_REDIRECTS: &str = "http.followRedirects=false";
@@ -160,6 +160,25 @@ pub(super) struct PushDestination {
     repository: RepositoryBinding,
     resolved: ResolvedDestination,
     internal_remote: String,
+}
+
+/// Exact state of the requested public branch projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RemoteBranchState {
+    Absent,
+    At(ObjectId),
+}
+
+/// The complete bounded observation needed before collecting the local stack.
+pub(super) struct InitialRemoteObservation {
+    default_branch: DefaultBranch,
+    public_branch: Option<RemoteBranchState>,
+}
+
+impl InitialRemoteObservation {
+    pub(super) fn into_parts(self) -> (DefaultBranch, Option<RemoteBranchState>) {
+        (self.default_branch, self.public_branch)
+    }
 }
 
 /// The one acquisition behavior selected from exact graph-load evidence.
@@ -440,7 +459,6 @@ impl PushDestination {
     /// refspecs could update remote-tracking refs even for source-only wants.
     /// An empty bundle URI prevents a configured secondary object source and
     /// its creation-token state from participating in this one fetch.
-    #[allow(dead_code)]
     pub(super) fn exact_object_fetch(&self, mode: ExactObjectFetchMode) -> Command {
         let fixed = [
             "--quiet",
@@ -531,36 +549,37 @@ impl PushDestination {
         Ok(self.repository == RepositoryBinding::new(repository)?)
     }
 
-    pub(super) fn pr_url(&self, pr_number: u64) -> String {
-        format!(
-            "https://github.com/{}/{}/pull/{pr_number}",
-            self.resolved.coordinates.owner, self.resolved.coordinates.repository
-        )
-    }
-
     pub(super) fn repo_url_relative(&self) -> String {
         format!("/{}/{}", self.resolved.coordinates.owner, self.resolved.coordinates.repository)
     }
 
-    /// Observes the symbolic default branch and its exact tip from this
-    /// destination. No local remote-tracking ref participates in the result.
-    pub(super) fn observe_default_branch(&self) -> Result<DefaultBranch> {
-        let output = self
-            .ls_remote(["--symref".to_string()], ["HEAD".to_string()])
-            .stderr(Stdio::null())
-            .output()
-            .wrap_err_with(|| {
-                format!("Failed to observe GHerrit remote '{}'", self.configured_remote())
-            })?;
-        if !output.status.success() {
+    /// Constructs the initial exact observation for the bounded remote-command
+    /// adapter. Public mode adds its public branch projection without another
+    /// network request. No local remote-tracking ref participates.
+    pub(super) fn initial_observation(&self, public_branch: Option<&PublicBranchName>) -> Command {
+        self.ls_remote(
+            ["--symref".to_string()],
+            std::iter::once("HEAD".to_string())
+                .chain(public_branch.map(|branch| format!("refs/heads/{}", branch.as_str()))),
+        )
+    }
+
+    /// Decodes one bounded initial observation command result.
+    pub(super) fn decode_initial_observation(
+        &self,
+        status: &ExitStatus,
+        stdout: &[u8],
+        public_branch: Option<&PublicBranchName>,
+    ) -> Result<InitialRemoteObservation> {
+        if !status.success() {
             bail!(
                 "`git ls-remote --symref` failed for GHerrit remote '{}'",
                 self.configured_remote()
             );
         }
-        parse_default_branch(&output.stdout).wrap_err_with(|| {
+        parse_initial_remote_observation(stdout, public_branch).wrap_err_with(|| {
             format!(
-                "GHerrit remote '{}' did not report one valid symbolic default branch",
+                "GHerrit remote '{}' did not report one valid initial ref observation",
                 self.configured_remote()
             )
         })
@@ -998,9 +1017,23 @@ fn valid_repository_component(component: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+#[cfg(test)]
 fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
+    let InitialRemoteObservation { default_branch, public_branch } =
+        parse_initial_remote_observation(output, None)?;
+    debug_assert!(public_branch.is_none());
+    Ok(default_branch)
+}
+
+fn parse_initial_remote_observation(
+    output: &[u8],
+    requested_public_branch: Option<&PublicBranchName>,
+) -> Result<InitialRemoteObservation> {
     let mut symbolic_head = None;
     let mut direct_head = None;
+    let requested_public_ref =
+        requested_public_branch.map(|branch| format!("refs/heads/{}", branch.as_str()));
+    let mut direct_public_branch = None;
 
     for record in git_output_records(output) {
         let mut fields = record.split(|byte| *byte == b'\t');
@@ -1014,6 +1047,9 @@ fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
             if name == b"HEAD" && symbolic_head.replace(target).is_some() {
                 bail!("duplicate symbolic HEAD");
             }
+            if requested_public_ref.as_deref().is_some_and(|expected| name == expected.as_bytes()) {
+                bail!("requested public branch is symbolic");
+            }
         } else {
             validate_direct_advertised_ref_name(name)?;
             let object_id =
@@ -1023,6 +1059,11 @@ fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
             }
             if name == b"HEAD" && direct_head.replace(object_id).is_some() {
                 bail!("duplicate direct HEAD");
+            }
+            if requested_public_ref.as_deref().is_some_and(|expected| name == expected.as_bytes())
+                && direct_public_branch.replace(object_id).is_some()
+            {
+                bail!("duplicate requested public branch");
             }
         }
     }
@@ -1037,7 +1078,10 @@ fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
         .strip_prefix(b"refs/heads/")
         .ok_or_else(|| eyre!("symbolic HEAD does not target a local branch"))?;
     let branch = str::from_utf8(branch).wrap_err("default branch name is not UTF-8")?.to_owned();
-    DefaultBranch::new(branch, direct_head)
+    let default_branch = DefaultBranch::new(branch, direct_head)?;
+    let public_branch = requested_public_ref
+        .map(|_| direct_public_branch.map_or(RemoteBranchState::Absent, RemoteBranchState::At));
+    Ok(InitialRemoteObservation { default_branch, public_branch })
 }
 
 fn validate_advertised_ref_name(name: &[u8]) -> Result<()> {
@@ -1358,6 +1402,19 @@ mod tests {
             .map(OsStr::new)
         );
         assert!(arguments(&probe).iter().all(|argument| !argument.is_empty()));
+    }
+
+    #[test]
+    fn initial_observation_adds_only_the_checked_public_branch() {
+        let destination = destination();
+        let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+        let command = destination.initial_observation(Some(&branch));
+        let arguments = arguments(&command);
+
+        assert_eq!(
+            &arguments[arguments.len() - 2..],
+            [OsStr::new("HEAD"), OsStr::new("refs/heads/release-candidate")]
+        );
     }
 
     #[test]
@@ -1720,6 +1777,84 @@ mod tests {
                 .unwrap(),
             DefaultBranch::new("master".to_string(), ObjectId::from_hex(oid.as_bytes()).unwrap())
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn initial_observation_reports_exact_public_branch_presence_or_absence() {
+        let head = "1111111111111111111111111111111111111111";
+        let public = "2222222222222222222222222222222222222222";
+        let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+
+        for (extra, expected) in [
+            (String::new(), RemoteBranchState::Absent),
+            (
+                format!("{public}\trefs/heads/release-candidate\n"),
+                RemoteBranchState::At(ObjectId::from_hex(public.as_bytes()).unwrap()),
+            ),
+        ] {
+            let output = format!("ref: refs/heads/main\tHEAD\n{head}\tHEAD\n{extra}");
+            let observation =
+                parse_initial_remote_observation(output.as_bytes(), Some(&branch)).unwrap();
+            let (default, observed) = observation.into_parts();
+            assert_eq!(default.name(), "main");
+            assert_eq!(observed, Some(expected));
+        }
+    }
+
+    #[test]
+    fn initial_observation_rejects_ambiguous_public_branch_records() {
+        let oid = "1111111111111111111111111111111111111111";
+        let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+        for extra in [
+            format!("{oid}\trefs/heads/release-candidate\n{oid}\trefs/heads/release-candidate\n"),
+            "ref: refs/heads/other\trefs/heads/release-candidate\n".to_owned(),
+        ] {
+            let output = format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n{extra}");
+            assert!(
+                parse_initial_remote_observation(output.as_bytes(), Some(&branch)).is_err(),
+                "extra={extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_observation_rejects_malformed_public_branch_records() {
+        let oid = "1111111111111111111111111111111111111111";
+        let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+        for extra in [
+            "not-an-object-id\trefs/heads/release-candidate\n".to_owned(),
+            format!("{oid}\trefs/heads/invalid..branch\n"),
+        ] {
+            let output = format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n{extra}");
+            assert!(
+                parse_initial_remote_observation(output.as_bytes(), Some(&branch)).is_err(),
+                "extra={extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_observation_ignores_valid_unrequested_records_in_any_order() {
+        let head = "1111111111111111111111111111111111111111";
+        let public = "2222222222222222222222222222222222222222";
+        let unrelated = "3333333333333333333333333333333333333333";
+        let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+        let output = format!(
+            "{unrelated}\trefs/heads/candidate\n\
+             {public}\trefs/heads/release-candidate\n\
+             {head}\tHEAD\n\
+             ref: refs/heads/other\trefs/remotes/upstream/HEAD\n\
+             ref: refs/heads/main\tHEAD\n"
+        );
+
+        let observation =
+            parse_initial_remote_observation(output.as_bytes(), Some(&branch)).unwrap();
+        let (default, observed) = observation.into_parts();
+        assert_eq!(default.name(), "main");
+        assert_eq!(
+            observed,
+            Some(RemoteBranchState::At(ObjectId::from_hex(public.as_bytes()).unwrap()))
         );
     }
 

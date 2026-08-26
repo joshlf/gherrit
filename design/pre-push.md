@@ -5,9 +5,10 @@ This document defines the representation, the evidence required before a
 write, the order of durable effects, and the guarantees of the pre-push hook.
 
 Every change owns its mutable head branch and its mutable pull request base
-branch. Git records immutable patch history and durable pull request existence.
-GitHub pull requests are projections of that Git state and the current local
-stack.
+branch. A public managed branch additionally owns one force-updated projection
+of the local stack tip. Git records immutable patch history and durable pull
+request existence. GitHub pull requests are projections of that Git state and
+the current local stack.
 
 This file is the canonical specification for pre-push publication. It is
 written for both human readers and agents maintaining the implementation.
@@ -20,11 +21,12 @@ covers:
 - finding the local stack;
 - observing the remote Git and GitHub state relevant to that stack;
 - validating historical reachability and current repository state;
-- publishing change-owned Git refs;
+- publishing change-owned Git refs and an optional public branch projection;
 - creating and updating GitHub pull requests; and
 - retrying after crashes, rejected writes, and lost acknowledgements.
 
-One attempt publishes only changes in the local stack. It neither observes nor
+One attempt publishes only changes in the local stack and, in public mode, the
+single public branch named by the checked local branch. It neither observes nor
 validates the histories or pull requests of other GHerrit changes. This is safe
 because a valid pull request uses only its own head and owned base, or the
 stable default branch. Publishing one change therefore cannot move either ref
@@ -33,7 +35,8 @@ used by another valid change.
 Multiple GHerrit publishers may run concurrently. The protocol assumes:
 
 - every writer of managed heads, owned bases, version tags, pull request
-  markers, and managed pull request projection follows this protocol;
+  markers, public branch projections, and managed pull request projection
+  follows this protocol;
 - no independent change to a managed pull request's head repository, head
   name, or lifecycle while a publication attempt runs;
 - no other pull request uses a change-owned head or base as its base;
@@ -66,6 +69,12 @@ immutable ancestry. Competing projections are therefore safe
 last-writer-wins updates. Once one complete local intent is stable, a fresh
 attempt repairs any stale projection. If different revisions race, a
 protecting Git lease may instead reject conflicting work before later stages.
+The same exact-lease rule applies when a public branch needs a transition. If
+it was observed already at the desired stack tip, the plan emits no redundant
+operation or lease. A later competing move can therefore make a public link
+temporarily stale, just as a later tuple move can make an already-planned pull
+request projection stale. This remains safe and a fresh stable attempt repairs
+it.
 
 Each top-level GraphQL mutation alias is also assumed to be one indivisible
 pull request operation. A transmitted mutation may execute any subset of its
@@ -107,7 +116,7 @@ branch and through `HEAD`. It is valid only when:
 - every stack commit has exactly one valid change ID;
 - change IDs are unique in the stack and in the reachable ancestry relevant to
   validation;
-- no change ID equals the default branch name;
+- no change ID equals or is a ref-path ancestor of the default branch name;
 - the default branch is neither `gherrit-bases` nor below
   `gherrit-bases/`;
 - the default branch is an ancestor of `HEAD`;
@@ -118,6 +127,46 @@ branch and through `HEAD`. It is valid only when:
 Stack order supplies parent and child relationships. A merge commit may occur
 in the stack. Stack order follows first parents, while identity and
 reachability validation inspect all parents reachable from the required roots.
+
+### Optional public branch projection
+
+Every managed branch uses a loopback enclosing push. In public mode GHerrit
+itself projects the local stack tip to `refs/heads/B` at the configured push
+destination, where `B` is the checked local branch name. This ref is not part
+of change identity or patch history. Its only pull request effect is the public
+branch link rendered in each body.
+
+The first path component of `B` must contain a byte other than an ASCII letter
+or digit. `B` must be neither `gherrit-bases` nor below `gherrit-bases/`. It
+conflicts with the observed default branch `D` exactly when `B == D`, `B`
+starts with `D + "/"`, or `D` starts with `B + "/"`. This grammar makes `B`
+disjoint from every possible change-owned head, the complete owned-base
+namespace, and the default branch. For example, `feature-/work` and
+`release-candidate` are valid, while `feature`, `feature/work`, and
+`Gchange/backup` are not.
+
+The public ref is a GHerrit-owned, force-updated projection, not a second
+bidirectional source of truth. An exact lease protects a value which changes
+after observation, but an already-observed value different from the local tip
+is deliberately replaced. Other actors may read the branch for backup or
+sharing but must not update it independently. Changing the local branch to
+private mode or renaming it does not delete an earlier public ref because
+GHerrit cannot prove that deletion is still authorized.
+
+If the initial observation already names the desired tip, GHerrit has no public
+transition to lease. Even when a transition occurs, its acknowledgement proves
+the public target only at that barrier. A later writer can therefore make the
+target stale before pull request projection. This does not alter any managed
+pull request comparison ref: the public branch contributes only a link. A
+fresh attempt repairs the target after concurrent intent stabilizes.
+
+GHerrit does not scan unrelated ordinary branches for directory/file
+conflicts. If an ordinary remote branch is a ref-path ancestor or descendant
+of `B`, the remote rejects creation of `B`. Because the public operation is
+last, its containing atomic batch rolls back, any earlier complete tuple
+batches remain a safe prefix, and no GitHub mutation occurs. Retry cannot
+succeed until the conflicting ordinary ref is removed or the branch is made
+private or renamed.
 
 ### Refs owned by one change
 
@@ -237,13 +286,16 @@ read after a write.
 ### Empty-stack boundary
 
 GHerrit first resolves the configured Git push destination and observes the
-remote symbolic `HEAD`. That establishes the candidate default branch name
-and tip needed to derive the local stack.
+remote symbolic `HEAD`. In public mode the same request also observes the exact
+public branch or proves its absence. The default branch establishes the
+candidate name and tip needed to derive the local stack.
 
-If the stack after that default branch is empty, GHerrit returns successfully
-at once. It does not read a GitHub token, construct an authenticated client, or
-send a GitHub request. An empty managed branch has no local publication intent,
-so unrelated GitHub availability and credentials are irrelevant.
+If the stack after that default branch is empty, private mode returns
+successfully at once. Public mode first creates or advances its public branch
+to the stack tip, which in this case is the default tip, using the same exact
+lease and acknowledgement rules as the initial Git stage. Neither mode reads a
+GitHub token, constructs an authenticated client, or sends a GitHub request.
+Unrelated GitHub availability and credentials are therefore irrelevant.
 
 GitHub authentication begins only after a nonempty stack supplies the exact
 local change IDs to observe.
@@ -253,6 +305,8 @@ local change IDs to observe.
 For a nonempty stack, the complete logical observation contains:
 
 - one resolved push destination and its GitHub repository coordinates;
+- the exact initial value or authoritative absence of the optional public
+  branch;
 - one default branch name and object ID agreed by remote Git, the corresponding
   local branch, and GitHub;
 - the ordered local stack;
@@ -270,8 +324,10 @@ request enters the planner.
 
 ### Exact local Git evidence
 
-The first remote Git read asks for symbolic `HEAD` and its object ID. Once the
-local stack is known, later byte-bounded reads request only:
+The first remote Git read asks for symbolic `HEAD`, its object ID, and, in
+public mode, the exact public branch. This adds a ref pattern but no network
+round trip. Once the local stack is known, later byte-bounded reads request
+only:
 
 - the exact named default branch;
 - `refs/heads/G` for each local ID;
@@ -450,6 +506,13 @@ For each local change, validation derives:
   numbers immediately; missing pull request numbers remain parameters until
   exact create receipts supply them.
 
+For a public stack, the initial observation separately derives exactly one of:
+
+- create `refs/heads/B` from authoritative absence to the stack tip;
+- force-advance `refs/heads/B` from its exact observed object to the stack tip;
+  or
+- no operation because the ref already names the stack tip.
+
 The planner consumes the local stack, local Git histories, and local pull
 request observations in the same exact order. A request-derived ID remains
 attached to its observation, so a valid page cannot be reassigned to another
@@ -501,7 +564,7 @@ The supported local realities are:
 
 | Published history | Marker | Pull request | Result |
 | --- | --- | --- | --- |
-| absent or present | absent | `Absent` | Stable-key create after tuple publication |
+| absent or present | absent | `Absent` | Stable-key create after the complete initial-ref barrier |
 | present | absent | valid OPEN on owned base | Publish marker, then final projection |
 | present | present | valid OPEN | Apply remaining final projection |
 | any | present | `Absent` | Fail closed |
@@ -530,9 +593,10 @@ observation plus a marker never authorizes creation.
 ### Immutable plan
 
 The final plan owns all decisions which can be made before writing. It contains
-typed tuple operations, provisional create specifications, marker preflight,
-and a bounded recipe for the final projection. Raw Git records, GraphQL JSON,
-aliases, cursors, and freely recombinable booleans do not enter it.
+typed tuple operations, the optional public branch transition, provisional
+create specifications, marker preflight, and a bounded recipe for the final
+projection. Raw Git records, GraphQL JSON, aliases, cursors, and freely
+recombinable booleans do not enter it.
 
 For a stack with missing pull requests, final bodies and minimal updates are
 not yet values in the plan. The recipe is parameterized by the complete set of
@@ -556,10 +620,11 @@ The state machine is:
 
 ```text
 resolve destination
-    -> observe remote HEAD and derive local stack
-    -> if empty, return before GitHub authentication
+    -> observe remote HEAD and optional public branch; derive local stack
+    -> if empty, reconcile the optional public branch
+       and return before GitHub authentication
     -> observe and validate exact local Git and GitHub state
-    -> publish required Git tuples
+    -> publish required initial Git refs: tuples, then optional public branch
     -> create missing pull requests
     -> publish required pull request markers
     -> apply final pull request updates
@@ -569,7 +634,7 @@ Each arrow after planning is an acknowledgement barrier. Work after a barrier
 is unavailable until every required effect before it has an exact usable
 acknowledgement. A stage with no work crosses its barrier immediately.
 
-### Publish Git tuples
+### Publish initial Git refs
 
 Each changed revision produces one tuple operation:
 
@@ -584,10 +649,19 @@ The three refs are never split. Several tuples may share one bounded
 batches; an earlier acknowledged batch and an indeterminate later batch form a
 safe durable prefix.
 
-Every mutable ref uses an exact force-with-lease expectation. Every new tag
-uses an exact absence lease. A malformed, incomplete, or ambiguous porcelain
-acknowledgement ends the attempt. Creation remains inaccessible unless every
-required tuple batch is exactly acknowledged.
+An optional public branch operation is ordered after every tuple operation. It
+may share the final bounded atomic batch or occupy its own batch. It creates the
+ref under an exact absence lease or force-advances it under a lease for the
+exact initially observed object. The desired object is the local stack tip. If
+the ref was already desired, the plan contains no public operation. Ordering it
+last ensures that the public branch cannot advance before an earlier tuple
+batch, while the complete initial-ref barrier ensures that no GitHub mutation
+can precede it.
+
+Every mutable ref uses an exact force-with-lease expectation. Every new tag or
+branch uses an exact absence lease. A malformed, incomplete, or ambiguous
+porcelain acknowledgement ends the attempt. Creation remains inaccessible
+unless every required initial-ref batch is exactly acknowledged.
 
 Git reports a requested ref which already has its desired object as an
 acknowledged up-to-date no-op. This applies even when another identical
@@ -597,8 +671,9 @@ a different object still rejects under the exact lease.
 
 ### Create missing pull requests
 
-Creates run only after the tuple barrier, so every requested head and owned
-base already exists. Each create includes the exact destination repository,
+Creates run only after the initial-ref barrier, so every requested head and
+owned base already exists and an optional public branch is at the desired tip.
+Each create includes the exact destination repository,
 head repository, `G` head, `gherrit-bases/G` base, title, provisional body, and
 client mutation ID.
 
@@ -689,10 +764,18 @@ the attempt.
 
 ### Mutation footprint
 
-Only local changes produce writes. A valid nonlocal pull request for `X` uses
-head `X` and either `gherrit-bases/X` or the stable default branch. A local
-publication for `G != X` moves neither of those refs and cannot alter `X`'s
-projection.
+Only local changes and the optional checked public branch produce writes. A
+valid nonlocal pull request for `X` uses head `X` and either
+`gherrit-bases/X` or the stable default branch. A local publication for
+`G != X` moves neither of those refs and cannot alter `X`'s projection.
+
+The enclosing Git push is a proved local no-op for both public and private
+stacks. GHerrit writes the public projection inside its acknowledged initial
+Git stage. Its checked grammar is disjoint from all change-owned heads and
+bases and from the default branch. Public presentation links use that same
+checked name and the repository identity bound to the publication destination.
+As with any force-updated feature branch, consumers must not treat the public
+projection as an independently writable or stable base.
 
 A legacy, manually retargeted, or otherwise corrupt pull request could use a
 local change's head or owned base as its own base. This protocol does not scan
@@ -705,14 +788,16 @@ requires a separate exact base-consumer guard or migration protocol.
 
 Every externally visible prefix is safe:
 
-1. Read-only observation changes no managed remote state.
-2. An atomic tuple batch leaves every included change wholly old or wholly
-   new.
-3. Earlier acknowledged tuple batches contain only validated combinations.
-4. A created pull request starts on its permanent safe owned base.
-5. A marker push changes no pull request comparison ref.
-6. Final updates become available only after durable existence markers.
-7. A complete update alias leaves the pull request on an old validated base,
+1. The enclosing push has no ref update after the hook returns.
+2. Read-only observation changes no managed remote state.
+3. An atomic initial-ref batch leaves every included change wholly old or
+   wholly new and the optional public ref either old or at the desired tip.
+4. Earlier acknowledged initial-ref batches contain only validated tuples;
+   because the public operation is last, they cannot expose it prematurely.
+5. A created pull request starts on its permanent safe owned base.
+6. A marker push changes no pull request comparison ref.
+7. Final updates become available only after durable existence markers.
+8. A complete update alias leaves the pull request on an old validated base,
    its owned base, or its final validated base.
 
 Title and body fields do not affect reachability.
@@ -721,9 +806,11 @@ Title and body fields do not affect reachability.
 
 | Failure point | Durable result | Retry behavior |
 | --- | --- | --- |
-| Before tuple publication | No external write | Reobserve and replan |
-| Tuple acknowledgement lost | Batch is wholly old or wholly new | Exact refs reveal the result |
-| Some tuple batches acknowledged | Safe complete tuple prefix | Publish remaining tuples |
+| Before initial-ref publication | No external write | Reobserve and replan |
+| Initial-ref acknowledgement lost | Batch is wholly old or wholly new | Exact refs reveal the result |
+| Some initial-ref batches acknowledged | Safe complete tuple prefix; public ref remains old until its final unit | Publish remaining initial refs |
+| Concurrent public ref write | Exact public lease rejects the containing batch | The rejected attempt preserves it; a fresh attempt reobserves and may deliberately project the desired tip |
+| Unrelated ordinary public-ref D/F conflict | Remote rejects the containing batch | Remove the conflicting ref, rename the public branch, or use private mode |
 | Create acknowledgement lost | A provisional PR may exist | Repeat stable key or observe PR |
 | Some create aliases applied | Some provisional PRs exist | Observe exact local IDs |
 | Marker acknowledgement lost | Marker is absent or immutable | Reobserve exact tag namespace |
@@ -757,14 +844,15 @@ validated history rejects the attempt.
 Convergence is a liveness property after intent stabilizes, not while
 publishers continually express incompatible stacks. Fix one complete local
 intent and the default branch, and assume that after some point no publisher
-writes a conflicting tuple or projection. Other publishers may still perform
-effects required by the fixed intent. Measure its remaining durable work
-lexicographically by:
+writes a conflicting tuple, public branch, or pull request projection. Other
+publishers may still perform effects required by the fixed intent. Measure its
+remaining durable work lexicographically by:
 
 1. missing Git tuples;
-2. missing pull requests;
-3. missing pull request markers; and
-4. stale final projection fields.
+2. a missing or stale public branch projection;
+3. missing pull requests;
+4. missing pull request markers; and
+5. stale final projection fields.
 
 After stabilization, an acknowledged required effect reduces the earliest
 affected component. Another publisher may perform the same Git effect first,
@@ -776,14 +864,14 @@ stable GitHub visibility removes already-applied GitHub work from later plans.
 If still-required operations eventually receive usable acknowledgements,
 fresh attempts reach a plan with no action.
 
-Before stabilization, a tuple push whose desired object conflicts with the
-current object must satisfy exact leases, and a rejected push stops before its
-later stages. An attempt which had already observed its tuple as desired may
-emit a later stale projection after another publisher changes the tuple, but
-every allowed projection is safe. Conflicting effects may increase the
-remaining work for either intent, so the protocol promises safety rather than
-progress until one complete intent stabilizes. It never rolls back to
-manufacture progress.
+Before stabilization, an initial-ref push whose desired object conflicts with
+the current object must satisfy exact leases, and a rejected push stops before
+its later stages. This includes the public ref. An attempt which had already
+observed its tuple as desired may emit a later stale projection after another
+publisher changes the tuple, but every allowed projection is safe. Conflicting
+effects may increase the remaining work for either intent, so the protocol
+promises safety rather than progress until one complete intent stabilizes. It
+never rolls back to manufacture progress.
 
 ### Concurrent mutation limit
 
@@ -799,6 +887,37 @@ protocol. This design supports concurrent protocol publishers but states the
 boundary against independent lifecycle and topology writers plainly.
 
 ## Adapter contracts
+
+### Enclosing hook boundary
+
+Git invokes `pre-push` with a remote name and location and writes every planned
+ref update to the hook's standard input. Every managed branch is configured
+with `pushRemote = .`, `remote = .`, and its own local merge ref. A managed Git
+invocation is accepted only when both hook arguments are exactly `.` and
+standard input reaches EOF without one byte of update data. This proves that
+the enclosing Git process has no ref mutation after GHerrit's internal
+protocol is acknowledged. It does not prove that the enclosing process will
+succeed: another hook or a later Git failure may reject it after GHerrit has
+durably published, and a fresh invocation then reobserves that state.
+
+Plain `git push` has the accepted shape. An external destination or a refspec
+which would produce an update is rejected. Explicit `git push .` and an
+already-up-to-date refspec are observationally identical to the plain form and
+may be accepted.
+
+The hidden direct `gherrit hook pre-push` entry point has no enclosing Git
+effect and therefore uses zero arguments and requires no input. One supplied
+argument is invalid; two form the Git-hook invocation. An unmanaged Git
+invocation returns before reading standard input, so a composite hook can pass
+the complete stream to later checks. Internal GHerrit pushes return through the
+recursion guard before management or input handling. Installed and composite
+wrappers must forward both arguments unchanged and leave standard input
+connected to GHerrit.
+
+Git supplies no hook input which distinguishes `git push --dry-run` from a real
+push. The dry-run form therefore performs GHerrit's real internal publication;
+only the already-empty enclosing loopback push is dry-run. This is a documented
+limitation of the pre-push interface.
 
 ### Push destination
 
@@ -838,6 +957,7 @@ Remote observation is byte-oriented and validates exact ref names. It rejects:
 
 - malformed object IDs or ref records;
 - symbolic `HEAD` without a usable target;
+- a duplicate, malformed, or symbolic requested public branch;
 - disagreement between `HEAD` and its exact target ref;
 - an unexpected namespace root;
 - noncanonical or noncontiguous versions;
@@ -845,9 +965,9 @@ Remote observation is byte-oriented and validates exact ref names. It rejects:
 - any response which cannot prove complete coverage of the requested local
   names.
 
-Exact local queries, source-ref acquisitions, tuple pushes, and marker pushes
-use a conservative variable-argument budget. Batching never splits a tuple or
-marker operation.
+Exact local queries, source-ref acquisitions, initial-ref pushes, and marker
+pushes use a conservative variable-argument budget. Batching never splits a
+tuple, public branch, or marker operation.
 
 Observation and acquisition do not update local branches, tags,
 remote-tracking refs, `FETCH_HEAD`, or Git configuration. A successful
@@ -869,10 +989,10 @@ by a different current object.
 Each internal publication command sets an internal environment marker to its
 generated remote name. The GHerrit hook returns immediately only when Git
 supplies that same remote name and a nonempty remote location. A composite
-pre-push hook therefore continues to run its other checks for internal tuple
-and marker pushes. A wrapper which invokes GHerrit must preserve the marker.
-The marker prevents cooperative recursion; it is not an authentication or
-security boundary.
+pre-push hook therefore continues to run its other checks for internal tuple,
+public-branch, and marker pushes. A wrapper which invokes GHerrit must preserve
+the marker, arguments, and input stream. The marker prevents cooperative
+recursion; it is not an authentication or security boundary.
 
 ### GraphQL queries
 
@@ -905,7 +1025,7 @@ essential shape is:
 
 ```text
 PushDestination
-    -> RemoteDefault
+    -> InitialRemoteObservation(RemoteDefault, OptionalPublicBranchState)
     -> LocalStack
 
 LocalStack + PushDestination
@@ -921,7 +1041,7 @@ terminal-only exact history
 
 validated local evidence
     -> PublicationPlan
-    -> TupleStage
+    -> InitialRefStage(Tuples, OptionalPublicBranchTransition)
     -> CreateStage
     -> MarkerStage
     -> FinalProjection
@@ -938,6 +1058,8 @@ The planner cannot represent:
 - a pull request observation detached from its requested local ID;
 - a marker target outside validated history;
 - a split head/base/version publication action;
+- a public branch transition without an exact observed value or authoritative
+  absence;
 - final updates without marker acknowledgement; or
 - a create receipt for an unplanned change.
 
@@ -949,12 +1071,15 @@ additional planner states.
 Network latency and backend query execution dominate ordinary publication.
 Work therefore scales with the local stack rather than repository size.
 
-An empty stack performs only the Git work needed to identify its boundary. It
-does not authenticate to GitHub or send a GraphQL request.
+An empty private stack performs only the Git work needed to identify its
+boundary. An empty public stack may additionally perform one exact leased
+public-branch push, but performs none when the branch is already current.
+Neither authenticates to GitHub or sends a GraphQL request.
 
 A normal nonempty attempt performs:
 
-- one small symbolic remote `HEAD` observation;
+- one small symbolic remote `HEAD` observation which includes the optional
+  exact public branch in the same request;
 - byte-bounded exact Git reads for the default and local change namespaces;
 - at most one exact object-acquisition process and one final graph reload, only
   when the initial graph load reports an authorized missing object;
@@ -972,12 +1097,24 @@ require it. Connection pages remain fixed at one row. Expensive graph work is
 shared across local histories, and duplicate object IDs are loaded once
 without collapsing distinct version positions.
 
+Public mode adds at most one atomic ref unit. It performs no push when already
+current, normally shares the final tuple batch, and adds at most one push batch
+when it is the only initial work or the argument budget requires separation.
+GHerrit does not scan unrelated ordinary refs for D/F conflicts, so the public
+observation remains constant-size; the remote may reject such a conflict at
+the write boundary.
+
 ## Testing obligations
 
 [The testing strategy](../agent_docs/testing.md) assigns each claim to its
 lowest faithful layer. At minimum, coverage proves:
 
 - exact local Git ref and tag observation, including authoritative absence;
+- exact public branch presence and absence, malformed and symbolic records,
+  checked default-branch disjointness, and no extra observation round trip;
+- the first-component public-name grammar, both directions of public/default
+  D/F conflict, change-ID/default ancestor conflict, and unrelated ordinary-ref
+  D/F rejection before GitHub mutation;
 - deterministic causal-root provenance and exact source-ref acquisition
   payloads;
 - no acquisition for complete or invalid graphs, or for missing ancestry in an
@@ -985,7 +1122,8 @@ lowest faithful layer. At minimum, coverage proves:
 - one negotiated acquisition for a missing advertised root, one direct
   refetch for missing ancestry in a promisor repository, and no second request
   after the authoritative reload;
-- empty-stack completion before GitHub token access or requests;
+- private empty-stack completion and public empty-stack create, advance, and
+  already-current behavior before GitHub token access or requests;
 - pending-autosquash rejection before trailer validation or remote
   observation;
 - complete independently paginated all-state queries for exact local IDs;
@@ -993,11 +1131,20 @@ lowest faithful layer. At minimum, coverage proves:
   duplicate OPEN, fork, and malformed response outcomes;
 - no repository-wide or nonlocal observation;
 - historical reachability across all published and proposed pairings;
-- complete tuple atomicity and leases at a real Git remote;
+- complete tuple atomicity and exact public create/advance leases at a real Git
+  remote, including public-last batch ordering and conflict rollback;
+- already-current public no-op planning, same-desired race acknowledgement,
+  deliberate replacement of an already-observed value, movement after
+  observation or acknowledgement, lost acknowledgement, and fresh recovery;
 - exact create and update receipt validation;
 - internal publication recursion suppression without bypassing other
   pre-push checks;
-- tuple, create, marker, and update interruption prefixes;
+- exact installed-hook argument and input enforcement, loopback publication,
+  and unmanaged input preservation;
+- zero-argument direct invocation, incomplete and wrong arguments, wrapper
+  forwarding, real dry-run publication, and later enclosing-push failure;
+- no automatic public-ref deletion after privatization or rename;
+- initial-ref, create, marker, and update interruption prefixes;
 - protocol-conforming publisher interleavings and exact-lease conflicts;
 - stale visibility before and after marker publication; and
 - deterministic convergence to no action once intent stabilizes.
@@ -1013,6 +1160,9 @@ composition.
 Under the assumptions in this document, GHerrit guarantees:
 
 - every local version is one exactly leased head/base/version tuple;
+- the initial Git barrier is crossed only after an optional public branch was
+  observed already at the stack tip or its required exact-leased transition
+  was acknowledged;
 - every created pull request starts on its permanent safe owned base;
 - no final pull request update precedes durable marker acknowledgement;
 - every acknowledged and indeterminate prefix remains safe;
@@ -1038,6 +1188,13 @@ The protocol does not guarantee:
 - discovery of legacy or corrupt pull requests based on another change's
   owned branches;
 - preservation of concurrent manual title or body edits;
+- preservation of independent public-branch writes which were already visible
+  when GHerrit observed the branch;
+- a continuously current public target while concurrent publishers are active;
+- creation of a public ref whose path has an unrelated ordinary-ref D/F
+  conflict;
+- deletion of a stale public ref after a branch becomes private or is renamed;
+- a side-effect-free `git push --dry-run` on a managed branch;
 - use of native auto-merge or merge queues for owned-base pull requests; or
 - automatic rebasing after a root pull request merges.
 

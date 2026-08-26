@@ -9,4 +9,4 @@ STDOUT:
 
 STDERR:
 [gherrit] Branch visibility-feature is now managed by GHerrit in private mode.
-[gherrit]   - 'git push' will sync PRs only, but will not push visibility-feature itself.
+[gherrit]   - 'git push' will publish the stack without pushing visibility-feature itself.

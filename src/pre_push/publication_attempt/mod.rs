@@ -6,11 +6,6 @@
 //! No observation, client, action, receipt, or continuation crosses this
 //! module boundary.
 
-#![cfg_attr(
-    test,
-    allow(dead_code, reason = "the complete exact workflow remains dormant until activation")
-)]
-
 mod body;
 mod github;
 mod history;
@@ -26,6 +21,8 @@ use std::borrow::Cow;
 use color_eyre::eyre::{Context as _, Result, bail};
 use owo_colors::OwoColorize as _;
 
+#[cfg(test)]
+use self::refs::prepare_tuple_pushes;
 use self::{
     body::{GeneratedBody, StackBodyRecipes},
     github::{
@@ -36,64 +33,179 @@ use self::{
     },
     history::{Revision, ValidatedChangeHistory},
     refs::{
-        MarkerTransition, PreparedPushes, PublicationRevision, TupleTransition,
-        prepare_marker_pushes, prepare_tuple_pushes,
+        MarkerTransition, PreparedPushes, PublicBranchTransition, PublicationRevision,
+        TupleTransition, prepare_initial_pushes, prepare_marker_pushes,
     },
     remote::ValidatedPublication,
 };
 use super::{
-    GithubEndpoint, batching, destination,
-    destination::{DefaultBranch, PushDestination},
+    GithubEndpoint, Invocation, destination,
+    destination::{DefaultBranch, PushDestination, RemoteBranchState},
     local,
     local::{GherritPrId, LocalChange, LocalStack},
 };
-use crate::util::{self, HeadState};
+use crate::{
+    manage::{PublicBranchName, State},
+    util::{self, HeadState},
+};
+
+/// One public branch checked against the remote default observed by this
+/// publication attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicBranch(PublicBranchName);
+
+impl PublicBranch {
+    fn new(name: PublicBranchName, default_branch: &DefaultBranch) -> Result<Self> {
+        if ref_paths_conflict(name.as_str(), default_branch.name()) {
+            bail!("A public GHerrit branch cannot conflict with the repository default branch");
+        }
+        Ok(Self(name))
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    #[cfg(test)]
+    fn for_test(value: &str) -> Result<Self> {
+        Ok(Self(PublicBranchName::new(value.to_owned())?))
+    }
+}
+
+fn ref_paths_conflict(left: &str, right: &str) -> bool {
+    left == right
+        || left.strip_prefix(right).is_some_and(|suffix| suffix.starts_with('/'))
+        || right.strip_prefix(left).is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// One checked public branch and its exact state in the initial remote
+/// observation. This evidence is consumed into either an already-desired
+/// presentation identity or one checked leased transition which owns that
+/// identity.
+struct ObservedPublicBranch {
+    branch: PublicBranch,
+    remote: RemoteBranchState,
+}
+
+enum PlannedPublicBranch {
+    AlreadyDesired(PublicBranch),
+    Transition(PublicBranchTransition),
+}
+
+impl PlannedPublicBranch {
+    fn branch(&self) -> &PublicBranch {
+        match self {
+            Self::AlreadyDesired(branch) => branch,
+            Self::Transition(transition) => transition.branch(),
+        }
+    }
+
+    fn transition(&self) -> Option<&PublicBranchTransition> {
+        match self {
+            Self::AlreadyDesired(_) => None,
+            Self::Transition(transition) => Some(transition),
+        }
+    }
+}
+
+impl ObservedPublicBranch {
+    fn plan(self, desired: gix::ObjectId) -> Result<PlannedPublicBranch> {
+        let Self { branch, remote } = self;
+        match remote {
+            RemoteBranchState::Absent => PublicBranchTransition::create(branch, desired),
+            RemoteBranchState::At(current) if current == desired => {
+                return Ok(PlannedPublicBranch::AlreadyDesired(branch));
+            }
+            RemoteBranchState::At(current) => {
+                PublicBranchTransition::advance(branch, current, desired)
+            }
+        }
+        .map(PlannedPublicBranch::Transition)
+    }
+}
 
 /// Runs the complete publication protocol behind one private boundary.
 ///
 /// Callers cannot assemble a destination, observation, client, plan, or
 /// effect. This function derives each value from the supplied repository and
 /// consumes the complete attempt before returning.
-pub(super) async fn run(repository: &util::Repo, endpoint: &GithubEndpoint) -> Result<()> {
+pub(super) async fn run(
+    repository: &util::Repo,
+    endpoint: &GithubEndpoint,
+    invocation: Invocation,
+) -> Result<()> {
     let branch_name = match repository.current_branch() {
         HeadState::Attached(name) | HeadState::Pending(name) => name,
         HeadState::Detached => bail!("Cannot push from detached HEAD"),
     };
 
-    if !repository.is_managed(branch_name)? {
-        log::info!("Branch {} is UNMANAGED. Allowing standard push.", branch_name.yellow());
-        return Ok(());
-    }
+    let public_branch_name = match State::read_required_from(repository, branch_name)? {
+        State::Unmanaged => {
+            log::info!("Branch {} is UNMANAGED. Allowing standard push.", branch_name.yellow());
+            return Ok(());
+        }
+        State::Private => None,
+        State::Public => Some(PublicBranchName::new(branch_name.to_owned())?),
+    };
+    invocation.require_managed_noop()?;
     log::info!("Branch {} is MANAGED. Publishing stack...", branch_name.yellow());
 
     let configured_remote = repository
         .default_remote_name()
         .wrap_err("Failed to read the configured GHerrit remote")?;
     let destination = PushDestination::resolve(repository, configured_remote)?;
-    let default_branch = destination.observe_default_branch()?;
+    let initial_remote_output = subprocess::output(
+        destination.initial_observation(public_branch_name.as_ref()),
+        subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
+    )
+    .await
+    .wrap_err_with(|| {
+        format!("Failed to observe GHerrit remote '{}'", destination.configured_remote())
+    })?;
+    let initial = destination.decode_initial_observation(
+        initial_remote_output.status(),
+        initial_remote_output.stdout(),
+        public_branch_name.as_ref(),
+    )?;
+    let (default_branch, public_branch_state) = initial.into_parts();
+    let public_branch = match (public_branch_name, public_branch_state) {
+        (Some(name), Some(remote)) => {
+            Some(ObservedPublicBranch { branch: PublicBranch::new(name, &default_branch)?, remote })
+        }
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("Initial remote observation disagrees with public branch intent")
+        }
+    };
     let stack = LocalStack::collect(repository, &default_branch, destination.configured_remote())
         .wrap_err("Failed to collect commits")?;
+    let public_branch = public_branch.map(|branch| branch.plan(stack.tip())).transpose()?;
 
     if stack.is_empty() {
+        if let Some(public_branch) = public_branch {
+            prepare_initial_pushes(&destination, public_branch.transition(), &[])?
+                .execute(&destination)
+                .await?;
+        }
         log::info!("No commits to publish.");
         return Ok(());
     }
     if endpoint.is_disabled() {
-        bail!("The GHerrit test driver cannot sync PRs without a configured GitHub endpoint");
+        bail!("The GHerrit test driver cannot publish PRs without a configured GitHub endpoint");
     }
     if let Some(api_url) = endpoint.custom_url() {
         log::warn!("Using custom GitHub API URL: {api_url}");
     }
 
     let github = Github::new(endpoint, &destination)?;
-    let public_branch = super::public_stack_branch(repository, branch_name);
     let (validated, observed) = tokio::try_join!(
         remote::observe_and_validate_histories(&stack, repository, destination),
         github.observe_local_pull_requests(&stack),
     )?;
     let count = stack.len();
     plan_publication(validated, observed, public_branch, stack)?.execute().await?;
-    log::info!("Successfully published {count} commits.");
+    let noun = if count == 1 { "commit" } else { "commits" };
+    log::info!("Successfully published {count} {noun}.");
     Ok(())
 }
 
@@ -126,7 +238,7 @@ impl PublicationPlan {
 /// continuation. Each operation consumes an already-preflighted value and
 /// returns only the acknowledgement needed to release the next stage.
 trait EffectDriver {
-    async fn publish_tuples(&mut self, pushes: PreparedPushes) -> Result<()>;
+    async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()>;
 
     async fn create_pull_requests(
         &mut self,
@@ -146,7 +258,7 @@ struct RemoteEffectDriver<'attempt> {
 }
 
 impl EffectDriver for RemoteEffectDriver<'_> {
-    async fn publish_tuples(&mut self, pushes: PreparedPushes) -> Result<()> {
+    async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()> {
         pushes.execute(self.destination).await
     }
 
@@ -172,8 +284,8 @@ impl EffectDriver for RemoteEffectDriver<'_> {
 /// Test-only pure planning inspects this type; production wraps it in the
 /// consuming [`PublicationPlan`] above.
 struct PlannedPublication {
-    tuple_pushes: PreparedPushes,
-    after_tuples: AfterTuples,
+    initial_pushes: PreparedPushes,
+    after_initial_refs: AfterInitialRefs,
 }
 
 impl PlannedPublication {
@@ -182,18 +294,18 @@ impl PlannedPublication {
     /// Any error ends the attempt immediately. No later effect is exposed to
     /// the driver, and no effect is retried or reobserved here.
     async fn execute_with(self, driver: &mut impl EffectDriver) -> Result<()> {
-        let Self { tuple_pushes, after_tuples } = self;
-        driver.publish_tuples(tuple_pushes).await?;
-        let marker_stage = match after_tuples {
-            AfterTuples::Ready(stage) => *stage,
-            AfterTuples::Creates(stage) => stage.complete_with(driver).await?,
+        let Self { initial_pushes, after_initial_refs } = self;
+        driver.publish_initial_refs(initial_pushes).await?;
+        let marker_stage = match after_initial_refs {
+            AfterInitialRefs::Ready(stage) => *stage,
+            AfterInitialRefs::Creates(stage) => stage.complete_with(driver).await?,
         };
         driver.publish_markers(marker_stage.marker_pushes).await?;
         driver.update_pull_requests(marker_stage.updates).await
     }
 }
 
-enum AfterTuples {
+enum AfterInitialRefs {
     /// Every pull request identity was present in the observation, so exact
     /// final updates could be rendered and preflighted during planning.
     Ready(Box<MarkerStage>),
@@ -368,7 +480,7 @@ impl BoundProjectionEntry {
 fn plan_publication(
     validated: ValidatedPublication,
     observed: ObservedGithub,
-    public_branch: Option<String>,
+    public_branch: Option<PlannedPublicBranch>,
     stack: LocalStack,
 ) -> Result<PublicationPlan> {
     let (histories, destination) = validated.into_parts();
@@ -382,7 +494,7 @@ fn plan_publication(
 
 fn plan_effects(
     destination: &PushDestination,
-    public_branch: Option<String>,
+    public_branch: Option<PlannedPublicBranch>,
     stack: LocalStack,
     histories: Box<[ValidatedChangeHistory]>,
     pull_requests: CompleteLocalPullRequests,
@@ -406,14 +518,21 @@ fn plan_effects(
         .zip(&desired_revisions)
         .filter_map(|(history, desired)| tuple_transition(history, *desired))
         .collect::<Result<Vec<_>>>()?;
-    let tuple_pushes = prepare_tuple_pushes(destination, &tuple_transitions)?;
+    let projected_public_branch =
+        public_branch.as_ref().map(|public_branch| public_branch.branch().clone());
+    let initial_pushes = prepare_initial_pushes(
+        destination,
+        public_branch.as_ref().and_then(PlannedPublicBranch::transition),
+        &tuple_transitions,
+    )?;
     let realities =
         build_realities(histories.iter().zip(desired_revisions), pull_requests.into_vec())?;
-    let recipes = StackBodyRecipes::new(destination, public_branch, stack, histories.into_vec())?;
-    let after_tuples =
+    let recipes =
+        StackBodyRecipes::new(destination, projected_public_branch, stack, histories.into_vec())?;
+    let after_initial_refs =
         prepare_projection(destination, realities, recipes, create_preparation, default_branch)?;
 
-    Ok(PlannedPublication { tuple_pushes, after_tuples })
+    Ok(PlannedPublication { initial_pushes, after_initial_refs })
 }
 
 /// Checks every count and positional join before any truncating iterator can
@@ -572,7 +691,7 @@ fn prepare_projection(
     recipes: StackBodyRecipes,
     create_preparation: CreatePreparation,
     default_branch: DefaultBranch,
-) -> Result<AfterTuples> {
+) -> Result<AfterInitialRefs> {
     match realities {
         ProjectionRealities::AllExisting(realities) => {
             let mut marker_transitions = Vec::new();
@@ -586,7 +705,7 @@ fn prepare_projection(
             let marker_pushes = prepare_marker_pushes(destination, &marker_transitions)?;
             let updates = prepare_final_updates(entries, &recipes, default_branch.name())?;
             drop(create_preparation);
-            Ok(AfterTuples::Ready(Box::new(MarkerStage { marker_pushes, updates })))
+            Ok(AfterInitialRefs::Ready(Box::new(MarkerStage { marker_pushes, updates })))
         }
         ProjectionRealities::NeedsCreate(realities) => prepare_create_stage(
             destination,
@@ -596,7 +715,7 @@ fn prepare_projection(
             default_branch,
         )
         .map(Box::new)
-        .map(AfterTuples::Creates),
+        .map(AfterInitialRefs::Creates),
     }
 }
 
@@ -643,8 +762,8 @@ fn prepare_create_stage(
             }
         }
     }
-    // Both collections are fully preflighted before tuple publication can be
-    // exposed. Marker bytes stay private until receipt completion.
+    // Both collections are fully preflighted before initial Git publication
+    // can be exposed. Marker bytes stay private until receipt completion.
     let marker_pushes = prepare_marker_pushes(destination, &marker_transitions)?;
     let creates = create_preparation.prepare(create_operations)?;
     let seed = ProjectionSeed {

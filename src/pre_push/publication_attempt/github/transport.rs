@@ -258,7 +258,7 @@ impl Github {
                             eyre!("GitHub query for one local change exceeds resource limits")
                         })?;
                         log::warn!(
-                            "Backing off exact-local GraphQL aliases from {} to {}.",
+                            "Backing off the GitHub query batch from {} to {}.",
                             attempted,
                             pending.alias_count()
                         );
@@ -467,11 +467,8 @@ mod tests {
 
     use super::{
         super::{
-            super::{
-                batching::MAX_MUTATION_REQUEST_BYTES, destination::DefaultBranch,
-                local::GherritPrId,
-            },
-            PullRequestIdentity,
+            super::{destination::DefaultBranch, local::GherritPrId},
+            MAX_MUTATION_REQUEST_BYTES, PullRequestIdentity,
             mutation::{PreparedCreates, PreparedUpdates, TestCreate, TestUpdate},
             observation::LocalPullRequestObservation,
             pull_request::PullRequestIdentityRegistry,

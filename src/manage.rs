@@ -13,6 +13,36 @@ pub enum State {
     Public,
 }
 
+/// A checked public branch whose remote ref cannot overlap GHerrit's owned
+/// head or base namespaces.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublicBranchName(String);
+
+impl PublicBranchName {
+    pub(crate) fn new(value: String) -> Result<Self> {
+        let full_name = format!("refs/heads/{value}");
+        if gix::refs::FullName::try_from(full_name.as_str()).is_err() {
+            bail!("A public GHerrit branch must have a valid Git branch name");
+        }
+        if value == "gherrit-bases" || value.starts_with("gherrit-bases/") {
+            bail!(
+                "A public GHerrit branch cannot use GHerrit's reserved 'gherrit-bases' namespace"
+            );
+        }
+        let first_component = value.split('/').next().expect("validated branch is nonempty");
+        if first_component.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            bail!(
+                "A public GHerrit branch's first path component must contain a character other than an ASCII letter or digit so it cannot collide with a change-owned head"
+            );
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl State {
     const UNMANAGED: &str = "false";
     const PRIVATE: &str = "managedPrivate";
@@ -25,14 +55,26 @@ impl State {
             Some(State::PRIVATE) => Ok(Some(State::Private)),
             Some(State::UNMANAGED) => Ok(Some(State::Unmanaged)),
             None => Ok(None),
-            Some(unknown) => bail!(
-                "Invalid gherritManaged value: {}. Expected {}, {}, or {}.",
-                unknown.yellow(),
+            Some(_) => bail!(
+                "Invalid gherritManaged value. Expected {}, {}, or {}.",
                 State::PUBLIC.yellow(),
                 State::PRIVATE.yellow(),
                 State::UNMANAGED.yellow()
             ),
         }
+    }
+
+    /// Reads the branch's checked management intent or reports how to choose
+    /// it.
+    pub fn read_required_from(repo: &util::Repo, branch_name: &str) -> Result<State> {
+        let Some(state) = Self::read_from(repo, branch_name)? else {
+            bail!(
+                "It is unclear whether branch '{branch_name}' should be managed by GHerrit.\n\
+                 Run 'gherrit manage' to configure it as a GHerrit stack.\n\
+                 Run 'gherrit unmanage' to push it as a standard Git branch."
+            );
+        };
+        Ok(state)
     }
 
     fn config_value(self) -> &'static str {
@@ -52,13 +94,12 @@ struct BranchConfig {
 }
 
 impl BranchConfig {
-    fn expected(state: Option<State>, branch_name: &str, default_remote: &str) -> BranchConfig {
+    fn expected(state: Option<State>, branch_name: &str) -> BranchConfig {
         let self_merge_ref = format!("refs/heads/{branch_name}");
         BranchConfig {
             push_remote: match state {
                 Some(State::Unmanaged) | None => None,
-                Some(State::Private) => Some(".".to_string()),
-                Some(State::Public) => Some(default_remote.to_string()),
+                Some(State::Private | State::Public) => Some(".".to_string()),
             },
             remote: match state {
                 Some(State::Unmanaged) | None => None,
@@ -199,6 +240,9 @@ fn apply_config_update(
 /// Configures the Git branch state for GHerrit management.
 pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()> {
     let (branch_name, old_state) = repo.read_current_branch_and_state()?;
+    if new_state == State::Public {
+        PublicBranchName::new(branch_name.clone())?;
+    }
     match transition_kind(old_state, new_state) {
         TransitionKind::NoChange => {
             log::debug!(
@@ -209,15 +253,13 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
         }
         TransitionKind::RecordUnmanaged => {}
         TransitionKind::ReconcileConfig => {
-            let default_remote = repo.default_remote_name()?;
             let current = BranchConfig::read_from(repo, &branch_name)?;
             // Compare against the old state's expected configuration, not the
             // requested state's configuration. Otherwise a transition could
             // silently adopt a user's custom value that happens to match the
             // new state, then treat that value as GHerrit-owned in the future.
-            let expected = BranchConfig::expected(old_state, &branch_name, default_remote.as_str());
-            let desired =
-                BranchConfig::expected(Some(new_state), &branch_name, default_remote.as_str());
+            let expected = BranchConfig::expected(old_state, &branch_name);
+            let desired = BranchConfig::expected(Some(new_state), &branch_name);
 
             match drift_decision(&current, &expected, force) {
                 DriftDecision::NoDrift => {}
@@ -254,12 +296,16 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
         State::Private => {
             let managed_g = "managed".green();
             log::info!("Branch {branch_name_y} is now {managed_g} by GHerrit in private mode.");
-            log::info!("  - 'git push' will sync PRs only, but will not push {branch_name_y} itself.");
+            log::info!(
+                "  - 'git push' will publish the stack without pushing {branch_name_y} itself."
+            );
         }
         State::Public => {
             let managed_g = "managed".green();
             log::info!("Branch {branch_name_y} is now {managed_g} by GHerrit in public mode.");
-            log::info!("  - 'git push' will sync PRs and will also push {branch_name_y} itself.");
+            log::info!(
+                "  - 'git push' will publish the stack and also push {branch_name_y} itself."
+            );
         }
     }
 
@@ -387,8 +433,26 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
 mod tests {
     use super::*;
 
+    #[test]
+    fn public_branches_are_disjoint_from_every_owned_ref() {
+        for branch in ["feature-/one", "feature-one", "feature.one", "café", "gherrit-bases-other"]
+        {
+            assert_eq!(PublicBranchName::new(branch.to_owned()).unwrap().as_str(), branch);
+        }
+
+        for branch in [
+            "Gchange",
+            "Gchange/child",
+            "feature",
+            "feature/one",
+            "gherrit-bases",
+            "gherrit-bases/Gchange",
+        ] {
+            assert!(PublicBranchName::new(branch.to_owned()).is_err(), "branch={branch:?}");
+        }
+    }
+
     const BRANCH: &str = "feature";
-    const DEFAULT_REMOTE: &str = "origin";
     const STATES: [Option<State>; 4] =
         [None, Some(State::Unmanaged), Some(State::Private), Some(State::Public)];
     const REQUESTED_STATES: [State; 3] = [State::Unmanaged, State::Private, State::Public];
@@ -502,23 +566,15 @@ mod tests {
 
     #[test]
     fn expected_branch_configuration_is_owned_and_state_specific() {
-        assert_eq!(BranchConfig::expected(None, BRANCH, DEFAULT_REMOTE), BranchConfig::default());
+        assert_eq!(BranchConfig::expected(None, BRANCH), BranchConfig::default());
+        assert_eq!(BranchConfig::expected(Some(State::Unmanaged), BRANCH), BranchConfig::default());
         assert_eq!(
-            BranchConfig::expected(Some(State::Unmanaged), BRANCH, DEFAULT_REMOTE),
-            BranchConfig::default()
-        );
-        assert_eq!(
-            BranchConfig::expected(Some(State::Private), BRANCH, DEFAULT_REMOTE),
+            BranchConfig::expected(Some(State::Private), BRANCH),
             branch_config(Some("."), Some("."), Some("refs/heads/feature"))
         );
         assert_eq!(
-            BranchConfig::expected(Some(State::Public), BRANCH, DEFAULT_REMOTE),
-            branch_config(Some("origin"), Some("."), Some("refs/heads/feature"))
-        );
-        assert_eq!(
-            BranchConfig::expected(Some(State::Private), BRANCH, "."),
-            BranchConfig::expected(Some(State::Public), BRANCH, "."),
-            "private and public config may coincide for an unusual remote name"
+            BranchConfig::expected(Some(State::Public), BRANCH),
+            branch_config(Some("."), Some("."), Some("refs/heads/feature"))
         );
     }
 
@@ -542,7 +598,7 @@ mod tests {
 
     #[test]
     fn config_drift_decision_has_exactly_three_outcomes() {
-        let expected = BranchConfig::expected(Some(State::Private), BRANCH, DEFAULT_REMOTE);
+        let expected = BranchConfig::expected(Some(State::Private), BRANCH);
         let drifted = branch_config(Some("custom"), Some("."), Some("refs/heads/feature"));
 
         assert_eq!(drift_decision(&expected, &expected, false), DriftDecision::NoDrift);
@@ -564,19 +620,18 @@ mod tests {
     }
 
     #[test]
-    fn transition_does_not_adopt_config_owned_by_the_user() {
-        let expected_private = BranchConfig::expected(Some(State::Private), BRANCH, DEFAULT_REMOTE);
-        let already_public = BranchConfig::expected(Some(State::Public), BRANCH, DEFAULT_REMOTE);
+    fn visibility_transition_preserves_the_shared_noop_configuration() {
+        let expected_private = BranchConfig::expected(Some(State::Private), BRANCH);
+        let already_public = BranchConfig::expected(Some(State::Public), BRANCH);
 
-        assert_eq!(drift_decision(&already_public, &expected_private, false), DriftDecision::Block);
         assert_eq!(
-            drift_decision(&already_public, &expected_private, true),
-            DriftDecision::Overwrite
+            drift_decision(&already_public, &expected_private, false),
+            DriftDecision::NoDrift
         );
         assert_eq!(
             already_public.changes_to(&already_public).collect::<Vec<_>>(),
             Vec::new(),
-            "the desired configuration is already present, but is not GHerrit-owned"
+            "visibility is publication intent, not enclosing-push configuration"
         );
     }
 }

@@ -10,55 +10,40 @@ use color_eyre::eyre::{Result, bail};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 use super::{
+    PublicBranch,
     destination::PushDestination,
     github::PullRequestNumber,
     history::{Revision, ValidatedChangeHistory},
     local::{GherritPrId, LocalChange, LocalStack, PullRequestTitle},
     version::Version,
 };
-use crate::pre_push::body::MAX_BODY_SIZE_BYTES;
+
+// Per https://github.com/orgs/community/discussions/27190#discussioncomment-3254953,
+// GitHub stores PR bodies in a `mediumblob` with a 262,144-byte limit. Use half
+// of that limit as a safety factor.
+const MAX_BODY_SIZE_BYTES: usize = 131_072;
 
 /// Repository links derived from the selected push destination and an optional
-/// raw public branch.
-///
-/// The branch stays raw so its Markdown label and URL path always derive from
-/// the same value at the presentation boundary.
+/// checked public branch.
 #[derive(Debug, Eq, PartialEq)]
 struct BodyLinkContext {
     repository_url: String,
-    public_branch: Option<String>,
+    public_branch: Option<PublicBranch>,
 }
 
 impl BodyLinkContext {
     fn from_destination(
         destination: &PushDestination,
-        public_branch: Option<String>,
+        public_branch: Option<PublicBranch>,
     ) -> Result<Self> {
-        if let Some(branch) = &public_branch {
-            validate_public_branch(branch)?;
-        }
         Ok(Self { repository_url: destination.repo_url_relative(), public_branch })
     }
 
     #[cfg(test)]
     fn for_test(repository_url: &str, public_branch: Option<&str>) -> Result<Self> {
-        let public_branch = public_branch.map(str::to_owned);
-        if let Some(branch) = &public_branch {
-            validate_public_branch(branch)?;
-        }
+        let public_branch = public_branch.map(PublicBranch::for_test).transpose()?;
         Ok(Self { repository_url: repository_url.to_owned(), public_branch })
     }
-}
-
-fn validate_public_branch(value: &str) -> Result<()> {
-    if value.is_empty() {
-        bail!("A body recipe requires a nonempty public branch");
-    }
-    let full_name = format!("refs/heads/{value}");
-    if gix::refs::FullName::try_from(full_name.as_str()).is_err() {
-        bail!("A body recipe public branch must be a valid Git branch name");
-    }
-    Ok(())
 }
 
 /// Bytes which must be percent-encoded inside GitHub's branch path.
@@ -85,10 +70,19 @@ fn write_markdown_text(output: &mut impl fmt::Write, value: &str) -> fmt::Result
 /// route instead receives an RFC 3986 path projection which retains `/` as the
 /// branch hierarchy separator. Both projections stream into the caller's
 /// bounded writer.
-fn write_public_branch_link(output: &mut impl fmt::Write, branch: &str) -> fmt::Result {
+fn write_public_branch_link(
+    output: &mut impl fmt::Write,
+    repository_url: &str,
+    branch: &PublicBranch,
+) -> fmt::Result {
+    let branch = branch.as_str();
     output.write_str("This PR is on branch [")?;
     write_markdown_text(output, branch)?;
-    writeln!(output, "](../tree/{}).\n", utf8_percent_encode(branch, GITHUB_TREE_BRANCH_PATH),)
+    writeln!(
+        output,
+        "]({repository_url}/tree/{}).\n",
+        utf8_percent_encode(branch, GITHUB_TREE_BRANCH_PATH),
+    )
 }
 
 /// A generated body proven to fit GHerrit's product body limit.
@@ -113,10 +107,12 @@ pub(super) struct RenderedBody {
 }
 
 impl RenderedBody {
+    #[cfg(test)]
     pub(super) fn id(&self) -> &GherritPrId {
         &self.id
     }
 
+    #[cfg(test)]
     pub(super) fn body(&self) -> &GeneratedBody {
         &self.body
     }
@@ -141,7 +137,7 @@ pub(super) struct StackBodyRecipes {
 impl StackBodyRecipes {
     pub(super) fn new(
         destination: &PushDestination,
-        public_branch: Option<String>,
+        public_branch: Option<PublicBranch>,
         stack: LocalStack,
         histories: Vec<ValidatedChangeHistory>,
     ) -> Result<Self> {
@@ -273,7 +269,7 @@ impl PullRequestRecipe {
         // following marker effect.
         render_body(
             &context.repository_url,
-            context.public_branch.as_deref(),
+            context.public_branch.as_ref(),
             self.id(),
             current_index,
             &self.commit_body,
@@ -303,7 +299,7 @@ impl PullRequestRecipe {
     fn provisional_body(&self, context: &BodyLinkContext, current_index: usize) -> RenderedBody {
         let body = render_preferred_body(
             &context.repository_url,
-            context.public_branch.as_deref(),
+            context.public_branch.as_ref(),
             self.id(),
             current_index,
             &self.commit_body,
@@ -322,7 +318,7 @@ impl PullRequestRecipe {
     ) -> RenderedBody {
         let body = render_preferred_body(
             &context.repository_url,
-            context.public_branch.as_deref(),
+            context.public_branch.as_ref(),
             self.id(),
             current_index,
             &self.commit_body,
@@ -353,7 +349,7 @@ struct BodyTooLarge;
 #[allow(clippy::too_many_arguments)]
 fn render_preferred_body(
     repository_url: &str,
-    public_branch: Option<&str>,
+    public_branch: Option<&PublicBranch>,
     id: &GherritPrId,
     current_index: usize,
     commit_body: &str,
@@ -387,7 +383,7 @@ fn render_preferred_body(
 #[allow(clippy::too_many_arguments)]
 fn render_body(
     repository_url: &str,
-    public_branch: Option<&str>,
+    public_branch: Option<&PublicBranch>,
     id: &GherritPrId,
     current_index: usize,
     commit_body: &str,
@@ -415,7 +411,7 @@ fn render_body(
 fn write_body(
     output: &mut impl fmt::Write,
     repository_url: &str,
-    public_branch: Option<&str>,
+    public_branch: Option<&PublicBranch>,
     id: &GherritPrId,
     current_index: usize,
     commit_body: &str,
@@ -428,7 +424,7 @@ fn write_body(
     )?;
     output.write_str(commit_body)?;
     output.write_str("\n\n---\n\n")?;
-    write_navigation(output, public_branch, current_index, navigation)?;
+    write_navigation(output, repository_url, public_branch, current_index, navigation)?;
     write_history(output, repository_url, id, history, history_layout)?;
     write_download(output, id)?;
     output.write_str("\n\n")?;
@@ -437,12 +433,13 @@ fn write_body(
 
 fn write_navigation(
     output: &mut impl fmt::Write,
-    public_branch: Option<&str>,
+    repository_url: &str,
+    public_branch: Option<&PublicBranch>,
     current_index: usize,
     navigation: Navigation<'_>,
 ) -> fmt::Result {
     if let Some(branch) = public_branch {
-        write_public_branch_link(output, branch)?;
+        write_public_branch_link(output, repository_url, branch)?;
     }
 
     match navigation {
@@ -804,10 +801,10 @@ mod tests {
             ("Gmiddle", "Middle title", "Build on the root."),
             ("Gtip", "Tip title", "Finish the stack."),
         ]);
-        let recipes = recipes("/octo/widgets", Some("feature/public-stack"), fixture).unwrap();
+        let recipes = recipes("/octo/widgets", Some("feature-/public-stack"), fixture).unwrap();
         let report = provisional_report(&recipes);
 
-        assert!(report.contains("feature\\/public\\-stack"));
+        assert!(report.contains("feature\\-\\/public\\-stack"));
         assert!(!report.contains("\n- "));
         insta::assert_snapshot!("bounded_provisional_public_stack", report);
     }
@@ -1015,16 +1012,18 @@ mod tests {
         let destination = PushDestination::for_test();
         let context = BodyLinkContext::from_destination(
             &destination,
-            Some("feature/public-stack".to_owned()),
+            Some(PublicBranch::for_test("feature-/public-stack").unwrap()),
         )
         .unwrap();
         assert_eq!(context.repository_url, "/owner/repo");
-        assert_eq!(context.public_branch.as_deref(), Some("feature/public-stack"));
+        assert_eq!(
+            context.public_branch.as_ref().map(PublicBranch::as_str),
+            Some("feature-/public-stack")
+        );
 
         let mut rendered = String::new();
         for branch in [
-            "main",
-            "feature/public-stack",
+            "feature-/public-stack",
             "release_(candidate)",
             "fix]docs",
             "hash#fragment",
@@ -1034,10 +1033,11 @@ mod tests {
             "angle<tag>",
             "paren)tail",
             "café/東京",
-            "feature/🚀",
+            "feature-/🚀",
         ] {
             writeln!(rendered, "===== {branch:?} =====").unwrap();
-            write_public_branch_link(&mut rendered, branch).unwrap();
+            let branch = PublicBranch::for_test(branch).unwrap();
+            write_public_branch_link(&mut rendered, "/owner/repo", &branch).unwrap();
         }
         rendered.push_str("===== END =====\n");
         insta::assert_snapshot!("public_branch_links_are_data", rendered);
@@ -1073,21 +1073,22 @@ mod tests {
     #[test]
     fn public_branch_validation_enforces_git_ref_grammar() {
         for byte in (0..=0x1f).chain([0x7f]) {
-            let branch = format!("feature/{}tail", char::from(byte));
+            let branch = format!("feature-/{}tail", char::from(byte));
             assert!(BodyLinkContext::for_test("/octo/widgets", Some(&branch)).is_err());
         }
 
         for scalar in 0x80..=0x9f {
             let control = char::from_u32(scalar).unwrap();
-            let branch = format!("feature/{control}tail");
+            let branch = format!("feature-/{control}tail");
             BodyLinkContext::for_test("/octo/widgets", Some(&branch))
                 .expect("valid UTF-8 Git branch data remains linkable");
             let mut rendered = String::new();
-            write_public_branch_link(&mut rendered, &branch).unwrap();
+            let branch = PublicBranch::for_test(&branch).unwrap();
+            write_public_branch_link(&mut rendered, "/octo/widgets", &branch).unwrap();
             assert_eq!(
                 rendered,
                 format!(
-                    "This PR is on branch [feature\\/{control}tail](../tree/feature/%C2%{scalar:02X}tail).\n\n"
+                    "This PR is on branch [feature\\-\\/{control}tail](/octo/widgets/tree/feature-/%C2%{scalar:02X}tail).\n\n"
                 )
             );
         }
@@ -1120,7 +1121,7 @@ mod tests {
                 "branch={branch:?}"
             );
         }
-        BodyLinkContext::for_test("/octo/widgets", Some("feature/<!--gherrit-meta-ordinary-->"))
+        BodyLinkContext::for_test("/octo/widgets", Some("feature-/<!--gherrit-meta-ordinary-->"))
             .expect("metadata-looking text is ordinary valid branch data");
     }
 
@@ -1369,7 +1370,7 @@ mod tests {
 
     #[test]
     fn body_limit_includes_escaped_public_branch_expansion() {
-        let branch = "feature/(escaped)!café";
+        let branch = "feature-/(escaped)!café";
         let empty = single_recipes_with_branch("Gbranch", "", 1, Some(branch)).unwrap();
         let fixed = final_single(&empty, PullRequestNumber::MAX).body().as_str().len();
         let exact_padding = "x".repeat(MAX_BODY_SIZE_BYTES - fixed);

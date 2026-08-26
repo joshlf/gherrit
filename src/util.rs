@@ -412,17 +412,7 @@ impl Repo {
 
     // Check whether the branch is managed by GHerrit.
     pub fn is_managed(&self, branch_name: &str) -> Result<bool> {
-        match State::read_from(self, branch_name)? {
-            Some(State::Unmanaged) => Ok(false),
-            Some(State::Private | State::Public) => Ok(true),
-            None => {
-                bail!(
-                    "It is unclear whether branch '{branch_name}' should be managed by GHerrit.\n\
-                    Run 'gherrit manage' to sync it as a GHerrit stack.\n\
-                    Run 'gherrit unmanage' to push it as a standard Git branch."
-                );
-            }
-        }
+        Ok(!matches!(State::read_required_from(self, branch_name)?, State::Unmanaged))
     }
 
     pub fn read_current_branch_and_state(&self) -> Result<(String, Option<State>)> {
@@ -547,7 +537,7 @@ impl std::ops::Deref for Repo {
 /// Determines the current HEAD state.
 fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     if let Some(name) = repo.head()?.referent_name() {
-        let name = name.shorten().to_string();
+        let name = decode_branch_name(name.shorten().as_ref())?;
         return Ok(HeadState::Attached(name));
     }
 
@@ -558,22 +548,40 @@ fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     // are states in which we don't have any branch name at all.
     if let Some(InProgress::Rebase) | Some(InProgress::RebaseInteractive) = repo.state() {
         let git_dir = repo.path();
-        let try_read_ref = |path: PathBuf| -> Option<String> {
-            std::fs::read_to_string(path).ok().map(|content| {
-                content.trim().strip_prefix("refs/heads/").unwrap_or(content.trim()).to_string()
-            })
+        let try_read_ref = |path: PathBuf| -> Result<Option<String>> {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error)
+                        .wrap_err_with(|| format!("Failed to read {}", path.display()));
+                }
+            };
+            let bytes = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+            let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+            let bytes = bytes.strip_prefix(b"refs/heads/").unwrap_or(bytes);
+            Ok(Some(decode_branch_name(bytes)?))
         };
 
-        if let Some(name) = try_read_ref(git_dir.join("rebase-merge/head-name")) {
+        if let Some(name) = try_read_ref(git_dir.join("rebase-merge/head-name"))? {
             return Ok(HeadState::Pending(name));
         }
 
-        if let Some(name) = try_read_ref(git_dir.join("rebase-apply/head-name")) {
+        if let Some(name) = try_read_ref(git_dir.join("rebase-apply/head-name"))? {
             return Ok(HeadState::Pending(name));
         }
     }
 
     Ok(HeadState::Detached)
+}
+
+fn decode_branch_name(bytes: &[u8]) -> Result<String> {
+    if bytes.is_empty() {
+        bail!("GHerrit requires a nonempty branch name");
+    }
+    Ok(str::from_utf8(bytes)
+        .wrap_err("GHerrit requires branch names to be valid UTF-8")?
+        .to_owned())
 }
 
 pub trait CommandExt {
@@ -635,6 +643,14 @@ pub fn get_github_token() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_names_are_decoded_without_lossy_substitution() {
+        assert_eq!(decode_branch_name("révision".as_bytes()).unwrap(), "révision");
+        assert!(decode_branch_name(b"").is_err());
+        let error = decode_branch_name(b"bad\xffbranch").unwrap_err();
+        assert!(error.to_string().contains("valid UTF-8"));
+    }
 
     #[test]
     fn remote_names_are_decoded_and_validated_without_fallback() {
