@@ -112,14 +112,55 @@ impl PublicationPlan {
     /// durable acknowledgement has completed.
     async fn execute(self) -> Result<()> {
         let Self { destination, github, effects } = self;
-        let PlannedPublication { tuple_pushes, after_tuples } = effects;
-        tuple_pushes.execute(&destination).await?;
-        let marker_stage = match after_tuples {
-            AfterTuples::Ready(stage) => *stage,
-            AfterTuples::Creates(stage) => stage.complete_from_github(&github).await?,
-        };
-        marker_stage.marker_pushes.execute(&destination).await?;
-        github.update_pull_requests(marker_stage.updates).await
+        effects
+            .execute_with(&mut RemoteEffectDriver { destination: &destination, github: &github })
+            .await
+    }
+}
+
+/// Performs the four externally durable effect kinds for one bound attempt.
+///
+/// The staged plan, rather than the driver, owns their order and every
+/// continuation. Each operation consumes an already-preflighted value and
+/// returns only the acknowledgement needed to release the next stage.
+trait EffectDriver {
+    async fn publish_tuples(&mut self, pushes: PreparedPushes) -> Result<()>;
+
+    async fn create_pull_requests(
+        &mut self,
+        creates: PreparedCreates,
+    ) -> Result<CompleteCreateReceipts>;
+
+    async fn publish_markers(&mut self, pushes: PreparedPushes) -> Result<()>;
+
+    async fn update_pull_requests(&mut self, updates: PreparedUpdates) -> Result<()>;
+}
+
+/// The sole production effect driver, bound to the destination and GitHub
+/// client retained by the complete publication plan.
+struct RemoteEffectDriver<'attempt> {
+    destination: &'attempt PushDestination,
+    github: &'attempt Github,
+}
+
+impl EffectDriver for RemoteEffectDriver<'_> {
+    async fn publish_tuples(&mut self, pushes: PreparedPushes) -> Result<()> {
+        pushes.execute(self.destination).await
+    }
+
+    async fn create_pull_requests(
+        &mut self,
+        creates: PreparedCreates,
+    ) -> Result<CompleteCreateReceipts> {
+        self.github.create_pull_requests(creates).await
+    }
+
+    async fn publish_markers(&mut self, pushes: PreparedPushes) -> Result<()> {
+        pushes.execute(self.destination).await
+    }
+
+    async fn update_pull_requests(&mut self, updates: PreparedUpdates) -> Result<()> {
+        self.github.update_pull_requests(updates).await
     }
 }
 
@@ -131,6 +172,23 @@ impl PublicationPlan {
 struct PlannedPublication {
     tuple_pushes: PreparedPushes,
     after_tuples: AfterTuples,
+}
+
+impl PlannedPublication {
+    /// Consumes the fixed effect sequence through one attempt-bound driver.
+    ///
+    /// Any error ends the attempt immediately. No later effect is exposed to
+    /// the driver, and no effect is retried or reobserved here.
+    async fn execute_with(self, driver: &mut impl EffectDriver) -> Result<()> {
+        let Self { tuple_pushes, after_tuples } = self;
+        driver.publish_tuples(tuple_pushes).await?;
+        let marker_stage = match after_tuples {
+            AfterTuples::Ready(stage) => *stage,
+            AfterTuples::Creates(stage) => stage.complete_with(driver).await?,
+        };
+        driver.publish_markers(marker_stage.marker_pushes).await?;
+        driver.update_pull_requests(marker_stage.updates).await
+    }
 }
 
 enum AfterTuples {
@@ -154,9 +212,9 @@ struct CreateStage {
 }
 
 impl CreateStage {
-    async fn complete_from_github(self, github: &Github) -> Result<MarkerStage> {
+    async fn complete_with(self, driver: &mut impl EffectDriver) -> Result<MarkerStage> {
         let Self { creates, seed } = self;
-        let receipts = github.create_pull_requests(creates).await?;
+        let receipts = driver.create_pull_requests(creates).await?;
         seed.complete(receipts)
     }
 
