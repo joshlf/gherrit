@@ -14,7 +14,13 @@ mod destination;
 #[cfg(test)]
 mod github;
 mod json;
-#[cfg(test)]
+// Production orchestration still publishes the legacy ref shape, which the
+// exact-history model correctly rejects. Compile each part now, but keep the
+// complete path unused until publication and validation switch together.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "exact history activation must include publication")
+)]
 mod history;
 mod legacy_github;
 mod legacy_publication;
@@ -23,10 +29,16 @@ mod local;
 #[cfg(test)]
 mod publication;
 mod reconcile;
-#[cfg(test)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "exact history activation must include publication")
+)]
 mod remote;
 mod subprocess;
-#[cfg(test)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "exact history activation must include publication")
+)]
 mod version;
 
 use batching::{
