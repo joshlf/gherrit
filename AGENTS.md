@@ -2,10 +2,10 @@
 
 ## Agent Persona & Role
 
-You are an expert Rust systems programmer contributing to **GHerrit**, a CLI tool
-that implements Gerrit-style **stacked diffs** for GitHub. Your goal is to
-write high-quality, maintainable, and performant Rust code that adheres to best
-practices and integrates seamlessly with the existing codebase.
+You are an expert Rust systems programmer contributing to **GHerrit**, a CLI
+tool that implements Gerrit-style **stacked diffs** for GitHub. Your goal is
+to write high-quality, maintainable, and performant Rust code that adheres to
+best practices and integrates seamlessly with the existing codebase.
 
 ## Critical Rules
 
@@ -31,10 +31,20 @@ It allows users to maintain a local stack of commits and forces them to be
 represented as a chain of Pull Requests on GitHub.
 
 It achieves this by:
-1.  Intercepting `git push` via the `pre-push` hook.
-2.  Pushing unique `refs/gherrit/<id>` refs for every commit to the remote.
-3.  Using the `gh` CLI tool to create/update PRs and chain them together
-    (setting the base of one PR to the head of the previous one).
+1.  Configuring every managed branch with a local loopback push and using the
+    `pre-push` hook to prove that the enclosing push has no ref update.
+2.  Publishing each changed revision as one atomic change-owned tuple:
+    `refs/heads/<id>` at the revision,
+    `refs/heads/gherrit-bases/<id>` at its literal first parent, and
+    `refs/tags/gherrit/<id>/vN` at the revision. An optional GHerrit-owned
+    public-branch projection is the final indivisible unit of the initial Git
+    stage and may share its final atomic batch with tuples.
+3.  Creating each missing PR with head `<id>` and the stable creation base
+    `gherrit-bases/<id>`.
+4.  Recording established PR existence with the immutable
+    `refs/tags/gherrit/<id>/pr` marker.
+5.  Projecting the final PR title, body, and base after that marker barrier. A
+    root targets the default branch; a nonroot remains on its owned base.
 
 ### Project Structure
 
@@ -44,11 +54,22 @@ It achieves this by:
     - `process.rs`: Process setup shared by the two executable targets.
     - `test_git.rs`: Git interceptor compiled only into the test driver.
     - `lib.rs`: Fallible asynchronous command dispatch and runtime inputs.
-    - `pre_push/mod.rs`: **CORE LOGIC**. Handles commit analysis, ref creation,
-      pushing, and PR syncing.
-    - `manage.rs`: Handles the state of branches (Managed vs Unmanaged) via `git config`.
+    - `pre_push/mod.rs`: Pre-push composition boundary, hook argument and input
+      validation, and recursion guard.
+    - `pre_push/publication_attempt/mod.rs`: One-attempt orchestration only.
+    - `pre_push/publication_attempt/plan/`: Public-branch and stacked-PR
+      planning plus staged execution with one-use acknowledgement authority.
+    - `pre_push/publication_attempt/refs.rs`: Atomic change tuples, public-ref
+      transitions, batching, exact push receipts, and marker publication.
+    - `pre_push/subprocess/`: The single bounded subprocess implementation
+      shared by destination observation, remote acquisition, and publication.
+    - `pre_push/destination.rs` and `pre_push/local.rs`: Destination binding
+      and local stack derivation.
+    - `manage.rs`: Handles branch management state and loopback configuration
+      through `git config`, plus public branch name validation.
     - `commit_msg.rs`: Ensures commits have `gherrit-pr-id` trailers.
-- `hooks/`: Git hooks (`pre-push`, `commit-msg`, `post-checkout`) that shell out to the `gherrit` binary.
+- `hooks/`: Git hooks (`pre-push`, `commit-msg`, `post-checkout`) that shell out
+  to the `gherrit` binary.
 
 ## Development Workflow
 

@@ -2,13 +2,13 @@ use gix::ObjectId;
 
 use super::{
     super::{
-        github::{AbsentPullRequest, ObservedBase},
+        github::{AbsentPullRequest, MAX_MUTATION_REQUEST_BYTES, ObservedBase},
         history::ValidatedChangeHistory,
+        refs::TestPushEffect,
     },
     *,
 };
 use crate::pre_push::{
-    batching::MAX_MUTATION_REQUEST_BYTES,
     destination::RepositoryCoordinates,
     local::{GherritPrId, LocalStack},
 };
@@ -34,6 +34,40 @@ fn identity(number: u32, node: &str) -> PullRequestIdentity {
 
 fn default_branch(name: &str, tip: ObjectId) -> DefaultBranch {
     DefaultBranch::new(name.to_owned(), tip).expect("valid test default branch")
+}
+
+#[test]
+fn public_branch_cannot_conflict_with_the_default_branch_ref_path() {
+    for (public, default) in [
+        ("release-v1", "release-v1"),
+        ("release-v1/work", "release-v1"),
+        ("release-v1", "release-v1/stable"),
+    ] {
+        let name = PublicBranchName::new(public.to_owned()).unwrap();
+        assert!(PublicBranch::new(name, &default_branch(default, oid(10))).is_err());
+    }
+
+    let name = PublicBranchName::new("release-v1/work".to_owned()).unwrap();
+    assert!(PublicBranch::new(name, &default_branch("release-v2", oid(10))).is_ok());
+}
+
+#[test]
+fn public_branch_plan_retains_exactly_the_observed_transition_state() {
+    let desired = oid(20);
+    for (remote, needs_transition) in [
+        (RemoteBranchState::Absent, true),
+        (RemoteBranchState::At(desired), false),
+        (RemoteBranchState::At(oid(19)), true),
+    ] {
+        let name = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+        let observed = ObservedPublicBranch::for_test(name, remote);
+        let planned =
+            plan_public_branch(Some(observed), &default_branch(DEFAULT_NAME, oid(10)), desired)
+                .unwrap()
+                .unwrap();
+        assert_eq!(planned.branch().as_str(), "release-candidate");
+        assert_eq!(planned.transition().is_some(), needs_transition);
+    }
 }
 
 #[derive(Clone)]
@@ -191,6 +225,11 @@ fn plan_with_public_branch(
     public_branch: Option<String>,
 ) -> Result<PlannedPublication> {
     let Inputs { destination, stack, histories, pull_requests } = inputs(specs);
+    let observed = public_branch
+        .map(PublicBranchName::new)
+        .transpose()?
+        .map(|name| ObservedPublicBranch::for_test(name, RemoteBranchState::Absent));
+    let public_branch = plan_public_branch(observed, stack.default_branch(), stack.tip())?;
     plan_effects(&destination, public_branch, stack, histories, pull_requests)
 }
 
@@ -203,9 +242,11 @@ fn observed_for_plan(
 }
 
 fn tuple_count(pushes: &PreparedPushes) -> usize {
-    let refs = pushes.batches().map(|batch| batch.refspecs().len()).sum::<usize>();
-    assert_eq!(refs % 3, 0);
-    refs / 3
+    pushes
+        .batches()
+        .flat_map(|batch| batch.semantic_effects_for_test())
+        .filter(|effect| matches!(effect, TestPushEffect::Tuple { .. }))
+        .count()
 }
 
 fn marker_destinations(pushes: &PreparedPushes) -> Vec<String> {
@@ -739,8 +780,16 @@ fn mixed_specs() -> [EntrySpec; 4] {
 #[test]
 fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
     let plan =
-        plan_with_public_branch(&mixed_specs(), Some("release/candidate".to_owned())).unwrap();
+        plan_with_public_branch(&mixed_specs(), Some("release-candidate".to_owned())).unwrap();
     assert_eq!(tuple_count(&plan.initial_ref_pushes), 1);
+    assert_eq!(
+        plan.initial_ref_pushes
+            .batches()
+            .flat_map(|batch| batch.semantic_effects_for_test())
+            .filter(|effect| matches!(effect, TestPushEffect::PublicBranch { .. }))
+            .count(),
+        1
+    );
     let stage = creates(plan);
     let create_operations = stage.creates.operations_for_test();
     assert_eq!(create_operations.len(), 2);
@@ -756,7 +805,9 @@ fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
     for (operation, expected_id) in create_operations.iter().zip(["Gtwo", "Gfour"]) {
         assert_eq!(operation.title, desired_title(expected_id));
         assert!(operation.body.contains(&desired_body(expected_id)));
-        assert!(operation.body.contains("[release\\/candidate](../tree/release/candidate)"));
+        assert!(
+            operation.body.contains("[release\\-candidate](/owner/repo/tree/release-candidate)")
+        );
         assert!(operation.body.contains(&format!("refs/heads/{expected_id}")));
     }
 
@@ -783,7 +834,7 @@ fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
     for (update, expected_id) in updates.iter().zip(["Gone", "Gtwo", "Gthree", "Gfour"]) {
         let body = update.body.as_deref().unwrap();
         assert!(body.contains(&desired_body(expected_id)));
-        assert!(body.contains("[release\\/candidate](../tree/release/candidate)"));
+        assert!(body.contains("[release\\-candidate](/owner/repo/tree/release-candidate)"));
         assert!(body.contains(&format!("refs/heads/{expected_id}")));
         for other_id in ["Gone", "Gtwo", "Gthree", "Gfour"] {
             assert_eq!(body.contains(&desired_body(other_id)), other_id == expected_id);
@@ -1185,11 +1236,14 @@ impl EffectDriver for ScriptedEffectDriver {
 }
 
 fn fresh_execution_plan() -> PlannedPublication {
-    plan(&[EntrySpec {
-        id: "Gfresh",
-        history: HistorySpec::absent(),
-        pull_request: PullRequestSpec::Absent,
-    }])
+    plan_with_public_branch(
+        &[EntrySpec {
+            id: "Gfresh",
+            history: HistorySpec::absent(),
+            pull_request: PullRequestSpec::Absent,
+        }],
+        Some("release-candidate".to_owned()),
+    )
     .unwrap()
 }
 

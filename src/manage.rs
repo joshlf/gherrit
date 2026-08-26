@@ -13,6 +13,36 @@ pub enum State {
     Public,
 }
 
+/// A checked public branch whose remote ref cannot overlap GHerrit's owned
+/// head or base namespaces.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PublicBranchName(String);
+
+impl PublicBranchName {
+    pub(crate) fn new(value: String) -> Result<Self> {
+        let full_name = format!("refs/heads/{value}");
+        if gix::refs::FullName::try_from(full_name.as_str()).is_err() {
+            bail!("A public GHerrit branch must have a valid Git branch name");
+        }
+        if value == "gherrit-bases" || value.starts_with("gherrit-bases/") {
+            bail!(
+                "A public GHerrit branch cannot use GHerrit's reserved 'gherrit-bases' namespace"
+            );
+        }
+        let first_component = value.split('/').next().expect("validated branch is nonempty");
+        if first_component.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            bail!(
+                "A public GHerrit branch's first path component must contain a character other than an ASCII letter or digit so it cannot collide with a change-owned head"
+            );
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl State {
     const UNMANAGED: &str = "false";
     const PRIVATE: &str = "managedPrivate";
@@ -25,14 +55,26 @@ impl State {
             Some(State::PRIVATE) => Ok(Some(State::Private)),
             Some(State::UNMANAGED) => Ok(Some(State::Unmanaged)),
             None => Ok(None),
-            Some(unknown) => bail!(
-                "Invalid gherritManaged value: {}. Expected {}, {}, or {}.",
-                unknown.yellow(),
+            Some(_) => bail!(
+                "Invalid gherritManaged value. Expected {}, {}, or {}.",
                 State::PUBLIC.yellow(),
                 State::PRIVATE.yellow(),
                 State::UNMANAGED.yellow()
             ),
         }
+    }
+
+    /// Reads the branch's checked management intent or reports how to choose
+    /// it.
+    pub fn read_required_from(repo: &util::Repo, branch_name: &str) -> Result<State> {
+        let Some(state) = Self::read_from(repo, branch_name)? else {
+            bail!(
+                "It is unclear whether branch '{branch_name}' should be managed by GHerrit.\n\
+                 Run 'gherrit manage' to configure it as a GHerrit stack.\n\
+                 Run 'gherrit unmanage' to push it as a standard Git branch."
+            );
+        };
+        Ok(state)
     }
 
     fn config_value(self) -> &'static str {
@@ -52,13 +94,12 @@ struct BranchConfig {
 }
 
 impl BranchConfig {
-    fn expected(state: Option<State>, branch_name: &str, default_remote: &str) -> BranchConfig {
+    fn expected(state: Option<State>, branch_name: &str) -> BranchConfig {
         let self_merge_ref = format!("refs/heads/{branch_name}");
         BranchConfig {
             push_remote: match state {
                 Some(State::Unmanaged) | None => None,
-                Some(State::Private) => Some(".".to_string()),
-                Some(State::Public) => Some(default_remote.to_string()),
+                Some(State::Private | State::Public) => Some(".".to_string()),
             },
             remote: match state {
                 Some(State::Unmanaged) | None => None,
@@ -97,6 +138,48 @@ impl BranchConfig {
             let desired = desired.value(key).as_deref();
             (current != desired).then_some((key, current, desired))
         })
+    }
+}
+
+/// The mutually exclusive ownership evidence available for existing branch
+/// configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchConfigOwnership {
+    Current,
+    LegacyPublic,
+    Drifted,
+}
+
+fn classify_public_branch_config(
+    observed: &BranchConfig,
+    current: &BranchConfig,
+    read_legacy_remote: impl FnOnce() -> Option<util::RemoteName>,
+) -> BranchConfigOwnership {
+    if observed == current {
+        return BranchConfigOwnership::Current;
+    }
+
+    // A legacy public configuration differs from the current form only in
+    // `pushRemote`. Reject every other shape before consulting the separate
+    // legacy destination setting: malformed unrelated configuration must not
+    // turn an ordinary drift report into a command failure.
+    if observed.remote != current.remote || observed.merge != current.merge {
+        return BranchConfigOwnership::Drifted;
+    }
+    let Some(push_remote) = observed.push_remote.as_deref() else {
+        return BranchConfigOwnership::Drifted;
+    };
+    // An unreadable or non-unique legacy remote supplies no evidence that
+    // GHerrit owns this candidate. Preserve it as drift instead of failing the
+    // management command.
+    let Some(legacy_remote) = read_legacy_remote() else {
+        return BranchConfigOwnership::Drifted;
+    };
+
+    if push_remote == legacy_remote.as_str() {
+        BranchConfigOwnership::LegacyPublic
+    } else {
+        BranchConfigOwnership::Drifted
     }
 }
 
@@ -145,17 +228,40 @@ fn transition_kind(current_state: Option<State>, requested_state: State) -> Tran
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DriftDecision {
-    NoDrift,
-    Block,
-    Overwrite,
+enum ConfigReconciliation {
+    ReconcileCurrent,
+    MigrateLegacyPublic,
+    BlockDrift,
+    OverwriteDrift,
 }
 
-fn drift_decision(current: &BranchConfig, expected: &BranchConfig, force: bool) -> DriftDecision {
-    match (current == expected, force) {
-        (true, _) => DriftDecision::NoDrift,
-        (false, false) => DriftDecision::Block,
-        (false, true) => DriftDecision::Overwrite,
+fn config_reconciliation(ownership: BranchConfigOwnership, force: bool) -> ConfigReconciliation {
+    match (ownership, force) {
+        (BranchConfigOwnership::Current, _) => ConfigReconciliation::ReconcileCurrent,
+        (BranchConfigOwnership::LegacyPublic, _) => ConfigReconciliation::MigrateLegacyPublic,
+        (BranchConfigOwnership::Drifted, false) => ConfigReconciliation::BlockDrift,
+        (BranchConfigOwnership::Drifted, true) => ConfigReconciliation::OverwriteDrift,
+    }
+}
+
+fn classify_owned_branch_config(
+    repo: &util::Repo,
+    current_state: Option<State>,
+    branch_name: &str,
+    current: &BranchConfig,
+) -> BranchConfigOwnership {
+    let expected = BranchConfig::expected(current_state, branch_name);
+    match current_state {
+        Some(State::Public) => {
+            classify_public_branch_config(current, &expected, || repo.default_remote_name().ok())
+        }
+        Some(State::Unmanaged | State::Private) | None => {
+            if current == &expected {
+                BranchConfigOwnership::Current
+            } else {
+                BranchConfigOwnership::Drifted
+            }
+        }
     }
 }
 
@@ -199,6 +305,9 @@ fn apply_config_update(
 /// Configures the Git branch state for GHerrit management.
 pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()> {
     let (branch_name, old_state) = repo.read_current_branch_and_state()?;
+    if new_state == State::Public {
+        PublicBranchName::new(branch_name.clone())?;
+    }
     match transition_kind(old_state, new_state) {
         TransitionKind::NoChange => {
             log::debug!(
@@ -209,19 +318,32 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
         }
         TransitionKind::RecordUnmanaged => {}
         TransitionKind::ReconcileConfig => {
-            let default_remote = repo.default_remote_name()?;
             let current = BranchConfig::read_from(repo, &branch_name)?;
             // Compare against the old state's expected configuration, not the
             // requested state's configuration. Otherwise a transition could
             // silently adopt a user's custom value that happens to match the
             // new state, then treat that value as GHerrit-owned in the future.
-            let expected = BranchConfig::expected(old_state, &branch_name, default_remote.as_str());
-            let desired =
-                BranchConfig::expected(Some(new_state), &branch_name, default_remote.as_str());
+            let expected = BranchConfig::expected(old_state, &branch_name);
+            let desired = BranchConfig::expected(Some(new_state), &branch_name);
+            // `--force` is explicit authority to replace any non-current
+            // owned configuration. It must remain usable even when unrelated
+            // destination configuration is malformed; exact legacy
+            // recognition is needed only for the unforced migration path.
+            let ownership = if force && current != expected {
+                BranchConfigOwnership::Drifted
+            } else {
+                classify_owned_branch_config(repo, old_state, &branch_name, &current)
+            };
 
-            match drift_decision(&current, &expected, force) {
-                DriftDecision::NoDrift => {}
-                DriftDecision::Block => {
+            match config_reconciliation(ownership, force) {
+                ConfigReconciliation::ReconcileCurrent => {}
+                ConfigReconciliation::MigrateLegacyPublic => {
+                    log::info!(
+                        "Migrating branch {} from GHerrit's legacy public configuration.",
+                        branch_name.yellow(),
+                    );
+                }
+                ConfigReconciliation::BlockDrift => {
                     // FIXME(#219): Add the ability to save the user's custom
                     // configuration so it can be restored during a subsequent
                     // `gherrit unmanage`.
@@ -229,7 +351,7 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
                     log::warn!("Use --force to overwrite manual changes.");
                     return Ok(());
                 }
-                DriftDecision::Overwrite => {
+                ConfigReconciliation::OverwriteDrift => {
                     log_configuration_drift(&branch_name, old_state, &current, &expected);
                     log::warn!("Overwriting manual changes (--force).");
                 }
@@ -254,12 +376,16 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
         State::Private => {
             let managed_g = "managed".green();
             log::info!("Branch {branch_name_y} is now {managed_g} by GHerrit in private mode.");
-            log::info!("  - 'git push' will sync PRs only, but will not push {branch_name_y} itself.");
+            log::info!(
+                "  - 'git push' will publish the stack without projecting {branch_name_y} to the push destination."
+            );
         }
         State::Public => {
             let managed_g = "managed".green();
             log::info!("Branch {branch_name_y} is now {managed_g} by GHerrit in public mode.");
-            log::info!("  - 'git push' will sync PRs and will also push {branch_name_y} itself.");
+            log::info!(
+                "  - 'git push' will publish the stack and project {branch_name_y}'s captured tip to its same-named remote branch."
+            );
         }
     }
 
@@ -387,8 +513,26 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
 mod tests {
     use super::*;
 
+    #[test]
+    fn public_branches_are_disjoint_from_every_owned_ref() {
+        for branch in ["feature-/one", "feature-one", "feature.one", "café", "gherrit-bases-other"]
+        {
+            assert_eq!(PublicBranchName::new(branch.to_owned()).unwrap().as_str(), branch);
+        }
+
+        for branch in [
+            "Gchange",
+            "Gchange/child",
+            "feature",
+            "feature/one",
+            "gherrit-bases",
+            "gherrit-bases/Gchange",
+        ] {
+            assert!(PublicBranchName::new(branch.to_owned()).is_err(), "branch={branch:?}");
+        }
+    }
+
     const BRANCH: &str = "feature";
-    const DEFAULT_REMOTE: &str = "origin";
     const STATES: [Option<State>; 4] =
         [None, Some(State::Unmanaged), Some(State::Private), Some(State::Public)];
     const REQUESTED_STATES: [State; 3] = [State::Unmanaged, State::Private, State::Public];
@@ -502,23 +646,62 @@ mod tests {
 
     #[test]
     fn expected_branch_configuration_is_owned_and_state_specific() {
-        assert_eq!(BranchConfig::expected(None, BRANCH, DEFAULT_REMOTE), BranchConfig::default());
+        assert_eq!(BranchConfig::expected(None, BRANCH), BranchConfig::default());
+        assert_eq!(BranchConfig::expected(Some(State::Unmanaged), BRANCH), BranchConfig::default());
         assert_eq!(
-            BranchConfig::expected(Some(State::Unmanaged), BRANCH, DEFAULT_REMOTE),
-            BranchConfig::default()
-        );
-        assert_eq!(
-            BranchConfig::expected(Some(State::Private), BRANCH, DEFAULT_REMOTE),
+            BranchConfig::expected(Some(State::Private), BRANCH),
             branch_config(Some("."), Some("."), Some("refs/heads/feature"))
         );
         assert_eq!(
-            BranchConfig::expected(Some(State::Public), BRANCH, DEFAULT_REMOTE),
-            branch_config(Some("origin"), Some("."), Some("refs/heads/feature"))
+            BranchConfig::expected(Some(State::Public), BRANCH),
+            branch_config(Some("."), Some("."), Some("refs/heads/feature"))
         );
+    }
+
+    #[test]
+    fn public_configuration_ownership_classification_is_exhaustive() {
+        let current = BranchConfig::expected(Some(State::Public), BRANCH);
+        let legacy = branch_config(Some("origin"), Some("."), Some("refs/heads/feature"));
+        let cases = branch_configs()
+            .inspect(|observed| {
+                let legacy_candidate = observed != &current
+                    && observed.push_remote.is_some()
+                    && observed.remote == current.remote
+                    && observed.merge == current.merge;
+                let remote_read = std::cell::Cell::new(false);
+                let expected = if observed == &current {
+                    BranchConfigOwnership::Current
+                } else if observed == &legacy {
+                    BranchConfigOwnership::LegacyPublic
+                } else {
+                    BranchConfigOwnership::Drifted
+                };
+                assert_eq!(
+                    classify_public_branch_config(observed, &current, || {
+                        remote_read.set(true);
+                        util::RemoteName::from_config(b"origin").ok()
+                    }),
+                    expected,
+                    "observed={observed:?}"
+                );
+                assert_eq!(remote_read.get(), legacy_candidate, "observed={observed:?}");
+            })
+            .count();
+
+        assert_eq!(cases, 125);
+    }
+
+    #[test]
+    fn current_public_configuration_wins_when_the_legacy_remote_is_loopback() {
+        let current = BranchConfig::expected(Some(State::Public), BRANCH);
+        let legacy = branch_config(Some("."), Some("."), Some("refs/heads/feature"));
+
+        assert_eq!(current, legacy);
         assert_eq!(
-            BranchConfig::expected(Some(State::Private), BRANCH, "."),
-            BranchConfig::expected(Some(State::Public), BRANCH, "."),
-            "private and public config may coincide for an unusual remote name"
+            classify_public_branch_config(&current, &current, || {
+                panic!("current configuration must not read the legacy remote")
+            }),
+            BranchConfigOwnership::Current
         );
     }
 
@@ -541,14 +724,29 @@ mod tests {
     }
 
     #[test]
-    fn config_drift_decision_has_exactly_three_outcomes() {
-        let expected = BranchConfig::expected(Some(State::Private), BRANCH, DEFAULT_REMOTE);
-        let drifted = branch_config(Some("custom"), Some("."), Some("refs/heads/feature"));
+    fn configuration_reconciliation_truth_table_is_exhaustive() {
+        let ownerships = [
+            BranchConfigOwnership::Current,
+            BranchConfigOwnership::LegacyPublic,
+            BranchConfigOwnership::Drifted,
+        ];
+        let cases = ownerships
+            .into_iter()
+            .flat_map(|ownership| [false, true].map(move |force| (ownership, force)))
+            .inspect(|&(ownership, force)| {
+                let expected = match (ownership, force) {
+                    (BranchConfigOwnership::Current, _) => ConfigReconciliation::ReconcileCurrent,
+                    (BranchConfigOwnership::LegacyPublic, _) => {
+                        ConfigReconciliation::MigrateLegacyPublic
+                    }
+                    (BranchConfigOwnership::Drifted, false) => ConfigReconciliation::BlockDrift,
+                    (BranchConfigOwnership::Drifted, true) => ConfigReconciliation::OverwriteDrift,
+                };
+                assert_eq!(config_reconciliation(ownership, force), expected);
+            })
+            .count();
 
-        assert_eq!(drift_decision(&expected, &expected, false), DriftDecision::NoDrift);
-        assert_eq!(drift_decision(&expected, &expected, true), DriftDecision::NoDrift);
-        assert_eq!(drift_decision(&drifted, &expected, false), DriftDecision::Block);
-        assert_eq!(drift_decision(&drifted, &expected, true), DriftDecision::Overwrite);
+        assert_eq!(cases, 6);
     }
 
     #[test]
@@ -564,19 +762,15 @@ mod tests {
     }
 
     #[test]
-    fn transition_does_not_adopt_config_owned_by_the_user() {
-        let expected_private = BranchConfig::expected(Some(State::Private), BRANCH, DEFAULT_REMOTE);
-        let already_public = BranchConfig::expected(Some(State::Public), BRANCH, DEFAULT_REMOTE);
+    fn visibility_transition_preserves_the_shared_noop_configuration() {
+        let expected_private = BranchConfig::expected(Some(State::Private), BRANCH);
+        let already_public = BranchConfig::expected(Some(State::Public), BRANCH);
 
-        assert_eq!(drift_decision(&already_public, &expected_private, false), DriftDecision::Block);
-        assert_eq!(
-            drift_decision(&already_public, &expected_private, true),
-            DriftDecision::Overwrite
-        );
+        assert_eq!(already_public, expected_private);
         assert_eq!(
             already_public.changes_to(&already_public).collect::<Vec<_>>(),
             Vec::new(),
-            "the desired configuration is already present, but is not GHerrit-owned"
+            "visibility is publication intent, not enclosing-push configuration"
         );
     }
 }

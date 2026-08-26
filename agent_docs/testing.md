@@ -18,12 +18,19 @@ user-visible behavior, and its own operational quality.
 
 The suite establishes that GHerrit:
 
-- derives the intended ordered local stack from the exact default branch;
-- returns for an empty stack before GitHub authentication or requests;
+- captures the logical branch, checked management intent, and exact local tip
+  before yielding to remote work;
+- derives the intended ordered local stack from that retained tip and the exact
+  default branch without resolving the live worktree branch again;
+- observes an optional public branch together with the default branch;
+- publishes the public projection for an empty public stack before returning,
+  without GitHub authentication or requests;
 - observes and validates only Git and GitHub state belonging to local change
   IDs;
 - represents each revision as one inseparable head, literal-owned-base, and
   immutable-version tuple;
+- represents a changed public branch as one real initial-ref effect, ordered
+  after every tuple and retained in its complete atomic batch;
 - records established pull request existence with a separate immutable marker;
 - withholds final pull request projection until every required marker is
   exactly acknowledged;
@@ -53,9 +60,11 @@ The suite establishes that:
 
 - local Git history and branch state are derived accurately;
 - remote Git observation requests only the exact default and local change
-  namespaces;
+  namespaces plus the configured public branch when public mode requires it;
 - exact absence, immutable history, and marker state survive byte parsing;
 - Git publication uses complete atomic tuples and exact leases;
+- public-ref creation and advancement use exact absence/value leases and the
+  same bounded initial-ref batching boundary;
 - GitHub observes fully paginated all-state connections for the exact local
   IDs;
 - GraphQL aliases, cursors, errors, nullable fields, and partial mutation
@@ -128,20 +137,25 @@ convergence.
 
 ## Architecture
 
-The pure planner is surrounded by narrow local-Git, remote-Git, GitHub,
-command-line, and hook adapters. One attempt supplies one exact local evidence
-set and invokes the planner once.
+The domain planner and its one-use staged executor are surrounded by narrow
+local-Git, remote-Git, GitHub, command-line, and hook adapters. One attempt
+supplies one exact local evidence set and invokes the planner once.
 
 ```text
-remote symbolic HEAD -> local stack -> empty? -> return
-                              |
-                              +-> exact local refs, tags, and graph ----\
-                              +-> exact local all-state PR connections --+
-                                                                        |
-                                                              publication plan
-                                                                        |
-atomic head/base/version tuples -> GraphQL creates -> marker batches
-                                                   -> final GraphQL updates
+sealed branch + management + exact HEAD --\
+                                          +-> local stack from retained HEAD
+remote symbolic HEAD + exact public ref --/                 |
+                                                            +-> empty public stack
+                                                            |            |
+                                                            +-> exact local refs, tags, graph --+
+                                                            +-> exact local all-state PRs ------+
+                                                                                               |
+                                                                                     publication plan
+                                                                                               |
+                                      initial Git batches: tuples, then optional public effect
+                                                            |
+                                                            +-> GraphQL creates -> marker batches
+                                                                                   -> final GraphQL updates
 ```
 
 "Exact" means that every requested Git name or namespace and every requested
@@ -155,10 +169,14 @@ connection includes OPEN, CLOSED, and MERGED. Complete pagination produces one
 OPEN value, one sealed absence proof, or a terminal-only rejection before the
 planner runs.
 
-Exact acknowledgement of all required tuple pushes releases pull request
-creation. An initially observed valid OPEN pull request authorizes its marker;
-a newly created pull request authorizes its marker only through an exact create
-receipt. Exact acknowledgement of every marker push releases final projection.
+Exact acknowledgement of all required initial Git batches—including the
+optional public effect—releases pull request creation. An initially observed
+valid OPEN pull request authorizes its marker; a newly created pull request
+authorizes its marker only through an exact create receipt. Exact
+acknowledgement of every marker push releases final projection. If an earlier
+tuple batch succeeds but the final public-containing batch fails atomically,
+the earlier tuples remain durable and a fresh attempt plans only the remaining
+work.
 
 An indeterminate write ends the attempt. The same attempt does not retry the
 mutation, roll back, or reobserve. A fresh process reconstructs all authority
@@ -172,6 +190,8 @@ formatted command, raw JSON value, or detachable map entry.
 The pure core distinguishes:
 
 - default branch name and object ID;
+- optional public branch intent, exact observed state, and create/advance
+  transition;
 - ordered local changes, each with change ID, head, literal first parent,
   title, and body;
 - absent or nonempty local published histories;
@@ -179,7 +199,8 @@ The pure core distinguishes:
 - one exact planner input: sealed `Absent` or validated `Open`;
 - pull request identities as coupled number and GraphQL node ID values;
 - desired complete projections and minimal update masks;
-- whole tuple, create, and marker effects with stable change IDs;
+- whole tuple, public-branch, create, and marker effects with stable
+  identities;
 - minimal update effects addressed by sealed pull request identities; and
 - one-use stage values which encode acknowledgement authority.
 
@@ -200,9 +221,13 @@ The Git boundary owns:
 
 - symbolic remote default discovery;
 - exact named default and local head/base observation;
+- exact optional public-branch presence or authoritative absence in the
+  bounded initial observation;
 - exact local version and marker namespace observation;
 - bounded acquisition from advertised local version refs;
 - atomic publication of complete three-ref tuples with exact leases; and
+- public-branch creation or advancement with an exact lease, ordered after all
+  tuple units in the initial Git stage; and
 - separate create-only marker publication with absence leases.
 
 The GitHub boundary owns:
@@ -238,7 +263,7 @@ They cover:
 - marker-aware creation authority;
 - pull request rendering and complete text equivalence;
 - minimal update masks;
-- tuple and marker decisions;
+- tuple, public-branch, and marker decisions;
 - batching boundaries over typed effects; and
 - bounded error formatting.
 
@@ -259,6 +284,7 @@ Its durable world and process-local intent are separate:
 ```text
 DurableWorld
   default tip
+  public branch projections
   published changes by stable ID
   literal pull request rows
 
@@ -267,6 +293,7 @@ PublishedChange
   optional OPEN pull request, either unmarked or marked at one revision
 
 LocalIntent
+  optional public branch and desired tip
   ordered local changes
 
 LocalChange
@@ -294,10 +321,13 @@ writes do not retroactively refresh an observation and that a complete body
 patch reaches an exact no-action retry without deriving desired state inside
 the fake world.
 
-The production planner exposes typed test effects:
+The production planner exposes typed test effects. Initial Git effects retain
+their complete atomic grouping; a public effect is never removed from a trace
+or inferred from branch mode:
 
 ```text
-Initial refs | Creates | Markers | Updates | Done | Rejected
+Initial Git batches (Tuples + optional PublicBranch) | Creates | Markers |
+Updates | Done | Rejected
 ```
 
 Tuple, create, and marker effects carry the stable change ID and their complete
@@ -340,11 +370,16 @@ Required bounded scenarios include:
    creates use one stable key; and different navigation projections for the
    same tuple are safe last-writer-wins updates which converge after one local
    intent stabilizes.
+6. Public projection: absent, already-desired, and divergent public refs;
+   public-only empty stacks; tuple batches followed by a final public effect;
+   atomic failure of that final batch; and retry after earlier tuple batches
+   have already become durable.
 
 Universal invariants include:
 
 - rejection exposes no mutation;
-- GitHub creates never precede exact tuple acknowledgement;
+- GitHub creates never precede exact acknowledgement of every initial Git
+  batch, including a planned public effect;
 - final updates never precede exact marker acknowledgement;
 - a converged world produces `Done`;
 - a successful required effect either makes durable progress or acknowledges
@@ -353,6 +388,8 @@ Universal invariants include:
 - every interleaving of protocol-conforming effects preserves safety;
 - immutable tags never move;
 - one tuple never splits its head, owned base, and version;
+- a public effect remains visible in the complete atomic batch trace and is
+  ordered after every tuple effect;
 - each create uses its own published base;
 - a final root uses the exact default and a nonroot uses its own base; and
 - no model transition reads or mutates a nonlocal change.
@@ -372,6 +409,8 @@ Use temporary repositories and a real bare remote to cover:
 
 - symbolic default discovery and exact target agreement;
 - exact local head, owned-base, version, and marker namespace parsing;
+- exact public branch presence and authoritative absence in the initial
+  observation;
 - authoritative absence for requested names;
 - absence of unrelated head or tag requests;
 - source-ref-only object acquisition without local ref effects;
@@ -382,6 +421,8 @@ Use temporary repositories and a real bare remote to cover:
 - conflicting competing tuple pushes where one wins and the other receives an
   exact-lease rejection;
 - byte-bounded batches which never split a tuple;
+- initial batches which place the optional public effect last without dropping
+  it from an atomic batch;
 - malformed or missing porcelain acknowledgements; and
 - destination, environment, timeout, and hook filesystem behavior.
 
@@ -622,7 +663,7 @@ repeating the primary owner's full matrix.
 | Pull request history classification | Pure table | GraphQL pagination contracts |
 | Pull request text and navigation | Pure renderer | One lifecycle snapshot |
 | Minimal update masks | Pure planner | GraphQL encoding contract |
-| Tuple and marker decisions | Pure planner | Real atomic-push contracts |
+| Tuple, public, and marker decisions | Pure planner | Real atomic-push contracts |
 | Restart convergence | Semantic world | Focused lost-ack composition |
 | Publisher concurrency | Semantic interleavings | Lease and create-key contracts |
 | GraphQL wire shape | Codec contract | One complete system flow |
@@ -643,10 +684,11 @@ refs/heads/gherrit-bases/G   -> first_parent(H)
 refs/tags/gherrit/G/vN       -> H
 ```
 
-The tuple is one indivisible effect. The independently optional
-`refs/tags/gherrit/G/pr` marker is a later create-only effect. Pure tests cover
-every meaningful durable prefix and exact complete-alias subset before
-rebuilding the planner from observation.
+The tuple is one indivisible effect. An optional public-branch transition is a
+separate, visible effect at the end of the initial Git stage. The independently
+optional `refs/tags/gherrit/G/pr` marker is a later create-only effect. Pure
+tests cover every meaningful durable prefix and exact complete-alias subset
+before rebuilding the planner from observation.
 
 Focused planner tables own the complete relation among published history,
 marker state, sealed absence or OPEN observation, root status, landing
@@ -668,10 +710,12 @@ transaction. They accept literal base object IDs and independently optional
 marker targets. They never infer a base from another change's current head or
 a marker from pull request state.
 
-After publication, tests inspect the bare remote and assert all tuple refs and
-object IDs. Lost-ack tests perform a real successful atomic push and replace or
-corrupt only its acknowledgement. They prove that each batch leaves a complete
-tuple prefix and that no GitHub action crosses an unacknowledged Git barrier.
+After publication, tests inspect the bare remote and assert all tuple and
+public refs and object IDs. Lost-ack tests perform a real successful atomic
+push and replace or corrupt only its acknowledgement. They prove that each
+batch leaves a complete atomic-unit prefix, that earlier tuple batches may
+remain after a later public-containing batch fails, and that no GitHub action
+crosses an unacknowledged Git barrier.
 
 Malformed-state tests construct incomplete tuples with low-level helpers, then
 assert failure and exact absence of further Git or GitHub writes.
@@ -697,15 +741,18 @@ local evidence set, planner result, and mutation trace unchanged.
 
 Retained process scenarios prove:
 
-1. Empty local intent exits before token access or any GitHub request.
+1. Empty private local intent exits before token access or any GitHub request;
+   empty public local intent projects only its public branch.
 2. One-change, two-change, and mixed established/new stacks publish literal
    complete tuples and correct final bases.
-3. A lifecycle trace orders tuple publication, create, marker publication, and
+3. A lifecycle trace retains complete initial batches, including the optional
+   public effect after all tuples, then orders create, marker publication, and
    final projection.
 4. Incomplete tuples, unsafe bases, and owned-base landing automation reject
    before every write.
-5. Lost tuple, create, and marker acknowledgements leave safe durable prefixes;
-   fresh invocations converge without confirmation reads or mutation retries.
+5. Lost tuple, public, create, and marker acknowledgements leave safe durable
+   prefixes; fresh invocations converge without confirmation reads or mutation
+   retries.
 6. Exact local Git and GitHub reads overlap after stack derivation, and no
    repository-wide or nonlocal observation occurs.
 7. Two overlapping publishers prove that identical publication receives an
