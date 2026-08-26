@@ -9,4 +9,4 @@ STDOUT:
 
 STDERR:
 [gherrit] Branch feature-rebase is now managed by GHerrit in private mode.
-[gherrit]   - 'git push' will sync PRs only, but will not push feature-rebase itself.
+[gherrit]   - 'git push' will publish the stack without projecting feature-rebase to the push destination.

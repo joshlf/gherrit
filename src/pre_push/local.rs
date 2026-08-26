@@ -1,8 +1,9 @@
 //! Validated local input for one pre-push publication attempt.
 //!
 //! A local stack is the ordered first-parent path from the default branch to
-//! `HEAD`. Its order is the source of parent, child, and root relationships.
-//! Those relationships are deliberately not stored alongside each change.
+//! the exact `HEAD` captured when publication began. Its order is the source
+//! of parent, child, and root relationships. Those relationships are
+//! deliberately not stored alongside each change.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -164,6 +165,7 @@ impl LocalChange {
         self.first_parent
     }
 
+    #[cfg(test)]
     pub(super) fn title(&self) -> &str {
         self.title.as_str()
     }
@@ -171,13 +173,9 @@ impl LocalChange {
     pub(super) fn into_pull_request_content(self) -> (PullRequestTitle, String) {
         (self.title, self.body)
     }
-
-    pub(super) fn body(&self) -> &str {
-        &self.body
-    }
 }
 
-/// An ordered, validated first-parent path from the default branch to `HEAD`.
+/// An ordered, validated first-parent path to one captured `HEAD`.
 #[derive(Debug)]
 pub(super) struct LocalStack {
     default_branch: DefaultBranch,
@@ -185,15 +183,23 @@ pub(super) struct LocalStack {
 }
 
 impl LocalStack {
-    /// Reads and validates the local managed stack without performing network
-    /// writes.
-    pub(super) fn collect(repo: &util::Repo, default_branch: &DefaultBranch) -> Result<Self> {
-        let head = repo.rev_parse_single("HEAD")?;
-        let default_ref_name = default_branch.full_ref_name();
-        let default_ref = repo.rev_parse_single(default_ref_name.as_str()).wrap_err_with(|| {
-            format!("Local default branch '{}' is unavailable", default_branch.name())
-        })?;
-        if default_ref.detach() != default_branch.tip() {
+    /// Reads and validates the captured local managed stack without performing
+    /// network writes.
+    ///
+    /// `branch_name` and `head` belong to the same pre-observation snapshot.
+    /// Neither is re-read from the worktree while collection is in progress.
+    pub(super) fn collect(
+        repo: &util::Repo,
+        branch_name: &str,
+        head: ObjectId,
+        default_branch: &DefaultBranch,
+    ) -> Result<Self> {
+        let default_ref =
+            repo.rev_parse_single(default_branch.full_ref_name().as_str()).wrap_err_with(|| {
+                format!("Local default branch '{}' is unavailable", default_branch.name())
+            })?;
+        let default_ref = default_ref.detach();
+        if default_ref != default_branch.tip() {
             bail!(
                 "Local default branch '{}' does not match the push repository",
                 default_branch.name()
@@ -206,7 +212,6 @@ impl LocalStack {
         repo.ensure_publishable_history()?;
         let commits = repo.first_parent_commits_between(default_ref, head).map_err(|err| match err {
             util::FirstParentCommitsBetweenError::NotOnFirstParentPath => {
-                let branch_name = repo.current_branch().name().unwrap_or("current branch");
                 let default_branch = default_branch.name();
                 eyre!(
                     "The branch '{branch_name}' does not descend from '{default_branch}' on its first-parent path.\n\
@@ -238,7 +243,8 @@ impl LocalStack {
             .collect::<Result<Vec<_>>>()?;
 
         let stack = Self::new(default_branch.clone(), changes)?;
-        ensure_change_ids_unique_in_head_ancestry(repo, &stack, head.detach())?;
+        debug_assert_eq!(stack.default_branch(), default_branch);
+        ensure_change_ids_unique_in_head_ancestry(repo, &stack, head)?;
         Ok(stack)
     }
 
@@ -306,6 +312,12 @@ impl LocalStack {
 
     pub(super) fn default_branch(&self) -> &DefaultBranch {
         &self.default_branch
+    }
+
+    /// The exact commit named by the checked-out stack branch. An empty stack
+    /// shares the observed default tip; otherwise its final change is HEAD.
+    pub(super) fn tip(&self) -> ObjectId {
+        self.changes.last().map_or(self.default_branch.tip(), LocalChange::head)
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -647,7 +659,8 @@ mod tests {
 
         let collect = || {
             let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
-            LocalStack::collect(&repository, &supplied_default)
+            let head = repository.head_snapshot().unwrap().target().unwrap();
+            LocalStack::collect(&repository, "feature", head, &supplied_default)
         };
 
         let accepted = "雪".repeat(MAX_TITLE_SCALARS);
@@ -673,6 +686,62 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn collection_uses_the_captured_head_after_the_worktree_moves() {
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        let initial = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let default_tip = initial.rev_parse_single("refs/heads/main").unwrap().detach();
+        let supplied_default = DefaultBranch::new("main".to_owned(), default_tip).unwrap();
+
+        context.checkout_new("captured-stack");
+        let captured_id = context.commit_with_gherrit_id("Captured change");
+        let captured_head = ObjectId::from_hex(context.head_oid().as_bytes())
+            .expect("fixture HEAD is an object ID");
+
+        context.run_git(&["checkout", "main"]);
+        context.checkout_new("later-stack");
+        context.commit_with_gherrit_id("Later change");
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+
+        let stack =
+            LocalStack::collect(&repository, "captured-stack", captured_head, &supplied_default)
+                .unwrap();
+
+        assert_eq!(stack.tip(), captured_head);
+        assert_eq!(
+            stack.iter().map(|change| change.id().as_str()).collect::<Vec<_>>(),
+            [captured_id.as_str()]
+        );
+    }
+
+    #[test]
+    fn ancestry_diagnostic_names_the_captured_branch_not_live_head() {
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        let initial = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let default_tip = initial.rev_parse_single("refs/heads/main").unwrap().detach();
+        let supplied_default = DefaultBranch::new("main".to_owned(), default_tip).unwrap();
+
+        context.run_git(&["checkout", "--orphan", "captured-unrelated"]);
+        context.commit_with_gherrit_id("Unrelated captured change");
+        let captured_head = ObjectId::from_hex(context.head_oid().as_bytes())
+            .expect("fixture HEAD is an object ID");
+
+        context.run_git(&["checkout", "main"]);
+        context.checkout_new("later-stack");
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let error = LocalStack::collect(
+            &repository,
+            "captured-unrelated",
+            captured_head,
+            &supplied_default,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("The branch 'captured-unrelated' does not descend from 'main'"));
+        assert!(!error.contains("later-stack"));
     }
 
     #[test]
@@ -726,7 +795,8 @@ mod tests {
         std::fs::write(context.repo_path.join(".git/shallow"), format!("{default_tip}\n")).unwrap();
         context.run_git(&["config", "remote.origin.promisor", "true"]);
 
-        let stack = LocalStack::collect(&repository, &supplied_default).unwrap();
+        let head = repository.head_snapshot().unwrap().target().unwrap();
+        let stack = LocalStack::collect(&repository, "main", head, &supplied_default).unwrap();
 
         assert!(stack.is_empty());
     }
