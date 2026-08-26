@@ -1,0 +1,5 @@
+---
+source: src/pre_push/github/observation.rs
+expression: document
+---
+query { repository(owner: "owner", name: "repository") { id, defaultBranchRef { name, target { oid } }, op0: pullRequests(headRefName: "Gone", first: 1, states: [OPEN, CLOSED, MERGED]) { nodes { number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, autoMergeRequest { enabledAt }, isInMergeQueue } pageInfo { hasNextPage, endCursor } } op1: pullRequests(headRefName: "Gtwo", first: 1, after: "cursor:\"2", states: [OPEN, CLOSED, MERGED]) { nodes { number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, autoMergeRequest { enabledAt }, isInMergeQueue } pageInfo { hasNextPage, endCursor } } } }
