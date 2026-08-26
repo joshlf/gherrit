@@ -53,14 +53,55 @@ impl PublicationPlan {
     /// durable acknowledgement has completed.
     pub(super) async fn execute(self) -> Result<()> {
         let Self { destination, github, effects } = self;
-        let PlannedPublication { tuple_pushes, after_tuples } = effects;
-        tuple_pushes.execute(&destination).await?;
-        let marker_stage = match after_tuples {
-            AfterTuples::Ready(stage) => *stage,
-            AfterTuples::Creates(stage) => stage.complete_from_github(&github).await?,
-        };
-        marker_stage.marker_pushes.execute(&destination).await?;
-        github.update_pull_requests(marker_stage.updates).await
+        effects
+            .execute_with(&mut RemoteEffectDriver { destination: &destination, github: &github })
+            .await
+    }
+}
+
+/// Performs the four externally durable effect kinds for one bound attempt.
+///
+/// The staged plan, rather than the driver, owns their order and every
+/// continuation. Each operation consumes an already-preflighted value and
+/// returns only the acknowledgement needed to release the next stage.
+pub(super) trait EffectDriver {
+    async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()>;
+
+    async fn create_pull_requests(
+        &mut self,
+        creates: PreparedCreates,
+    ) -> Result<CompleteCreateReceipts>;
+
+    async fn publish_markers(&mut self, pushes: PreparedPushes) -> Result<()>;
+
+    async fn update_pull_requests(&mut self, updates: PreparedUpdates) -> Result<()>;
+}
+
+/// The sole production effect driver, bound to the destination and GitHub
+/// client retained by the complete publication plan.
+struct RemoteEffectDriver<'attempt> {
+    destination: &'attempt PushDestination,
+    github: &'attempt Github,
+}
+
+impl EffectDriver for RemoteEffectDriver<'_> {
+    async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()> {
+        pushes.execute(self.destination).await
+    }
+
+    async fn create_pull_requests(
+        &mut self,
+        creates: PreparedCreates,
+    ) -> Result<CompleteCreateReceipts> {
+        self.github.create_pull_requests(creates).await
+    }
+
+    async fn publish_markers(&mut self, pushes: PreparedPushes) -> Result<()> {
+        pushes.execute(self.destination).await
+    }
+
+    async fn update_pull_requests(&mut self, updates: PreparedUpdates) -> Result<()> {
+        self.github.update_pull_requests(updates).await
     }
 }
 
@@ -69,12 +110,29 @@ impl PublicationPlan {
 ///
 /// Test-only pure planning inspects this type; production wraps it in the
 /// consuming [`PublicationPlan`] above.
-struct PlannedPublication {
-    tuple_pushes: PreparedPushes,
-    after_tuples: AfterTuples,
+pub(super) struct PlannedPublication {
+    initial_ref_pushes: PreparedPushes,
+    after_initial_refs: AfterInitialRefs,
 }
 
-enum AfterTuples {
+impl PlannedPublication {
+    /// Consumes the fixed effect sequence through one attempt-bound driver.
+    ///
+    /// Any error ends the attempt immediately. No later effect is exposed to
+    /// the driver, and no effect is retried or reobserved here.
+    pub(super) async fn execute_with(self, driver: &mut impl EffectDriver) -> Result<()> {
+        let Self { initial_ref_pushes, after_initial_refs } = self;
+        driver.publish_initial_refs(initial_ref_pushes).await?;
+        let marker_stage = match after_initial_refs {
+            AfterInitialRefs::Ready(stage) => *stage,
+            AfterInitialRefs::Creates(stage) => stage.complete_with(driver).await?,
+        };
+        driver.publish_markers(marker_stage.marker_pushes).await?;
+        driver.update_pull_requests(marker_stage.updates).await
+    }
+}
+
+enum AfterInitialRefs {
     /// Every pull request identity was present in the observation, so exact
     /// final updates could be rendered and preflighted during planning.
     Ready(Box<MarkerStage>),
@@ -95,9 +153,9 @@ struct CreateStage {
 }
 
 impl CreateStage {
-    async fn complete_from_github(self, github: &Github) -> Result<MarkerStage> {
+    async fn complete_with(self, driver: &mut impl EffectDriver) -> Result<MarkerStage> {
         let Self { creates, seed } = self;
-        let receipts = github.create_pull_requests(creates).await?;
+        let receipts = driver.create_pull_requests(creates).await?;
         seed.complete(receipts)
     }
 
@@ -261,7 +319,7 @@ pub(super) fn plan_publication(
     Ok(PublicationPlan { destination, github, effects })
 }
 
-fn plan_effects(
+pub(super) fn plan_effects(
     destination: &PushDestination,
     public_branch: Option<String>,
     stack: LocalStack,
@@ -287,14 +345,14 @@ fn plan_effects(
         .zip(&desired_revisions)
         .filter_map(|(history, desired)| tuple_transition(history, *desired))
         .collect::<Result<Vec<_>>>()?;
-    let tuple_pushes = prepare_tuple_pushes(destination, &tuple_transitions)?;
+    let initial_ref_pushes = prepare_tuple_pushes(destination, &tuple_transitions)?;
     let realities =
         build_realities(histories.iter().zip(desired_revisions), pull_requests.into_vec())?;
     let recipes = StackBodyRecipes::new(destination, public_branch, stack, histories.into_vec())?;
-    let after_tuples =
+    let after_initial_refs =
         prepare_projection(destination, realities, recipes, create_preparation, default_branch)?;
 
-    Ok(PlannedPublication { tuple_pushes, after_tuples })
+    Ok(PlannedPublication { initial_ref_pushes, after_initial_refs })
 }
 
 /// Checks every count and positional join before any truncating iterator can
@@ -452,7 +510,7 @@ fn prepare_projection(
     recipes: StackBodyRecipes,
     create_preparation: CreatePreparation,
     default_branch: DefaultBranch,
-) -> Result<AfterTuples> {
+) -> Result<AfterInitialRefs> {
     match realities {
         ProjectionRealities::AllExisting(realities) => {
             let mut marker_transitions = Vec::new();
@@ -466,7 +524,7 @@ fn prepare_projection(
             let marker_pushes = prepare_marker_pushes(destination, &marker_transitions)?;
             let updates = prepare_final_updates(entries, &recipes, default_branch.name())?;
             drop(create_preparation);
-            Ok(AfterTuples::Ready(Box::new(MarkerStage { marker_pushes, updates })))
+            Ok(AfterInitialRefs::Ready(Box::new(MarkerStage { marker_pushes, updates })))
         }
         ProjectionRealities::NeedsCreate(realities) => prepare_create_stage(
             destination,
@@ -476,7 +534,7 @@ fn prepare_projection(
             default_branch,
         )
         .map(Box::new)
-        .map(AfterTuples::Creates),
+        .map(AfterInitialRefs::Creates),
     }
 }
 
