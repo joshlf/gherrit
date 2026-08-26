@@ -18,7 +18,8 @@
 use std::sync::mpsc;
 use std::{
     fmt,
-    io::{self, Read},
+    fs::File,
+    io::{self, Read, Seek as _, SeekFrom, Write as _},
     process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
         Arc,
@@ -41,6 +42,12 @@ const SUPERVISOR_GRACE: Duration = Duration::from_secs(1);
 /// adversarial remote. Observing the first byte beyond this cap stops execution
 /// and enters bounded cleanup immediately.
 pub(super) const REMOTE_GIT_STDOUT_LIMIT: usize = 64 * 1024 * 1024;
+/// Maximum input accepted for one remote Git command.
+///
+/// Input and retained stdout have the same finite budget. The regular file is
+/// fully prepared before execution, so neither its producer nor pipe capacity
+/// can extend the command lifetime.
+pub(super) const REGULAR_FILE_STDIN_LIMIT: u64 = 64 * 1024 * 1024;
 /// Maximum stderr retained for a diagnostic after normal process completion.
 ///
 /// The suffix is retained because a local pre-push hook writes immediately
@@ -76,12 +83,192 @@ pub(super) async fn output(
     output_with_stdout_limit(command, timeout, REMOTE_GIT_STDOUT_LIMIT).await
 }
 
+/// Runs one remote Git command with a prepared regular file as stdin.
+///
+/// The input was validated, rewound, unlinked, and stripped of its writer by
+/// [`RegularFileStdinBuilder::finish`] before this function could accept it.
+/// This deliberately does not admit an arbitrary [`Stdio`], pipe, or in-memory
+/// producer: all input is finite and complete before the command deadline
+/// begins, with no producer lifetime to supervise.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "regular-file input activates with exact history acquisition")
+)]
+pub(super) async fn output_with_regular_file_stdin(
+    command: Command,
+    input: RegularFileStdin,
+    timeout: Duration,
+) -> Result<CommandOutput, CommandError> {
+    output_with_input(command, CommandInput::RegularFile(input), timeout, REMOTE_GIT_STDOUT_LIMIT)
+        .await
+}
+
+enum CommandInput {
+    Null,
+    RegularFile(RegularFileStdin),
+}
+
+/// Builds the only non-null input accepted by the command boundary.
+///
+/// The private temporary name exists only while input is being written. Once
+/// [`finish`](Self::finish) consumes the builder, the exact file has been
+/// reopened read-only, its name has been removed, and its GHerrit-owned
+/// writable handle has been closed.
+pub(super) struct RegularFileStdinBuilder {
+    file: tempfile::NamedTempFile,
+    written: u64,
+    limit: u64,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "regular-file input activates with exact history acquisition")
+)]
+impl RegularFileStdinBuilder {
+    pub(super) fn new() -> Result<Self, CommandError> {
+        Self::with_limit(REGULAR_FILE_STDIN_LIMIT)
+    }
+
+    fn with_limit(limit: u64) -> Result<Self, CommandError> {
+        let file = tempfile::NamedTempFile::new()
+            .map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+        Ok(Self { file, written: 0, limit })
+    }
+
+    /// Reopens the exact file read-only, removes its name, and closes
+    /// GHerrit's writer.
+    pub(super) fn finish(self) -> Result<RegularFileStdin, CommandError> {
+        let Self { mut file, written, limit } = self;
+        file.flush().map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+        let metadata =
+            file.as_file().metadata().map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+        if !metadata.is_file() {
+            return Err(CommandError::StdinNotRegular);
+        }
+        if metadata.len() != written || written > limit {
+            return Err(CommandError::StdinChanged);
+        }
+
+        let mut read_only = reopen_read_only(file.as_file(), file.path())?;
+        let metadata =
+            read_only.metadata().map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+        if !metadata.is_file() || metadata.len() != written {
+            return Err(CommandError::StdinChanged);
+        }
+        read_only
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+
+        // Remove the name while both exact handles are still live, then close
+        // the writer. No pathname or writable GHerrit handle survives this
+        // transition. A temporary-file cleaner may already have removed the
+        // name; that is the desired anonymous state.
+        let (writer, path) = file.into_parts();
+        let unlinked = path.close();
+        drop(writer);
+        if let Err(error) = unlinked
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(io_error(IoStage::PrepareInput, &error));
+        }
+        let metadata =
+            read_only.metadata().map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+        if !metadata.is_file() || metadata.len() != written {
+            return Err(CommandError::StdinChanged);
+        }
+
+        Ok(RegularFileStdin { file: read_only })
+    }
+}
+
+#[cfg(unix)]
+fn reopen_read_only(file: &File, path: &std::path::Path) -> Result<File, CommandError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let read_only = File::open(path).map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+    let original = file.metadata().map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+    let reopened = read_only.metadata().map_err(|error| io_error(IoStage::PrepareInput, &error))?;
+    if original.dev() != reopened.dev() || original.ino() != reopened.ino() {
+        return Err(CommandError::StdinChanged);
+    }
+    Ok(read_only)
+}
+
+#[cfg(windows)]
+fn reopen_read_only(file: &File, _path: &std::path::Path) -> Result<File, CommandError> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, RawHandle};
+
+    use windows_sys::Win32::{
+        Foundation::{HANDLE, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+        },
+    };
+
+    // SAFETY: `file` owns a live file handle. `ReOpenFile` returns a distinct
+    // handle to the same file, and successful ownership is transferred exactly
+    // once into `File`.
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle() as HANDLE,
+            FILE_GENERIC_READ,
+            FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io_error(IoStage::PrepareInput, &io::Error::last_os_error()));
+    }
+    // SAFETY: the successful `ReOpenFile` result is a newly owned handle with
+    // no other Rust owner.
+    Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
+}
+
+impl io::Write for RegularFileStdinBuilder {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let requested = u64::try_from(buffer.len())
+            .map_err(|_| io::Error::other("regular-file stdin input length overflowed"))?;
+        self.written.checked_add(requested).filter(|next| *next <= self.limit).ok_or_else(
+            || {
+                io::Error::other(format!(
+                    "regular-file stdin input exceeded the {}-byte limit",
+                    self.limit
+                ))
+            },
+        )?;
+        let written = self.file.write(buffer)?;
+        self.written = self
+            .written
+            .checked_add(u64::try_from(written).expect("a write length fits in u64"))
+            .expect("the preflighted regular-file stdin length cannot overflow");
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// An unlinked regular file held by a read-only GHerrit-owned handle.
+pub(super) struct RegularFileStdin {
+    file: File,
+}
+
 pub(super) async fn output_with_stdout_limit(
     command: Command,
     timeout: Duration,
     stdout_limit: usize,
 ) -> Result<CommandOutput, CommandError> {
-    output_with_faults(command, timeout, stdout_limit, Faults::NONE).await
+    output_with_input(command, CommandInput::Null, timeout, stdout_limit).await
+}
+
+async fn output_with_input(
+    command: Command,
+    input: CommandInput,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<CommandOutput, CommandError> {
+    output_with_input_and_faults(command, input, timeout, stdout_limit, Faults::NONE).await
 }
 
 #[cfg(test)]
@@ -98,8 +285,19 @@ async fn output_with_injected_stdout_failure(
     .await
 }
 
+#[cfg(test)]
 async fn output_with_faults(
     command: Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    faults: Faults,
+) -> Result<CommandOutput, CommandError> {
+    output_with_input_and_faults(command, CommandInput::Null, timeout, stdout_limit, faults).await
+}
+
+async fn output_with_input_and_faults(
+    command: Command,
+    input: CommandInput,
     timeout: Duration,
     stdout_limit: usize,
     faults: Faults,
@@ -116,7 +314,7 @@ async fn output_with_faults(
 
     let worker_cancelled = Arc::clone(&cancelled);
     let mut worker = tokio::task::spawn_blocking(move || {
-        output_blocking(command, deadline, stdout_limit, faults, &worker_cancelled)
+        output_blocking(command, input, deadline, stdout_limit, faults, &worker_cancelled)
     });
 
     let result =
@@ -466,6 +664,8 @@ impl fmt::Debug for CommandOutput {
 pub(super) enum CommandError {
     InvalidTimeout,
     TimedOut,
+    StdinNotRegular,
+    StdinChanged,
     StdoutTooLarge { limit: usize },
     CleanupTimedOut,
     WorkerUnavailable,
@@ -474,6 +674,7 @@ pub(super) enum CommandError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum IoStage {
+    PrepareInput,
     Start,
     Monitor,
     Terminate,
@@ -488,6 +689,12 @@ impl fmt::Display for CommandError {
         match self {
             Self::InvalidTimeout => formatter.write_str("remote Git command timeout is invalid"),
             Self::TimedOut => formatter.write_str("remote Git command timed out"),
+            Self::StdinNotRegular => {
+                formatter.write_str("remote Git command stdin is not a regular file")
+            }
+            Self::StdinChanged => {
+                formatter.write_str("remote Git command stdin changed after it was sealed")
+            }
             Self::StdoutTooLarge { limit } => {
                 write!(formatter, "remote Git command stdout exceeded the {limit}-byte limit")
             }
@@ -507,6 +714,7 @@ impl std::error::Error for CommandError {}
 impl fmt::Display for IoStage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::PrepareInput => "input preparation",
             Self::Start => "startup",
             Self::Monitor => "execution",
             Self::Terminate => "termination",
@@ -548,6 +756,7 @@ impl Drop for CancellationGuard {
 
 fn output_blocking(
     mut command: Command,
+    input: CommandInput,
     deadline: Deadline,
     stdout_limit: usize,
     faults: Faults,
@@ -558,7 +767,13 @@ fn output_blocking(
     }
     deadline.check()?;
 
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let stdin = prepare_input(input);
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CommandError::CleanupTimedOut);
+    }
+    deadline.check()?;
+
+    command.stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     let started = spawn_owned(&mut command);
     #[cfg(windows)]
@@ -736,6 +951,13 @@ fn output_blocking(
         Stopped::Cancelled => Err(CommandError::CleanupTimedOut),
         Stopped::Monitor(error) => Err(error),
         Stopped::Reader(error) => Err(error),
+    }
+}
+
+fn prepare_input(input: CommandInput) -> Stdio {
+    match input {
+        CommandInput::Null => Stdio::null(),
+        CommandInput::RegularFile(RegularFileStdin { file }) => Stdio::from(file),
     }
 }
 
