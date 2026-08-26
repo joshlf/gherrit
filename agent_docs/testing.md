@@ -179,7 +179,8 @@ The pure core distinguishes:
 - one exact planner input: sealed `Absent` or validated `Open`;
 - pull request identities as coupled number and GraphQL node ID values;
 - desired complete projections and minimal update masks;
-- whole tuple, create, marker, and update effects with stable change IDs; and
+- whole tuple, create, and marker effects with stable change IDs;
+- minimal update effects addressed by sealed pull request identities; and
 - one-use stage values which encode acknowledgement authority.
 
 Invalid combinations should be impossible or private to a boundary decoder.
@@ -248,8 +249,10 @@ recombinable set of booleans which admits impossible states.
 ### Bounded semantic recovery model
 
 The recovery model compares the production planner with an independent literal
-world. It deliberately knows nothing about refspecs, `ls-remote`, GraphQL,
-aliases, JSON, URLs, or HTTP.
+world. It deliberately knows nothing about refspecs, `ls-remote`, GraphQL
+documents or alias names, JSON, URLs, or HTTP. It preserves only semantic
+operations and the request and alias boundaries which constrain durable
+subsets.
 
 Its durable world and process-local intent are separate:
 
@@ -261,7 +264,7 @@ DurableWorld
 
 PublishedChange
   ordered published revisions
-  independently optional marker target
+  optional OPEN pull request, either unmarked or marked at one revision
 
 LocalIntent
   ordered local changes
@@ -272,28 +275,38 @@ LocalChange
   title and body
 ```
 
-The marker and pull request are stored independently because they are durable
-effects in different systems. Reachable recovery worlds enforce that a marker
-was authorized by a durable OPEN identity; an observation may still hide that
-row. Terminal-only exact connections are rejected during correlation, before
-a planner value or recovery world exists. Focused correlation tests own those
-external lifecycle combinations. A marker may target an older published
-revision after an amendment. OPEN pull request rows retain identity, exact ref
-and object values, and literal projection bytes. The model can therefore prove
-that a complete body patch reaches an exact no-action retry without deriving
-desired state inside the fake world.
+The durable model couples a marker to the OPEN pull request which authorized
+it. The stage machine cannot publish a marker until an OPEN identity is
+durable, so a marker without that pull request is not a reachable state for a
+protocol-conforming publisher. Per-query visibility remains separate and may
+hide the durable row, including a marked row, without deleting it from the
+world. Terminal-only exact connections are rejected during correlation,
+before a planner value or recovery world exists. Focused correlation tests own
+those external lifecycle combinations.
+
+A marker may target an older published revision after an amendment. The
+durable Git history supplies current head and owned-base object IDs. A stale
+query result separately retains the exact head and base object IDs and literal
+projection bytes which that query returned; the immutable pull request
+identity remains coupled to the durable row. The two object IDs may lag to
+different immutable history positions. The model can therefore prove that
+writes do not retroactively refresh an observation and that a complete body
+patch reaches an exact no-action retry without deriving desired state inside
+the fake world.
 
 The production planner exposes typed test effects:
 
 ```text
-Git tuples | Creates | Markers | Updates | Done | Rejected
+Initial refs | Creates | Markers | Updates | Done | Rejected
 ```
 
-Every effect carries the stable change ID and its complete semantic payload.
-The model compares exact effect order and content, applies an allowed durable
-prefix or alias subset, discards all process-local authority, rebuilds a fresh
-observation, and requires the next plan to describe exactly the remaining
-work.
+Tuple, create, and marker effects carry the stable change ID and their complete
+semantic payload. Updates are addressed by sealed pull request identities; the
+model resolves the requested node ID to a durable OPEN row and records the
+resolved change ID only in its local trace. It compares exact effect order and
+content, applies an allowed durable prefix or alias subset, discards all
+process-local authority, rebuilds a fresh observation, and requires the next
+plan to describe exactly the remaining work.
 
 Concurrency cases derive two plans from independently chosen observations and
 interleave their complete external effects. The durable model applies Git
