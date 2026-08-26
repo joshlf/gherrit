@@ -240,16 +240,16 @@ fn tuple_for_test(history: &ValidatedChangeHistory) -> Option<Result<TupleTransi
 }
 
 fn ready(plan: PlannedPublication) -> MarkerStage {
-    match plan.after_tuples {
-        AfterTuples::Ready(stage) => *stage,
-        AfterTuples::Creates(_) => panic!("expected an all-existing projection"),
+    match plan.after_initial_refs {
+        AfterInitialRefs::Ready(stage) => *stage,
+        AfterInitialRefs::Creates(_) => panic!("expected an all-existing projection"),
     }
 }
 
 fn creates(plan: PlannedPublication) -> CreateStage {
-    match plan.after_tuples {
-        AfterTuples::Creates(stage) => *stage,
-        AfterTuples::Ready(_) => panic!("expected a create-dependent projection"),
+    match plan.after_initial_refs {
+        AfterInitialRefs::Creates(stage) => *stage,
+        AfterInitialRefs::Ready(_) => panic!("expected a create-dependent projection"),
     }
 }
 
@@ -306,7 +306,7 @@ fn planner_accepts_exactly_the_four_supported_local_realities() {
         pull_request: PullRequestSpec::Absent,
     }])
     .unwrap();
-    assert_eq!(tuple_count(&fresh.tuple_pushes), 1);
+    assert_eq!(tuple_count(&fresh.initial_ref_pushes), 1);
     let fresh = creates(fresh);
     assert_eq!(fresh.creates.operations_for_test()[0].id, id("Gfresh"));
 
@@ -316,7 +316,7 @@ fn planner_accepts_exactly_the_four_supported_local_realities() {
         pull_request: PullRequestSpec::Absent,
     }])
     .unwrap();
-    assert_eq!(tuple_count(&recovery.tuple_pushes), 0);
+    assert_eq!(tuple_count(&recovery.initial_ref_pushes), 0);
     assert_eq!(creates(recovery).creates.operations_for_test().len(), 1);
 
     let unmarked =
@@ -697,7 +697,7 @@ fn every_new_marker_targets_the_single_desired_revision() {
         pull_request: PullRequestSpec::Open(OpenSpec::new(7, oid(101), BaseKind::Owned, oid(10))),
     };
     let existing = plan(&[existing]).unwrap();
-    assert_eq!(tuple_count(&existing.tuple_pushes), 1);
+    assert_eq!(tuple_count(&existing.initial_ref_pushes), 1);
     assert_eq!(
         marker_refspecs(&ready(existing).marker_pushes),
         [format!("{}:refs/tags/gherrit/Gexisting/pr", oid(20))]
@@ -709,7 +709,7 @@ fn every_new_marker_targets_the_single_desired_revision() {
         pull_request: PullRequestSpec::Absent,
     };
     let absent = plan(&[absent]).unwrap();
-    assert_eq!(tuple_count(&absent.tuple_pushes), 1);
+    assert_eq!(tuple_count(&absent.initial_ref_pushes), 1);
     let absent = creates(absent);
     assert_eq!(absent.creates.operations_for_test()[0].head_oid, oid(20));
     let absent = absent.complete_for_test(receipts(&[("Gabsent", 8, "PR_8")])).unwrap();
@@ -740,7 +740,7 @@ fn mixed_specs() -> [EntrySpec; 4] {
 fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
     let plan =
         plan_with_public_branch(&mixed_specs(), Some("release/candidate".to_owned())).unwrap();
-    assert_eq!(tuple_count(&plan.tuple_pushes), 1);
+    assert_eq!(tuple_count(&plan.initial_ref_pushes), 1);
     let stage = creates(plan);
     let create_operations = stage.creates.operations_for_test();
     assert_eq!(create_operations.len(), 2);
@@ -993,4 +993,264 @@ fn body_comparison_normalizes_only_crlf_pairs() {
     };
     let stage = ready(plan(&[spec]).unwrap());
     assert!(stage.updates.operations_for_test().is_empty());
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffectBoundary {
+    InitialRefs,
+    Creates,
+    Markers,
+    Updates,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+struct GitBatchAttempt {
+    options: Box<[String]>,
+    refspecs: Box<[String]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+struct CreateAttempt {
+    id: String,
+    title: String,
+    body: Box<[String]>,
+    head: String,
+    base: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+struct UpdateAttempt {
+    number: u32,
+    node_id: String,
+    title: Option<String>,
+    body: Option<Box<[String]>>,
+    base_branch: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+enum DurableEffectAttempt {
+    InitialRefs(Box<[GitBatchAttempt]>),
+    Creates(Box<[CreateAttempt]>),
+    Markers(Box<[GitBatchAttempt]>),
+    Updates(Box<[UpdateAttempt]>),
+}
+
+impl DurableEffectAttempt {
+    fn boundary(&self) -> EffectBoundary {
+        match self {
+            Self::InitialRefs(_) => EffectBoundary::InitialRefs,
+            Self::Creates(_) => EffectBoundary::Creates,
+            Self::Markers(_) => EffectBoundary::Markers,
+            Self::Updates(_) => EffectBoundary::Updates,
+        }
+    }
+}
+
+/// A deterministic driver which can fail exactly once at one reached stage.
+///
+/// The adapter tests own distinctions between rejected and indeterminate
+/// acknowledgements. This driver verifies only that any returned error stops
+/// the consuming stage machine before a later effect or same-attempt retry.
+struct ScriptedEffectDriver {
+    failure: Option<EffectBoundary>,
+    attempts: Vec<DurableEffectAttempt>,
+}
+
+impl ScriptedEffectDriver {
+    fn new(failure: Option<EffectBoundary>) -> Self {
+        Self { failure, attempts: Vec::new() }
+    }
+
+    fn record(&mut self, attempt: DurableEffectAttempt) -> Result<()> {
+        let boundary = attempt.boundary();
+        self.attempts.push(attempt);
+        if self.failure == Some(boundary) {
+            self.failure = None;
+            return Err(color_eyre::eyre::eyre!("injected failure at {boundary:?}"));
+        }
+        Ok(())
+    }
+
+    fn assert_consumed(&self) {
+        assert_eq!(self.failure, None, "the configured failure was not reached");
+    }
+
+    fn push_attempts(pushes: &PreparedPushes) -> Box<[GitBatchAttempt]> {
+        pushes
+            .batches()
+            .map(|batch| GitBatchAttempt {
+                options: batch.options().map(str::to_owned).collect(),
+                refspecs: batch.refspecs().map(str::to_owned).collect(),
+            })
+            .collect()
+    }
+
+    fn body_lines(body: &str) -> Box<[String]> {
+        body.split('\n').map(str::to_owned).collect()
+    }
+}
+
+impl EffectDriver for ScriptedEffectDriver {
+    async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()> {
+        let attempts = Self::push_attempts(&pushes);
+        if attempts.is_empty() {
+            Ok(())
+        } else {
+            self.record(DurableEffectAttempt::InitialRefs(attempts))
+        }
+    }
+
+    async fn create_pull_requests(
+        &mut self,
+        creates: PreparedCreates,
+    ) -> Result<CompleteCreateReceipts> {
+        let operations = creates.operations_for_test();
+        assert!(!operations.is_empty(), "a create stage must contain a create");
+        let receipts = operations
+            .iter()
+            .enumerate()
+            .map(|(index, operation)| {
+                let number = 100 + u32::try_from(index).unwrap();
+                (operation.id.clone(), identity(number, &format!("CREATED_PULL_REQUEST_{number}")))
+            })
+            .collect();
+        let attempts = operations
+            .iter()
+            .map(|operation| CreateAttempt {
+                id: operation.id.as_str().to_owned(),
+                title: operation.title.clone(),
+                body: Self::body_lines(&operation.body),
+                head: operation.head_oid.to_string(),
+                base: operation.base_oid.to_string(),
+            })
+            .collect();
+        self.record(DurableEffectAttempt::Creates(attempts))?;
+        Ok(CompleteCreateReceipts::for_plan_test(receipts))
+    }
+
+    async fn publish_markers(&mut self, pushes: PreparedPushes) -> Result<()> {
+        let attempts = Self::push_attempts(&pushes);
+        if attempts.is_empty() {
+            Ok(())
+        } else {
+            self.record(DurableEffectAttempt::Markers(attempts))
+        }
+    }
+
+    async fn update_pull_requests(&mut self, updates: PreparedUpdates) -> Result<()> {
+        let attempts = updates
+            .operations_for_test()
+            .iter()
+            .map(|update| UpdateAttempt {
+                number: update.identity.number().get(),
+                node_id: update.identity.node_id_for_test().to_owned(),
+                title: update.title.clone(),
+                body: update.body.as_deref().map(Self::body_lines),
+                base_branch: update.base_branch.clone(),
+            })
+            .collect::<Box<[_]>>();
+        if attempts.is_empty() {
+            Ok(())
+        } else {
+            self.record(DurableEffectAttempt::Updates(attempts))
+        }
+    }
+}
+
+fn fresh_execution_plan() -> PlannedPublication {
+    plan(&[EntrySpec {
+        id: "Gfresh",
+        history: HistorySpec::absent(),
+        pull_request: PullRequestSpec::Absent,
+    }])
+    .unwrap()
+}
+
+fn all_existing_execution_plan() -> PlannedPublication {
+    plan(&[EntrySpec {
+        id: "Gexisting",
+        history: HistorySpec { published: vec![(oid(101), oid(10))], marker: false },
+        pull_request: PullRequestSpec::Open(OpenSpec::new(7, oid(101), BaseKind::Owned, oid(10))),
+    }])
+    .unwrap()
+}
+
+async fn execute_scripted(
+    plan: PlannedPublication,
+    failure: Option<EffectBoundary>,
+) -> (Result<()>, ScriptedEffectDriver) {
+    let mut driver = ScriptedEffectDriver::new(failure);
+    let result = plan.execute_with(&mut driver).await;
+    (result, driver)
+}
+
+#[tokio::test]
+async fn durable_effect_barriers_release_only_the_next_reachable_stage() {
+    let (result, acknowledged) = execute_scripted(fresh_execution_plan(), None).await;
+    result.unwrap();
+    acknowledged.assert_consumed();
+    assert_eq!(
+        acknowledged.attempts.iter().map(DurableEffectAttempt::boundary).collect::<Vec<_>>(),
+        [
+            EffectBoundary::InitialRefs,
+            EffectBoundary::Creates,
+            EffectBoundary::Markers,
+            EffectBoundary::Updates,
+        ]
+    );
+    insta::assert_yaml_snapshot!("acknowledged_publication_effects", acknowledged.attempts);
+
+    for boundary in [
+        EffectBoundary::InitialRefs,
+        EffectBoundary::Creates,
+        EffectBoundary::Markers,
+        EffectBoundary::Updates,
+    ] {
+        let (result, interrupted) = execute_scripted(fresh_execution_plan(), Some(boundary)).await;
+        let error = result.expect_err("the configured durable effect must interrupt the attempt");
+        interrupted.assert_consumed();
+        let prefix_len = acknowledged
+            .attempts
+            .iter()
+            .position(|attempt| attempt.boundary() == boundary)
+            .unwrap()
+            + 1;
+        assert_eq!(interrupted.attempts, acknowledged.attempts[..prefix_len]);
+        assert!(error.to_string().contains(&format!("{boundary:?}")));
+    }
+}
+
+#[tokio::test]
+async fn all_existing_publication_skips_create_without_reordering_effects() {
+    let (result, driver) = execute_scripted(all_existing_execution_plan(), None).await;
+    result.unwrap();
+    driver.assert_consumed();
+    assert_eq!(
+        driver.attempts.iter().map(DurableEffectAttempt::boundary).collect::<Vec<_>>(),
+        [EffectBoundary::InitialRefs, EffectBoundary::Markers, EffectBoundary::Updates]
+    );
+    insta::assert_yaml_snapshot!("all_existing_publication_effects", driver.attempts);
+}
+
+#[tokio::test]
+async fn empty_effect_stages_cross_without_attempting_a_durable_write() {
+    let plan = plan(&[EntrySpec {
+        id: "Gone",
+        history: HistorySpec::current(oid(20), oid(10), true),
+        pull_request: PullRequestSpec::Open(OpenSpec {
+            number: 7,
+            node: "PR_7".to_owned(),
+            head: oid(20),
+            base_kind: BaseKind::Default,
+            base: oid(10),
+            title: None,
+            body: Some(single_desired_body()),
+            landing_automation: false,
+        }),
+    }])
+    .unwrap();
+    let (result, driver) = execute_scripted(plan, None).await;
+    result.unwrap();
+    driver.assert_consumed();
+    assert!(driver.attempts.is_empty());
 }
