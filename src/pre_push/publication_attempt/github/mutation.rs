@@ -408,6 +408,29 @@ impl PreparedCreates {
     }
 
     #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn batches_for_test(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &[TestCreate]> + '_ {
+        assert_eq!(
+            self.batches.iter().map(|batch| batch.expected.len()).sum::<usize>(),
+            self.operations.len(),
+            "semantic create operations must cover the exact prepared batches"
+        );
+        let mut start = 0;
+        self.batches.iter().map(move |batch| {
+            let end = start + batch.expected.len();
+            let operations = &self.operations[start..end];
+            start = end;
+            operations
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn repository_id_for_test(&self) -> &str {
+        self.repository_id.as_str()
+    }
+
+    #[cfg(test)]
     pub(super) fn for_test(
         repository_id: String,
         operations: Vec<TestCreate>,
@@ -449,8 +472,14 @@ impl CompleteCreateReceipts {
     }
 }
 
+/// One minimal projection patch coupled to both of its stable identities.
+///
+/// GitHub addresses the mutation by pull request node ID, while the retained
+/// change ID prevents planner and recovery evidence from relabelling it as an
+/// update for another local change.
 #[derive(Debug, Eq, PartialEq)]
 pub(in crate::pre_push::publication_attempt) struct UpdatePullRequest {
+    id: GherritPrId,
     identity: PullRequestIdentity,
     title: Option<String>,
     body: Option<String>,
@@ -459,6 +488,7 @@ pub(in crate::pre_push::publication_attempt) struct UpdatePullRequest {
 
 impl UpdatePullRequest {
     fn new(
+        id: GherritPrId,
         identity: PullRequestIdentity,
         title: Option<String>,
         body: Option<String>,
@@ -467,17 +497,19 @@ impl UpdatePullRequest {
         if title.is_none() && body.is_none() && base_branch.is_none() {
             bail!("A pull request update must change at least one field");
         }
-        Ok(Self { identity, title, body, base_branch })
+        Ok(Self { id, identity, title, body, base_branch })
     }
 
     /// Converts validated semantic differences into one bounded wire update.
     pub(in crate::pre_push::publication_attempt) fn from_projection(
+        id: GherritPrId,
         identity: PullRequestIdentity,
         title: Option<PullRequestTitle>,
         body: Option<GeneratedBody>,
         base_branch: Option<String>,
     ) -> Result<Self> {
         Self::new(
+            id,
             identity,
             title.map(|title| title.as_str().to_owned()),
             body.map(GeneratedBody::into_string),
@@ -503,6 +535,7 @@ impl UpdatePullRequest {
     #[cfg(test)]
     pub(in crate::pre_push::publication_attempt) fn into_test(self) -> TestUpdate {
         TestUpdate {
+            id: self.id,
             identity: self.identity,
             title: self.title,
             body: self.body,
@@ -637,7 +670,14 @@ impl PreparedUpdates {
     ) -> Result<Self> {
         let mut numbers = HashSet::with_capacity(operations.len());
         let mut node_ids = HashSet::with_capacity(operations.len());
+        let mut ids = HashSet::with_capacity(operations.len());
         for (index, operation) in operations.iter().enumerate() {
+            if !ids.insert(&operation.id) {
+                bail!(
+                    "GraphQL update mutation at item {index} repeats change ID '{}'. No mutation was sent.",
+                    operation.id.as_str()
+                );
+            }
             if !numbers.insert(operation.identity.number()) {
                 bail!(
                     "GraphQL update mutation at item {index} repeats a pull request number. No mutation was sent."
@@ -662,6 +702,24 @@ impl PreparedUpdates {
     #[cfg(test)]
     pub(in crate::pre_push::publication_attempt) fn operations_for_test(&self) -> &[TestUpdate] {
         &self.operations
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn batches_for_test(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &[TestUpdate]> + '_ {
+        assert_eq!(
+            self.batches.iter().map(|batch| batch.expected.len()).sum::<usize>(),
+            self.operations.len(),
+            "semantic update operations must cover the exact prepared batches"
+        );
+        let mut start = 0;
+        self.batches.iter().map(move |batch| {
+            let end = start + batch.expected.len();
+            let operations = &self.operations[start..end];
+            start = end;
+            operations
+        })
     }
 
     async fn execute(self, github: &Github) -> Result<()> {
@@ -722,6 +780,7 @@ impl TestCreate {
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::pre_push::publication_attempt) struct TestUpdate {
+    pub(in crate::pre_push::publication_attempt) id: GherritPrId,
     pub(in crate::pre_push::publication_attempt) identity: PullRequestIdentity,
     pub(in crate::pre_push::publication_attempt) title: Option<String>,
     pub(in crate::pre_push::publication_attempt) body: Option<String>,
@@ -731,7 +790,7 @@ pub(in crate::pre_push::publication_attempt) struct TestUpdate {
 #[cfg(test)]
 impl TestUpdate {
     fn into_operation(self) -> Result<UpdatePullRequest> {
-        UpdatePullRequest::new(self.identity, self.title, self.body, self.base_branch)
+        UpdatePullRequest::new(self.id, self.identity, self.title, self.body, self.base_branch)
     }
 }
 
@@ -878,6 +937,14 @@ mod tests {
         assert_eq!(prepared.batches.len(), 2);
         assert_eq!(prepared.batches[0].expected.len(), MAX_MUTATION_ALIASES);
         assert_eq!(prepared.batches[1].expected.len(), 1);
+        assert_eq!(prepared.repository_id_for_test(), "REPOSITORY");
+        let semantic_batches = prepared.batches_for_test().collect::<Vec<_>>();
+        assert_eq!(
+            semantic_batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+            [MAX_MUTATION_ALIASES, 1]
+        );
+        assert_eq!(semantic_batches[0][0].id, id("G0"));
+        assert_eq!(semantic_batches[1][0].id, id(&format!("G{MAX_MUTATION_ALIASES}")));
         assert!(
             prepared
                 .batches
@@ -911,6 +978,7 @@ mod tests {
         let operations = (1..=MAX_MUTATION_ALIASES + 1)
             .map(|number| {
                 UpdatePullRequest::new(
+                    id(&format!("G{number}")),
                     PullRequestIdentity::new(u64::try_from(number).unwrap(), format!("PR{number}"))
                         .unwrap(),
                     Some(format!("title {number}")),
@@ -924,8 +992,21 @@ mod tests {
         assert_eq!(prepared.batches.len(), 2);
         assert_eq!(prepared.batches[0].expected.len(), MAX_MUTATION_ALIASES);
         assert_eq!(prepared.batches[1].expected.len(), 1);
+        let semantic_batches = prepared.batches_for_test().collect::<Vec<_>>();
+        assert_eq!(
+            semantic_batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+            [MAX_MUTATION_ALIASES, 1]
+        );
+        assert_eq!(semantic_batches[0][0].identity.number().get(), 1);
+        assert_eq!(semantic_batches[0][0].id, id("G1"));
+        assert_eq!(
+            semantic_batches[1][0].identity.number().get(),
+            u32::try_from(MAX_MUTATION_ALIASES + 1).unwrap()
+        );
+        assert_eq!(semantic_batches[1][0].id, id(&format!("G{}", MAX_MUTATION_ALIASES + 1)));
 
         let mut exact = UpdatePullRequest::new(
+            id("Gexact"),
             PullRequestIdentity::new(1, "PR1".to_owned()).unwrap(),
             None,
             Some(String::new()),
@@ -944,6 +1025,7 @@ mod tests {
         let mut late_oversized = (1..=MAX_MUTATION_ALIASES)
             .map(|number| {
                 UpdatePullRequest::new(
+                    id(&format!("Glate{number}")),
                     PullRequestIdentity::new(
                         u64::try_from(number).unwrap(),
                         format!("LATE{number}"),
@@ -958,6 +1040,7 @@ mod tests {
             .collect::<Vec<_>>();
         late_oversized.push(
             UpdatePullRequest::new(
+                id("Goversized"),
                 PullRequestIdentity::new(10_000, "OVERSIZED".to_owned()).unwrap(),
                 None,
                 Some("x".repeat(MAX_MUTATION_REQUEST_BYTES)),
@@ -990,19 +1073,39 @@ mod tests {
 
         assert!(PreparedUpdates::new(Vec::new()).unwrap().operations_for_test().is_empty());
         let one = PullRequestIdentity::new(1, "ONE".to_owned()).unwrap();
-        assert!(UpdatePullRequest::new(one.clone(), None, None, None).is_err());
+        assert!(UpdatePullRequest::new(id("Gone"), one.clone(), None, None, None).is_err());
         let same_number = PullRequestIdentity::new(1, "TWO".to_owned()).unwrap();
         let same_node = PullRequestIdentity::new(2, "ONE".to_owned()).unwrap();
-        let update = |identity| {
-            UpdatePullRequest::new(identity, Some("title".to_owned()), None, None).unwrap()
+        let update = |change, identity| {
+            UpdatePullRequest::new(change, identity, Some("title".to_owned()), None, None).unwrap()
         };
-        assert!(PreparedUpdates::new(vec![update(one.clone()), update(same_number)]).is_err());
-        assert!(PreparedUpdates::new(vec![update(one), update(same_node)]).is_err());
+        assert!(
+            PreparedUpdates::new(vec![
+                update(id("Gone"), one.clone()),
+                update(id("Gtwo"), same_number),
+            ])
+            .is_err()
+        );
+        assert!(
+            PreparedUpdates::new(vec![
+                update(id("Gone"), one.clone()),
+                update(id("Gtwo"), same_node),
+            ])
+            .is_err()
+        );
+        assert!(
+            PreparedUpdates::new(vec![
+                update(id("Gone"), one),
+                update(id("Gone"), PullRequestIdentity::new(2, "TWO".to_owned()).unwrap(),),
+            ])
+            .is_err()
+        );
     }
 
     #[test]
     fn update_document_is_an_exact_json_escaped_graphql_operation() {
         let operation = UpdatePullRequest::new(
+            id("Gseven"),
             PullRequestIdentity::new(7, "PR_\"SEVEN".to_owned()).unwrap(),
             Some("title \" seven".to_owned()),
             Some("line one\nline two".to_owned()),
@@ -1016,6 +1119,7 @@ mod tests {
     fn update_receipt_requires_the_exact_coupled_identity() {
         let identity = PullRequestIdentity::new(7, "PR_SEVEN".to_owned()).unwrap();
         let operation = UpdatePullRequest::new(
+            id("Gseven"),
             identity.clone(),
             Some("new title".to_owned()),
             None,

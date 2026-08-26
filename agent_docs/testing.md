@@ -261,7 +261,7 @@ DurableWorld
 
 PublishedChange
   ordered published revisions
-  independently optional marker target
+  optional OPEN pull request, either unmarked or marked at one revision
 
 LocalIntent
   ordered local changes
@@ -272,16 +272,24 @@ LocalChange
   title and body
 ```
 
-The marker and pull request are stored independently because they are durable
-effects in different systems. Reachable recovery worlds enforce that a marker
-was authorized by a durable OPEN identity; an observation may still hide that
-row. Terminal-only exact connections are rejected during correlation, before
-a planner value or recovery world exists. Focused correlation tests own those
-external lifecycle combinations. A marker may target an older published
-revision after an amendment. OPEN pull request rows retain identity, exact ref
-and object values, and literal projection bytes. The model can therefore prove
-that a complete body patch reaches an exact no-action retry without deriving
-desired state inside the fake world.
+The durable model couples a marker to the OPEN pull request which authorized
+it. The stage machine cannot publish a marker until an OPEN identity is
+durable, so a marker without that pull request is not a reachable state for a
+protocol-conforming publisher. Per-query visibility remains separate and may
+hide the durable row, including a marked row, without deleting it from the
+world. Terminal-only exact connections are rejected during correlation,
+before a planner value or recovery world exists. Focused correlation tests own
+those external lifecycle combinations.
+
+A marker may target an older published revision after an amendment. The
+durable Git history supplies current head and owned-base object IDs. A stale
+query result separately retains the exact head and base object IDs and literal
+projection bytes which that query returned; the immutable pull request
+identity remains coupled to the durable row. The two object IDs may lag to
+different immutable history positions. The model can therefore prove that
+writes do not retroactively refresh an observation and that a complete body
+patch reaches an exact no-action retry without deriving desired state inside
+the fake world.
 
 The production planner exposes typed test effects:
 
@@ -296,12 +304,16 @@ observation, and requires the next plan to describe exactly the remaining
 work.
 
 Concurrency cases derive two plans from independently chosen observations and
-interleave their complete external effects. The durable model applies Git
-effects only when every exact lease still matches, creates at most one OPEN
-pull request for a stable creation key, and stops an attempt whose effect is
-rejected or indeterminate. It then retries the selected stable intent from a
-fresh observation. This explores concurrency without giving either planner
-access to the other's process-local state.
+run one complete competing plan while the primary plan is suspended at each
+cross-stage authority barrier and between acknowledged serialized batches or
+requests. Complete-alias subset enumeration separately covers indeterminate
+execution within one GraphQL request. The durable model applies Git effects
+only when every exact lease still matches, creates at most one OPEN pull request
+for a stable creation key, and stops an attempt whose effect is rejected or
+indeterminate. It then retries the selected stable intent from a fresh
+observation. This explores concurrency without giving either planner access to
+the other's process-local state or inventing a second executor for extracted
+effects.
 
 Required bounded scenarios include:
 
@@ -313,14 +325,16 @@ Required bounded scenarios include:
    remarking an established pull request.
 4. Visibility: hiding an unmarked provisional OPEN row repeats only the stable
    create key; hiding a marked OPEN row rejects without a create.
-5. Concurrent publishers: disjoint changes commute; a tuple or marker which
-   another publisher applied is already complete on retry; identical tuple
-   pushes from the same observation both receive usable acknowledgements even
-   though only one changes the refs; pushes with different desired tuples from
-   the same observation admit one exact-lease winner and stop the loser;
-   simultaneous creates use one stable key; and different navigation
-   projections for the same tuple are safe last-writer-wins updates which
-   converge after one local intent stabilizes.
+5. Concurrent publishers: disjoint changes independently converge regardless
+   of execution order, while allocation order may change literal pull request
+   identities and the bodies which embed them; a tuple or marker which another
+   publisher applied is already complete on retry; identical tuple pushes from
+   the same observation both receive usable acknowledgements even though only
+   one changes the refs; pushes with different desired tuples from the same
+   observation admit one exact-lease winner and stop the loser; simultaneous
+   creates use one stable key; and different navigation projections for the
+   same tuple are safe last-writer-wins updates which converge after one local
+   intent stabilizes.
 
 Universal invariants include:
 
@@ -328,7 +342,8 @@ Universal invariants include:
 - GitHub creates never precede exact tuple acknowledgement;
 - final updates never precede exact marker acknowledgement;
 - a converged world produces `Done`;
-- applying a successful required effect makes measurable progress;
+- a successful required effect either makes durable progress or acknowledges
+  the exact state established by another publisher;
 - retrying every reachable durable prefix converges after intent stabilizes;
 - every interleaving of protocol-conforming effects preserves safety;
 - immutable tags never move;

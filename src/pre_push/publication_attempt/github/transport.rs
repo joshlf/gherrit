@@ -768,6 +768,7 @@ mod tests {
 
     fn test_update(number: u32) -> TestUpdate {
         TestUpdate {
+            id: id(&format!("G{number}")),
             identity: PullRequestIdentity::new(u64::from(number), format!("PR{number}")).unwrap(),
             title: Some(format!("title {number}")),
             body: None,

@@ -16,6 +16,8 @@ mod github;
 mod history;
 mod refs;
 mod remote;
+#[cfg(test)]
+mod semantic_oracle;
 mod subprocess;
 mod version;
 
@@ -743,20 +745,27 @@ fn final_update(
     let desired_kind = desired_base(index);
     match entry {
         BoundProjectionEntry::Existing(pull_request) => {
+            let id = pull_request.id().clone();
             let title = (pull_request.title() != title.as_str()).then(|| title.clone());
             let body = (!bodies_equal(pull_request.body(), body.as_str())).then_some(body);
             let base = (pull_request.base().kind() != desired_kind)
-                .then(|| desired_base_name(desired_kind, default_branch, pull_request.id()));
+                .then(|| desired_base_name(desired_kind, default_branch, &id));
             if title.is_none() && body.is_none() && base.is_none() {
                 return Ok(None);
             }
-            UpdatePullRequest::from_projection(pull_request.identity().clone(), title, body, base)
-                .map(Some)
+            UpdatePullRequest::from_projection(
+                id,
+                pull_request.identity().clone(),
+                title,
+                body,
+                base,
+            )
+            .map(Some)
         }
         BoundProjectionEntry::Created { id, identity } => {
             let base = (desired_kind == BaseKind::Default)
                 .then(|| desired_base_name(desired_kind, default_branch, &id));
-            UpdatePullRequest::from_projection(identity, None, Some(body), base).map(Some)
+            UpdatePullRequest::from_projection(id, identity, None, Some(body), base).map(Some)
         }
     }
 }
