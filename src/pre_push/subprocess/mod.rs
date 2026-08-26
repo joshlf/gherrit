@@ -90,10 +90,6 @@ pub(super) async fn output(
 /// This deliberately does not admit an arbitrary [`Stdio`], pipe, or in-memory
 /// producer: all input is finite and complete before the command deadline
 /// begins, with no producer lifetime to supervise.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "regular-file input activates with exact history acquisition")
-)]
 pub(super) async fn output_with_regular_file_stdin(
     command: Command,
     input: RegularFileStdin,
@@ -120,10 +116,6 @@ pub(super) struct RegularFileStdinBuilder {
     limit: u64,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "regular-file input activates with exact history acquisition")
-)]
 impl RegularFileStdinBuilder {
     pub(super) fn new() -> Result<Self, CommandError> {
         Self::with_limit(REGULAR_FILE_STDIN_LIMIT)
