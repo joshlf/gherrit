@@ -1,18 +1,27 @@
 //! Complete GraphQL evidence for the exact local change IDs.
 //!
-//! A query page is inseparably bound to its requested change ID and input
-//! cursor. Partial pages remain adapter evidence: only the accumulator can
-//! expose a complete observation, and it does so only after every requested
-//! connection is exhausted.
+//! Each query page is inseparably bound to its requested change ID and input
+//! cursor. Rows are validated, registered, and folded as pages arrive. Raw
+//! rows are never collected into a second complete representation, and no
+//! correlated value is exposed until every requested connection is exhausted.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    num::NonZeroUsize,
+};
 
-use color_eyre::eyre::{Context as _, Result, bail, eyre};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use color_eyre::eyre::{Result, bail, eyre};
+use gix::ObjectId;
+use serde::{
+    Deserialize, Deserializer,
+    de::{self, MapAccess, SeqAccess, Visitor},
+};
+use serde_json::{Map, Number, Value, json};
 
 use super::{
-    PullRequestIdentity, PullRequestState, Repository, RepositoryNodeId, SameRepositoryPullRequest,
+    PullRequestIdentity, Repository, RepositoryNodeId,
+    pull_request::ExactLocalPullRequestIdentities,
 };
 use crate::pre_push::{
     destination::{DefaultBranch, RepositoryCoordinates},
@@ -20,8 +29,10 @@ use crate::pre_push::{
 };
 
 const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 80;
+const EXCESS_OBSERVATION_ROWS: usize = 99;
+const MAX_DIAGNOSTIC_IDENTITIES: usize = 20;
 
-/// Escapes and bounds text received from GitHub before putting it in an error.
+/// Escapes and bounds an identity or wire detail before putting it in an error.
 fn diagnostic_detail(value: &str) -> String {
     let mut rendered = String::new();
     for character in value.chars() {
@@ -35,29 +46,320 @@ fn diagnostic_detail(value: &str) -> String {
     rendered
 }
 
+/// A JSON value decoded without collapsing duplicate object members.
+///
+/// The ordinary `serde_json::Value` decoder keeps the final value for a
+/// duplicate key. That behavior is unusable for authority-bearing aliases and
+/// fields, so this visitor checks every object recursively before constructing
+/// the bounded response value consumed by semantic decoding.
+struct UniqueJson(Value);
+
+impl<'de> Deserialize<'de> for UniqueJson {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct UniqueJsonVisitor;
+
+        impl<'de> Visitor<'de> for UniqueJsonVisitor {
+            type Value = UniqueJson;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("one JSON value with unique object members")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Bool(value)))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Number(value.into())))
+            }
+
+            fn visit_i128<E>(self, value: i128) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let deserializer = de::value::I128Deserializer::new(value);
+                Number::deserialize(deserializer).map(|number| UniqueJson(Value::Number(number)))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Number(value.into())))
+            }
+
+            fn visit_u128<E>(self, value: u128) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let deserializer = de::value::U128Deserializer::new(value);
+                Number::deserialize(deserializer).map(|number| UniqueJson(Value::Number(number)))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let number = Number::from_f64(value)
+                    .ok_or_else(|| de::Error::custom("non-finite JSON number"))?;
+                Ok(UniqueJson(Value::Number(number)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_string(value.to_owned())
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(Value::String(value)))
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Null))
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                UniqueJson::deserialize(deserializer)
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Null))
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(UniqueJson(value)) = sequence.next_element::<UniqueJson>()? {
+                    values.push(value);
+                }
+                Ok(UniqueJson(Value::Array(values)))
+            }
+
+            fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut values = Map::new();
+                while let Some(key) = object.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(de::Error::custom("duplicate JSON object member"));
+                    }
+                    let UniqueJson(value) = object.next_value::<UniqueJson>()?;
+                    assert!(values.insert(key, value).is_none());
+                }
+                Ok(UniqueJson(Value::Object(values)))
+            }
+        }
+
+        deserializer.deserialize_any(UniqueJsonVisitor)
+    }
+}
+
+fn decode_unique_json(response: &[u8]) -> Result<Value> {
+    let mut deserializer = serde_json::Deserializer::from_slice(response);
+    let UniqueJson(value) = UniqueJson::deserialize(&mut deserializer)
+        .map_err(|_| eyre!("GitHub local pull request response contains malformed JSON"))?;
+    deserializer
+        .end()
+        .map_err(|_| eyre!("GitHub local pull request response contains malformed JSON"))?;
+    Ok(value)
+}
+
+/// The lifecycle states which cannot be selected as the current projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalState {
+    Closed,
+    Merged,
+}
+
+/// The only base kinds supported by a managed OPEN pull request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::pre_push) enum BaseKind {
+    Default,
+    Owned,
+}
+
+/// A classified base name coupled to the object GitHub observed for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::pre_push) struct ObservedBase {
+    kind: BaseKind,
+    oid: ObjectId,
+}
+
+impl ObservedBase {
+    pub(in crate::pre_push) fn kind(&self) -> BaseKind {
+        self.kind
+    }
+
+    pub(in crate::pre_push) fn oid(&self) -> ObjectId {
+        self.oid
+    }
+}
+
+/// Same-repository OPEN evidence for one exact local change.
+///
+/// The requested connection already proves the head branch name, so storing it
+/// again would make disagreement representable. Construction remains private
+/// to this observation boundary.
+#[derive(Debug)]
+pub(in crate::pre_push) struct ManagedOpenPullRequest {
+    id: GherritPrId,
+    identity: PullRequestIdentity,
+    head_oid: ObjectId,
+    base: ObservedBase,
+    title: Box<str>,
+    body: Box<str>,
+    has_landing_automation: bool,
+}
+
+impl ManagedOpenPullRequest {
+    #[allow(clippy::too_many_arguments)]
+    fn from_observation(
+        default_branch: &str,
+        id: GherritPrId,
+        identity: PullRequestIdentity,
+        title: String,
+        body: String,
+        base_name: String,
+        base_oid: ObjectId,
+        head_oid: ObjectId,
+        has_landing_automation: bool,
+    ) -> Result<Self> {
+        let kind = if base_name == default_branch {
+            BaseKind::Default
+        } else if base_name == owned_base_name(&id) {
+            BaseKind::Owned
+        } else {
+            let id = diagnostic_detail(id.as_str());
+            bail!(
+                "GitHub pull request #{} for '{}' has an unsupported base",
+                identity.number().get(),
+                id
+            );
+        };
+        Ok(Self {
+            id,
+            identity,
+            head_oid,
+            base: ObservedBase { kind, oid: base_oid },
+            title: title.into_boxed_str(),
+            body: body.into_boxed_str(),
+            has_landing_automation,
+        })
+    }
+
+    pub(in crate::pre_push) fn id(&self) -> &GherritPrId {
+        &self.id
+    }
+
+    pub(in crate::pre_push) fn identity(&self) -> &PullRequestIdentity {
+        &self.identity
+    }
+
+    pub(in crate::pre_push) fn head_oid(&self) -> ObjectId {
+        self.head_oid
+    }
+
+    pub(in crate::pre_push) fn base(&self) -> ObservedBase {
+        self.base
+    }
+
+    pub(in crate::pre_push) fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub(in crate::pre_push) fn body(&self) -> &str {
+        &self.body
+    }
+
+    pub(in crate::pre_push) fn has_landing_automation(&self) -> bool {
+        self.has_landing_automation
+    }
+}
+
+/// Proof that an exhausted exact all-state connection had no same-repository
+/// row. Cross-repository rows do not prevent this conclusion.
+#[derive(Debug)]
+pub(in crate::pre_push) struct AbsentPullRequest {
+    id: GherritPrId,
+}
+
+impl AbsentPullRequest {
+    fn after_exhaustion(id: GherritPrId) -> Self {
+        Self { id }
+    }
+
+    pub(in crate::pre_push) fn id(&self) -> &GherritPrId {
+        &self.id
+    }
+}
+
+/// Correlated state for one local change, in exact local stack order.
+#[derive(Debug)]
+pub(in crate::pre_push) enum LocalPullRequestObservation {
+    Open(ManagedOpenPullRequest),
+    Absent(AbsentPullRequest),
+}
+
+impl LocalPullRequestObservation {
+    pub(in crate::pre_push) fn id(&self) -> &GherritPrId {
+        match self {
+            Self::Open(pull_request) => pull_request.id(),
+            Self::Absent(absent) => absent.id(),
+        }
+    }
+}
+
+/// Complete repository facts, ordered local rows, and every retained identity.
+///
+/// Only exhausting the request-bound accumulator can construct this value. Its
+/// identity registry cannot be detached from or recombined with another local
+/// observation.
+#[derive(Debug)]
+pub(in crate::pre_push) struct CompleteLocalPullRequests {
+    repository: Repository,
+    local: Box<[LocalPullRequestObservation]>,
+    identities: ExactLocalPullRequestIdentities,
+}
+
+impl CompleteLocalPullRequests {
+    pub(in crate::pre_push) fn repository(&self) -> &Repository {
+        &self.repository
+    }
+
+    pub(in crate::pre_push) fn local(&self) -> &[LocalPullRequestObservation] {
+        &self.local
+    }
+}
+
+fn owned_base_name(id: &GherritPrId) -> String {
+    format!("gherrit-bases/{}", id.as_str())
+}
+
 /// One exact local-ID connection and the page it requests next.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LocalPullRequestQuery {
     id: GherritPrId,
     after: Option<String>,
-    first: usize,
 }
 
 impl LocalPullRequestQuery {
-    const MAX_PAGE_SIZE: usize = 100;
-
-    fn new(id: GherritPrId, after: Option<String>, first: usize) -> Result<Self> {
-        if !(1..=Self::MAX_PAGE_SIZE).contains(&first) {
-            bail!("A local pull request query requires a page size between one and 100");
-        }
+    fn new(id: GherritPrId, after: Option<String>) -> Result<Self> {
         if after.as_deref() == Some("") {
             bail!("A local pull request query requires a nonempty pagination cursor");
         }
-        Ok(Self { id, after, first })
+        Ok(Self { id, after })
     }
 }
 
-/// One batch of independently paginated local-ID connections.
+/// One batch of independently paginated exact local-ID connections.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LocalPullRequests {
     coordinates: RepositoryCoordinates,
@@ -79,7 +381,10 @@ impl LocalPullRequests {
         let mut ids = HashSet::with_capacity(queries.len());
         for query in &queries {
             if !ids.insert(&query.id) {
-                bail!("A local pull request query repeats change '{}'", query.id.as_str());
+                bail!(
+                    "A local pull request query repeats change '{}'",
+                    diagnostic_detail(query.id.as_str())
+                );
             }
         }
         Ok(Self { coordinates, queries, include_repository_facts })
@@ -102,9 +407,8 @@ impl LocalPullRequests {
                     .map(|cursor| format!(", after: {}", json!(cursor)))
                     .unwrap_or_default();
                 format!(
-                    "op{index}: pullRequests(headRefName: {}, first: {}{after}, states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, autoMergeRequest {{ enabledAt }}, isInMergeQueue }} pageInfo {{ hasNextPage, endCursor }} }}",
+                    "op{index}: pullRequests(headRefName: {}, first: 1{after}, states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, autoMergeRequest {{ enabledAt }}, isInMergeQueue }} pageInfo {{ hasNextPage, endCursor }} }}",
                     json!(query.id.as_str()),
-                    query.first,
                 )
             })
             .collect::<Vec<_>>()
@@ -116,7 +420,29 @@ impl LocalPullRequests {
         )
     }
 
-    fn decode(self, response: Value) -> Result<LocalPullRequestBatch> {
+    /// Decodes one bounded raw response without first collapsing duplicate JSON
+    /// members.
+    fn decode(self, response: &[u8]) -> Result<LocalPullRequestBatch> {
+        self.decode_unique_value(decode_unique_json(response)?)
+    }
+
+    #[cfg(test)]
+    fn decode_value(self, response: Value) -> Result<LocalPullRequestBatch> {
+        let response = serde_json::to_vec(&response).expect("JSON value is serializable");
+        self.decode(&response)
+    }
+
+    fn decode_unique_value(self, response: Value) -> Result<LocalPullRequestBatch> {
+        let response = response
+            .as_object()
+            .ok_or_else(|| eyre!("GitHub local pull request response is not an object"))?;
+        if response.keys().any(|field| !matches!(field.as_str(), "data" | "errors" | "extensions"))
+        {
+            bail!("GitHub local pull request response has unexpected top-level fields");
+        }
+        if response.get("extensions").is_some_and(|extensions| !extensions.is_object()) {
+            bail!("GitHub local pull request response has malformed extensions");
+        }
         match response.get("errors") {
             None => {}
             Some(Value::Array(errors)) if errors.is_empty() => {}
@@ -134,16 +460,13 @@ impl LocalPullRequests {
             eyre!("GitHub local pull request response is missing repository data")
         })?;
 
-        let repository_evidence = if self.include_repository_facts {
-            RepositoryEvidence::Observed(decode_repository(
-                &mut repository,
-                self.coordinates.clone(),
-            )?)
+        let repository_facts = if self.include_repository_facts {
+            Some(decode_repository(&mut repository, self.coordinates.clone())?)
         } else {
             if repository.contains_key("id") || repository.contains_key("defaultBranchRef") {
                 bail!("GitHub returned repository facts more than once");
             }
-            RepositoryEvidence::Coordinates(self.coordinates.clone())
+            None
         };
 
         let expected =
@@ -171,7 +494,11 @@ impl LocalPullRequests {
             })
             .collect::<Result<Vec<_>>>()?;
         debug_assert!(repository.is_empty());
-        Ok(LocalPullRequestBatch { repository: repository_evidence, pages })
+        Ok(LocalPullRequestBatch {
+            coordinates: self.coordinates,
+            repository: repository_facts,
+            pages,
+        })
     }
 }
 
@@ -201,14 +528,14 @@ fn decode_repository(
             .remove("defaultBranchRef")
             .ok_or_else(|| eyre!("GitHub omitted the repository default branch"))?,
     )
-    .wrap_err("Failed to decode the repository default branch")?;
+    .map_err(|_| eyre!("GitHub returned malformed repository default branch data"))?;
     let tip = gix::ObjectId::from_hex(default_branch.target.oid.as_bytes())
-        .wrap_err("GitHub reported an invalid default branch object ID")?;
+        .map_err(|_| eyre!("GitHub reported an invalid default branch object ID"))?;
     Ok(Repository {
         coordinates,
         node_id: RepositoryNodeId::new(node_id)?,
         default_branch: DefaultBranch::new(default_branch.name, tip)
-            .wrap_err("GitHub reported an invalid default branch")?,
+            .map_err(|_| eyre!("GitHub reported an invalid default branch"))?,
     })
 }
 
@@ -237,36 +564,60 @@ enum Nullable<T> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AutoMergeRequest {
-    enabled_at: Nullable<String>,
+    enabled_at: String,
 }
 
+/// The selected wire row keeps projection fields untyped until lifecycle and
+/// repository are known. Fork and terminal rows must have the selected shape,
+/// but their irrelevant projection payload is deliberately not interpreted.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Node {
     number: i64,
     id: String,
-    title: String,
-    body: String,
-    base_ref_name: String,
-    base_ref_oid: String,
+    title: Value,
+    body: Value,
+    base_ref_name: Value,
+    base_ref_oid: Value,
     head_ref_name: String,
-    head_ref_oid: String,
-    state: PullRequestState,
+    head_ref_oid: Value,
+    state: WirePullRequestState,
     is_cross_repository: bool,
-    auto_merge_request: Nullable<AutoMergeRequest>,
-    is_in_merge_queue: bool,
+    auto_merge_request: Value,
+    is_in_merge_queue: Value,
 }
 
-/// The only outcomes which survive decoding one selected wire row.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum WirePullRequestState {
+    Open,
+    Closed,
+    Merged,
+}
+
+/// The only row states which survive wire decoding.
 ///
-/// A cross-repository row is relevant only because it occupies a page. Its
-/// selected shape, identity, and exact requested head are validated, but none
-/// of that nonlocal evidence is retained. A same-repository row retains the
-/// fields which can become local authority or projection evidence.
+/// Cross-repository rows retain nothing. Their wire identity and exact
+/// requested head are validated before decoding reaches this type, but a fork
+/// is not local repository evidence and cannot constrain later creates.
+/// Terminal and OPEN rows retain only the local evidence each later stage
+/// needs.
 #[derive(Debug)]
 enum DecodedPullRequest {
     CrossRepository,
-    SameRepository(SameRepositoryPullRequest),
+    Terminal { identity: PullRequestIdentity, state: TerminalState },
+    Open(OpenPullRequest),
+}
+
+#[derive(Debug)]
+struct OpenPullRequest {
+    identity: PullRequestIdentity,
+    title: String,
+    body: String,
+    base_name: String,
+    base_oid: gix::ObjectId,
+    head_oid: gix::ObjectId,
+    has_landing_automation: bool,
 }
 
 fn decode_connection(
@@ -274,42 +625,39 @@ fn decode_connection(
     connection: Value,
 ) -> Result<LocalPullRequestPageEvidence> {
     let connection: Connection = serde_json::from_value(connection)
-        .wrap_err("Failed to decode local pull request query response")?;
-    if connection.nodes.len() > query.first {
+        .map_err(|_| eyre!("GitHub returned malformed local pull request connection data"))?;
+    if connection.nodes.len() > 1 {
+        let id = diagnostic_detail(query.id.as_str());
         bail!(
-            "GitHub returned {} rows for '{}' after at most {} were requested",
+            "GitHub returned {} rows for '{}' after exactly one was requested",
             connection.nodes.len(),
-            query.id.as_str(),
-            query.first
+            id
         );
     }
-    let pull_requests = connection
+    let row = connection
         .nodes
         .into_iter()
+        .next()
         .map(|node| decode_pull_request(&query.id, node))
-        .collect::<Result<Vec<_>>>()?;
+        .transpose()?;
     let PageInfo { has_next_page, end_cursor } = connection.page_info;
-    let end_cursor = match end_cursor {
-        Nullable::Value(cursor) if cursor.is_empty() => {
-            bail!("GitHub reported an empty local pull request pagination cursor")
+    let end = match (has_next_page, row, end_cursor) {
+        (true, None, _) => {
+            let id = diagnostic_detail(query.id.as_str());
+            bail!("GitHub reported an empty advancing pull request page for '{id}'")
         }
-        Nullable::Value(cursor) => Some(cursor),
-        Nullable::Null(()) => None,
+        (true, Some(row), Nullable::Value(next_cursor)) if !next_cursor.is_empty() => {
+            PageEnd::Advancing { row, next_cursor }
+        }
+        (true, Some(_), _) => {
+            let id = diagnostic_detail(query.id.as_str());
+            bail!(
+                "GitHub reported another local pull request page for '{id}' without an end cursor"
+            )
+        }
+        (false, row, _) => PageEnd::Exhausted { row },
     };
-    let next_cursor = match (has_next_page, end_cursor) {
-        (true, Some(cursor)) => Some(cursor),
-        (true, None) => bail!(
-            "GitHub reported another local pull request page for '{}' without an end cursor",
-            query.id.as_str()
-        ),
-        (false, _) => None,
-    };
-    Ok(LocalPullRequestPageEvidence {
-        id: query.id,
-        after: query.after,
-        pull_requests,
-        next_cursor,
-    })
+    Ok(LocalPullRequestPageEvidence { id: query.id, after: query.after, end })
 }
 
 fn decode_pull_request(id: &GherritPrId, node: Node) -> Result<DecodedPullRequest> {
@@ -317,65 +665,75 @@ fn decode_pull_request(id: &GherritPrId, node: Node) -> Result<DecodedPullReques
         .map_err(|_| eyre!("GitHub reported an invalid pull request number {}", node.number))?;
     let identity = PullRequestIdentity::new(number, node.id)?;
     if node.head_ref_name != id.as_str() {
+        let id = diagnostic_detail(id.as_str());
         bail!(
             "GitHub pull request query for '{}' returned head branch '{}'",
-            id.as_str(),
+            id,
             diagnostic_detail(&node.head_ref_name)
         );
     }
+
     if node.is_cross_repository {
         return Ok(DecodedPullRequest::CrossRepository);
     }
-    if node.base_ref_name.is_empty() {
+    let terminal = match node.state {
+        WirePullRequestState::Closed => Some(TerminalState::Closed),
+        WirePullRequestState::Merged => Some(TerminalState::Merged),
+        WirePullRequestState::Open => None,
+    };
+    if let Some(state) = terminal {
+        return Ok(DecodedPullRequest::Terminal { identity, state });
+    }
+
+    let string = |field: &str, value: Value| match value {
+        Value::String(value) => Ok(value),
+        _ => bail!("GitHub reported an invalid {field}"),
+    };
+    let title = string("pull request title", node.title)?;
+    let body = string("pull request body", node.body)?;
+    let base_name = string("pull request base ref name", node.base_ref_name)?;
+    if base_name.is_empty() {
         bail!("GitHub reported an empty pull request base ref name");
     }
-    let parse_oid = |field: &str, oid: &str| {
+    let parse_oid = |field: &str, value: Value| {
+        let oid = string(field, value)?;
         let object_id = gix::ObjectId::from_hex(oid.as_bytes())
-            .wrap_err_with(|| format!("GitHub reported an invalid {field}"))?;
+            .map_err(|_| eyre!("GitHub reported an invalid {field}"))?;
         if object_id.is_null() {
             bail!("GitHub reported a null {field}");
         }
         Ok(object_id)
     };
+    let base_oid = parse_oid("pull request base ref object ID", node.base_ref_oid)?;
+    let head_oid = parse_oid("pull request head ref object ID", node.head_ref_oid)?;
     let has_auto_merge_request = match node.auto_merge_request {
-        Nullable::Value(request) => {
+        Value::Null => false,
+        value => {
+            let request: AutoMergeRequest = serde_json::from_value(value)
+                .map_err(|_| eyre!("GitHub reported an invalid pull request auto-merge request"))?;
             let _ = request.enabled_at;
             true
         }
-        Nullable::Null(()) => false,
     };
-    Ok(DecodedPullRequest::SameRepository(SameRepositoryPullRequest {
+    let is_in_merge_queue = node
+        .is_in_merge_queue
+        .as_bool()
+        .ok_or_else(|| eyre!("GitHub reported invalid pull request merge-queue state"))?;
+    Ok(DecodedPullRequest::Open(OpenPullRequest {
         identity,
-        title: node.title,
-        body: node.body,
-        base_branch: node.base_ref_name,
-        base_oid: parse_oid("pull request base ref object ID", &node.base_ref_oid)?,
-        head_oid: parse_oid("pull request head ref object ID", &node.head_ref_oid)?,
-        state: node.state,
-        has_auto_merge_request,
-        is_in_merge_queue: node.is_in_merge_queue,
+        title,
+        body,
+        base_name,
+        base_oid,
+        head_oid,
+        has_landing_automation: has_auto_merge_request || is_in_merge_queue,
     }))
-}
-
-/// The one repository capability carried before or after facts are observed.
-#[derive(Debug)]
-enum RepositoryEvidence {
-    Coordinates(RepositoryCoordinates),
-    Observed(Repository),
-}
-
-impl RepositoryEvidence {
-    fn coordinates(&self) -> &RepositoryCoordinates {
-        match self {
-            Self::Coordinates(coordinates) => coordinates,
-            Self::Observed(repository) => &repository.coordinates,
-        }
-    }
 }
 
 #[derive(Debug)]
 struct LocalPullRequestBatch {
-    repository: RepositoryEvidence,
+    coordinates: RepositoryCoordinates,
+    repository: Option<Repository>,
     pages: Vec<LocalPullRequestPageEvidence>,
 }
 
@@ -384,8 +742,16 @@ struct LocalPullRequestBatch {
 struct LocalPullRequestPageEvidence {
     id: GherritPrId,
     after: Option<String>,
-    pull_requests: Vec<DecodedPullRequest>,
-    next_cursor: Option<String>,
+    end: PageEnd,
+}
+
+/// A decoded page can either exhaust its connection or advance with exactly
+/// one row. The forbidden empty-advancing combination exists only while the
+/// wire `PageInfo` and `nodes` fields are being decoded.
+#[derive(Debug)]
+enum PageEnd {
+    Exhausted { row: Option<DecodedPullRequest> },
+    Advancing { row: DecodedPullRequest, next_cursor: String },
 }
 
 #[derive(Debug)]
@@ -408,57 +774,120 @@ impl Progress {
         let Some(next_cursor) = next_cursor else {
             return Ok(Self::Exhausted);
         };
+        let diagnostic_id = || diagnostic_detail(id.as_str());
         let mut seen = match self {
             Self::Initial => HashSet::new(),
             Self::Next { seen, .. } => seen,
             Self::Exhausted => bail!(
                 "Local pull request observation returned another page after exhausting '{}'",
-                id.as_str()
+                diagnostic_id()
             ),
         };
         if !seen.insert(next_cursor.clone()) {
             bail!(
                 "Local pull request observation repeated a pagination cursor for '{}'",
-                id.as_str()
+                diagnostic_id()
             );
         }
         Ok(Self::Next { cursor: next_cursor, seen })
     }
 }
 
-/// Pull request identities proved to belong to this repository.
-///
-/// Fork rows are deliberately excluded: their identities cannot authorize a
-/// later mutation of a same-repository pull request.
-#[derive(Debug, Default)]
-struct IdentityRegistry {
-    numbers: HashSet<u64>,
-    node_ids: HashSet<Box<str>>,
+/// Exact set of terminal lifecycle kinds seen for one head.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalKinds {
+    Closed,
+    Merged,
+    Both,
 }
 
-impl IdentityRegistry {
-    fn insert(&mut self, identity: &PullRequestIdentity) -> Result<()> {
-        if !self.numbers.insert(identity.number) {
-            bail!("Local pull request observation repeats number {}", identity.number);
+impl TerminalKinds {
+    fn record(self, state: TerminalState) -> Self {
+        match (self, state) {
+            (Self::Closed, TerminalState::Closed) => Self::Closed,
+            (Self::Merged, TerminalState::Merged) => Self::Merged,
+            (Self::Closed | Self::Merged | Self::Both, _) => Self::Both,
         }
-        if !self.node_ids.insert(identity.node_id.clone()) {
-            bail!(
-                "Local pull request observation repeats node ID '{}'",
-                diagnostic_detail(&identity.node_id)
-            );
+    }
+}
+
+/// Nonempty terminal history for one exact-head connection.
+///
+/// The lowest-numbered identity is a deterministic representative. The exact
+/// state union and nonzero count are folded independently, so pagination order
+/// cannot change either the classification or its diagnostic.
+#[derive(Debug)]
+struct TerminalSummary {
+    representative: PullRequestIdentity,
+    kinds: TerminalKinds,
+    count: NonZeroUsize,
+}
+
+impl TerminalSummary {
+    fn first(identity: PullRequestIdentity, state: TerminalState) -> Self {
+        Self {
+            representative: identity,
+            kinds: match state {
+                TerminalState::Closed => TerminalKinds::Closed,
+                TerminalState::Merged => TerminalKinds::Merged,
+            },
+            count: NonZeroUsize::MIN,
         }
+    }
+
+    fn record_another(
+        &mut self,
+        identity: PullRequestIdentity,
+        state: TerminalState,
+    ) -> Result<()> {
+        let count =
+            self.count.get().checked_add(1).and_then(NonZeroUsize::new).ok_or_else(|| {
+                eyre!("Local pull request terminal history exceeds platform limits")
+            })?;
+        if identity.number().get() < self.representative.number().get() {
+            self.representative = identity;
+        }
+        self.kinds = self.kinds.record(state);
+        self.count = count;
         Ok(())
     }
 }
 
+/// Incremental correlation state for one exact-head connection.
+#[derive(Debug)]
+struct ConnectionObservation {
+    progress: Progress,
+    baseline_row_available: bool,
+    open: Option<OpenPullRequest>,
+    terminal: Option<TerminalSummary>,
+}
+
+impl Default for ConnectionObservation {
+    fn default() -> Self {
+        Self {
+            progress: Progress::Initial,
+            baseline_row_available: true,
+            open: None,
+            terminal: None,
+        }
+    }
+}
+
 /// In-progress evidence for exactly one ordered local change-ID set.
+///
+/// Each requested ID owns one baseline row. All IDs then share exactly 99
+/// excess rows. A large local stack therefore cannot donate unused baseline
+/// rows to one pathological connection. Because every advancing page must
+/// contain its one requested row, an N-ID observation accepts at most N + 99
+/// rows and at most 2N + 99 pages (one final empty page per connection).
 #[derive(Debug)]
 struct LocalPullRequestAccumulator {
-    repository: RepositoryEvidence,
+    coordinates: RepositoryCoordinates,
+    repository: Option<Repository>,
     order: Box<[GherritPrId]>,
-    progress: HashMap<GherritPrId, Progress>,
-    rows: HashMap<GherritPrId, Vec<SameRepositoryPullRequest>>,
-    identities: IdentityRegistry,
+    connections: HashMap<GherritPrId, ConnectionObservation>,
+    excess_rows_remaining: usize,
+    identities: ExactLocalPullRequestIdentities,
 }
 
 impl LocalPullRequestAccumulator {
@@ -467,13 +896,11 @@ impl LocalPullRequestAccumulator {
         ids: impl IntoIterator<Item = GherritPrId>,
     ) -> Result<Self> {
         let mut order = Vec::new();
-        let mut progress = HashMap::new();
+        let mut connections = HashMap::new();
         for id in ids {
-            if progress.insert(id.clone(), Progress::Initial).is_some() {
-                bail!(
-                    "Local pull request observation requested change '{}' more than once",
-                    id.as_str()
-                );
+            if connections.insert(id.clone(), ConnectionObservation::default()).is_some() {
+                let id = diagnostic_detail(id.as_str());
+                bail!("Local pull request observation requested change '{}' more than once", id);
             }
             order.push(id);
         }
@@ -481,104 +908,195 @@ impl LocalPullRequestAccumulator {
             bail!("Local pull request observation requires at least one change");
         }
         Ok(Self {
-            repository: RepositoryEvidence::Coordinates(coordinates),
+            coordinates,
+            repository: None,
             order: order.into_boxed_slice(),
-            progress,
-            rows: HashMap::new(),
-            identities: IdentityRegistry::default(),
+            connections,
+            excess_rows_remaining: EXCESS_OBSERVATION_ROWS,
+            identities: ExactLocalPullRequestIdentities::default(),
         })
     }
 
-    /// Consumes a decoded batch so an invalid partial batch cannot be reused.
+    /// Consumes the old accumulator and returns a new one only if every page
+    /// in the batch is accepted. An error therefore cannot expose the state
+    /// produced by an earlier page in the same batch.
     fn record_batch(mut self, batch: LocalPullRequestBatch) -> Result<Self> {
-        if batch.repository.coordinates() != self.repository.coordinates() {
+        if batch.coordinates != self.coordinates {
             bail!("Local pull request pages identify different repositories");
         }
         self.repository = match (self.repository, batch.repository) {
-            (RepositoryEvidence::Coordinates(_), RepositoryEvidence::Observed(repository)) => {
-                RepositoryEvidence::Observed(repository)
-            }
-            (RepositoryEvidence::Coordinates(_), RepositoryEvidence::Coordinates(_)) => {
-                bail!("The first local pull request page omitted repository facts")
-            }
-            (RepositoryEvidence::Observed(_), RepositoryEvidence::Observed(_)) => {
+            (None, Some(repository)) => Some(repository),
+            (None, None) => bail!("The first local pull request page omitted repository facts"),
+            (Some(_), Some(_)) => {
                 bail!("A later local pull request page repeated repository facts")
             }
-            (repository @ RepositoryEvidence::Observed(_), RepositoryEvidence::Coordinates(_)) => {
-                repository
-            }
+            (repository @ Some(_), None) => repository,
         };
-        for page in batch.pages {
-            self.record_page(page)?;
-        }
-        Ok(self)
+        batch.pages.into_iter().try_fold(self, Self::record_page)
     }
 
-    fn record_page(&mut self, page: LocalPullRequestPageEvidence) -> Result<()> {
-        let LocalPullRequestPageEvidence { id, after, pull_requests, next_cursor } = page;
-        let progress = self.progress.remove(&id).ok_or_else(|| {
-            eyre!("Local pull request observation returned unrequested change '{}'", id.as_str())
+    /// Consuming page insertion is the atomic adapter boundary. Any mutation
+    /// before a validation failure is dropped with `self`.
+    fn record_page(mut self, page: LocalPullRequestPageEvidence) -> Result<Self> {
+        let LocalPullRequestPageEvidence { id, after, end } = page;
+        let mut connection = self.connections.remove(&id).ok_or_else(|| {
+            eyre!(
+                "Local pull request observation returned unrequested change '{}'",
+                diagnostic_detail(id.as_str())
+            )
         })?;
-        if !progress.expects(after.as_deref()) {
+        if !connection.progress.expects(after.as_deref()) {
             bail!(
                 "Local pull request observation returned an unexpected page cursor for '{}'",
-                id.as_str()
+                diagnostic_detail(id.as_str())
             );
         }
-        let rows = self.rows.entry(id.clone()).or_default();
-        for pull_request in pull_requests {
-            let DecodedPullRequest::SameRepository(pull_request) = pull_request else {
-                continue;
-            };
-            self.identities.insert(&pull_request.identity)?;
-            rows.push(pull_request);
+        let (row, next_cursor) = match end {
+            PageEnd::Exhausted { row } => (row, None),
+            PageEnd::Advancing { row, next_cursor } => (Some(row), Some(next_cursor)),
+        };
+
+        if let Some(row) = row {
+            if connection.baseline_row_available {
+                connection.baseline_row_available = false;
+            } else {
+                self.excess_rows_remaining =
+                    self.excess_rows_remaining.checked_sub(1).ok_or_else(|| {
+                        eyre!(
+                            "Local pull request observation exceeds its {} excess-row limit",
+                            EXCESS_OBSERVATION_ROWS
+                        )
+                    })?;
+            }
+            match row {
+                DecodedPullRequest::CrossRepository => {}
+                DecodedPullRequest::Terminal { identity, state } => {
+                    self.identities.insert(&identity)?;
+                    match &mut connection.terminal {
+                        Some(summary) => summary.record_another(identity, state)?,
+                        terminal @ None => {
+                            *terminal = Some(TerminalSummary::first(identity, state))
+                        }
+                    }
+                }
+                DecodedPullRequest::Open(open) => {
+                    self.identities.insert(&open.identity)?;
+                    if connection.open.is_some() {
+                        bail!(
+                            "GitHub has more than one same-repository OPEN pull request for '{}'",
+                            diagnostic_detail(id.as_str())
+                        );
+                    }
+                    connection.open = Some(open);
+                }
+            }
         }
-        let progress = progress.advance(&id, next_cursor)?;
-        assert!(self.progress.insert(id, progress).is_none());
-        Ok(())
+
+        connection.progress = connection.progress.advance(&id, next_cursor)?;
+        assert!(self.connections.insert(id, connection).is_none());
+        Ok(self)
     }
 
     fn finish(self) -> Result<CompleteLocalPullRequests> {
         let mut incomplete = self
-            .progress
+            .connections
             .iter()
-            .filter(|(_, progress)| !matches!(progress, Progress::Exhausted))
+            .filter(|(_, connection)| !matches!(connection.progress, Progress::Exhausted))
             .map(|(id, _)| id.as_str())
             .collect::<Vec<_>>();
         incomplete.sort_unstable();
         if !incomplete.is_empty() {
+            let total = incomplete.len();
+            let displayed = incomplete
+                .into_iter()
+                .take(MAX_DIAGNOSTIC_IDENTITIES)
+                .map(diagnostic_detail)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let omitted = total.saturating_sub(MAX_DIAGNOSTIC_IDENTITIES);
+            if omitted == 0 {
+                bail!("Local pull request observation did not exhaust change ID(s): {displayed}");
+            }
             bail!(
-                "Local pull request observation did not exhaust change ID(s): {}",
-                incomplete.join(", ")
+                "Local pull request observation did not exhaust change ID(s): {displayed}; additional change IDs omitted: {omitted}"
             );
         }
-        let repository = match self.repository {
-            RepositoryEvidence::Observed(repository) => repository,
-            RepositoryEvidence::Coordinates(_) => {
-                bail!("Local pull request observation omitted repository facts")
+        let repository = self
+            .repository
+            .ok_or_else(|| eyre!("Local pull request observation omitted repository facts"))?;
+        let default_branch = repository.default_branch().name();
+        let mut connections = self.connections;
+        let mut local = Vec::with_capacity(self.order.len());
+        let mut terminal_count = 0_usize;
+        let mut terminal_representatives = Vec::new();
+
+        for id in self.order.into_vec() {
+            let connection = connections.remove(&id).expect("ordered local ID has connection");
+            if let Some(open) = connection.open {
+                local.push(LocalPullRequestObservation::Open(
+                    ManagedOpenPullRequest::from_observation(
+                        default_branch,
+                        id,
+                        open.identity,
+                        open.title,
+                        open.body,
+                        open.base_name,
+                        open.base_oid,
+                        open.head_oid,
+                        open.has_landing_automation,
+                    )?,
+                ));
+            } else if let Some(terminal) = connection.terminal {
+                terminal_count =
+                    terminal_count.checked_add(terminal.count.get()).ok_or_else(|| {
+                        eyre!("Local pull request terminal history exceeds platform limits")
+                    })?;
+                if terminal_representatives.len() < MAX_DIAGNOSTIC_IDENTITIES {
+                    terminal_representatives.push((id, terminal));
+                }
+            } else {
+                local.push(LocalPullRequestObservation::Absent(
+                    AbsentPullRequest::after_exhaustion(id),
+                ));
             }
-        };
-        let mut rows = self.rows;
-        let entries = self
-            .order
-            .into_vec()
-            .into_iter()
-            .map(|id| {
-                let pull_requests = rows.remove(&id).unwrap_or_default();
-                (id, pull_requests)
-            })
-            .collect::<Vec<_>>();
-        debug_assert!(rows.is_empty());
+        }
+        debug_assert!(connections.is_empty());
 
-        Ok(CompleteLocalPullRequests { repository, entries: entries.into_boxed_slice() })
+        if terminal_count != 0 {
+            let displayed = terminal_representatives.len();
+            let mut message = terminal_representatives
+                .into_iter()
+                .map(|(id, summary)| {
+                    let id = diagnostic_detail(id.as_str());
+                    let number = summary.representative.number().get();
+                    match summary.kinds {
+                        TerminalKinds::Closed => format!(
+                            "Cannot push GHerrit change '{id}' because PR #{number} is closed. Reopen it or change the commit's gherrit-pr-id to start a new review.\n"
+                        ),
+                        TerminalKinds::Merged => format!(
+                            "Cannot push GHerrit change '{id}' because PR #{number} is merged. Change the commit's gherrit-pr-id to start a new review.\n"
+                        ),
+                        TerminalKinds::Both => format!(
+                            "Cannot push GHerrit change '{id}' because its exact head has both closed and merged pull request history (for example PR #{number}). Reopen a closed pull request if possible or change the commit's gherrit-pr-id to start a new review.\n"
+                        ),
+                    }
+                })
+                .collect::<String>();
+            let omitted = terminal_count - displayed;
+            if omitted != 0 {
+                message
+                    .push_str(&format!("Additional terminal pull requests omitted: {omitted}.\n"));
+            }
+            message.pop();
+            bail!(message);
+        }
+
+        Ok(CompleteLocalPullRequests {
+            repository,
+            local: local.into_boxed_slice(),
+            identities: self.identities,
+        })
     }
-}
-
-/// Repository facts and complete same-repository rows for the requested IDs.
-#[derive(Debug)]
-struct CompleteLocalPullRequests {
-    repository: Repository,
-    entries: Box<[(GherritPrId, Vec<SameRepositoryPullRequest>)]>,
 }
 
 #[cfg(test)]
@@ -593,8 +1111,8 @@ mod tests {
         GherritPrId::from_ref_component(value.as_bytes()).unwrap()
     }
 
-    fn query(value: &str, after: Option<&str>, first: usize) -> LocalPullRequestQuery {
-        LocalPullRequestQuery::new(id(value), after.map(str::to_owned), first).unwrap()
+    fn query(value: &str, after: Option<&str>) -> LocalPullRequestQuery {
+        LocalPullRequestQuery::new(id(value), after.map(str::to_owned)).unwrap()
     }
 
     fn coordinates() -> RepositoryCoordinates {
@@ -631,6 +1149,12 @@ mod tests {
         })
     }
 
+    fn fork(number: i64, node_id: &str, head: &str) -> Value {
+        let mut node = node(number, node_id, head, "OPEN");
+        node["isCrossRepository"] = json!(true);
+        node
+    }
+
     fn connection(nodes: Vec<Value>, has_next_page: bool, end_cursor: Value) -> Value {
         json!({
             "nodes": nodes,
@@ -643,7 +1167,7 @@ mod tests {
 
     fn response(
         include_repository_facts: bool,
-        connections: impl IntoIterator<Item = (&'static str, Value)>,
+        connections: impl IntoIterator<Item = (String, Value)>,
     ) -> Value {
         let mut repository = serde_json::Map::new();
         if include_repository_facts {
@@ -653,91 +1177,99 @@ mod tests {
                 json!({ "name": "main", "target": { "oid": DEFAULT_OID } }),
             );
         }
-        repository.extend(connections.into_iter().map(|(alias, value)| (alias.to_owned(), value)));
+        repository.extend(connections);
         json!({ "data": { "repository": repository } })
     }
 
     fn one_response(node: Value) -> Value {
-        response(true, [("op0", connection(vec![node], false, Value::Null))])
+        response(true, [("op0".to_owned(), connection(vec![node], false, Value::Null))])
+    }
+
+    fn decoded_page(
+        id: &str,
+        after: Option<&str>,
+        row: Option<Value>,
+        next: Option<&str>,
+        include_repository_facts: bool,
+    ) -> LocalPullRequestBatch {
+        operation(vec![query(id, after)], include_repository_facts)
+            .decode_value(response(
+                include_repository_facts,
+                [(
+                    "op0".to_owned(),
+                    connection(
+                        row.into_iter().collect(),
+                        next.is_some(),
+                        next.map_or(Value::Null, |cursor| json!(cursor)),
+                    ),
+                )],
+            ))
+            .unwrap()
+    }
+
+    fn record_rows(
+        mut accumulator: LocalPullRequestAccumulator,
+        id: &str,
+        start: usize,
+        count: usize,
+        finish_connection: bool,
+        include_repository_facts: bool,
+    ) -> Result<LocalPullRequestAccumulator> {
+        let mut after: Option<String> = None;
+        for offset in 0..count {
+            let index = start + offset;
+            let next =
+                (!finish_connection || offset + 1 != count).then(|| format!("cursor-{id}-{index}"));
+            let row = fork(i64::try_from(index + 1).unwrap(), &format!("NODE-{id}-{index}"), id);
+            let batch = decoded_page(
+                id,
+                after.as_deref(),
+                Some(row),
+                next.as_deref(),
+                include_repository_facts && offset == 0,
+            );
+            accumulator = accumulator.record_batch(batch)?;
+            after = next;
+        }
+        Ok(accumulator)
+    }
+
+    fn kinds(complete: &CompleteLocalPullRequests) -> Vec<(&str, &'static str)> {
+        complete
+            .local()
+            .iter()
+            .map(|observation| {
+                (
+                    observation.id().as_str(),
+                    match observation {
+                        LocalPullRequestObservation::Open(_) => "open",
+                        LocalPullRequestObservation::Absent(_) => "absent",
+                    },
+                )
+            })
+            .collect()
     }
 
     #[test]
-    fn document_binds_each_alias_to_one_exact_head_cursor_and_all_states() {
+    fn document_binds_fixed_one_row_pages_to_exact_heads_and_cursors() {
         let document =
-            operation(vec![query("Gone", None, 17), query("Gtwo", Some("cursor:\"2"), 3)], true)
+            operation(vec![query("Gone", None), query("Gtwo", Some("cursor:\"2"))], true)
                 .document();
+        insta::assert_snapshot!("initial_exact_local_query", document);
 
-        assert_eq!(
-            document,
-            concat!(
-                "query { repository(owner: \"owner\", name: \"repository\") { ",
-                "id, defaultBranchRef { name, target { oid } }, ",
-                "op0: pullRequests(headRefName: \"Gone\", first: 17, ",
-                "states: [OPEN, CLOSED, MERGED]) { nodes { number, id, ",
-                "title, body, baseRefName, baseRefOid, headRefName, ",
-                "headRefOid, state, isCrossRepository, autoMergeRequest { ",
-                "enabledAt }, isInMergeQueue } pageInfo { hasNextPage, ",
-                "endCursor } } op1: pullRequests(headRefName: \"Gtwo\", ",
-                "first: 3, after: \"cursor:\\\"2\", states: [OPEN, CLOSED, ",
-                "MERGED]) { nodes { number, id, title, body, baseRefName, ",
-                "baseRefOid, headRefName, headRefOid, state, ",
-                "isCrossRepository, autoMergeRequest { enabledAt }, ",
-                "isInMergeQueue } pageInfo { hasNextPage, endCursor } } } }",
-            )
-        );
-
-        let later = operation(vec![query("Gone", Some("next"), 1)], false).document();
-        assert_eq!(
-            later,
-            concat!(
-                "query { repository(owner: \"owner\", name: \"repository\") { ",
-                "op0: pullRequests(headRefName: \"Gone\", first: 1, ",
-                "after: \"next\", states: [OPEN, CLOSED, MERGED]) { nodes { ",
-                "number, id, title, body, baseRefName, baseRefOid, ",
-                "headRefName, headRefOid, state, isCrossRepository, ",
-                "autoMergeRequest { enabledAt }, isInMergeQueue } pageInfo { ",
-                "hasNextPage, endCursor } } } }",
-            )
-        );
+        let later = operation(vec![query("Gone", Some("next"))], false).document();
+        insta::assert_snapshot!("later_exact_local_query", later);
     }
 
     #[test]
-    fn page_cannot_exceed_its_requested_size() {
-        let oversized = response(
-            true,
-            [(
-                "op0",
-                connection(
-                    vec![node(1, "PR_ONE", "Gone", "OPEN"), node(2, "PR_TWO", "Gone", "OPEN")],
-                    false,
-                    Value::Null,
-                ),
-            )],
-        );
-
-        assert!(operation(vec![query("Gone", None, 1)], true).decode(oversized).is_err());
-    }
-
-    #[test]
-    fn untrusted_diagnostic_details_are_escaped_and_bounded() {
-        assert_eq!(diagnostic_detail("line\n\x1b'\\"), r"line\n\u{1b}\'\\");
-
-        let rendered = diagnostic_detail(&"雪".repeat(100));
-        assert!(rendered.ends_with('…'));
-        assert!(rendered.len() <= MAX_DIAGNOSTIC_DETAIL_BYTES + '…'.len_utf8());
-    }
-
-    #[test]
-    fn constructors_reject_empty_oversized_and_duplicate_requests() {
-        assert!(LocalPullRequestQuery::new(id("Gone"), None, 0).is_err());
-        assert!(LocalPullRequestQuery::new(id("Gone"), None, 101).is_err());
-        assert!(LocalPullRequestQuery::new(id("Gone"), Some(String::new()), 1).is_err());
+    fn constructors_reject_unusable_or_ambiguous_requests() {
+        assert!(LocalPullRequestQuery::new(id("Gone"), Some(String::new())).is_err());
         assert!(LocalPullRequests::new(coordinates(), Vec::new(), true).is_err());
         assert!(
             LocalPullRequests::new(
                 coordinates(),
                 (0..=LocalPullRequests::MAX_ALIASES)
-                    .map(|index| query(&format!("G{index}"), None, 1))
+                    .map(|index| query(&format!("G{index}"), None))
                     .collect(),
                 true,
             )
@@ -746,7 +1278,7 @@ mod tests {
         assert!(
             LocalPullRequests::new(
                 coordinates(),
-                vec![query("Gone", None, 1), query("Gone", Some("next"), 1)],
+                vec![query("Gone", None), query("Gone", Some("next"))],
                 true,
             )
             .is_err()
@@ -756,91 +1288,401 @@ mod tests {
     }
 
     #[test]
-    fn complete_rows_retain_every_local_authority_field_and_discard_forks() {
-        let opaque_body = "<!-- gherrit-meta: { not identity } -->\nmanual text";
-        let mut open = node(1, "PR_OPEN", "Gone", "OPEN");
-        open["body"] = json!(opaque_body);
-        open["autoMergeRequest"] = json!({ "enabledAt": null });
-        open["isInMergeQueue"] = json!(true);
-        let mut fork = node(4, "PR_FORK", "Gone", "OPEN");
-        fork["isCrossRepository"] = json!(true);
-        fork["baseRefName"] = json!("");
-        fork["baseRefOid"] = json!("not-an-object-id");
-        fork["headRefOid"] = json!("not-an-object-id");
-        let batch = operation(vec![query("Gone", None, 100)], true)
-            .decode(response(
-                true,
-                [(
-                    "op0",
-                    connection(
-                        vec![
-                            open,
-                            node(2, "PR_CLOSED", "Gone", "CLOSED"),
-                            node(3, "PR_MERGED", "Gone", "MERGED"),
-                            fork,
-                        ],
-                        false,
-                        json!("last-row"),
-                    ),
-                )],
-            ))
-            .unwrap();
-        let complete =
-            accumulator([id("Gone")]).unwrap().record_batch(batch).unwrap().finish().unwrap();
+    fn one_row_wire_limit_is_exact() {
+        let oversized = response(
+            true,
+            [(
+                "op0".to_owned(),
+                connection(
+                    vec![node(1, "ONE", "G", "OPEN"), node(2, "TWO", "G", "CLOSED")],
+                    false,
+                    Value::Null,
+                ),
+            )],
+        );
+        assert!(operation(vec![query("G", None)], true).decode_value(oversized).is_err());
+    }
 
-        assert_eq!(complete.repository.node_id.as_str(), "REPOSITORY_NODE");
-        assert_eq!(complete.repository.coordinates, coordinates());
-        assert_eq!(
-            complete.repository.default_branch,
-            DefaultBranch::new(
-                "main".to_owned(),
-                gix::ObjectId::from_hex(DEFAULT_OID.as_bytes()).unwrap(),
-            )
+    #[test]
+    fn empty_terminal_pages_are_valid_but_empty_advancing_pages_are_not() {
+        for terminal_cursor in [Value::Null, json!(""), json!("unused")] {
+            let terminal = response(
+                true,
+                [("op0".to_owned(), connection(Vec::new(), false, terminal_cursor))],
+            );
+            assert!(operation(vec![query("G", None)], true).decode_value(terminal).is_ok());
+        }
+        for advancing_cursor in [Value::Null, json!(""), json!("next")] {
+            let advancing = response(
+                true,
+                [("op0".to_owned(), connection(Vec::new(), true, advancing_cursor))],
+            );
+            assert!(operation(vec![query("G", None)], true).decode_value(advancing).is_err());
+        }
+    }
+
+    #[test]
+    fn one_id_accepts_its_baseline_plus_exactly_99_excess_rows() {
+        let accumulator =
+            record_rows(accumulator([id("G")]).unwrap(), "G", 0, 100, true, true).unwrap();
+        let complete = accumulator.finish().unwrap();
+        assert_eq!(kinds(&complete), [("G", "absent")]);
+        assert_eq!(complete.identities.lengths(), (0, 0));
+    }
+
+    #[test]
+    fn the_100th_excess_row_is_rejected() {
+        let accumulator =
+            record_rows(accumulator([id("G")]).unwrap(), "G", 0, 100, false, true).unwrap();
+        let over_limit =
+            decoded_page("G", Some("cursor-G-99"), Some(fork(101, "NODE-G-100", "G")), None, false);
+        assert!(accumulator.record_batch(over_limit).is_err());
+    }
+
+    #[test]
+    fn baselines_are_per_id_and_shared_excess_is_observation_wide() {
+        let ids = [id("A"), id("B")];
+        let within_limit = record_rows(accumulator(ids).unwrap(), "A", 0, 100, true, true).unwrap();
+        let within_limit = record_rows(within_limit, "B", 1000, 1, true, false).unwrap();
+        assert_eq!(kinds(&within_limit.finish().unwrap()), [("A", "absent"), ("B", "absent")]);
+
+        let ids = [id("A"), id("B")];
+        let accumulator = record_rows(accumulator(ids).unwrap(), "A", 0, 100, true, true).unwrap();
+        let accumulator = record_rows(accumulator, "B", 1000, 1, false, false).unwrap();
+        let over_limit = decoded_page(
+            "B",
+            Some("cursor-B-1000"),
+            Some(fork(1002, "NODE-B-1001", "B")),
+            None,
+            false,
+        );
+        assert!(accumulator.record_batch(over_limit).is_err());
+    }
+
+    #[test]
+    fn a_large_stack_cannot_donate_unused_baselines_to_one_head() {
+        let ids = (0..500).map(|index| id(&format!("G{index}"))).collect::<Vec<_>>();
+        let accumulator =
+            record_rows(accumulator(ids).unwrap(), "G0", 0, 100, false, true).unwrap();
+        let over_limit = decoded_page(
+            "G0",
+            Some("cursor-G0-99"),
+            Some(fork(101, "NODE-G0-100", "G0")),
+            None,
+            false,
+        );
+        assert!(accumulator.record_batch(over_limit).is_err());
+    }
+
+    #[test]
+    fn maximum_one_id_page_chain_includes_a_final_empty_page() {
+        let accumulator =
+            record_rows(accumulator([id("G")]).unwrap(), "G", 0, 100, false, true).unwrap();
+        let terminal = decoded_page("G", Some("cursor-G-99"), None, None, false);
+        let complete = accumulator.record_batch(terminal).unwrap().finish().unwrap();
+        assert_eq!(kinds(&complete), [("G", "absent")]);
+    }
+
+    #[test]
+    fn cursor_repetition_rejects_a_long_chain() {
+        let accumulator =
+            record_rows(accumulator([id("G")]).unwrap(), "G", 0, 99, false, true).unwrap();
+        let repeated = decoded_page(
+            "G",
+            Some("cursor-G-98"),
+            Some(fork(100, "NODE-G-99", "G")),
+            Some("cursor-G-10"),
+            false,
+        );
+        assert!(accumulator.record_batch(repeated).is_err());
+    }
+
+    #[test]
+    fn consuming_batch_recording_cannot_return_partial_over_limit_state() {
+        let ids = [id("A"), id("B"), id("C")];
+        let accumulator = record_rows(accumulator(ids).unwrap(), "A", 0, 100, true, true).unwrap();
+        let accumulator = record_rows(accumulator, "B", 1000, 1, false, false).unwrap();
+        let batch = LocalPullRequestBatch {
+            coordinates: coordinates(),
+            repository: None,
+            pages: vec![
+                LocalPullRequestPageEvidence {
+                    id: id("C"),
+                    after: None,
+                    end: PageEnd::Exhausted { row: Some(DecodedPullRequest::CrossRepository) },
+                },
+                LocalPullRequestPageEvidence {
+                    id: id("B"),
+                    after: Some("cursor-B-1000".to_owned()),
+                    end: PageEnd::Exhausted { row: Some(DecodedPullRequest::CrossRepository) },
+                },
+            ],
+        };
+        assert!(accumulator.record_batch(batch).is_err());
+        // `record_batch` consumed the only accumulator; no partially recorded
+        // value exists which a caller could finish or reuse.
+    }
+
+    #[test]
+    fn open_wins_history_and_forks_while_local_identities_are_retained() {
+        let mut terminal = node(1, "TERMINAL", "G", "CLOSED");
+        terminal["title"] = json!({ "ignored": true });
+        terminal["baseRefOid"] = json!(null);
+        let mut foreign = fork(2, "FORK", "G");
+        foreign["body"] = json!(["ignored"]);
+        foreign["headRefOid"] = json!(17);
+        let mut open = node(3, "OPEN", "G", "OPEN");
+        open["body"] = json!("<!-- gherrit-meta: opaque ordinary text -->");
+        open["baseRefName"] = json!("gherrit-bases/G");
+        open["autoMergeRequest"] = json!({ "enabledAt": "now" });
+
+        let first = decoded_page("G", None, Some(terminal), Some("one"), true);
+        let second = decoded_page("G", Some("one"), Some(foreign), Some("two"), false);
+        let third = decoded_page("G", Some("two"), Some(open), None, false);
+        let complete = accumulator([id("G")])
             .unwrap()
-        );
-        assert_eq!(complete.entries.len(), 1);
-        let rows = &complete.entries[0].1;
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].identity.number, 1);
-        assert_eq!(rows[0].identity.node_id.as_ref(), "PR_OPEN");
-        assert_eq!(rows[0].body, opaque_body);
-        assert_eq!(rows[0].base_branch, "main");
-        assert_eq!(rows[0].base_oid.to_string(), BASE_OID);
-        assert_eq!(rows[0].head_oid.to_string(), HEAD_OID);
-        assert!(rows[0].has_auto_merge_request);
-        assert!(rows[0].is_in_merge_queue);
-        assert_eq!(
-            rows.iter().map(|row| row.state).collect::<Vec<_>>(),
-            [PullRequestState::Open, PullRequestState::Closed, PullRequestState::Merged,]
-        );
+            .record_batch(first)
+            .unwrap()
+            .record_batch(second)
+            .unwrap()
+            .record_batch(third)
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        let LocalPullRequestObservation::Open(open) = &complete.local()[0] else {
+            panic!("OPEN row must win");
+        };
+        assert_eq!(open.identity().number().get(), 3);
+        assert_eq!(open.title(), "title 3");
+        assert_eq!(open.body(), "<!-- gherrit-meta: opaque ordinary text -->");
+        assert_eq!(open.base().kind(), BaseKind::Owned);
+        assert_eq!(open.base().oid().to_string(), BASE_OID);
+        assert_eq!(open.head_oid().to_string(), HEAD_OID);
+        assert!(open.has_landing_automation());
+
+        assert_eq!(complete.identities.number_values(), HashSet::from([1, 3]));
+        assert_eq!(complete.identities.node_id_values(), HashSet::from(["TERMINAL", "OPEN"]));
     }
 
     #[test]
     fn fork_identities_do_not_participate_in_local_identity_evidence() {
-        let mut first_fork = node(1, "PR_ONE", "Gone", "OPEN");
-        first_fork["isCrossRepository"] = json!(true);
-        let mut second_fork = first_fork.clone();
-        second_fork["state"] = json!("CLOSED");
-        let batch = operation(vec![query("Gone", None, 100)], true)
-            .decode(response(
-                true,
-                [(
-                    "op0",
-                    connection(
-                        vec![first_fork, second_fork, node(1, "PR_ONE", "Gone", "OPEN")],
-                        false,
-                        Value::Null,
-                    ),
-                )],
-            ))
+        let first = decoded_page("G", None, Some(fork(1, "ONE", "G")), Some("one"), true);
+        let second = decoded_page("G", Some("one"), Some(fork(1, "ONE", "G")), Some("two"), false);
+        let third = decoded_page("G", Some("two"), Some(node(1, "ONE", "G", "OPEN")), None, false);
+        let complete = accumulator([id("G")])
+            .unwrap()
+            .record_batch(first)
+            .unwrap()
+            .record_batch(second)
+            .unwrap()
+            .record_batch(third)
+            .unwrap()
+            .finish()
             .unwrap();
-        let complete =
-            accumulator([id("Gone")]).unwrap().record_batch(batch).unwrap().finish().unwrap();
 
-        let rows = &complete.entries[0].1;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].identity.number, 1);
-        assert_eq!(rows[0].identity.node_id.as_ref(), "PR_ONE");
+        assert_eq!(kinds(&complete), [("G", "open")]);
+        assert_eq!(complete.identities.number_values(), HashSet::from([1]));
+        assert_eq!(complete.identities.node_id_values(), HashSet::from(["ONE"]));
+    }
+
+    #[test]
+    fn fork_only_connection_yields_sealed_absence() {
+        let mut foreign = fork(1, "FORK", "G");
+        foreign["title"] = Value::Null;
+        foreign["body"] = json!(17);
+        foreign["baseRefName"] = json!([]);
+        foreign["baseRefOid"] = json!({});
+        foreign["headRefOid"] = json!(false);
+        foreign["autoMergeRequest"] = json!("ignored");
+        foreign["isInMergeQueue"] = Value::Null;
+        let batch = decoded_page("G", None, Some(foreign), None, true);
+        let complete =
+            accumulator([id("G")]).unwrap().record_batch(batch).unwrap().finish().unwrap();
+        assert_eq!(kinds(&complete), [("G", "absent")]);
+    }
+
+    #[test]
+    fn terminal_only_diagnostics_are_globally_bounded() {
+        let ids = (0..MAX_DIAGNOSTIC_IDENTITIES + 7)
+            .map(|index| id(&format!("G{}{}", index, "x".repeat(100))))
+            .collect::<Vec<_>>();
+        let mut accumulator = accumulator(ids.clone()).unwrap();
+        for (index, id) in ids.iter().enumerate() {
+            let state = if index == 0 { "CLOSED" } else { "MERGED" };
+            let batch = decoded_page(
+                id.as_str(),
+                None,
+                Some(node(
+                    i64::try_from(index + 1).unwrap(),
+                    &format!("NODE-{index}"),
+                    id.as_str(),
+                    state,
+                )),
+                None,
+                index == 0,
+            );
+            accumulator = accumulator.record_batch(batch).unwrap();
+        }
+        let error = accumulator.finish().unwrap_err().to_string();
+        assert!(error.contains("PR #1 is closed. Reopen it"));
+        assert!(error.contains("PR #2 is merged. Change the commit's gherrit-pr-id"));
+        assert!(error.contains("Additional terminal pull requests omitted: 7."));
+        assert!(!error.contains("PR #21"));
+        assert!(error.len() < 8_000, "diagnostic was {} bytes", error.len());
+    }
+
+    #[test]
+    fn mixed_terminal_history_is_order_independent_and_uses_the_lowest_number() {
+        let observe = |first: Value, second: Value| {
+            let first = decoded_page("G", None, Some(first), Some("next"), true);
+            let second = decoded_page("G", Some("next"), Some(second), None, false);
+            accumulator([id("G")])
+                .unwrap()
+                .record_batch(first)
+                .unwrap()
+                .record_batch(second)
+                .unwrap()
+                .finish()
+                .unwrap_err()
+                .to_string()
+        };
+        let closed_then_merged =
+            observe(node(1, "ONE", "G", "CLOSED"), node(2, "TWO", "G", "MERGED"));
+        let merged_then_closed =
+            observe(node(2, "TWO", "G", "MERGED"), node(1, "ONE", "G", "CLOSED"));
+        let expected = "Cannot push GHerrit change 'G' because its exact head has both closed and merged pull request history (for example PR #1). Reopen a closed pull request if possible or change the commit's gherrit-pr-id to start a new review.\nAdditional terminal pull requests omitted: 1.";
+        assert_eq!(closed_then_merged, expected);
+        assert_eq!(merged_then_closed, expected);
+    }
+
+    #[test]
+    fn single_terminal_kinds_have_exact_truthful_advice() {
+        for (state, expected) in [
+            (
+                "CLOSED",
+                "Cannot push GHerrit change 'G' because PR #1 is closed. Reopen it or change the commit's gherrit-pr-id to start a new review.",
+            ),
+            (
+                "MERGED",
+                "Cannot push GHerrit change 'G' because PR #1 is merged. Change the commit's gherrit-pr-id to start a new review.",
+            ),
+        ] {
+            let batch = decoded_page("G", None, Some(node(1, "ONE", "G", state)), None, true);
+            let error = accumulator([id("G")])
+                .unwrap()
+                .record_batch(batch)
+                .unwrap()
+                .finish()
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, expected, "state={state}");
+        }
+    }
+
+    #[test]
+    fn terminal_history_diagnostic_is_complete_and_actionable() {
+        let a_first =
+            decoded_page("A", None, Some(node(1, "A_ONE", "A", "CLOSED")), Some("next"), true);
+        let a_second =
+            decoded_page("A", Some("next"), Some(node(2, "A_TWO", "A", "MERGED")), None, false);
+        let b = decoded_page("B", None, Some(node(3, "B_ONE", "B", "MERGED")), None, false);
+        let error = accumulator([id("A"), id("B")])
+            .unwrap()
+            .record_batch(a_first)
+            .unwrap()
+            .record_batch(a_second)
+            .unwrap()
+            .record_batch(b)
+            .unwrap()
+            .finish()
+            .unwrap_err()
+            .to_string();
+
+        insta::assert_snapshot!(error, @r###"
+    Cannot push GHerrit change 'A' because its exact head has both closed and merged pull request history (for example PR #1). Reopen a closed pull request if possible or change the commit's gherrit-pr-id to start a new review.
+    Cannot push GHerrit change 'B' because PR #3 is merged. Change the commit's gherrit-pr-id to start a new review.
+    Additional terminal pull requests omitted: 1.
+"###);
+    }
+
+    #[test]
+    fn a_second_same_repository_open_rejects_across_pages() {
+        let first = decoded_page("G", None, Some(node(1, "ONE", "G", "OPEN")), Some("next"), true);
+        let second =
+            decoded_page("G", Some("next"), Some(node(2, "TWO", "G", "OPEN")), None, false);
+        assert!(
+            accumulator([id("G")])
+                .unwrap()
+                .record_batch(first)
+                .unwrap()
+                .record_batch(second)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn identity_number_node_and_pair_collisions_reject_across_ids_and_pages() {
+        for (second_number, second_node) in [(1, "TWO"), (2, "ONE"), (1, "ONE")] {
+            let first = decoded_page("A", None, Some(node(1, "ONE", "A", "CLOSED")), None, true);
+            let second = decoded_page(
+                "B",
+                None,
+                Some(node(second_number, second_node, "B", "CLOSED")),
+                None,
+                false,
+            );
+            assert!(
+                accumulator([id("A"), id("B")])
+                    .unwrap()
+                    .record_batch(first)
+                    .unwrap()
+                    .record_batch(second)
+                    .is_err(),
+                "number={second_number}, node={second_node}"
+            );
+        }
+
+        for (second_number, second_node) in [(1, "TWO"), (2, "ONE"), (1, "ONE")] {
+            let first =
+                decoded_page("A", None, Some(node(1, "ONE", "A", "CLOSED")), Some("next"), true);
+            let second = decoded_page(
+                "A",
+                Some("next"),
+                Some(node(second_number, second_node, "A", "CLOSED")),
+                None,
+                false,
+            );
+            assert!(
+                accumulator([id("A")])
+                    .unwrap()
+                    .record_batch(first)
+                    .unwrap()
+                    .record_batch(second)
+                    .is_err(),
+                "number={second_number}, node={second_node}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_and_terminal_projection_fields_are_not_interpreted() {
+        for mut row in [fork(1, "FORK", "G"), node(1, "TERMINAL", "G", "CLOSED")] {
+            for field in [
+                "title",
+                "body",
+                "baseRefName",
+                "baseRefOid",
+                "headRefOid",
+                "autoMergeRequest",
+                "isInMergeQueue",
+            ] {
+                row[field] = json!({ "arbitrary": [null, 17] });
+            }
+            assert!(
+                operation(vec![query("G", None)], true).decode_value(one_response(row)).is_ok()
+            );
+        }
     }
 
     #[test]
@@ -852,228 +1694,67 @@ mod tests {
             ("/data/repository/op0/nodes/0/headRefName", json!("")),
             ("/data/repository/op0/nodes/0/headRefName", json!("Other")),
         ] {
-            let mut fork = node(1, "PR_ONE", "Gone", "OPEN");
-            fork["isCrossRepository"] = json!(true);
-            let mut value = one_response(fork);
+            let mut value = one_response(fork(1, "ONE", "G"));
             *value.pointer_mut(pointer).unwrap() = replacement;
             assert!(
-                operation(vec![query("Gone", None, 1)], true).decode(value).is_err(),
+                operation(vec![query("G", None)], true).decode_value(value).is_err(),
                 "accepted invalid fork field {pointer}"
             );
         }
     }
 
     #[test]
-    fn repository_facts_are_required_exactly_once() {
-        let empty_page = || connection(Vec::new(), false, Value::Null);
-        assert!(
-            operation(vec![query("Gone", None, 1)], true)
-                .decode(response(false, [("op0", empty_page())]))
-                .is_err()
-        );
-        assert!(
-            operation(vec![query("Gone", None, 1)], false)
-                .decode(response(true, [("op0", empty_page())]))
-                .is_err()
-        );
-
-        for pointer in [
-            "/data/repository/id",
-            "/data/repository/defaultBranchRef",
-            "/data/repository/defaultBranchRef/target",
-            "/data/repository/defaultBranchRef/target/oid",
-        ] {
-            let mut value = response(true, [("op0", empty_page())]);
-            *value.pointer_mut(pointer).unwrap() = Value::Null;
-            assert!(
-                operation(vec![query("Gone", None, 1)], true).decode(value).is_err(),
-                "accepted null {pointer}"
-            );
-        }
-        for (pointer, replacement) in [
-            ("/data/repository/id", json!("")),
-            ("/data/repository/defaultBranchRef/name", json!("")),
-            ("/data/repository/defaultBranchRef/target/oid", json!("not-an-oid")),
-            (
-                "/data/repository/defaultBranchRef/target/oid",
-                json!("0000000000000000000000000000000000000000"),
-            ),
-        ] {
-            let mut value = response(true, [("op0", empty_page())]);
-            *value.pointer_mut(pointer).unwrap() = replacement;
-            assert!(
-                operation(vec![query("Gone", None, 1)], true).decode(value).is_err(),
-                "accepted invalid {pointer}"
-            );
-        }
-
-        let first = operation(vec![query("Gone", None, 1)], true)
-            .decode(response(true, [("op0", empty_page())]))
-            .unwrap();
-        let partial = accumulator([id("Gone")]).unwrap().record_batch(first).unwrap();
-        let repeated = operation(vec![query("Gone", None, 1)], true)
-            .decode(response(true, [("op0", empty_page())]))
-            .unwrap();
-        assert!(partial.record_batch(repeated).is_err());
-
-        let later_first = operation(vec![query("Gone", None, 1)], false)
-            .decode(response(false, [("op0", empty_page())]))
-            .unwrap();
-        assert!(accumulator([id("Gone")]).unwrap().record_batch(later_first).is_err());
-    }
-
-    #[test]
-    fn every_page_remains_bound_to_the_same_repository() {
-        let other_repository = RepositoryCoordinates::for_test("owner", "other");
-        let first_from_other =
-            LocalPullRequests::new(other_repository.clone(), vec![query("Gone", None, 1)], true)
-                .unwrap()
-                .decode(response(true, [("op0", connection(Vec::new(), false, Value::Null))]))
-                .unwrap();
-        assert!(accumulator([id("Gone")]).unwrap().record_batch(first_from_other).is_err());
-
-        let first = operation(vec![query("Gone", None, 1)], true)
-            .decode(response(true, [("op0", connection(Vec::new(), true, json!("next")))]))
-            .unwrap();
-        let later =
-            LocalPullRequests::new(other_repository, vec![query("Gone", Some("next"), 1)], false)
-                .unwrap()
-                .decode(response(false, [("op0", connection(Vec::new(), false, Value::Null))]))
-                .unwrap();
-
-        assert!(
-            accumulator([id("Gone")])
-                .unwrap()
-                .record_batch(first)
-                .unwrap()
-                .record_batch(later)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn response_requires_the_exact_alias_set_and_usable_data() {
-        let operations = || operation(vec![query("Gone", None, 1), query("Gtwo", None, 1)], true);
-        let valid = || {
-            response(
-                true,
-                [
-                    ("op0", connection(Vec::new(), false, Value::Null)),
-                    ("op1", connection(Vec::new(), false, Value::Null)),
-                ],
-            )
-        };
-        assert!(operations().decode(valid()).is_ok());
-
-        for alias in ["op0", "op1"] {
-            let mut value = valid();
-            value["data"]["repository"].as_object_mut().unwrap().remove(alias);
-            assert!(operations().decode(value).is_err(), "accepted missing {alias}");
-        }
-        let mut extra = valid();
-        extra["data"]["repository"]["op2"] = connection(Vec::new(), false, Value::Null);
-        assert!(operations().decode(extra).is_err());
-        let mut null_alias = valid();
-        null_alias["data"]["repository"]["op0"] = Value::Null;
-        assert!(operations().decode(null_alias).is_err());
-        for value in [
-            json!({}),
-            json!({ "data": null }),
-            json!({ "data": {} }),
-            json!({ "data": { "repository": null } }),
-            json!({ "data": { "repository": {}, "viewer": {} } }),
-        ] {
-            assert!(operations().decode(value).is_err());
-        }
-        let mut errors = valid();
-        errors["errors"] = json!([{ "message": "partial result" }]);
-        assert!(operations().decode(errors).is_err());
-        let mut malformed_errors = valid();
-        malformed_errors["errors"] = Value::Null;
-        assert!(operations().decode(malformed_errors).is_err());
-        let mut empty_errors = valid();
-        empty_errors["errors"] = json!([]);
-        assert!(operations().decode(empty_errors).is_ok());
-    }
-
-    #[test]
-    fn every_selected_connection_and_node_field_is_required() {
-        for pointer in [
-            "/data/repository/op0/nodes",
-            "/data/repository/op0/pageInfo",
-            "/data/repository/op0/pageInfo/hasNextPage",
-            "/data/repository/op0/pageInfo/endCursor",
-            "/data/repository/op0/nodes/0/number",
-            "/data/repository/op0/nodes/0/id",
-            "/data/repository/op0/nodes/0/title",
-            "/data/repository/op0/nodes/0/body",
-            "/data/repository/op0/nodes/0/baseRefName",
-            "/data/repository/op0/nodes/0/baseRefOid",
-            "/data/repository/op0/nodes/0/headRefName",
-            "/data/repository/op0/nodes/0/headRefOid",
-            "/data/repository/op0/nodes/0/state",
-            "/data/repository/op0/nodes/0/isCrossRepository",
-            "/data/repository/op0/nodes/0/autoMergeRequest",
-            "/data/repository/op0/nodes/0/isInMergeQueue",
-        ] {
-            let mut value = one_response(node(1, "PR_ONE", "Gone", "OPEN"));
-            let (parent, field) = pointer.rsplit_once('/').unwrap();
-            value.pointer_mut(parent).unwrap().as_object_mut().unwrap().remove(field);
-            assert!(
-                operation(vec![query("Gone", None, 1)], true).decode(value).is_err(),
-                "accepted missing {pointer}"
-            );
-        }
-
-        let mut missing_enabled_at = one_response(node(1, "PR_ONE", "Gone", "OPEN"));
-        missing_enabled_at["data"]["repository"]["op0"]["nodes"][0]["autoMergeRequest"] = json!({});
-        assert!(operation(vec![query("Gone", None, 1)], true).decode(missing_enabled_at).is_err());
-        for pointer in ["/data/repository/op0/nodes/0/title", "/data/repository/op0/nodes/0/body"] {
-            let mut value = one_response(node(1, "PR_ONE", "Gone", "OPEN"));
-            *value.pointer_mut(pointer).unwrap() = Value::Null;
-            assert!(
-                operation(vec![query("Gone", None, 1)], true).decode(value).is_err(),
-                "accepted null {pointer}"
-            );
-        }
-    }
-
-    #[test]
-    fn selected_nested_objects_reject_unrequested_fields() {
-        for pointer in [
-            "/data/repository/defaultBranchRef",
-            "/data/repository/defaultBranchRef/target",
-            "/data/repository/op0",
-            "/data/repository/op0/pageInfo",
-            "/data/repository/op0/nodes/0",
-            "/data/repository/op0/nodes/0/autoMergeRequest",
-        ] {
-            let mut value = one_response(node(1, "PR_ONE", "Gone", "OPEN"));
-            value["data"]["repository"]["op0"]["nodes"][0]["autoMergeRequest"] =
-                json!({ "enabledAt": null });
-            value
-                .pointer_mut(pointer)
-                .unwrap()
-                .as_object_mut()
-                .unwrap()
-                .insert("notSelected".to_owned(), json!(true));
-            assert!(
-                operation(vec![query("Gone", None, 1)], true).decode(value).is_err(),
-                "accepted an unrequested field at {pointer}"
-            );
-        }
-    }
-
-    #[test]
-    fn authority_bearing_row_fields_are_validated_and_coupled() {
+    fn every_row_validates_identity_schema_state_and_requested_head() {
         let cases = [
             ("/data/repository/op0/nodes/0/number", json!(0)),
             ("/data/repository/op0/nodes/0/number", json!(-1)),
             ("/data/repository/op0/nodes/0/number", json!(i64::from(i32::MAX) + 1)),
             ("/data/repository/op0/nodes/0/id", json!("")),
-            ("/data/repository/op0/nodes/0/baseRefName", json!("")),
             ("/data/repository/op0/nodes/0/headRefName", json!("")),
             ("/data/repository/op0/nodes/0/headRefName", json!("Other")),
+            ("/data/repository/op0/nodes/0/state", json!("DRAFT")),
+            ("/data/repository/op0/nodes/0/isCrossRepository", json!(null)),
+        ];
+        for state in ["OPEN", "CLOSED", "MERGED"] {
+            for (pointer, replacement) in &cases {
+                let mut value = one_response(node(1, "ONE", "G", state));
+                *value.pointer_mut(pointer).unwrap() = replacement.clone();
+                assert!(
+                    operation(vec![query("G", None)], true).decode_value(value).is_err(),
+                    "state={state}, pointer={pointer}"
+                );
+            }
+        }
+
+        for field in [
+            "number",
+            "id",
+            "title",
+            "body",
+            "baseRefName",
+            "baseRefOid",
+            "headRefName",
+            "headRefOid",
+            "state",
+            "isCrossRepository",
+            "autoMergeRequest",
+            "isInMergeQueue",
+        ] {
+            let mut value = one_response(fork(1, "ONE", "G"));
+            value["data"]["repository"]["op0"]["nodes"][0].as_object_mut().unwrap().remove(field);
+            assert!(
+                operation(vec![query("G", None)], true).decode_value(value).is_err(),
+                "missing {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_projection_fields_are_validated_and_minimized() {
+        let cases = [
+            ("/data/repository/op0/nodes/0/title", Value::Null),
+            ("/data/repository/op0/nodes/0/body", json!(17)),
+            ("/data/repository/op0/nodes/0/baseRefName", json!("")),
             ("/data/repository/op0/nodes/0/baseRefOid", json!("bad")),
             (
                 "/data/repository/op0/nodes/0/baseRefOid",
@@ -1084,103 +1765,120 @@ mod tests {
                 "/data/repository/op0/nodes/0/headRefOid",
                 json!("0000000000000000000000000000000000000000"),
             ),
-            ("/data/repository/op0/nodes/0/state", json!("DRAFT")),
+            ("/data/repository/op0/nodes/0/autoMergeRequest", json!({})),
+            ("/data/repository/op0/nodes/0/autoMergeRequest", json!({ "enabledAt": null })),
+            ("/data/repository/op0/nodes/0/isInMergeQueue", json!("no")),
         ];
         for (pointer, replacement) in cases {
-            let mut value = one_response(node(1, "PR_ONE", "Gone", "OPEN"));
+            let mut value = one_response(node(1, "ONE", "G", "OPEN"));
             *value.pointer_mut(pointer).unwrap() = replacement;
             assert!(
-                operation(vec![query("Gone", None, 1)], true).decode(value).is_err(),
+                operation(vec![query("G", None)], true).decode_value(value).is_err(),
                 "accepted invalid {pointer}"
             );
+        }
+
+        for (auto_merge, in_queue) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut open = node(1, "ONE", "G", "OPEN");
+            if auto_merge {
+                open["autoMergeRequest"] = json!({ "enabledAt": "now" });
+            }
+            open["isInMergeQueue"] = json!(in_queue);
+            let complete = accumulator([id("G")])
+                .unwrap()
+                .record_batch(decoded_page("G", None, Some(open), None, true))
+                .unwrap()
+                .finish()
+                .unwrap();
+            let LocalPullRequestObservation::Open(open) = &complete.local()[0] else {
+                panic!("G must be open");
+            };
+            assert_eq!(open.has_landing_automation(), auto_merge || in_queue);
         }
     }
 
     #[test]
-    fn pagination_is_independent_complete_and_preserves_requested_order() {
-        let mut first_a = node(1, "PR_A1", "A", "OPEN");
-        first_a["body"] = json!("first page");
-        let first = operation(vec![query("A", None, 1)], true)
-            .decode(response(true, [("op0", connection(vec![first_a], true, json!("A_NEXT")))]))
-            .unwrap();
-        let second = operation(vec![query("B", None, 1)], false)
-            .decode(response(
-                false,
-                [("op0", connection(vec![node(2, "PR_B", "B", "OPEN")], false, Value::Null))],
-            ))
-            .unwrap();
-        let third = operation(vec![query("A", Some("A_NEXT"), 1)], false)
-            .decode(response(
-                false,
-                [("op0", connection(vec![node(3, "PR_A2", "A", "CLOSED")], false, json!("last")))],
-            ))
-            .unwrap();
+    fn unsupported_open_base_rejects_only_after_complete_observation() {
+        let mut open = node(1, "ONE", "G", "OPEN");
+        open["baseRefName"] = json!("feature");
+        let batch = decoded_page("G", None, Some(open), None, true);
+        let accumulator = accumulator([id("G")]).unwrap().record_batch(batch).unwrap();
+        assert!(accumulator.finish().is_err());
+    }
 
-        let partial = accumulator([id("B"), id("A")]).unwrap().record_batch(first).unwrap();
-        assert!(partial.finish().is_err(), "partial pages must not become an observation");
-
-        let first = operation(vec![query("A", None, 1)], true)
-            .decode(response(
+    #[test]
+    fn output_preserves_exact_local_order_and_complete_repository_facts() {
+        let first = operation(vec![query("A", None), query("C", None)], true)
+            .decode_value(response(
                 true,
-                [("op0", connection(vec![node(1, "PR_A1", "A", "OPEN")], true, json!("A_NEXT")))],
+                [
+                    ("op0".to_owned(), connection(Vec::new(), false, Value::Null)),
+                    ("op1".to_owned(), connection(vec![fork(3, "C", "C")], false, Value::Null)),
+                ],
             ))
             .unwrap();
-        let complete = accumulator([id("B"), id("A")])
+        let second = decoded_page("B", None, Some(node(2, "B", "B", "OPEN")), None, false);
+        let complete = accumulator([id("C"), id("A"), id("B")])
             .unwrap()
             .record_batch(first)
             .unwrap()
             .record_batch(second)
             .unwrap()
-            .record_batch(third)
-            .unwrap()
             .finish()
             .unwrap();
-        assert_eq!(
-            complete.entries.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-            ["B", "A"]
-        );
-        assert_eq!(complete.entries[0].1.len(), 1);
-        assert_eq!(complete.entries[1].1.len(), 2);
+
+        assert_eq!(kinds(&complete), [("C", "absent"), ("A", "absent"), ("B", "open")]);
+        assert_eq!(complete.repository().coordinates(), &coordinates());
+        assert_eq!(complete.repository().node_id().as_str(), "REPOSITORY_NODE");
+        assert_eq!(complete.repository().default_branch().name(), "main");
+        assert_eq!(complete.repository().default_branch().tip().to_string(), DEFAULT_OID);
     }
 
     #[test]
-    fn pagination_rejects_missing_empty_repeated_and_wrong_cursors() {
-        for end_cursor in [Value::Null, json!("")] {
-            let value = response(true, [("op0", connection(Vec::new(), true, end_cursor))]);
-            assert!(operation(vec![query("A", None, 1)], true).decode(value).is_err());
-        }
-        let empty_terminal = response(true, [("op0", connection(Vec::new(), false, json!("")))]);
-        assert!(operation(vec![query("A", None, 1)], true).decode(empty_terminal).is_err());
-        for terminal_cursor in [Value::Null, json!("last-edge")] {
-            let terminal =
-                response(true, [("op0", connection(Vec::new(), false, terminal_cursor))]);
-            let decoded = operation(vec![query("A", None, 1)], true).decode(terminal).unwrap();
-            assert!(decoded.pages[0].next_cursor.is_none());
-        }
-
-        let initial = operation(vec![query("A", None, 1)], true)
-            .decode(response(true, [("op0", connection(Vec::new(), true, json!("same")))]))
-            .unwrap();
-        let repeated = operation(vec![query("A", Some("same"), 1)], false)
-            .decode(response(false, [("op0", connection(Vec::new(), true, json!("same")))]))
-            .unwrap();
+    fn repository_facts_are_required_once_and_every_page_matches_coordinates() {
+        let empty = || connection(Vec::new(), false, Value::Null);
         assert!(
-            accumulator([id("A")])
+            operation(vec![query("G", None)], true)
+                .decode_value(response(false, [("op0".to_owned(), empty())]))
+                .is_err()
+        );
+        assert!(
+            operation(vec![query("G", None)], false)
+                .decode_value(response(true, [("op0".to_owned(), empty())]))
+                .is_err()
+        );
+
+        let first = decoded_page("G", None, None, None, true);
+        let repeated = decoded_page("G", None, None, None, true);
+        assert!(
+            accumulator([id("G")])
                 .unwrap()
-                .record_batch(initial)
+                .record_batch(first)
                 .unwrap()
                 .record_batch(repeated)
                 .is_err()
         );
 
-        let initial = operation(vec![query("A", None, 1)], true)
-            .decode(response(true, [("op0", connection(Vec::new(), true, json!("expected")))]))
+        let other = RepositoryCoordinates::for_test("owner", "other");
+        let foreign = LocalPullRequests::new(other, vec![query("G", None)], true)
+            .unwrap()
+            .decode_value(response(true, [("op0".to_owned(), empty())]))
             .unwrap();
-        let wrong = operation(vec![query("A", Some("wrong"), 1)], false)
-            .decode(response(false, [("op0", connection(Vec::new(), false, Value::Null))]))
+        assert!(accumulator([id("G")]).unwrap().record_batch(foreign).is_err());
+    }
+
+    #[test]
+    fn partial_connections_wrong_cursors_and_pages_after_exhaustion_reject() {
+        let partial = accumulator([id("A"), id("B")])
+            .unwrap()
+            .record_batch(decoded_page("A", None, None, None, true))
             .unwrap();
+        assert!(partial.finish().is_err());
+
+        let initial = decoded_page("G", None, Some(fork(1, "ONE", "G")), Some("expected"), true);
+        let wrong = decoded_page("G", Some("wrong"), None, None, false);
         assert!(
-            accumulator([id("A")])
+            accumulator([id("G")])
                 .unwrap()
                 .record_batch(initial)
                 .unwrap()
@@ -1188,14 +1886,10 @@ mod tests {
                 .is_err()
         );
 
-        let exhausted = operation(vec![query("A", None, 1)], true)
-            .decode(response(true, [("op0", connection(Vec::new(), false, Value::Null))]))
-            .unwrap();
-        let another = operation(vec![query("A", None, 1)], false)
-            .decode(response(false, [("op0", connection(Vec::new(), false, Value::Null))]))
-            .unwrap();
+        let exhausted = decoded_page("G", None, None, None, true);
+        let another = decoded_page("G", None, None, None, false);
         assert!(
-            accumulator([id("A")])
+            accumulator([id("G")])
                 .unwrap()
                 .record_batch(exhausted)
                 .unwrap()
@@ -1205,47 +1899,201 @@ mod tests {
     }
 
     #[test]
-    fn pull_request_identities_are_unique_across_pages_and_change_ids() {
-        let first = operation(vec![query("A", None, 1)], true)
-            .decode(response(
-                true,
-                [("op0", connection(vec![node(1, "PR_ONE", "A", "OPEN")], true, json!("next")))],
-            ))
-            .unwrap();
-        let repeated_number = operation(vec![query("A", Some("next"), 1)], false)
-            .decode(response(
-                false,
-                [("op0", connection(vec![node(1, "PR_OTHER", "A", "CLOSED")], false, Value::Null))],
-            ))
-            .unwrap();
-        assert!(
-            accumulator([id("A")])
-                .unwrap()
-                .record_batch(first)
-                .unwrap()
-                .record_batch(repeated_number)
-                .is_err()
-        );
+    fn incomplete_connection_diagnostic_is_bounded() {
+        let ids = (0..MAX_DIAGNOSTIC_IDENTITIES + 7)
+            .map(|index| id(&format!("G{}{}", index, "x".repeat(100))))
+            .collect::<Vec<_>>();
+        let error = accumulator(ids).unwrap().finish().unwrap_err().to_string();
+        assert!(error.contains("additional change IDs omitted: 7"));
+        assert!(error.contains('…'));
+        assert!(error.len() < 2_500, "diagnostic was {} bytes", error.len());
+    }
 
-        let first = operation(vec![query("A", None, 1)], true)
-            .decode(response(
-                true,
-                [("op0", connection(vec![node(1, "PR_ONE", "A", "OPEN")], false, Value::Null))],
-            ))
-            .unwrap();
-        let repeated_node = operation(vec![query("B", None, 1)], false)
-            .decode(response(
-                false,
-                [("op0", connection(vec![node(2, "PR_ONE", "B", "OPEN")], false, Value::Null))],
-            ))
-            .unwrap();
-        assert!(
-            accumulator([id("A"), id("B")])
-                .unwrap()
-                .record_batch(first)
-                .unwrap()
-                .record_batch(repeated_node)
-                .is_err()
+    #[test]
+    fn raw_json_rejects_duplicate_members_at_every_authority_depth() {
+        let valid = serde_json::to_string(&one_response(node(1, "ONE", "G", "OPEN"))).unwrap();
+        let insert_before = |needle: &str, member: &str| {
+            let index = valid.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+            let mut response = valid.clone();
+            response.insert_str(index, member);
+            response
+        };
+        let duplicates = [
+            format!("{{\"data\":null,{}", &valid[1..]),
+            format!("{{\"errors\":[],\"errors\":[],{}", &valid[1..]),
+            insert_before("\"op0\":", "\"op0\":null,"),
+            insert_before("\"number\":1", "\"number\":2,"),
+            insert_before("\"id\":\"ONE\"", "\"id\":\"OTHER\","),
+            insert_before("\"state\":\"OPEN\"", "\"state\":\"CLOSED\","),
+            insert_before("\"hasNextPage\":false", "\"hasNextPage\":true,"),
+        ];
+        for response in duplicates {
+            let error = operation(vec![query("G", None)], true)
+                .decode(response.as_bytes())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error, "GitHub local pull request response contains malformed JSON",
+                "response={response}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_json_rejects_null_alias_trailing_data_and_untrusted_schema_keys() {
+        let mut null_alias = one_response(node(1, "ONE", "G", "OPEN"));
+        null_alias["data"]["repository"]["op0"] = Value::Null;
+        let null_alias = serde_json::to_vec(&null_alias).unwrap();
+        let error =
+            operation(vec![query("G", None)], true).decode(&null_alias).unwrap_err().to_string();
+        assert_eq!(error, "GitHub returned malformed local pull request connection data");
+
+        let mut trailing = serde_json::to_vec(&one_response(node(1, "ONE", "G", "OPEN"))).unwrap();
+        trailing.extend_from_slice(b" null");
+        let error =
+            operation(vec![query("G", None)], true).decode(&trailing).unwrap_err().to_string();
+        assert_eq!(error, "GitHub local pull request response contains malformed JSON");
+
+        let mut unknown = one_response(node(1, "ONE", "G", "OPEN"));
+        let key = format!("{}\n\x1b[31m", "untrusted".repeat(200));
+        unknown["data"]["repository"]["op0"]["nodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert(key.clone(), json!(true));
+        let unknown = serde_json::to_vec(&unknown).unwrap();
+        let error = operation(vec![query("G", None)], true).decode(&unknown).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "GitHub returned malformed local pull request connection data"
         );
+        let rendered = format!("{error:?}");
+        assert!(!rendered.contains("untrusted"));
+    }
+
+    #[test]
+    fn raw_json_preserves_the_parser_recursion_limit() {
+        let depth = 256;
+        let response = format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
+        let error = decode_unique_json(response.as_bytes()).unwrap_err().to_string();
+        assert_eq!(error, "GitHub local pull request response contains malformed JSON");
+    }
+
+    #[test]
+    fn response_requires_exact_aliases_schema_and_usable_data() {
+        let operations = || operation(vec![query("A", None), query("B", None)], true);
+        let valid = || {
+            response(
+                true,
+                [
+                    ("op0".to_owned(), connection(Vec::new(), false, Value::Null)),
+                    ("op1".to_owned(), connection(Vec::new(), false, Value::Null)),
+                ],
+            )
+        };
+        assert!(operations().decode_value(valid()).is_ok());
+        for alias in ["op0", "op1"] {
+            let mut value = valid();
+            value["data"]["repository"].as_object_mut().unwrap().remove(alias);
+            assert!(operations().decode_value(value).is_err());
+        }
+        let mut extra = valid();
+        extra["data"]["repository"]["op2"] = connection(Vec::new(), false, Value::Null);
+        assert!(operations().decode_value(extra).is_err());
+        for value in [
+            json!({}),
+            json!({ "data": null }),
+            json!({ "data": {} }),
+            json!({ "data": { "repository": null } }),
+            json!({ "data": { "repository": {}, "viewer": {} } }),
+        ] {
+            assert!(operations().decode_value(value).is_err());
+        }
+        let mut errors = valid();
+        errors["errors"] = json!([{ "message": "partial result" }]);
+        assert!(operations().decode_value(errors).is_err());
+        let mut empty_errors = valid();
+        empty_errors["errors"] = json!([]);
+        assert!(operations().decode_value(empty_errors).is_ok());
+        let mut extensions = valid();
+        extensions["extensions"] = json!({ "requestId": "opaque" });
+        assert!(operations().decode_value(extensions).is_ok());
+        let mut malformed_extensions = valid();
+        malformed_extensions["extensions"] = json!(null);
+        assert!(operations().decode_value(malformed_extensions).is_err());
+        let mut unexpected_top_level = valid();
+        unexpected_top_level["unexpected"] = json!(true);
+        assert!(operations().decode_value(unexpected_top_level).is_err());
+
+        for pointer in [
+            "/data/repository/op0/nodes",
+            "/data/repository/op0/pageInfo",
+            "/data/repository/op0/pageInfo/hasNextPage",
+            "/data/repository/op0/pageInfo/endCursor",
+        ] {
+            let mut value = one_response(node(1, "ONE", "G", "OPEN"));
+            let (parent, field) = pointer.rsplit_once('/').unwrap();
+            value.pointer_mut(parent).unwrap().as_object_mut().unwrap().remove(field);
+            assert!(
+                operation(vec![query("G", None)], true).decode_value(value).is_err(),
+                "accepted missing {pointer}"
+            );
+        }
+
+        for pointer in [
+            "/data/repository/defaultBranchRef",
+            "/data/repository/defaultBranchRef/target",
+            "/data/repository/op0",
+            "/data/repository/op0/pageInfo",
+            "/data/repository/op0/nodes/0",
+            "/data/repository/op0/nodes/0/autoMergeRequest",
+        ] {
+            let mut value = one_response(node(1, "ONE", "G", "OPEN"));
+            value["data"]["repository"]["op0"]["nodes"][0]["autoMergeRequest"] =
+                json!({ "enabledAt": "now" });
+            value
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("notSelected".to_owned(), json!(true));
+            assert!(operation(vec![query("G", None)], true).decode_value(value).is_err());
+        }
+    }
+
+    #[test]
+    fn repository_facts_are_strict_and_complete() {
+        for pointer in [
+            "/data/repository/id",
+            "/data/repository/defaultBranchRef",
+            "/data/repository/defaultBranchRef/target",
+            "/data/repository/defaultBranchRef/target/oid",
+        ] {
+            let mut value =
+                response(true, [("op0".to_owned(), connection(Vec::new(), false, Value::Null))]);
+            *value.pointer_mut(pointer).unwrap() = Value::Null;
+            assert!(operation(vec![query("G", None)], true).decode_value(value).is_err());
+        }
+        for (pointer, replacement) in [
+            ("/data/repository/id", json!("")),
+            ("/data/repository/defaultBranchRef/name", json!("")),
+            ("/data/repository/defaultBranchRef/target/oid", json!("bad")),
+            (
+                "/data/repository/defaultBranchRef/target/oid",
+                json!("0000000000000000000000000000000000000000"),
+            ),
+        ] {
+            let mut value =
+                response(true, [("op0".to_owned(), connection(Vec::new(), false, Value::Null))]);
+            *value.pointer_mut(pointer).unwrap() = replacement;
+            assert!(operation(vec![query("G", None)], true).decode_value(value).is_err());
+        }
+    }
+
+    #[test]
+    fn untrusted_diagnostic_details_are_escaped_and_bounded() {
+        assert_eq!(diagnostic_detail("line\n\x1b'\\"), r"line\n\u{1b}\'\\");
+        let rendered = diagnostic_detail(&"雪".repeat(100));
+        assert!(rendered.ends_with('…'));
+        assert!(rendered.len() <= MAX_DIAGNOSTIC_DETAIL_BYTES + '…'.len_utf8());
     }
 }
