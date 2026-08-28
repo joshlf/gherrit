@@ -1,21 +1,18 @@
-//! Pure planning for one exact-local publication attempt.
+//! Planning and staged execution for one exact-local publication attempt.
 //!
 //! The planner consumes the complete local stack, its validated literal Git
 //! histories, and the exhausted GitHub observations for those same changes.
 //! It freezes every action which can be known before a write. Later actions
-//! remain inside private consuming stages, so an executor cannot cross a
+//! remain inside private consuming stages, so the executor cannot cross a
 //! durable-effect barrier without the exact acknowledgement required by the
 //! preceding stage.
-
-#![cfg_attr(
-    test,
-    allow(dead_code, reason = "the production executor remains dormant until activation")
-)]
 
 use std::borrow::Cow;
 
 use color_eyre::eyre::{Result, bail};
 
+#[cfg(test)]
+use super::refs::prepare_tuple_pushes;
 use super::{
     body::{GeneratedBody, StackBodyRecipes},
     github::{
@@ -26,15 +23,105 @@ use super::{
     },
     history::{Revision, ValidatedChangeHistory},
     refs::{
-        MarkerTransition, PreparedPushes, PublicationRevision, TupleTransition,
-        prepare_marker_pushes, prepare_tuple_pushes,
+        MarkerTransition, PreparedPushes, PublicBranchTransition, PublicationRevision,
+        TupleTransition, prepare_initial_pushes, prepare_marker_pushes,
     },
     remote::ValidatedPublication,
 };
-use crate::pre_push::{
-    destination::{DefaultBranch, PushDestination},
-    local::{GherritPrId, LocalChange, LocalStack, PullRequestTitle},
+use crate::{
+    manage::PublicBranchName,
+    pre_push::{
+        destination::{DefaultBranch, ObservedPublicBranch, PushDestination, RemoteBranchState},
+        local::{GherritPrId, LocalChange, LocalStack, PullRequestTitle},
+    },
 };
+
+/// One public branch checked against the remote default observed by this
+/// publication attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PublicBranch(PublicBranchName);
+
+impl PublicBranch {
+    fn new(name: PublicBranchName, default_branch: &DefaultBranch) -> Result<Self> {
+        if ref_paths_conflict(name.as_str(), default_branch.name()) {
+            bail!("A public GHerrit branch cannot conflict with the repository default branch");
+        }
+        Ok(Self(name))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(value: &str) -> Result<Self> {
+        Ok(Self(PublicBranchName::new(value.to_owned())?))
+    }
+}
+
+fn ref_paths_conflict(left: &str, right: &str) -> bool {
+    left == right
+        || left.strip_prefix(right).is_some_and(|suffix| suffix.starts_with('/'))
+        || right.strip_prefix(left).is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+pub(super) enum PlannedPublicBranch {
+    AlreadyDesired(PublicBranch),
+    Transition(PublicBranchTransition),
+}
+
+impl PlannedPublicBranch {
+    fn branch(&self) -> &PublicBranch {
+        match self {
+            Self::AlreadyDesired(branch) => branch,
+            Self::Transition(transition) => transition.branch(),
+        }
+    }
+
+    fn transition(&self) -> Option<&PublicBranchTransition> {
+        match self {
+            Self::AlreadyDesired(_) => None,
+            Self::Transition(transition) => Some(transition),
+        }
+    }
+}
+
+/// Consumes management intent and its corresponding exact remote evidence
+/// into the optional public projection for this attempt.
+pub(super) fn plan_public_branch(
+    observed: Option<ObservedPublicBranch>,
+    default_branch: &DefaultBranch,
+    desired: gix::ObjectId,
+) -> Result<Option<PlannedPublicBranch>> {
+    observed
+        .map(|observed| {
+            let (name, remote) = observed.into_parts();
+            let branch = PublicBranch::new(name, default_branch)?;
+            match remote {
+                RemoteBranchState::Absent => PublicBranchTransition::create(branch, desired),
+                RemoteBranchState::At(current) if current == desired => {
+                    return Ok(PlannedPublicBranch::AlreadyDesired(branch));
+                }
+                RemoteBranchState::At(current) => {
+                    PublicBranchTransition::advance(branch, current, desired)
+                }
+            }
+            .map(PlannedPublicBranch::Transition)
+        })
+        .transpose()
+}
+
+/// Prepares the only initial-ref work possible for an empty local stack.
+pub(super) fn plan_empty_publication(
+    destination: &PushDestination,
+    public_branch: Option<&PlannedPublicBranch>,
+) -> Result<PreparedPushes> {
+    prepare_initial_pushes(
+        destination,
+        public_branch.and_then(PlannedPublicBranch::transition),
+        &[],
+    )
+}
 
 /// One complete executable publication plan.
 ///
@@ -307,7 +394,7 @@ impl BoundProjectionEntry {
 pub(super) fn plan_publication(
     validated: ValidatedPublication,
     observed: ObservedGithub,
-    public_branch: Option<String>,
+    public_branch: Option<PlannedPublicBranch>,
     stack: LocalStack,
 ) -> Result<PublicationPlan> {
     let (histories, destination) = validated.into_parts();
@@ -321,7 +408,7 @@ pub(super) fn plan_publication(
 
 pub(super) fn plan_effects(
     destination: &PushDestination,
-    public_branch: Option<String>,
+    public_branch: Option<PlannedPublicBranch>,
     stack: LocalStack,
     histories: Box<[ValidatedChangeHistory]>,
     pull_requests: CompleteLocalPullRequests,
@@ -345,10 +432,15 @@ pub(super) fn plan_effects(
         .zip(&desired_revisions)
         .filter_map(|(history, desired)| tuple_transition(history, *desired))
         .collect::<Result<Vec<_>>>()?;
-    let initial_ref_pushes = prepare_tuple_pushes(destination, &tuple_transitions)?;
+    let initial_ref_pushes = prepare_initial_pushes(
+        destination,
+        public_branch.as_ref().and_then(PlannedPublicBranch::transition),
+        &tuple_transitions,
+    )?;
     let realities =
         build_realities(histories.iter().zip(desired_revisions), pull_requests.into_vec())?;
-    let recipes = StackBodyRecipes::new(destination, public_branch, stack, histories.into_vec())?;
+    let body_branch = public_branch.as_ref().map(|branch| branch.branch().clone());
+    let recipes = StackBodyRecipes::new(destination, body_branch, stack, histories.into_vec())?;
     let after_initial_refs =
         prepare_projection(destination, realities, recipes, create_preparation, default_branch)?;
 
