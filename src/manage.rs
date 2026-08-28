@@ -13,6 +13,36 @@ pub enum State {
     Public,
 }
 
+/// A checked public branch whose remote ref cannot overlap GHerrit's owned
+/// head or base namespaces.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PublicBranchName(String);
+
+impl PublicBranchName {
+    pub(crate) fn new(value: String) -> Result<Self> {
+        let full_name = format!("refs/heads/{value}");
+        if gix::refs::FullName::try_from(full_name.as_str()).is_err() {
+            bail!("A public GHerrit branch must have a valid Git branch name");
+        }
+        if value == "gherrit-bases" || value.starts_with("gherrit-bases/") {
+            bail!(
+                "A public GHerrit branch cannot use GHerrit's reserved 'gherrit-bases' namespace"
+            );
+        }
+        let first_component = value.split('/').next().expect("validated branch is nonempty");
+        if first_component.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            bail!(
+                "A public GHerrit branch's first path component must contain a character other than an ASCII letter or digit so it cannot collide with a change-owned head"
+            );
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl State {
     const UNMANAGED: &str = "false";
     const PRIVATE: &str = "managedPrivate";
@@ -33,6 +63,19 @@ impl State {
                 State::UNMANAGED.yellow()
             ),
         }
+    }
+
+    /// Reads the branch's checked management intent or reports how to choose
+    /// it.
+    pub fn read_required_from(repo: &util::Repo, branch_name: &str) -> Result<State> {
+        let Some(state) = Self::read_from(repo, branch_name)? else {
+            bail!(
+                "It is unclear whether branch '{branch_name}' should be managed by GHerrit.\n\
+                 Run 'gherrit manage' to configure it as a GHerrit stack.\n\
+                 Run 'gherrit unmanage' to push it as a standard Git branch."
+            );
+        };
+        Ok(state)
     }
 
     fn config_value(self) -> &'static str {
@@ -405,6 +448,25 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_branches_are_disjoint_from_every_owned_ref() {
+        for branch in ["feature-/one", "feature-one", "feature.one", "café", "gherrit-bases-other"]
+        {
+            assert_eq!(PublicBranchName::new(branch.to_owned()).unwrap().as_str(), branch);
+        }
+
+        for branch in [
+            "Gchange",
+            "Gchange/child",
+            "feature",
+            "feature/one",
+            "gherrit-bases",
+            "gherrit-bases/Gchange",
+        ] {
+            assert!(PublicBranchName::new(branch.to_owned()).is_err(), "branch={branch:?}");
+        }
+    }
 
     const BRANCH: &str = "feature";
     const DEFAULT_REMOTE: &str = "origin";
