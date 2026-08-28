@@ -174,7 +174,7 @@ impl<'local> ExactLocalQueryPlan<'local> {
             let expected_default = (index == 0).then_some(&default_branch);
             let patterns = query.patterns(expected_default);
             let output = destination
-                .observe_refs_from(repository, ["--quiet".to_owned()], patterns)
+                .observe_refs(repository, ["--quiet".to_owned()], patterns)
                 .await
                 .wrap_err_with(|| {
                     format!(
