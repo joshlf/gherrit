@@ -17,8 +17,9 @@ mod legacy_github;
 mod legacy_publication;
 mod legacy_remote;
 mod local;
-// The complete exact-local workflow is compiled behind one private boundary.
-// It becomes reachable only when observation and publication switch together.
+// The exact-local workflow is assembled behind one private boundary. It
+// becomes reachable only when hook validation, observation, and publication
+// switch together.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "exact publication activates as one complete workflow")
@@ -165,7 +166,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     // an arbitrary Git server could hide a symbolic ref behind that output.
     github_endpoint.validate_destination(&destination)?;
     let git_default_branch = destination.observe_default_branch().await?;
-    let commits = LocalStack::collect_captured(repo, &branch_name, head, &git_default_branch)
+    let commits = LocalStack::collect_captured(repo, &branch_name, head, git_default_branch)
         .wrap_err("Failed to collect commits")?;
 
     if commits.is_empty() {
