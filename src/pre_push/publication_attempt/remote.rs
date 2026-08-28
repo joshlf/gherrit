@@ -208,7 +208,7 @@ struct ExactLocalObservation<'local, 'repository> {
     raw: RawExactLocalObservation,
 }
 
-impl<'local, 'repository> ExactLocalObservation<'local, 'repository> {
+impl ExactLocalObservation<'_, '_> {
     /// Consumes this exact observation through one straight-line graph load.
     ///
     /// Complete and invalid evidence return without constructing acquisition
