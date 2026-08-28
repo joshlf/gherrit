@@ -17,6 +17,8 @@ pub(super) use mutation::{
     CompleteCreateReceipts, CreatePullRequest, PreparedCreates, PreparedUpdates, UpdatePullRequest,
 };
 #[cfg(test)]
+pub(in crate::pre_push::publication_attempt) use mutation::{TestCreate, TestUpdate};
+#[cfg(test)]
 pub(super) use observation::ObservedBase;
 pub(super) use observation::{
     AbsentPullRequest, BaseKind, CompleteLocalPullRequests, LocalPullRequestObservation,
