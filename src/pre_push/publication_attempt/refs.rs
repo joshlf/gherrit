@@ -184,19 +184,36 @@ struct AtomicUnit {
     refspecs: Box<[String]>,
     expected: Box<[(String, ExpectedRefReceipt)]>,
     encoded_argv_bytes: usize,
+    #[cfg(test)]
+    semantic_effect: TestPushEffect,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::pre_push::publication_attempt) enum TestPushEffect {
+    Tuple {
+        id: GherritPrId,
+        expected: Option<PublicationRevision>,
+        desired: PublicationRevision,
+        version: u64,
+    },
+    Marker {
+        id: GherritPrId,
+        target: ObjectId,
+    },
 }
 
 impl AtomicUnit {
     fn tuple(transition: &TupleTransition) -> Self {
         let id = transition.id().as_str();
         let desired = transition.desired();
-        let expected = transition.expected();
+        let expected_revision = transition.expected();
         let head = format!("refs/heads/{id}");
         let base = format!("refs/heads/gherrit-bases/{id}");
         let tag = format!("refs/tags/gherrit/{id}/v{}", transition.version());
-        let head_expectation = expected
+        let head_expectation = expected_revision
             .map_or(LeaseExpectation::Absent, |revision| LeaseExpectation::At(revision.head));
-        let base_expectation = expected
+        let base_expectation = expected_revision
             .map_or(LeaseExpectation::Absent, |revision| LeaseExpectation::At(revision.owned_base));
         let options = [
             format!("--force-with-lease={head}:{}", head_expectation.render()),
@@ -222,7 +239,18 @@ impl AtomicUnit {
                 ),
             ),
         ];
-        Self::new(options, refspecs, expected)
+        Self::new(
+            options,
+            refspecs,
+            expected,
+            #[cfg(test)]
+            TestPushEffect::Tuple {
+                id: transition.id().clone(),
+                expected: expected_revision,
+                desired,
+                version: transition.version().get(),
+            },
+        )
     }
 
     fn marker(transition: &MarkerTransition) -> Self {
@@ -236,13 +264,20 @@ impl AtomicUnit {
                 ExpectedRefTransition::CreateOrAlreadyDesired,
             ),
         );
-        Self::new([option], [refspec], [expected])
+        Self::new(
+            [option],
+            [refspec],
+            [expected],
+            #[cfg(test)]
+            TestPushEffect::Marker { id: transition.id.clone(), target: transition.target },
+        )
     }
 
     fn new<const OPTIONS: usize, const REFSPECS: usize, const RECEIPTS: usize>(
         options: [String; OPTIONS],
         refspecs: [String; REFSPECS],
         expected: [(String, ExpectedRefReceipt); RECEIPTS],
+        #[cfg(test)] semantic_effect: TestPushEffect,
     ) -> Self {
         let encoded_argv_bytes =
             options.iter().chain(&refspecs).map(|argument| argument.len() + 1).sum();
@@ -251,6 +286,8 @@ impl AtomicUnit {
             refspecs: refspecs.into(),
             expected: expected.into(),
             encoded_argv_bytes,
+            #[cfg(test)]
+            semantic_effect,
         }
     }
 }
@@ -422,6 +459,8 @@ pub(super) struct PushBatch {
     options: Box<[String]>,
     refspecs: Box<[String]>,
     expected: ExpectedReceipts,
+    #[cfg(test)]
+    semantic_effects: Box<[TestPushEffect]>,
 }
 
 impl PushBatch {
@@ -432,7 +471,11 @@ impl PushBatch {
         let mut options = FIXED_PUSH_OPTIONS.map(str::to_owned).to_vec();
         let mut refspecs = Vec::new();
         let mut expected = Vec::new();
+        #[cfg(test)]
+        let mut semantic_effects = Vec::with_capacity(units.len());
         for unit in units {
+            #[cfg(test)]
+            semantic_effects.push(unit.semantic_effect);
             options.extend(unit.options);
             refspecs.extend(unit.refspecs);
             expected.extend(unit.expected);
@@ -441,7 +484,16 @@ impl PushBatch {
             options: options.into_boxed_slice(),
             refspecs: refspecs.into_boxed_slice(),
             expected: ExpectedReceipts::new(expected)?,
+            #[cfg(test)]
+            semantic_effects: semantic_effects.into_boxed_slice(),
         })
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn semantic_effects_for_test(
+        &self,
+    ) -> &[TestPushEffect] {
+        &self.semantic_effects
     }
 
     #[cfg(test)]
@@ -760,6 +812,15 @@ mod tests {
     fn advancement_leases_both_mutable_refs_and_creates_only_the_next_tag() {
         let batch = one_tuple_batch(advance("Gone", 0x22, 0x11, 0x44, 0x11, 7));
         assert_eq!(
+            batch.semantic_effects_for_test(),
+            [TestPushEffect::Tuple {
+                id: id("Gone"),
+                expected: Some(revision(0x22, 0x11)),
+                desired: revision(0x44, 0x11),
+                version: 8,
+            }]
+        );
+        assert_eq!(
             &batch.options().collect::<Vec<_>>()[FIXED_PUSH_OPTIONS.len()..],
             [
                 format!("--force-with-lease=refs/heads/Gone:{}", object_id(0x22)),
@@ -841,6 +902,27 @@ mod tests {
         .unwrap();
         assert_eq!(split.batches().len(), 2);
         assert!(split.batches().all(|batch| batch.refspecs().len() == 3));
+        let semantic_batches =
+            split.batches().map(PushBatch::semantic_effects_for_test).collect::<Vec<_>>();
+        assert_eq!(semantic_batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(), [1, 1]);
+        assert_eq!(
+            semantic_batches[0],
+            [TestPushEffect::Tuple {
+                id: id("Gone"),
+                expected: None,
+                desired: revision(2, 1),
+                version: 1,
+            }]
+        );
+        assert_eq!(
+            semantic_batches[1],
+            [TestPushEffect::Tuple {
+                id: id("Gtwo"),
+                expected: None,
+                desired: revision(4, 3),
+                version: 1,
+            }]
+        );
 
         let exact_single =
             prepare_tuple_pushes_with_budget(&destination(), &[create("Gone", 2, 1)], first_bytes)
@@ -885,6 +967,13 @@ mod tests {
                 .unwrap();
         assert_eq!(batches.batches().len(), 2);
         assert!(batches.batches().all(|batch| batch.refspecs().len() == 1));
+        assert_eq!(
+            batches.batches().map(PushBatch::semantic_effects_for_test).collect::<Vec<_>>(),
+            [
+                &[TestPushEffect::Marker { id: id("Gone"), target: object_id(2) }][..],
+                &[TestPushEffect::Marker { id: id("Gtwo"), target: object_id(3) }][..],
+            ]
+        );
         assert!(
             prepare_marker_pushes_with_budget(
                 &destination(),
