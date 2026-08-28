@@ -407,6 +407,29 @@ impl PreparedCreates {
     }
 
     #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn batches_for_test(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &[TestCreate]> + '_ {
+        assert_eq!(
+            self.batches.iter().map(|batch| batch.expected.len()).sum::<usize>(),
+            self.operations.len(),
+            "semantic create operations must cover the exact prepared batches"
+        );
+        let mut start = 0;
+        self.batches.iter().map(move |batch| {
+            let end = start + batch.expected.len();
+            let operations = &self.operations[start..end];
+            start = end;
+            operations
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn repository_id_for_test(&self) -> &str {
+        self.repository_id.as_str()
+    }
+
+    #[cfg(test)]
     pub(super) fn for_test(
         repository_id: String,
         operations: Vec<TestCreate>,
@@ -663,6 +686,24 @@ impl PreparedUpdates {
         &self.operations
     }
 
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn batches_for_test(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &[TestUpdate]> + '_ {
+        assert_eq!(
+            self.batches.iter().map(|batch| batch.expected.len()).sum::<usize>(),
+            self.operations.len(),
+            "semantic update operations must cover the exact prepared batches"
+        );
+        let mut start = 0;
+        self.batches.iter().map(move |batch| {
+            let end = start + batch.expected.len();
+            let operations = &self.operations[start..end];
+            start = end;
+            operations
+        })
+    }
+
     async fn execute(self, github: &Github) -> Result<()> {
         for batch in self.batches.into_vec() {
             log::trace!(
@@ -877,6 +918,14 @@ mod tests {
         assert_eq!(prepared.batches.len(), 2);
         assert_eq!(prepared.batches[0].expected.len(), MAX_MUTATION_ALIASES);
         assert_eq!(prepared.batches[1].expected.len(), 1);
+        assert_eq!(prepared.repository_id_for_test(), "REPOSITORY");
+        let semantic_batches = prepared.batches_for_test().collect::<Vec<_>>();
+        assert_eq!(
+            semantic_batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+            [MAX_MUTATION_ALIASES, 1]
+        );
+        assert_eq!(semantic_batches[0][0].id, id("G0"));
+        assert_eq!(semantic_batches[1][0].id, id(&format!("G{MAX_MUTATION_ALIASES}")));
         assert!(
             prepared
                 .batches
@@ -923,6 +972,16 @@ mod tests {
         assert_eq!(prepared.batches.len(), 2);
         assert_eq!(prepared.batches[0].expected.len(), MAX_MUTATION_ALIASES);
         assert_eq!(prepared.batches[1].expected.len(), 1);
+        let semantic_batches = prepared.batches_for_test().collect::<Vec<_>>();
+        assert_eq!(
+            semantic_batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+            [MAX_MUTATION_ALIASES, 1]
+        );
+        assert_eq!(semantic_batches[0][0].identity.number().get(), 1);
+        assert_eq!(
+            semantic_batches[1][0].identity.number().get(),
+            u32::try_from(MAX_MUTATION_ALIASES + 1).unwrap()
+        );
 
         let mut exact = UpdatePullRequest::new(
             PullRequestIdentity::new(1, "PR1".to_owned()).unwrap(),
