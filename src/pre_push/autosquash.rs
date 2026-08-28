@@ -19,7 +19,7 @@ impl fmt::Display for PendingAutosquash {
             formatter,
             concat!(
                 "Stack contains pending fixup/squash/amend commits.\n",
-                "Please squash your history before syncing:\n",
+                "Please squash your history before publishing:\n",
                 "    git rebase -i --autosquash {}",
             ),
             self.default_ref,
@@ -124,7 +124,7 @@ mod tests {
                 format!(
                     concat!(
                         "Stack contains pending fixup/squash/amend commits.\n",
-                        "Please squash your history before syncing:\n",
+                        "Please squash your history before publishing:\n",
                         "    git rebase -i --autosquash refs/heads/{}",
                     ),
                     branch,

@@ -70,17 +70,16 @@ pub fn run(repo: &util::Repo, msg_file: &str, acquire_entropy: fn() -> IdEntropy
         return Ok(());
     }
 
-    // Skip temporary squash commits (e.g. from `git commit --squash`) to
-    // prevent creating "phantom" PRs for changes destined to be merged away.
-    // These commits are transient and shouldn't be part of the persistent
-    // managed stack.
+    // Skip temporary squash commits (e.g. from `git commit --squash`) so
+    // changes intended to be folded into another commit do not receive a
+    // persistent review identity or enter the managed stack.
     let msg_content = fs::read_to_string(msg_path).wrap_err("Failed to read msg file")?;
     if is_temporary_squash(&msg_content) {
         return Ok(());
     }
 
-    // Calculate Change-ID
-    // Construct the input: "Ident\nRefHash\nMsgContent"
+    // Construct the stable GHerrit ID input:
+    // "Ident\nRefHash\nMsgContent".
     let input_data = {
         let committer_ident = cmd!("git var GIT_COMMITTER_IDENT").checked_output()?;
         let committer_ident =
