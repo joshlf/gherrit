@@ -1,6 +1,5 @@
 ---
 source: tests/pre_push/failures/mod.rs
-assertion_line: 330
 expression: content
 ---
 EXIT_CODE: 1
@@ -9,5 +8,5 @@ STDOUT:
 (empty)
 
 STDERR:
-[gherrit] Branch feature-fail is MANAGED. Syncing stack...
+[gherrit] Branch feature-fail is MANAGED. Publishing stack...
 [gherrit] [ERROR] `git ls-remote --symref` failed for GHerrit remote 'broken-remote'
