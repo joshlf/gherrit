@@ -928,7 +928,8 @@ fn graphql_stages_are_preflighted_before_a_tuple_plan_can_escape() {
 }
 
 #[test]
-fn existing_projection_emits_exactly_the_differing_field_mask() {
+fn existing_projection_emits_exact_desired_values_for_differing_fields() {
+    let desired_title = desired_title("Gone");
     let desired_body = single_desired_body();
     for mask in 0_u8..8 {
         let title_differs = mask & 0b001 != 0;
@@ -954,8 +955,16 @@ fn existing_projection_emits_exactly_the_differing_field_mask() {
         let updates = stage.updates.operations_for_test();
         assert_eq!(updates.len(), usize::from(mask != 0), "mask={mask:03b}");
         if let Some(update) = updates.first() {
-            assert_eq!(update.title.is_some(), title_differs, "mask={mask:03b}");
-            assert_eq!(update.body.is_some(), body_differs, "mask={mask:03b}");
+            assert_eq!(
+                update.title.as_deref(),
+                title_differs.then_some(desired_title.as_str()),
+                "mask={mask:03b}"
+            );
+            assert_eq!(
+                update.body.as_deref(),
+                body_differs.then_some(desired_body.as_str()),
+                "mask={mask:03b}"
+            );
             assert_eq!(update.base_branch.as_deref(), base_differs.then_some(DEFAULT_NAME));
         }
     }
@@ -1245,6 +1254,7 @@ async fn empty_effect_stages_cross_without_attempting_a_durable_write() {
             base: oid(10),
             title: None,
             body: Some(single_desired_body()),
+            is_draft: true,
             landing_automation: false,
         }),
     }])
