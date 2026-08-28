@@ -17,8 +17,9 @@ mod legacy_github;
 mod legacy_publication;
 mod legacy_remote;
 mod local;
-// The complete exact-local workflow is compiled behind one private boundary.
-// It becomes reachable only when observation and publication switch together.
+// The exact-local workflow is assembled behind one private boundary. It
+// becomes reachable only when hook validation, observation, and publication
+// switch together.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "exact publication activates as one complete workflow")
@@ -160,7 +161,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
         repo.default_remote_name().wrap_err("Failed to read the configured GHerrit remote")?;
     let destination = PushDestination::resolve(repo, configured_remote)?;
     let git_default_branch = destination.observe_default_branch().await?;
-    let commits = LocalStack::collect_captured(repo, &branch_name, head, &git_default_branch)
+    let commits = LocalStack::collect_captured(repo, &branch_name, head, git_default_branch)
         .wrap_err("Failed to collect commits")?;
 
     if commits.is_empty() {
