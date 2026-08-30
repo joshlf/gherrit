@@ -724,6 +724,29 @@ impl PushDestination {
         stderr: &[u8],
         stderr_bytes: u64,
     ) -> Option<String> {
+        let retained = u64::try_from(stderr.len()).unwrap_or(u64::MAX);
+        let omitted_before_suffix = stderr_bytes.saturating_sub(retained);
+        let (stderr, omitted) = if omitted_before_suffix == 0 {
+            (stderr, 0)
+        } else if let Some(newline) = stderr.iter().position(|byte| *byte == b'\n') {
+            // The bounded reader retains the end of stderr. If bytes were
+            // dropped, the first retained byte can be in the middle of a
+            // `remote:` line or a private destination. Without its missing
+            // prefix that fragment cannot be classified or safely redacted.
+            // Discard through the first retained newline so filtering starts
+            // at a complete logical line.
+            let discarded = newline.saturating_add(1);
+            (
+                &stderr[discarded..],
+                omitted_before_suffix.saturating_add(u64::try_from(discarded).unwrap_or(u64::MAX)),
+            )
+        } else {
+            // There is no proof that any retained byte belongs to a complete
+            // line. The total byte count is still useful and reveals none of
+            // the untrusted fragment.
+            (&[][..], stderr_bytes)
+        };
+
         // Git prefixes remote-side messages with `remote:`. Those messages
         // are not evidence about a local composite pre-push policy and may
         // contain arbitrary server-private text. Git's own final failure line
@@ -771,8 +794,6 @@ impl PushDestination {
             }
         }
         let safe = safe.trim().to_owned();
-        let retained = u64::try_from(stderr.len()).unwrap_or(u64::MAX);
-        let omitted = stderr_bytes.saturating_sub(retained);
         let has_visible_content = safe
             .chars()
             .any(|character| character.is_alphanumeric() || character.is_ascii_punctuation());
@@ -3135,7 +3156,7 @@ mod tests {
         );
 
         let rendered = destination
-            .render_child_diagnostic(diagnostic.as_bytes(), diagnostic.len() as u64 + 7)
+            .render_child_diagnostic(diagnostic.as_bytes(), diagnostic.len() as u64)
             .unwrap();
 
         assert!(rendered.contains("policy denied publication for <private destination>"));
@@ -3145,7 +3166,6 @@ mod tests {
         );
         assert!(rendered.contains("alternate transport <path or URL redacted>"));
         assert!(rendered.contains("\\u{1b}[31m\\r"));
-        assert!(rendered.contains("[7 earlier diagnostic bytes omitted]"));
         for private in [
             &literal,
             &canonical,
@@ -3163,6 +3183,41 @@ mod tests {
         assert!(!rendered.contains("remote end hung up"));
         assert!(!rendered.contains('\x1b'));
         assert!(!rendered.contains('\r'));
+    }
+
+    #[test]
+    fn truncated_child_diagnostics_discard_the_unclassifiable_first_line() {
+        let destination = destination();
+        let local = "local policy denied https://github.com/owner/repo.git";
+
+        for (first_line, private_fragment) in [
+            ("server-private text whose remote prefix was omitted", "server-private"),
+            ("ner/repo.git whose destination prefix was omitted", "ner/repo.git"),
+        ] {
+            let retained = format!("{first_line}\n{local}\n");
+            let rendered = destination
+                .render_child_diagnostic(
+                    retained.as_bytes(),
+                    u64::try_from(retained.len()).unwrap() + 17,
+                )
+                .unwrap();
+
+            assert_eq!(
+                rendered,
+                format!(
+                    "local policy denied <private destination>\n[{} earlier diagnostic bytes omitted]",
+                    17 + first_line.len() + 1
+                )
+            );
+            assert!(!rendered.contains(private_fragment));
+        }
+
+        let retained = b"ivate/repository.git";
+        let total = u64::try_from(retained.len()).unwrap() + 29;
+        assert_eq!(
+            destination.render_child_diagnostic(retained, total),
+            Some(format!("[{total} earlier diagnostic bytes omitted]"))
+        );
     }
 
     #[test]
