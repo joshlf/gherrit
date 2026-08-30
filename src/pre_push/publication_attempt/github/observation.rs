@@ -47,13 +47,6 @@ fn decode_unique_json(response: &[u8]) -> Result<Value> {
         .into_value())
 }
 
-/// The lifecycle states which cannot be selected as the current projection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TerminalState {
-    Closed,
-    Merged,
-}
-
 /// The only base kinds supported by a managed OPEN pull request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::pre_push::publication_attempt) enum BaseKind {
@@ -198,7 +191,7 @@ impl ManagedOpenPullRequest {
     }
 }
 
-/// Proof that an exhausted exact all-state connection had no same-repository
+/// Proof that an exhausted exact OPEN-only connection had no same-repository
 /// row. Cross-repository rows do not prevent this conclusion.
 #[derive(Debug)]
 pub(in crate::pre_push::publication_attempt) struct AbsentPullRequest {
@@ -390,7 +383,7 @@ impl LocalPullRequests {
                     .map(|cursor| format!(", after: {}", json!(cursor)))
                     .unwrap_or_default();
                 format!(
-                    "op{index}: pullRequests(headRefName: {}, first: 1{after}, states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isDraft, isCrossRepository, autoMergeRequest {{ enabledAt }}, isInMergeQueue }} pageInfo {{ hasNextPage, endCursor }} }}",
+                    "op{index}: pullRequests(headRefName: {}, first: 1{after}, states: [OPEN]) {{ nodes {{ number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isDraft, isCrossRepository, autoMergeRequest {{ enabledAt }}, isInMergeQueue }} pageInfo {{ hasNextPage, endCursor }} }}",
                     json!(query.id.as_str()),
                 )
             })
@@ -559,9 +552,9 @@ struct AutoMergeRequest {
     enabled_at: Nullable<String>,
 }
 
-/// The selected wire row keeps projection fields untyped until lifecycle and
-/// repository are known. Fork and terminal rows must have the selected shape,
-/// but their irrelevant projection payload is deliberately not interpreted.
+/// The selected wire row keeps projection fields untyped until repository
+/// ownership is known. Fork rows must have the selected shape, but their
+/// irrelevant projection payload is deliberately not interpreted.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Node {
@@ -584,21 +577,16 @@ struct Node {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum WirePullRequestState {
     Open,
-    Closed,
-    Merged,
 }
 
-/// The only row states which survive wire decoding.
+/// The only row kinds which survive wire decoding.
 ///
 /// Cross-repository rows retain nothing. Their wire identity and exact
 /// requested head are validated before decoding reaches this type, but a fork
 /// is not local repository evidence and cannot constrain later creates.
-/// Terminal and OPEN rows retain only the local evidence each later stage
-/// needs.
 #[derive(Debug)]
 enum DecodedPullRequest {
     CrossRepository,
-    Terminal { identity: PullRequestIdentity, state: TerminalState },
     Open(OpenPullRequest),
 }
 
@@ -667,16 +655,9 @@ fn decode_pull_request(id: &GherritPrId, node: Node) -> Result<DecodedPullReques
         );
     }
 
+    let WirePullRequestState::Open = node.state;
     if node.is_cross_repository {
         return Ok(DecodedPullRequest::CrossRepository);
-    }
-    let terminal = match node.state {
-        WirePullRequestState::Closed => Some(TerminalState::Closed),
-        WirePullRequestState::Merged => Some(TerminalState::Merged),
-        WirePullRequestState::Open => None,
-    };
-    if let Some(state) = terminal {
-        return Ok(DecodedPullRequest::Terminal { identity, state });
     }
 
     let string = |field: &str, value: Value| match value {
@@ -788,73 +769,12 @@ impl Progress {
     }
 }
 
-/// Exact set of terminal lifecycle kinds seen for one head.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TerminalKinds {
-    Closed,
-    Merged,
-    Both,
-}
-
-impl TerminalKinds {
-    fn record(self, state: TerminalState) -> Self {
-        match (self, state) {
-            (Self::Closed, TerminalState::Closed) => Self::Closed,
-            (Self::Merged, TerminalState::Merged) => Self::Merged,
-            (Self::Closed | Self::Merged | Self::Both, _) => Self::Both,
-        }
-    }
-}
-
-/// Nonempty terminal history for one exact-head connection.
-///
-/// The lowest-numbered identity is a deterministic representative. The exact
-/// state union and nonzero count are folded independently, so pagination order
-/// cannot change either the classification or its diagnostic.
-#[derive(Debug)]
-struct TerminalSummary {
-    representative: PullRequestIdentity,
-    kinds: TerminalKinds,
-    count: NonZeroUsize,
-}
-
-impl TerminalSummary {
-    fn first(identity: PullRequestIdentity, state: TerminalState) -> Self {
-        Self {
-            representative: identity,
-            kinds: match state {
-                TerminalState::Closed => TerminalKinds::Closed,
-                TerminalState::Merged => TerminalKinds::Merged,
-            },
-            count: NonZeroUsize::MIN,
-        }
-    }
-
-    fn record_another(
-        &mut self,
-        identity: PullRequestIdentity,
-        state: TerminalState,
-    ) -> Result<()> {
-        let count =
-            self.count.get().checked_add(1).and_then(NonZeroUsize::new).ok_or_else(|| {
-                eyre!("Local pull request terminal history exceeds platform limits")
-            })?;
-        if identity.number().get() < self.representative.number().get() {
-            self.representative = identity;
-        }
-        self.kinds = self.kinds.record(state);
-        self.count = count;
-        Ok(())
-    }
-}
-
-/// Incremental correlation state for one exact-head connection.
+/// Incremental correlation state for one exact local-ID connection.
 #[derive(Debug)]
 struct ConnectionObservation {
     progress: Progress,
     baseline_row_available: bool,
     open: Option<OpenPullRequest>,
-    terminal: Option<TerminalSummary>,
 }
 
 /// One local change and the only observation state which can belong to it.
@@ -869,12 +789,7 @@ struct ConnectionSlot {
 
 impl Default for ConnectionObservation {
     fn default() -> Self {
-        Self {
-            progress: Progress::Initial,
-            baseline_row_available: true,
-            open: None,
-            terminal: None,
-        }
+        Self { progress: Progress::Initial, baseline_row_available: true, open: None }
     }
 }
 
@@ -1080,15 +995,6 @@ impl LocalPullRequestAccumulator {
             }
             match row {
                 DecodedPullRequest::CrossRepository => {}
-                DecodedPullRequest::Terminal { identity, state } => {
-                    self.identities.insert_observation(&identity)?;
-                    match &mut connection.terminal {
-                        Some(summary) => summary.record_another(identity, state)?,
-                        terminal @ None => {
-                            *terminal = Some(TerminalSummary::first(identity, state))
-                        }
-                    }
-                }
                 DecodedPullRequest::Open(open) => {
                     self.identities.insert_observation(&open.identity)?;
                     if connection.open.is_some() {
@@ -1163,8 +1069,6 @@ impl LocalPullRequestAccumulator {
             .ok_or_else(|| eyre!("Local pull request observation omitted repository facts"))?;
         let default_branch = repository.default_branch().name();
         let mut local = Vec::with_capacity(self.connections.len());
-        let mut terminal_count = 0_usize;
-        let mut terminal_representatives = Vec::new();
 
         for ConnectionSlot { id, observation: connection } in self.connections.into_vec() {
             if let Some(open) = connection.open {
@@ -1182,47 +1086,11 @@ impl LocalPullRequestAccumulator {
                         open.has_landing_automation,
                     )?,
                 ));
-            } else if let Some(terminal) = connection.terminal {
-                terminal_count =
-                    terminal_count.checked_add(terminal.count.get()).ok_or_else(|| {
-                        eyre!("Local pull request terminal history exceeds platform limits")
-                    })?;
-                if terminal_representatives.len() < MAX_DIAGNOSTIC_IDENTITIES {
-                    terminal_representatives.push((id, terminal));
-                }
             } else {
                 local.push(LocalPullRequestObservation::Absent(
                     AbsentPullRequest::after_exhaustion(id),
                 ));
             }
-        }
-        if terminal_count != 0 {
-            let displayed = terminal_representatives.len();
-            let mut message = terminal_representatives
-                .into_iter()
-                .map(|(id, summary)| {
-                    let id = diagnostic_detail(id.as_str());
-                    let number = summary.representative.number().get();
-                    match summary.kinds {
-                        TerminalKinds::Closed => format!(
-                            "Cannot push GHerrit change '{id}' because PR #{number} is closed. Reopen it or change the commit's gherrit-pr-id to start a new review.\n"
-                        ),
-                        TerminalKinds::Merged => format!(
-                            "Cannot push GHerrit change '{id}' because PR #{number} is merged. Change the commit's gherrit-pr-id to start a new review.\n"
-                        ),
-                        TerminalKinds::Both => format!(
-                            "Cannot push GHerrit change '{id}' because its exact head has both closed and merged pull request history (for example PR #{number}). Reopen a closed pull request if possible or change the commit's gherrit-pr-id to start a new review.\n"
-                        ),
-                    }
-                })
-                .collect::<String>();
-            let omitted = terminal_count - displayed;
-            if omitted != 0 {
-                message
-                    .push_str(&format!("Additional terminal pull requests omitted: {omitted}.\n"));
-            }
-            message.pop();
-            bail!(message);
         }
 
         Ok(CompleteLocalPullRequests {
@@ -1613,49 +1481,6 @@ mod tests {
     }
 
     #[test]
-    fn open_wins_history_and_forks_while_local_identities_are_retained() {
-        let mut terminal = node(1, "TERMINAL", "G", "CLOSED");
-        terminal["title"] = json!({ "ignored": true });
-        terminal["baseRefOid"] = json!(null);
-        let mut foreign = fork(2, "FORK", "G");
-        foreign["body"] = json!(["ignored"]);
-        foreign["headRefOid"] = json!(17);
-        let mut open = node(3, "OPEN", "G", "OPEN");
-        open["body"] = json!("<!-- gherrit-meta: opaque ordinary text -->");
-        open["baseRefName"] = json!("gherrit-bases/G");
-        open["autoMergeRequest"] = json!({ "enabledAt": "now" });
-
-        let first = decoded_page("G", None, Some(terminal), Some("one"), true);
-        let second = decoded_page("G", Some("one"), Some(foreign), Some("two"), false);
-        let third = decoded_page("G", Some("two"), Some(open), None, false);
-        let complete = accumulator([id("G")])
-            .unwrap()
-            .record_batch(first)
-            .unwrap()
-            .record_batch(second)
-            .unwrap()
-            .record_batch(third)
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let LocalPullRequestObservation::Open(open) = &complete.local()[0] else {
-            panic!("OPEN row must win");
-        };
-        assert_eq!(open.identity().number().get(), 3);
-        assert_eq!(open.title(), "title 3");
-        assert_eq!(open.body(), "<!-- gherrit-meta: opaque ordinary text -->");
-        assert!(open.is_draft());
-        assert_eq!(open.base().kind(), BaseKind::Owned);
-        assert_eq!(open.base().oid().to_string(), BASE_OID);
-        assert_eq!(open.head_oid().to_string(), HEAD_OID);
-        assert!(open.has_landing_automation());
-
-        assert_eq!(complete.identities.number_values(), HashSet::from([1, 3]));
-        assert_eq!(complete.identities.node_id_values(), HashSet::from(["TERMINAL", "OPEN"]));
-    }
-
-    #[test]
     fn fork_identities_do_not_participate_in_local_identity_evidence() {
         let first = decoded_page("G", None, Some(fork(1, "ONE", "G")), Some("one"), true);
         let second = decoded_page("G", Some("one"), Some(fork(1, "ONE", "G")), Some("two"), false);
@@ -1693,110 +1518,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_only_diagnostics_are_globally_bounded() {
-        let ids = (0..MAX_DIAGNOSTIC_IDENTITIES + 7)
-            .map(|index| id(&format!("G{}{}", index, "x".repeat(100))))
-            .collect::<Vec<_>>();
-        let mut accumulator = accumulator(ids.clone()).unwrap();
-        for (index, id) in ids.iter().enumerate() {
-            let state = if index == 0 { "CLOSED" } else { "MERGED" };
-            let batch = decoded_page(
-                id.as_str(),
-                None,
-                Some(node(
-                    i64::try_from(index + 1).unwrap(),
-                    &format!("NODE-{index}"),
-                    id.as_str(),
-                    state,
-                )),
-                None,
-                index == 0,
-            );
-            accumulator = accumulator.record_batch(batch).unwrap();
-        }
-        let error = accumulator.finish().unwrap_err().to_string();
-        assert!(error.contains("PR #1 is closed. Reopen it"));
-        assert!(error.contains("PR #2 is merged. Change the commit's gherrit-pr-id"));
-        assert!(error.contains("Additional terminal pull requests omitted: 7."));
-        assert!(!error.contains("PR #21"));
-        assert!(error.len() < 8_000, "diagnostic was {} bytes", error.len());
-    }
-
-    #[test]
-    fn mixed_terminal_history_is_order_independent_and_uses_the_lowest_number() {
-        let observe = |first: Value, second: Value| {
-            let first = decoded_page("G", None, Some(first), Some("next"), true);
-            let second = decoded_page("G", Some("next"), Some(second), None, false);
-            accumulator([id("G")])
-                .unwrap()
-                .record_batch(first)
-                .unwrap()
-                .record_batch(second)
-                .unwrap()
-                .finish()
-                .unwrap_err()
-                .to_string()
-        };
-        let closed_then_merged =
-            observe(node(1, "ONE", "G", "CLOSED"), node(2, "TWO", "G", "MERGED"));
-        let merged_then_closed =
-            observe(node(2, "TWO", "G", "MERGED"), node(1, "ONE", "G", "CLOSED"));
-        let expected = "Cannot push GHerrit change 'G' because its exact head has both closed and merged pull request history (for example PR #1). Reopen a closed pull request if possible or change the commit's gherrit-pr-id to start a new review.\nAdditional terminal pull requests omitted: 1.";
-        assert_eq!(closed_then_merged, expected);
-        assert_eq!(merged_then_closed, expected);
-    }
-
-    #[test]
-    fn single_terminal_kinds_have_exact_truthful_advice() {
-        for (state, expected) in [
-            (
-                "CLOSED",
-                "Cannot push GHerrit change 'G' because PR #1 is closed. Reopen it or change the commit's gherrit-pr-id to start a new review.",
-            ),
-            (
-                "MERGED",
-                "Cannot push GHerrit change 'G' because PR #1 is merged. Change the commit's gherrit-pr-id to start a new review.",
-            ),
-        ] {
-            let batch = decoded_page("G", None, Some(node(1, "ONE", "G", state)), None, true);
-            let error = accumulator([id("G")])
-                .unwrap()
-                .record_batch(batch)
-                .unwrap()
-                .finish()
-                .unwrap_err()
-                .to_string();
-            assert_eq!(error, expected, "state={state}");
-        }
-    }
-
-    #[test]
-    fn terminal_history_diagnostic_is_complete_and_actionable() {
-        let a_first =
-            decoded_page("A", None, Some(node(1, "A_ONE", "A", "CLOSED")), Some("next"), true);
-        let a_second =
-            decoded_page("A", Some("next"), Some(node(2, "A_TWO", "A", "MERGED")), None, false);
-        let b = decoded_page("B", None, Some(node(3, "B_ONE", "B", "MERGED")), None, false);
-        let error = accumulator([id("A"), id("B")])
-            .unwrap()
-            .record_batch(a_first)
-            .unwrap()
-            .record_batch(a_second)
-            .unwrap()
-            .record_batch(b)
-            .unwrap()
-            .finish()
-            .unwrap_err()
-            .to_string();
-
-        insta::assert_snapshot!(error, @r###"
-    Cannot push GHerrit change 'A' because its exact head has both closed and merged pull request history (for example PR #1). Reopen a closed pull request if possible or change the commit's gherrit-pr-id to start a new review.
-    Cannot push GHerrit change 'B' because PR #3 is merged. Change the commit's gherrit-pr-id to start a new review.
-    Additional terminal pull requests omitted: 1.
-"###);
-    }
-
-    #[test]
     fn a_second_same_repository_open_rejects_across_pages() {
         let first = decoded_page("G", None, Some(node(1, "ONE", "G", "OPEN")), Some("next"), true);
         let second =
@@ -1814,11 +1535,11 @@ mod tests {
     #[test]
     fn identity_number_node_and_pair_collisions_reject_across_ids_and_pages() {
         for (second_number, second_node) in [(1, "TWO"), (2, "ONE"), (1, "ONE")] {
-            let first = decoded_page("A", None, Some(node(1, "ONE", "A", "CLOSED")), None, true);
+            let first = decoded_page("A", None, Some(node(1, "ONE", "A", "OPEN")), None, true);
             let second = decoded_page(
                 "B",
                 None,
-                Some(node(second_number, second_node, "B", "CLOSED")),
+                Some(node(second_number, second_node, "B", "OPEN")),
                 None,
                 false,
             );
@@ -1835,11 +1556,11 @@ mod tests {
 
         for (second_number, second_node) in [(1, "TWO"), (2, "ONE"), (1, "ONE")] {
             let first =
-                decoded_page("A", None, Some(node(1, "ONE", "A", "CLOSED")), Some("next"), true);
+                decoded_page("A", None, Some(node(1, "ONE", "A", "OPEN")), Some("next"), true);
             let second = decoded_page(
                 "A",
                 Some("next"),
-                Some(node(second_number, second_node, "A", "CLOSED")),
+                Some(node(second_number, second_node, "A", "OPEN")),
                 None,
                 false,
             );
@@ -1856,21 +1577,29 @@ mod tests {
     }
 
     #[test]
-    fn fork_and_terminal_projection_fields_are_not_interpreted() {
-        for mut row in [fork(1, "FORK", "G"), node(1, "TERMINAL", "G", "CLOSED")] {
-            for field in [
-                "title",
-                "body",
-                "baseRefName",
-                "baseRefOid",
-                "headRefOid",
-                "autoMergeRequest",
-                "isInMergeQueue",
-            ] {
-                row[field] = json!({ "arbitrary": [null, 17] });
-            }
+    fn fork_projection_fields_are_not_interpreted() {
+        let mut row = fork(1, "FORK", "G");
+        for field in [
+            "title",
+            "body",
+            "baseRefName",
+            "baseRefOid",
+            "headRefOid",
+            "autoMergeRequest",
+            "isInMergeQueue",
+        ] {
+            row[field] = json!({ "arbitrary": [null, 17] });
+        }
+        assert!(operation(vec![query("G", None)], true).decode_value(one_response(row)).is_ok());
+    }
+
+    #[test]
+    fn rows_outside_the_requested_open_lifecycle_are_rejected() {
+        for state in ["CLOSED", "MERGED"] {
+            let row = node(1, "ONE", "G", state);
             assert!(
-                operation(vec![query("G", None)], true).decode_value(one_response(row)).is_ok()
+                operation(vec![query("G", None)], true).decode_value(one_response(row)).is_err(),
+                "accepted {state} despite the OPEN-only query"
             );
         }
     }
@@ -1906,15 +1635,13 @@ mod tests {
             ("/data/repository/op0/nodes/0/isDraft", Value::Null),
             ("/data/repository/op0/nodes/0/isCrossRepository", json!(null)),
         ];
-        for state in ["OPEN", "CLOSED", "MERGED"] {
-            for (pointer, replacement) in &cases {
-                let mut value = one_response(node(1, "ONE", "G", state));
-                *value.pointer_mut(pointer).unwrap() = replacement.clone();
-                assert!(
-                    operation(vec![query("G", None)], true).decode_value(value).is_err(),
-                    "state={state}, pointer={pointer}"
-                );
-            }
+        for (pointer, replacement) in &cases {
+            let mut value = one_response(node(1, "ONE", "G", "OPEN"));
+            *value.pointer_mut(pointer).unwrap() = replacement.clone();
+            assert!(
+                operation(vec![query("G", None)], true).decode_value(value).is_err(),
+                "pointer={pointer}"
+            );
         }
 
         for field in [
@@ -1974,20 +1701,24 @@ mod tests {
             (json!({ "enabledAt": "now" }), true),
             (json!({ "enabledAt": null }), true),
         ] {
-            for in_queue in [false, true] {
-                let mut open = node(1, "ONE", "G", "OPEN");
-                open["autoMergeRequest"] = auto_merge_request.clone();
-                open["isInMergeQueue"] = json!(in_queue);
-                let complete = accumulator([id("G")])
-                    .unwrap()
-                    .record_batch(decoded_page("G", None, Some(open), None, true))
-                    .unwrap()
-                    .finish()
-                    .unwrap();
-                let LocalPullRequestObservation::Open(open) = &complete.local()[0] else {
-                    panic!("G must be open");
-                };
-                assert_eq!(open.has_landing_automation(), has_auto_merge_request || in_queue);
+            for is_draft in [false, true] {
+                for in_queue in [false, true] {
+                    let mut open = node(1, "ONE", "G", "OPEN");
+                    open["autoMergeRequest"] = auto_merge_request.clone();
+                    open["isDraft"] = json!(is_draft);
+                    open["isInMergeQueue"] = json!(in_queue);
+                    let complete = accumulator([id("G")])
+                        .unwrap()
+                        .record_batch(decoded_page("G", None, Some(open), None, true))
+                        .unwrap()
+                        .finish()
+                        .unwrap();
+                    let LocalPullRequestObservation::Open(open) = &complete.local()[0] else {
+                        panic!("G must be open");
+                    };
+                    assert_eq!(open.is_draft(), is_draft);
+                    assert_eq!(open.has_landing_automation(), has_auto_merge_request || in_queue);
+                }
             }
         }
     }
