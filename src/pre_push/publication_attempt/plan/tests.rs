@@ -2,7 +2,10 @@ use gix::ObjectId;
 
 use super::{
     super::{
-        github::{AbsentPullRequest, MAX_MUTATION_REQUEST_BYTES, ObservedBase, ObservedGithub},
+        github::{
+            AbsentPullRequest, MAX_MUTATION_REQUEST_BYTES, ObservedBase, ObservedGithub,
+            TestPullRequestProjection,
+        },
         history::ValidatedChangeHistory,
         refs::TestPushEffect,
     },
@@ -92,6 +95,7 @@ impl HistorySpec {
 enum PullRequestSpec {
     Absent,
     Open(OpenSpec),
+    OpenWithDuplicates(OpenSpec, Vec<OpenSpec>),
 }
 
 #[derive(Clone)]
@@ -180,10 +184,10 @@ fn inputs_with_repository(
             PullRequestSpec::Absent => {
                 LocalPullRequestObservation::Absent(AbsentPullRequest::for_plan_test(id(spec.id)))
             }
-            PullRequestSpec::Open(open) => {
+            PullRequestSpec::Open(open) | PullRequestSpec::OpenWithDuplicates(open, _) => {
                 let title = open.title.clone().unwrap_or_else(|| desired_title(spec.id));
                 let body = open.body.clone().unwrap_or_else(|| desired_body(spec.id));
-                LocalPullRequestObservation::Open(ManagedOpenPullRequest::for_plan_test(
+                let observed = ManagedOpenPullRequest::for_plan_test(
                     id(spec.id),
                     identity(open.number, &open.node),
                     open.head,
@@ -191,7 +195,24 @@ fn inputs_with_repository(
                     &title,
                     &body,
                     open.landing_automation,
-                ))
+                );
+                let duplicates = match &spec.pull_request {
+                    PullRequestSpec::OpenWithDuplicates(_, duplicates) => duplicates
+                        .iter()
+                        .map(|duplicate| {
+                            (
+                                identity(duplicate.number, &duplicate.node),
+                                duplicate.head,
+                                ObservedBase::for_plan_test(duplicate.base_kind, duplicate.base),
+                                duplicate.landing_automation,
+                            )
+                        })
+                        .collect(),
+                    PullRequestSpec::Absent | PullRequestSpec::Open(_) => Vec::new(),
+                };
+                LocalPullRequestObservation::Open(
+                    observed.with_duplicates_for_plan_test(duplicates),
+                )
             }
         })
         .collect();
@@ -714,21 +735,21 @@ fn every_published_owned_head_and_base_pair_is_independently_valid() {
     for head in heads {
         for base in bases {
             let pull_request = open_for_validation(&history, head, BaseKind::Owned, base, false);
-            validate_open(&history, &pull_request, BaseKind::Owned, &default).unwrap();
+            validate_open(&history, pull_request, BaseKind::Owned, &default).unwrap();
         }
     }
 
     let proposal = open_for_validation(&history, oid(20), BaseKind::Owned, bases[0], false);
-    assert!(validate_open(&history, &proposal, BaseKind::Owned, &default).is_err());
+    assert!(validate_open(&history, proposal, BaseKind::Owned, &default).is_err());
 
     let wrong_owned = open_for_validation(&history, heads[0], BaseKind::Owned, oid(999), false);
-    assert!(validate_open(&history, &wrong_owned, BaseKind::Owned, &default).is_err());
+    assert!(validate_open(&history, wrong_owned, BaseKind::Owned, &default).is_err());
 
     let exact_default =
         open_for_validation(&history, heads[0], BaseKind::Default, default.tip(), false);
-    validate_open(&history, &exact_default, BaseKind::Default, &default).unwrap();
+    validate_open(&history, exact_default, BaseKind::Default, &default).unwrap();
     let wrong_default = open_for_validation(&history, heads[0], BaseKind::Default, oid(999), false);
-    assert!(validate_open(&history, &wrong_default, BaseKind::Default, &default).is_err());
+    assert!(validate_open(&history, wrong_default, BaseKind::Default, &default).is_err());
 }
 
 #[test]
@@ -751,8 +772,7 @@ fn marker_base_and_landing_automation_rules_form_the_exact_truth_table() {
                         oid(10),
                         landing_automation,
                     );
-                    let accepted =
-                        validate_open(&history, &pull_request, desired, &default).is_ok();
+                    let accepted = validate_open(&history, pull_request, desired, &default).is_ok();
                     let expected = (marker || observed == BaseKind::Owned)
                         && (!landing_automation
                             || (observed == BaseKind::Default && desired == BaseKind::Default));
@@ -764,6 +784,131 @@ fn marker_base_and_landing_automation_rules_form_the_exact_truth_table() {
             }
         }
     }
+}
+
+#[test]
+fn duplicate_opens_close_before_the_canonical_update_in_one_projection_batch() {
+    let canonical = OpenSpec::new(1, oid(20), BaseKind::Default, oid(10));
+    let duplicates = vec![
+        OpenSpec::new(2, oid(20), BaseKind::Owned, oid(10)),
+        OpenSpec::new(3, oid(20), BaseKind::Default, oid(10)),
+    ];
+    let spec = EntrySpec {
+        id: "Gone",
+        history: HistorySpec::current(oid(20), oid(10), true),
+        pull_request: PullRequestSpec::OpenWithDuplicates(canonical, duplicates),
+    };
+
+    let stage = ready(plan(&[spec]).unwrap());
+    let operations = stage.projection.projection_operations_for_test();
+    assert!(matches!(
+        operations,
+        [
+            TestPullRequestProjection::Close(close_two),
+            TestPullRequestProjection::Close(close_three),
+            TestPullRequestProjection::Update(update),
+        ] if close_two.identity.number().get() == 2
+            && close_three.identity.number().get() == 3
+            && update.identity.number().get() == 1
+    ));
+    assert_eq!(stage.projection.projection_batches_for_test().len(), 1);
+}
+
+#[test]
+fn duplicate_repair_does_not_invent_a_canonical_update() {
+    let canonical = OpenSpec {
+        body: Some(single_desired_body()),
+        ..OpenSpec::new(7, oid(20), BaseKind::Default, oid(10))
+    };
+    let duplicate = OpenSpec::new(8, oid(20), BaseKind::Owned, oid(10));
+    let spec = EntrySpec {
+        id: "Gone",
+        history: HistorySpec::current(oid(20), oid(10), true),
+        pull_request: PullRequestSpec::OpenWithDuplicates(canonical, vec![duplicate]),
+    };
+
+    let stage = ready(plan(&[spec]).unwrap());
+    assert!(matches!(
+        stage.projection.projection_operations_for_test(),
+        [TestPullRequestProjection::Close(close)]
+            if close.identity.number().get() == 8
+    ));
+}
+
+#[test]
+fn markerless_multiple_opens_are_repairable_after_every_candidate_validates() {
+    let canonical = OpenSpec::new(1, oid(20), BaseKind::Owned, oid(10));
+    let duplicate = OpenSpec::new(2, oid(20), BaseKind::Owned, oid(10));
+    let spec = EntrySpec {
+        id: "Gone",
+        history: HistorySpec::current(oid(20), oid(10), false),
+        pull_request: PullRequestSpec::OpenWithDuplicates(canonical, vec![duplicate]),
+    };
+
+    let stage = ready(plan(&[spec]).unwrap());
+    assert_eq!(marker_destinations(&stage.marker_pushes), ["refs/tags/gherrit/Gone/pr"]);
+    assert!(matches!(
+        stage.projection.projection_operations_for_test(),
+        [
+            TestPullRequestProjection::Close(close),
+            TestPullRequestProjection::Update(update),
+        ] if close.identity.number().get() == 2
+            && update.identity.number().get() == 1
+            && update.base_branch.as_deref() == Some(DEFAULT_NAME)
+    ));
+}
+
+#[test]
+fn every_duplicate_must_have_valid_history_base_and_inert_landing_state() {
+    let default = default_branch(DEFAULT_NAME, oid(10));
+    let history = ValidatedChangeHistory::for_plan_test(
+        id("Gone"),
+        &[(oid(20), oid(10))],
+        (oid(20), oid(10)),
+        true,
+    );
+    for desired in [BaseKind::Default, BaseKind::Owned] {
+        for duplicate in [
+            (identity(8, "BAD_HEAD"), oid(99), BaseKind::Owned, oid(10), false),
+            (identity(8, "BAD_BASE"), oid(20), BaseKind::Owned, oid(99), false),
+            (identity(8, "AUTO_DEFAULT"), oid(20), BaseKind::Default, oid(10), true),
+            (identity(8, "AUTO_OWNED"), oid(20), BaseKind::Owned, oid(10), true),
+        ] {
+            let candidate =
+                open_for_validation(&history, oid(20), BaseKind::Default, oid(10), false)
+                    .with_duplicates_for_plan_test(vec![(
+                        duplicate.0,
+                        duplicate.1,
+                        ObservedBase::for_plan_test(duplicate.2, duplicate.3),
+                        duplicate.4,
+                    )]);
+            let node_id =
+                candidate.duplicate_identities().next().unwrap().node_id_for_test().to_owned();
+            assert!(
+                validate_open(&history, candidate, desired, &default).is_err(),
+                "accepted duplicate {} with desired base {desired:?}",
+                node_id
+            );
+        }
+    }
+
+    let invalid_last = open_for_validation(&history, oid(20), BaseKind::Default, oid(10), false)
+        .with_duplicates_for_plan_test(vec![
+            (
+                identity(8, "VALID_FIRST"),
+                oid(20),
+                ObservedBase::for_plan_test(BaseKind::Owned, oid(10)),
+                false,
+            ),
+            (
+                identity(9, "INVALID_LAST"),
+                oid(20),
+                ObservedBase::for_plan_test(BaseKind::Default, oid(10)),
+                true,
+            ),
+        ]);
+    let error = validate_open(&history, invalid_last, BaseKind::Default, &default).unwrap_err();
+    assert!(error.to_string().contains("#9"));
 }
 
 #[test]
@@ -896,7 +1041,7 @@ fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
         marker_destinations(&final_stage.marker_pushes),
         ["refs/tags/gherrit/Gtwo/pr", "refs/tags/gherrit/Gthree/pr", "refs/tags/gherrit/Gfour/pr",]
     );
-    let updates = final_stage.updates.operations_for_test();
+    let updates = final_stage.projection.operations_for_test();
     assert_eq!(
         updates.iter().map(|update| update.identity.number().get()).collect::<Vec<_>>(),
         [11, 22, 33, 44]
@@ -918,6 +1063,38 @@ fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
             assert_eq!(body.contains(&desired_body(other_id)), other_id == expected_id);
         }
     }
+}
+
+#[test]
+fn create_receipts_preserve_known_duplicate_closes_in_the_final_projection() {
+    let specs = [
+        EntrySpec {
+            id: "Gexisting",
+            history: HistorySpec::current(oid(20), oid(10), true),
+            pull_request: PullRequestSpec::OpenWithDuplicates(
+                OpenSpec::new(1, oid(20), BaseKind::Default, oid(10)),
+                vec![OpenSpec::new(2, oid(20), BaseKind::Owned, oid(10))],
+            ),
+        },
+        EntrySpec {
+            id: "Gmissing",
+            history: HistorySpec::absent(),
+            pull_request: PullRequestSpec::Absent,
+        },
+    ];
+    let stage = creates(plan(&specs).unwrap());
+    let final_stage = stage.complete_for_test(receipts(&[("Gmissing", 3, "PR_3")])).unwrap();
+
+    assert!(matches!(
+        final_stage.projection.projection_operations_for_test(),
+        [
+            TestPullRequestProjection::Close(close),
+            TestPullRequestProjection::Update(existing),
+            TestPullRequestProjection::Update(created),
+        ] if close.identity.number().get() == 2
+            && existing.identity.number().get() == 1
+            && created.identity.number().get() == 3
+    ));
 }
 
 #[test]
@@ -943,7 +1120,7 @@ fn root_and_nonroot_creates_share_the_owned_key_but_only_root_moves_final_base()
 
     let final_stage =
         stage.complete_for_test(receipts(&[("Groot", 1, "PR_1"), ("Gtip", 2, "PR_2")])).unwrap();
-    let updates = final_stage.updates.operations_for_test();
+    let updates = final_stage.projection.operations_for_test();
     assert_eq!(updates.len(), 2);
     assert_eq!(updates[0].base_branch.as_deref(), Some(DEFAULT_NAME));
     assert_eq!(updates[1].base_branch, None);
@@ -959,7 +1136,7 @@ fn a_marked_pull_request_moved_below_the_root_returns_to_its_owned_base() {
 
     let stage = ready(plan(&specs).unwrap());
     let moved = stage
-        .updates
+        .projection
         .operations_for_test()
         .iter()
         .find(|update| update.identity.number().get() == 2)
@@ -1011,6 +1188,35 @@ fn exact_update_preflight_after_receipts_still_precedes_marker_release() {
     let error = creates(plan(&[spec]).unwrap()).complete_for_test(receipts).err().unwrap();
     let limit = MAX_MUTATION_REQUEST_BYTES;
     assert!(error.to_string().contains(&format!("exceeds the {limit}-byte request limit")));
+}
+
+#[test]
+fn known_duplicate_closes_are_preflighted_before_a_create_dependent_plan_escapes() {
+    let mut duplicate = OpenSpec::new(2, oid(20), BaseKind::Default, oid(10));
+    duplicate.node = "N".repeat(MAX_MUTATION_REQUEST_BYTES);
+    let specs = [
+        EntrySpec {
+            id: "Gexisting",
+            history: HistorySpec::current(oid(20), oid(10), true),
+            pull_request: PullRequestSpec::OpenWithDuplicates(
+                OpenSpec::new(1, oid(20), BaseKind::Default, oid(10)),
+                vec![duplicate],
+            ),
+        },
+        EntrySpec {
+            id: "Gmissing",
+            history: HistorySpec::absent(),
+            pull_request: PullRequestSpec::Absent,
+        },
+    ];
+
+    let error = plan(&specs).err().expect("known close preflight must prevent a staged plan");
+    assert!(error.to_string().contains("GraphQL pull request projection at item 0 serializes to"));
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("exceeds the {MAX_MUTATION_REQUEST_BYTES}-byte request limit"))
+    );
 }
 
 #[test]
@@ -1079,7 +1285,7 @@ fn existing_projection_emits_exact_desired_values_for_differing_fields() {
             pull_request: PullRequestSpec::Open(open),
         };
         let stage = ready(plan(&[spec]).unwrap());
-        let updates = stage.updates.operations_for_test();
+        let updates = stage.projection.operations_for_test();
         assert_eq!(updates.len(), usize::from(mask != 0), "mask={mask:03b}");
         if let Some(update) = updates.first() {
             assert_eq!(
@@ -1127,7 +1333,7 @@ fn body_comparison_normalizes_only_crlf_pairs() {
         }),
     };
     let stage = ready(plan(&[spec]).unwrap());
-    assert!(stage.updates.operations_for_test().is_empty());
+    assert!(stage.projection.operations_for_test().is_empty());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

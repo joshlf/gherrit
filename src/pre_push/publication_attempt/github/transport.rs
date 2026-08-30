@@ -470,7 +470,10 @@ mod tests {
     use super::{
         super::{
             MAX_MUTATION_REQUEST_BYTES, PullRequestIdentity,
-            mutation::{PreparedCreates, PreparedUpdates, TestCreate, TestUpdate},
+            mutation::{
+                PreparedCreates, PreparedPullRequestProjection, PreparedUpdates, TestClose,
+                TestCreate, TestUpdate,
+            },
             observation::LocalPullRequestObservation,
             pull_request::PullRequestIdentityRegistry,
         },
@@ -858,6 +861,27 @@ mod tests {
             })
             .collect::<serde_json::Map<_, _>>();
         json!({ "data": data })
+    }
+
+    fn mixed_projection_request() -> Value {
+        json!({
+            "query": "mutation { op0: closePullRequest(input: { pullRequestId: \"PR2\", clientMutationId: \"gherrit:close:PR2\" }) { clientMutationId, pullRequest { number, id, state } } op1: updatePullRequest(input: { pullRequestId: \"PR1\", title: \"title 1\", clientMutationId: \"gherrit:update:PR1\" }) { clientMutationId, pullRequest { number, id, state } } }"
+        })
+    }
+
+    fn mixed_projection_response() -> Value {
+        json!({
+            "data": {
+                "op0": {
+                    "clientMutationId": "gherrit:close:PR2",
+                    "pullRequest": { "number": 2, "id": "PR2", "state": "CLOSED" },
+                },
+                "op1": {
+                    "clientMutationId": "gherrit:update:PR1",
+                    "pullRequest": { "number": 1, "id": "PR1", "state": "OPEN" },
+                },
+            },
+        })
     }
 
     #[test]
@@ -1357,6 +1381,45 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(requests.len(), 2);
+        assert!(error.to_string().contains("acknowledgement is indeterminate"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_closes_and_canonical_updates_share_one_request() {
+        let (api_url, server) = scripted_peer(vec![exchange(
+            mixed_projection_request(),
+            Reply::Json(mixed_projection_response()),
+        )])
+        .await;
+        let projection = PreparedPullRequestProjection::for_projection_test(
+            vec![TestClose { identity: PullRequestIdentity::new(2, "PR2".to_owned()).unwrap() }],
+            vec![test_update(1)],
+        )
+        .unwrap();
+        test_github(&api_url, test_timeouts()).project_pull_requests(projection).await.unwrap();
+        let requests = finish_peer(server).await;
+
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_close_receipt_makes_the_mixed_projection_indeterminate() {
+        let mut response = mixed_projection_response();
+        response["data"]["op0"]["pullRequest"]["state"] = json!("OPEN");
+        let (api_url, server) =
+            scripted_peer(vec![exchange(mixed_projection_request(), Reply::Json(response))]).await;
+        let projection = PreparedPullRequestProjection::for_projection_test(
+            vec![TestClose { identity: PullRequestIdentity::new(2, "PR2".to_owned()).unwrap() }],
+            vec![test_update(1)],
+        )
+        .unwrap();
+        let error = test_github(&api_url, test_timeouts())
+            .project_pull_requests(projection)
+            .await
+            .unwrap_err();
+        let requests = finish_peer(server).await;
+
+        assert_eq!(requests.len(), 1);
         assert!(error.to_string().contains("acknowledgement is indeterminate"));
     }
 
