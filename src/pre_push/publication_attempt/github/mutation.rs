@@ -14,12 +14,11 @@ use serde_json::{Map, Value, json};
 
 use super::{
     super::{body::GeneratedBody, refs::PublicationRevision},
-    RepositoryNodeId,
+    MAX_MUTATION_ALIASES, MAX_MUTATION_REQUEST_BYTES, RepositoryNodeId,
     pull_request::{PullRequestIdentity, PullRequestIdentityRegistry},
     transport::{Github, indeterminate_mutation},
 };
 use crate::pre_push::{
-    batching::{MAX_MUTATION_ALIASES, MAX_MUTATION_REQUEST_BYTES},
     json::UniqueJson,
     local::{GherritPrId, PullRequestTitle},
 };
