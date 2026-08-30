@@ -1,14 +1,14 @@
-//! One exact-local publication attempt.
+//! The exact-local publication workflow being prepared behind a private
+//! boundary.
 //!
-//! [`run`] is the only operation visible to the parent pre-push module. It
-//! derives the destination and local stack, observes Git and GitHub, plans the
-//! complete publication, and consumes every effect stage before returning.
-//! No observation, client, action, receipt, or continuation crosses this
-//! module boundary.
+//! The parent pre-push module does not call [`run`] until hook validation and
+//! runtime selection are activated. Keeping the candidate workflow here lets
+//! its observation, planning, recovery, and effect boundaries compile and test
+//! together before that switch.
 
 #![cfg_attr(
     test,
-    allow(dead_code, reason = "the complete exact workflow remains dormant until activation")
+    expect(dead_code, reason = "the candidate exact workflow remains dormant until activation")
 )]
 
 mod body;
@@ -21,57 +21,310 @@ mod remote;
 mod semantic_oracle;
 mod version;
 
-use color_eyre::eyre::{Context as _, Result, bail};
+use color_eyre::eyre::{Context as _, Result, bail, eyre};
+use gix::ObjectId;
 use owo_colors::OwoColorize as _;
 
-use self::github::Github;
-use super::{GithubEndpoint, destination::PushDestination, local::LocalStack};
-use crate::util::{self, HeadState};
+use self::{
+    github::{Github, ObservedGithub},
+    history::ValidatedChangeHistory,
+};
+use super::{
+    GithubEndpoint,
+    destination::{DefaultBranch, ObservedPublicBranch, PushDestination, RemoteBranchState},
+    local::LocalStack,
+};
+use crate::{
+    manage::{PublicBranchName, State},
+    util,
+};
 
-/// Runs the complete publication protocol behind one private boundary.
+/// A public branch checked against the repository default observed by the
+/// same publication attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicBranch(PublicBranchName);
+
+impl PublicBranch {
+    fn new(name: PublicBranchName, default_branch: &DefaultBranch) -> Result<Self> {
+        if ref_paths_conflict(name.as_str(), default_branch.name()) {
+            bail!("A public GHerrit branch cannot conflict with the repository default branch");
+        }
+        Ok(Self(name))
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+/// A checked public branch paired with the exact state observed for it.
+struct ObservedPublicProjection {
+    branch: PublicBranch,
+    state: RemoteBranchState,
+}
+
+impl ObservedPublicProjection {
+    fn new(observed: ObservedPublicBranch, default_branch: &DefaultBranch) -> Result<Self> {
+        let (name, state) = observed.into_parts();
+        Ok(Self { branch: PublicBranch::new(name, default_branch)?, state })
+    }
+
+    fn into_parts(self) -> (PublicBranch, RemoteBranchState) {
+        (self.branch, self.state)
+    }
+}
+
+fn ref_paths_conflict(left: &str, right: &str) -> bool {
+    left == right
+        || left.strip_prefix(right).is_some_and(|suffix| suffix.starts_with('/'))
+        || right.strip_prefix(left).is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// The complete local decision captured before remote observation begins.
+enum LocalPublicationIntent {
+    Unmanaged(String),
+    Managed(ManagedLocalPublication),
+}
+
+/// One managed branch's immutable local input for this attempt.
+struct ManagedLocalPublication {
+    branch_name: String,
+    head: ObjectId,
+    public_branch: Option<PublicBranchName>,
+}
+
+/// Local intent, initial remote evidence, and the sole destination capability
+/// which produced that evidence.
+///
+/// Production can construct this value only by observing the public branch
+/// selected by the same captured branch/head pair used to collect `stack`.
+/// This keeps the initial default/public evidence inseparable from its
+/// destination and local intent. Complete remote and GitHub evidence joins it
+/// in [`CompletePublicationObservation`] before planning.
+struct ObservedLocalPublication {
+    destination: PushDestination,
+    stack: LocalStack,
+    public_branch: Option<ObservedPublicProjection>,
+}
+
+/// Every observation which authorizes one nonempty publication plan.
+///
+/// The only production constructor is the straight-line parallel observation
+/// in [`ObservedLocalPublication::publish`]. Planning cannot receive remote
+/// histories or GitHub evidence separately from the local intent and exact
+/// destination which produced them.
+struct CompletePublicationObservation {
+    local: ObservedLocalPublication,
+    histories: Box<[ValidatedChangeHistory]>,
+    github: ObservedGithub,
+}
+
+impl CompletePublicationObservation {
+    fn into_parts(
+        self,
+    ) -> (ObservedLocalPublication, Box<[ValidatedChangeHistory]>, ObservedGithub) {
+        (self.local, self.histories, self.github)
+    }
+
+    #[cfg(test)]
+    fn for_plan_test(
+        local: ObservedLocalPublication,
+        histories: Box<[ValidatedChangeHistory]>,
+        github: ObservedGithub,
+    ) -> Self {
+        Self { local, histories, github }
+    }
+}
+
+impl LocalPublicationIntent {
+    fn capture(repository: &util::Repo) -> Result<Self> {
+        let head = repository
+            .branch_head_snapshot()?
+            .ok_or_else(|| eyre!("Cannot push from detached HEAD"))?;
+        let (branch_name, target) = head.into_parts();
+
+        let public_branch = match State::read_required_from(repository, &branch_name)? {
+            State::Unmanaged => return Ok(Self::Unmanaged(branch_name)),
+            State::Private => None,
+            State::Public => Some(PublicBranchName::new(branch_name.clone())?),
+        };
+        let target = target.ok_or_else(|| {
+            eyre!("Cannot publish managed branch '{branch_name}' because it has no commits")
+        })?;
+        Ok(Self::Managed(ManagedLocalPublication { branch_name, head: target, public_branch }))
+    }
+}
+
+impl ManagedLocalPublication {
+    async fn observe(
+        self,
+        repository: &util::Repo,
+        destination: PushDestination,
+    ) -> Result<ObservedLocalPublication> {
+        let Self { branch_name, head, public_branch } = self;
+        let initial = destination.observe_initial(public_branch).await?;
+        let (destination, default_branch, public_branch) = initial.into_parts();
+        let public_branch = public_branch
+            .map(|observed| ObservedPublicProjection::new(observed, &default_branch))
+            .transpose()?;
+        let stack = LocalStack::collect_captured(repository, &branch_name, head, default_branch)
+            .wrap_err("Failed to collect commits")?;
+        Ok(ObservedLocalPublication { destination, stack, public_branch })
+    }
+}
+
+impl ObservedLocalPublication {
+    fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.stack.len()
+    }
+
+    fn into_parts(self) -> (PushDestination, LocalStack, Option<ObservedPublicProjection>) {
+        (self.destination, self.stack, self.public_branch)
+    }
+
+    #[cfg(test)]
+    fn for_plan_test(
+        destination: PushDestination,
+        stack: LocalStack,
+        public_branch: Option<ObservedPublicBranch>,
+    ) -> Self {
+        let public_branch = public_branch.map(|observed| {
+            ObservedPublicProjection::new(observed, stack.default_branch()).unwrap()
+        });
+        Self { destination, stack, public_branch }
+    }
+
+    async fn publish(self, repository: &util::Repo, endpoint: &GithubEndpoint) -> Result<usize> {
+        if self.is_empty() {
+            plan::plan_empty_publication(self)?.execute().await?;
+            return Ok(0);
+        }
+        if endpoint.is_disabled() {
+            bail!(
+                "The GHerrit test driver cannot publish PRs without a configured GitHub endpoint"
+            );
+        }
+        if let Some(api_url) = endpoint.custom_url() {
+            log::warn!("Using custom GitHub API URL: {api_url}");
+        }
+
+        let count = self.len();
+        let github = Github::new(endpoint, &self.destination)?;
+        let (histories, observed) = tokio::try_join!(
+            remote::observe_and_validate_histories(&self.stack, repository, &self.destination),
+            github.observe_local_pull_requests(&self.stack),
+        )?;
+        let observation =
+            CompletePublicationObservation { local: self, histories, github: observed };
+        plan::plan_publication(observation)?.execute().await?;
+        Ok(count)
+    }
+}
+
+/// Runs the prepared publication protocol behind one private boundary.
 ///
 /// Callers cannot assemble a destination, observation, client, plan, or
 /// effect. This function derives each value from the supplied repository and
 /// consumes the complete attempt before returning.
 pub(super) async fn run(repository: &util::Repo, endpoint: &GithubEndpoint) -> Result<()> {
-    let branch_name = match repository.current_branch() {
-        HeadState::Attached(name) | HeadState::Pending(name) => name,
-        HeadState::Detached => bail!("Cannot push from detached HEAD"),
+    let managed = match LocalPublicationIntent::capture(repository)? {
+        LocalPublicationIntent::Unmanaged(branch_name) => {
+            log::info!("Branch {} is UNMANAGED. Allowing standard push.", branch_name.yellow());
+            return Ok(());
+        }
+        LocalPublicationIntent::Managed(managed) => managed,
     };
-
-    if !repository.is_managed(branch_name)? {
-        log::info!("Branch {} is UNMANAGED. Allowing standard push.", branch_name.yellow());
-        return Ok(());
-    }
+    let branch_name = managed.branch_name.clone();
     log::info!("Branch {} is MANAGED. Publishing stack...", branch_name.yellow());
 
     let configured_remote = repository
         .default_remote_name()
         .wrap_err("Failed to read the configured GHerrit remote")?;
     let destination = PushDestination::resolve(repository, configured_remote)?;
-    let default_branch = destination.observe_default_branch().await?;
-    let stack =
-        LocalStack::collect(repository, &default_branch).wrap_err("Failed to collect commits")?;
-
-    if stack.is_empty() {
+    let count =
+        managed.observe(repository, destination).await?.publish(repository, endpoint).await?;
+    if count == 0 {
         log::info!("No commits to publish.");
-        return Ok(());
+    } else {
+        let noun = if count == 1 { "commit" } else { "commits" };
+        log::info!("Successfully published {count} {noun}.");
     }
-    if endpoint.is_disabled() {
-        bail!("The GHerrit test driver cannot sync PRs without a configured GitHub endpoint");
-    }
-    if let Some(api_url) = endpoint.custom_url() {
-        log::warn!("Using custom GitHub API URL: {api_url}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_capture_models_each_checked_management_mode() {
+        enum Expected {
+            Unmanaged,
+            Managed(Option<&'static str>),
+        }
+
+        for (branch_name, configured_state, expected) in [
+            ("ordinary-stack", "false", Expected::Unmanaged),
+            ("private-stack", testutil::MANAGED_PRIVATE, Expected::Managed(None)),
+            ("public-stack", testutil::MANAGED_PUBLIC, Expected::Managed(Some("public-stack"))),
+        ] {
+            let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+            context.checkout_new(branch_name);
+            context.set_config(
+                &format!("branch.{branch_name}.gherritManaged"),
+                Some(configured_state),
+            );
+            let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+            let expected_head = ObjectId::from_hex(context.head_oid().as_bytes())
+                .expect("fixture HEAD is an object ID");
+
+            match (expected, LocalPublicationIntent::capture(&repository).unwrap()) {
+                (Expected::Unmanaged, LocalPublicationIntent::Unmanaged(observed)) => {
+                    assert_eq!(observed, branch_name);
+                }
+                (Expected::Managed(expected_public), LocalPublicationIntent::Managed(observed)) => {
+                    assert_eq!(observed.branch_name, branch_name);
+                    assert_eq!(observed.head, expected_head);
+                    assert_eq!(
+                        observed.public_branch.as_ref().map(PublicBranchName::as_str),
+                        expected_public
+                    );
+                }
+                _ => panic!("capture disagreed with configured management state"),
+            }
+        }
     }
 
-    let github = Github::new(endpoint, &destination)?;
-    let public_branch = super::public_stack_branch(repository, branch_name);
-    let (validated, observed) = tokio::try_join!(
-        remote::observe_and_validate_histories(&stack, repository, destination),
-        github.observe_local_pull_requests(&stack),
-    )?;
-    let count = stack.len();
-    plan::plan_publication(validated, observed, public_branch, stack)?.execute().await?;
-    log::info!("Successfully published {count} commits.");
-    Ok(())
+    #[tokio::test]
+    async fn captured_empty_public_stack_projects_unicode_c1_to_the_exact_default_tip() {
+        const BRANCH: &str = "public-\u{85}stack";
+
+        let context =
+            testutil::TestContextBuilder::new("unused").with_remote().with_initial_commit().build();
+        context.checkout_new(BRANCH);
+        context
+            .set_config(&format!("branch.{BRANCH}.gherritManaged"), Some(testutil::MANAGED_PUBLIC));
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let expected = ObjectId::from_hex(context.head_oid().as_bytes()).unwrap();
+        let LocalPublicationIntent::Managed(managed) =
+            LocalPublicationIntent::capture(&repository).unwrap()
+        else {
+            panic!("the configured public branch must be managed")
+        };
+        let remote = repository.default_remote_name().unwrap();
+        let destination = PushDestination::resolve(&repository, remote).unwrap();
+
+        let observed = managed.observe(&repository, destination).await.unwrap();
+        assert!(observed.is_empty());
+        plan::plan_empty_publication(observed).unwrap().execute().await.unwrap();
+
+        assert_eq!(
+            context.remote_ref_oid(&format!("refs/heads/{BRANCH}")),
+            Some(expected.to_string())
+        );
+    }
 }
