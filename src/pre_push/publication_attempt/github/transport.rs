@@ -469,16 +469,14 @@ mod tests {
 
     use super::{
         super::{
-            PullRequestIdentity,
+            MAX_MUTATION_REQUEST_BYTES, PullRequestIdentity,
             mutation::{PreparedCreates, PreparedUpdates, TestCreate, TestUpdate},
             observation::LocalPullRequestObservation,
             pull_request::PullRequestIdentityRegistry,
         },
         *,
     };
-    use crate::pre_push::{
-        batching::MAX_MUTATION_REQUEST_BYTES, destination::DefaultBranch, local::GherritPrId,
-    };
+    use crate::pre_push::{destination::DefaultBranch, local::GherritPrId};
 
     const SERVER_STEP_TIMEOUT: Duration = Duration::from_secs(2);
     const EXTRA_REQUEST_WINDOW: Duration = Duration::from_millis(550);
