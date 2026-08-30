@@ -86,30 +86,23 @@ impl ObservedBase {
     }
 }
 
-/// Same-repository OPEN evidence for one exact local change.
+/// The history and policy evidence retained for one same-repository OPEN row.
 ///
-/// The requested connection already proves the head branch name, so storing it
-/// again would make disagreement representable. Construction remains private
-/// to this observation boundary.
+/// The requested connection and enclosing value retain the head branch name,
+/// so storing it again would make disagreement representable.
 #[derive(Debug)]
-pub(in crate::pre_push::publication_attempt) struct ManagedOpenPullRequest {
-    id: GherritPrId,
+pub(in crate::pre_push::publication_attempt) struct ManagedOpenPullRequestCandidate {
     identity: PullRequestIdentity,
     head_oid: ObjectId,
     base: ObservedBase,
-    title: Box<str>,
-    body: Box<str>,
     has_landing_automation: bool,
 }
 
-impl ManagedOpenPullRequest {
-    #[allow(clippy::too_many_arguments)]
+impl ManagedOpenPullRequestCandidate {
     fn from_observation(
         default_branch: &str,
-        id: GherritPrId,
+        id: &GherritPrId,
         identity: PullRequestIdentity,
-        title: String,
-        body: String,
         base_name: String,
         base_oid: ObjectId,
         head_oid: ObjectId,
@@ -117,7 +110,7 @@ impl ManagedOpenPullRequest {
     ) -> Result<Self> {
         let kind = if base_name == default_branch {
             BaseKind::Default
-        } else if base_name == owned_base_name(&id) {
+        } else if base_name == owned_base_name(id) {
             BaseKind::Owned
         } else {
             let id = diagnostic_detail(id.as_str());
@@ -128,18 +121,11 @@ impl ManagedOpenPullRequest {
             );
         };
         Ok(Self {
-            id,
             identity,
             head_oid,
             base: ObservedBase { kind, oid: base_oid },
-            title: title.into_boxed_str(),
-            body: body.into_boxed_str(),
             has_landing_automation,
         })
-    }
-
-    pub(in crate::pre_push::publication_attempt) fn id(&self) -> &GherritPrId {
-        &self.id
     }
 
     pub(in crate::pre_push::publication_attempt) fn identity(&self) -> &PullRequestIdentity {
@@ -154,6 +140,87 @@ impl ManagedOpenPullRequest {
         self.base
     }
 
+    pub(in crate::pre_push::publication_attempt) fn has_landing_automation(&self) -> bool {
+        self.has_landing_automation
+    }
+}
+
+/// All same-repository OPEN evidence for one exact local change.
+///
+/// The lowest-numbered row is the canonical projection. Every later row is a
+/// repairable duplicate. Construction is private, so the canonical candidate
+/// is always present and duplicates are always ordered by increasing immutable
+/// pull request number.
+#[derive(Debug)]
+pub(in crate::pre_push::publication_attempt) struct ManagedOpenPullRequest {
+    id: GherritPrId,
+    canonical: ManagedOpenPullRequestCandidate,
+    title: Box<str>,
+    body: Box<str>,
+    duplicates: Box<[ManagedOpenPullRequestCandidate]>,
+}
+
+impl ManagedOpenPullRequest {
+    fn from_observations(
+        default_branch: &str,
+        id: GherritPrId,
+        mut observations: Vec<OpenPullRequest>,
+    ) -> Result<Self> {
+        observations.sort_unstable_by_key(|open| open.identity.number().get());
+        let mut observations = observations.into_iter();
+        let canonical = observations.next().expect("the nonempty OPEN collection was checked");
+        let OpenPullRequest {
+            identity,
+            title,
+            body,
+            base_name,
+            base_oid,
+            head_oid,
+            has_landing_automation,
+        } = canonical;
+        let canonical = ManagedOpenPullRequestCandidate::from_observation(
+            default_branch,
+            &id,
+            identity,
+            base_name,
+            base_oid,
+            head_oid,
+            has_landing_automation,
+        )?;
+        let duplicates = observations
+            .map(|open| {
+                ManagedOpenPullRequestCandidate::from_observation(
+                    default_branch,
+                    &id,
+                    open.identity,
+                    open.base_name,
+                    open.base_oid,
+                    open.head_oid,
+                    open.has_landing_automation,
+                )
+            })
+            .collect::<Result<Box<[_]>>>()?;
+        Ok(Self {
+            id,
+            canonical,
+            title: title.into_boxed_str(),
+            body: body.into_boxed_str(),
+            duplicates,
+        })
+    }
+
+    pub(in crate::pre_push::publication_attempt) fn id(&self) -> &GherritPrId {
+        &self.id
+    }
+
+    pub(in crate::pre_push::publication_attempt) fn identity(&self) -> &PullRequestIdentity {
+        self.canonical.identity()
+    }
+
+    pub(in crate::pre_push::publication_attempt) fn base(&self) -> ObservedBase {
+        self.canonical.base()
+    }
+
     pub(in crate::pre_push::publication_attempt) fn title(&self) -> &str {
         &self.title
     }
@@ -162,8 +229,27 @@ impl ManagedOpenPullRequest {
         &self.body
     }
 
+    #[cfg(test)]
     pub(in crate::pre_push::publication_attempt) fn has_landing_automation(&self) -> bool {
-        self.has_landing_automation
+        self.canonical.has_landing_automation()
+    }
+
+    pub(in crate::pre_push::publication_attempt) fn canonical_candidate(
+        &self,
+    ) -> &ManagedOpenPullRequestCandidate {
+        &self.canonical
+    }
+
+    pub(in crate::pre_push::publication_attempt) fn duplicate_candidates(
+        &self,
+    ) -> impl Iterator<Item = &ManagedOpenPullRequestCandidate> {
+        self.duplicates.iter()
+    }
+
+    pub(in crate::pre_push::publication_attempt) fn duplicate_identities(
+        &self,
+    ) -> impl Iterator<Item = &PullRequestIdentity> {
+        self.duplicate_candidates().map(ManagedOpenPullRequestCandidate::identity)
     }
 
     #[cfg(test)]
@@ -178,13 +264,43 @@ impl ManagedOpenPullRequest {
     ) -> Self {
         Self {
             id,
-            identity,
-            head_oid,
-            base,
+            canonical: ManagedOpenPullRequestCandidate {
+                identity,
+                head_oid,
+                base,
+                has_landing_automation,
+            },
             title: title.into(),
             body: body.into(),
-            has_landing_automation,
+            duplicates: Box::new([]),
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn with_duplicates_for_plan_test(
+        mut self,
+        duplicates: Vec<(PullRequestIdentity, ObjectId, ObservedBase, bool)>,
+    ) -> Self {
+        let mut previous_number = self.canonical.identity.number().get();
+        let mut node_ids = HashSet::from([self.canonical.identity.node_id().as_str()]);
+        for (identity, ..) in &duplicates {
+            assert!(
+                identity.number().get() > previous_number,
+                "plan-test duplicate identities must follow canonical number order"
+            );
+            assert!(
+                node_ids.insert(identity.node_id().as_str()),
+                "plan-test duplicate identities must have distinct node IDs"
+            );
+            previous_number = identity.number().get();
+        }
+        self.duplicates = duplicates
+            .into_iter()
+            .map(|(identity, head_oid, base, has_landing_automation)| {
+                ManagedOpenPullRequestCandidate { identity, head_oid, base, has_landing_automation }
+            })
+            .collect();
+        self
     }
 }
 
@@ -293,7 +409,11 @@ impl CompleteLocalPullRequests {
         let mut identities = PullRequestIdentityRegistry::default();
         for observation in &local {
             if let LocalPullRequestObservation::Open(pull_request) = observation {
-                identities.insert_observation(pull_request.identity())?;
+                for candidate in std::iter::once(pull_request.canonical_candidate())
+                    .chain(pull_request.duplicate_candidates())
+                {
+                    identities.insert_observation(candidate.identity())?;
+                }
             }
         }
         for identity in additional_identities {
@@ -850,7 +970,7 @@ impl TerminalSummary {
 struct ConnectionObservation {
     progress: Progress,
     baseline_row_available: bool,
-    open: Option<OpenPullRequest>,
+    opens: Vec<OpenPullRequest>,
     terminal: Option<TerminalSummary>,
 }
 
@@ -869,7 +989,7 @@ impl Default for ConnectionObservation {
         Self {
             progress: Progress::Initial,
             baseline_row_available: true,
-            open: None,
+            opens: Vec::new(),
             terminal: None,
         }
     }
@@ -1087,13 +1207,7 @@ impl LocalPullRequestAccumulator {
                 }
                 DecodedPullRequest::Open(open) => {
                     self.identities.insert_observation(&open.identity)?;
-                    if connection.open.is_some() {
-                        bail!(
-                            "GitHub has more than one same-repository OPEN pull request for '{}'",
-                            diagnostic_detail(id.as_str())
-                        );
-                    }
-                    connection.open = Some(open);
+                    connection.opens.push(open);
                 }
             }
         }
@@ -1163,7 +1277,8 @@ impl LocalPullRequestAccumulator {
         let mut terminal_representatives = Vec::new();
 
         for ConnectionSlot { id, observation: connection } in self.connections.into_vec() {
-            let terminal_is_violation = match (&connection.open, &connection.terminal) {
+            let canonical = connection.opens.iter().min_by_key(|open| open.identity.number().get());
+            let terminal_is_violation = match (canonical, &connection.terminal) {
                 (_, None) => false,
                 (None, Some(_)) => true,
                 (Some(open), Some(terminal)) => terminal.blocks(open),
@@ -1178,18 +1293,12 @@ impl LocalPullRequestAccumulator {
                 if terminal_representatives.len() < MAX_DIAGNOSTIC_IDENTITIES {
                     terminal_representatives.push((id, terminal));
                 }
-            } else if let Some(open) = connection.open {
+            } else if !connection.opens.is_empty() {
                 local.push(LocalPullRequestObservation::Open(
-                    ManagedOpenPullRequest::from_observation(
+                    ManagedOpenPullRequest::from_observations(
                         default_branch,
                         id,
-                        open.identity,
-                        open.title,
-                        open.body,
-                        open.base_name,
-                        open.base_oid,
-                        open.head_oid,
-                        open.has_landing_automation,
+                        connection.opens,
                     )?,
                 ));
             } else {
@@ -1830,17 +1939,25 @@ mod tests {
     }
 
     #[test]
-    fn a_second_same_repository_open_rejects_across_pages() {
-        let first = decoded_page("G", None, Some(node(1, "ONE", "G", "OPEN")), Some("next"), true);
+    fn multiple_opens_are_sorted_into_canonical_and_duplicate_rows() {
+        let first = decoded_page("G", None, Some(node(2, "TWO", "G", "OPEN")), Some("next"), true);
         let second =
-            decoded_page("G", Some("next"), Some(node(2, "TWO", "G", "OPEN")), None, false);
-        assert!(
-            accumulator([id("G")])
-                .unwrap()
-                .record_batch(first)
-                .unwrap()
-                .record_batch(second)
-                .is_err()
+            decoded_page("G", Some("next"), Some(node(1, "ONE", "G", "OPEN")), None, false);
+        let complete = accumulator([id("G")])
+            .unwrap()
+            .record_batch(first)
+            .unwrap()
+            .record_batch(second)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let LocalPullRequestObservation::Open(open) = &complete.local()[0] else {
+            panic!("G must have OPEN rows");
+        };
+        assert_eq!(open.identity().number().get(), 1);
+        assert_eq!(
+            open.duplicate_identities().map(|identity| identity.number().get()).collect::<Vec<_>>(),
+            [2]
         );
     }
 
