@@ -316,6 +316,70 @@ fn lost_update_acknowledgement_recovers_without_replaying_the_mutation() {
 }
 
 #[test]
+fn duplicate_repair_recovers_after_losing_the_mixed_projection_response() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("duplicate-repair");
+    let id = ctx.commit_with_gherrit_id("Initial canonical pull request");
+    ctx.hook_cmd("pre-push").assert().success();
+    let canonical = ctx.github().pull_requests().pop().unwrap();
+    ctx.github().seed_pull_request(testutil::PullRequestSeed {
+        number: 12,
+        title: "Delayed duplicate".to_string(),
+        body: String::new(),
+        head: id.clone(),
+        base: format!("gherrit-bases/{id}"),
+    });
+    ctx.amend_with_message("Repair duplicate pull requests");
+    let requests_before_repair = ctx.github().requests().len();
+    ctx.inject_failure(testutil::FailureKind::ClosePrApplyThenDisconnect);
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("acknowledgement is indeterminate"));
+    ctx.assert_failure_consumed();
+
+    let repaired = ctx.github().pull_requests();
+    assert_eq!(repaired[0].number, canonical.number);
+    assert_eq!(repaired[0].state, testutil::PullRequestState::Open);
+    assert_eq!(repaired[0].title, "Repair duplicate pull requests");
+    assert_eq!(repaired[1].number, 12);
+    assert_eq!(repaired[1].state, testutil::PullRequestState::Closed);
+    assert_eq!(
+        &ctx.github().requests()[requests_before_repair..],
+        [
+            vec![testutil::GraphQlOperation::open_query([id.clone()], true)],
+            vec![testutil::GraphQlOperation::open_query(
+                [testutil::PullRequestConnectionQuery::after(
+                    id.clone(),
+                    format!("cursor:open:{id}:1"),
+                )],
+                false,
+            )],
+            vec![testutil::GraphQlOperation::ClosePr, testutil::GraphQlOperation::UpdatePr,],
+        ],
+        "duplicate closure and canonical update share one ordered projection request"
+    );
+
+    let requests_before_retry = ctx.github().requests().len();
+    let pushes_before_retry = ctx.recorded_pushes().len();
+    ctx.hook_cmd("pre-push").assert().success();
+
+    assert_eq!(ctx.github().pull_requests(), repaired);
+    assert_eq!(ctx.recorded_pushes().len(), pushes_before_retry);
+    assert_eq!(
+        &ctx.github().requests()[requests_before_retry..],
+        &[vec![testutil::GraphQlOperation::open_query([id], true)]],
+        "fresh observation must recognize the durable repair without replaying it"
+    );
+}
+
+#[test]
 fn mixed_established_and_new_stack_publishes_only_the_new_change() {
     let ctx = testutil::test_context!()
         .with_remote()

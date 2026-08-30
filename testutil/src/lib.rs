@@ -481,6 +481,8 @@ pub enum FailureKind {
     CreatePrHttp(RetryableHttpStatus),
     SecondCreatePrHttp(RetryableHttpStatus),
     CreatePrRedirect(RedirectStatus),
+    ClosePr,
+    ClosePrApplyThenDisconnect,
     UpdatePr,
     UpdatePrApplyThenDisconnect,
     Git(GitOperation),
@@ -497,6 +499,7 @@ pub enum GraphQlOperation {
     OpenQuery { connections: Vec<PullRequestConnectionQuery>, include_repository_facts: bool },
     TerminalQuery { connections: Vec<PullRequestConnectionQuery> },
     CreatePr,
+    ClosePr,
     UpdatePr,
 }
 

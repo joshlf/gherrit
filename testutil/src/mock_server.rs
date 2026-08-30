@@ -167,6 +167,7 @@ fn check_and_apply_graphql_failure(
         SecondCreatePrHttp(_) => {
             create_request_number == 2 && operations.contains(&GraphQlOperation::CreatePr)
         }
+        ClosePr | ClosePrApplyThenDisconnect => operations.contains(&GraphQlOperation::ClosePr),
         UpdatePr | UpdatePrApplyThenDisconnect => operations.contains(&GraphQlOperation::UpdatePr),
         Git(_) | GitPushOutput { .. } => false,
     };
@@ -234,6 +235,7 @@ fn graphql_operations(
                     }
                 }
                 "createPullRequest" => GraphQlOperation::CreatePr,
+                "closePullRequest" => GraphQlOperation::ClosePr,
                 "updatePullRequest" => GraphQlOperation::UpdatePr,
                 _ => continue,
             };
@@ -750,6 +752,38 @@ fn validate_update_field(field: &executable::Field) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_close_field(field: &executable::Field) -> Result<(), String> {
+    const PATH: &str = "closePullRequest";
+    validate_argument_names(field, PATH, &["input"])?;
+    let input = input_object(field, PATH)?;
+    validate_input_fields(input, PATH, &["pullRequestId", "clientMutationId"])?;
+    required_string_field(input, "pullRequestId", PATH)?;
+    required_string_field(input, "clientMutationId", PATH)?;
+
+    for field in
+        validate_exact_fields(&field.selection_set, PATH, &["clientMutationId", "pullRequest"])?
+    {
+        match field.name.as_str() {
+            "clientMutationId" => {}
+            "pullRequest" => {
+                for field in validate_exact_fields(
+                    &field.selection_set,
+                    "closePullRequest.pullRequest",
+                    &["number", "id", "state"],
+                )? {
+                    validate_scalar_fields(
+                        &field.selection_set,
+                        "closePullRequest.pullRequest.scalar",
+                        &[],
+                    )?;
+                }
+            }
+            _ => unreachable!("the exact close field set was checked"),
+        }
+    }
+    Ok(())
+}
+
 fn validate_supported_document(
     document: &ExecutableDocument,
     variables: &GraphQlVariables,
@@ -772,10 +806,19 @@ fn validate_supported_document(
             "The mock GitHub API requires exactly one repository root field per query".to_string()
         );
     }
+    let has_create = fields.iter().any(|field| field.name == "createPullRequest");
+    let has_projection = fields
+        .iter()
+        .any(|field| matches!(field.name.as_str(), "closePullRequest" | "updatePullRequest"));
+    if has_create && has_projection {
+        return Err("The mock GitHub API does not mix pull request creation with final projection"
+            .to_string());
+    }
     for field in fields {
         match field.name.as_str() {
             "repository" => validate_repository_field(field, variables)?,
             "createPullRequest" => validate_create_field(field)?,
+            "closePullRequest" => validate_close_field(field)?,
             "updatePullRequest" => validate_update_field(field)?,
             _ => {
                 return Err(format!(
@@ -859,7 +902,9 @@ async fn graphql(
     {
         if matches!(
             failure,
-            FailureKind::CreatePrApplyThenDisconnect | FailureKind::UpdatePrApplyThenDisconnect
+            FailureKind::CreatePrApplyThenDisconnect
+                | FailureKind::ClosePrApplyThenDisconnect
+                | FailureKind::UpdatePrApplyThenDisconnect
         ) {
             let branch_oids = match remote_branch_oids(&app_state) {
                 Ok(branches) => branches,
@@ -869,14 +914,15 @@ async fn graphql(
             for operation in document.operations.iter() {
                 for selection in &operation.selection_set.selections {
                     let executable::Selection::Field(field) = selection else { continue };
-                    let result = match failure {
-                        FailureKind::CreatePrApplyThenDisconnect => {
+                    let result = match field.name.as_str() {
+                        "createPullRequest" => {
                             handle_create_pr(&mut mock_state, field, &branch_oid)
                         }
-                        FailureKind::UpdatePrApplyThenDisconnect => {
+                        "closePullRequest" => handle_close_pr(&mut mock_state, field),
+                        "updatePullRequest" => {
                             handle_update_pr(&mut mock_state, field, &branch_oid)
                         }
-                        _ => unreachable!("apply-then-disconnect fault was checked above"),
+                        _ => unreachable!("request was checked by validate_supported_document"),
                     };
                     if let Err(message) = result {
                         return graphql_http_error(&message);
@@ -903,8 +949,9 @@ async fn graphql(
                 let alias = response_key(field);
 
                 let result = match field.name.as_str() {
-                    "updatePullRequest" => handle_update_pr(&mut mock_state, field, &branch_oid),
                     "createPullRequest" => handle_create_pr(&mut mock_state, field, &branch_oid),
+                    "closePullRequest" => handle_close_pr(&mut mock_state, field),
+                    "updatePullRequest" => handle_update_pr(&mut mock_state, field, &branch_oid),
                     "repository" => handle_repository_query(
                         &mock_state,
                         field,
@@ -973,9 +1020,9 @@ fn graphql_failure_response(failure: FailureKind) -> Response {
             retryable_status(status)
         }
         CreatePrRedirect(status) => redirect_status(status),
-        GraphQl | CreatePr | UpdatePr => StatusCode::OK,
+        GraphQl | CreatePr | ClosePr | UpdatePr => StatusCode::OK,
         QueryTransport => unreachable!("handled above"),
-        CreatePrApplyThenDisconnect | UpdatePrApplyThenDisconnect => {
+        CreatePrApplyThenDisconnect | ClosePrApplyThenDisconnect | UpdatePrApplyThenDisconnect => {
             unreachable!("handled before response generation")
         }
         Git(_) | GitPushOutput { .. } => {
@@ -1125,6 +1172,49 @@ fn required_string_field(
         .ok_or_else(|| format!("The mock GitHub API requires string field `{path}.input.{key}`"))
 }
 
+fn handle_close_pr(
+    mock_state: &mut MockState,
+    field: &executable::Field,
+) -> Result<serde_json::Value, String> {
+    const PATH: &str = "closePullRequest";
+    let input = input_object(field, PATH)?;
+    let node_id = required_string_field(input, "pullRequestId", PATH)?;
+    let client_mutation_id = required_string_field(input, "clientMutationId", PATH)?;
+
+    let Some(pr) = mock_state.prs.iter_mut().find(|pr| pr.node_id == node_id) else {
+        return Err(format!("Pull request node `{node_id}` does not exist"));
+    };
+    if pr.state != PullRequestState::Open {
+        return Err(format!("Pull request node `{node_id}` is not OPEN and cannot be closed"));
+    }
+    pr.state = PullRequestState::Closed;
+
+    let mut response = serde_json::Map::new();
+    for field in selected_fields(&field.selection_set, PATH)? {
+        match field.name.as_str() {
+            "clientMutationId" => {
+                response.insert(response_key(field), serde_json::json!(client_mutation_id));
+            }
+            "pullRequest" => {
+                let mut pull_request = serde_json::Map::new();
+                for field in selected_fields(&field.selection_set, "closePullRequest.pullRequest")?
+                {
+                    let value = match field.name.as_str() {
+                        "number" => serde_json::json!(pr.number),
+                        "id" => serde_json::json!(pr.node_id),
+                        "state" => serde_json::json!(pr.state),
+                        _ => unreachable!("request was checked by validate_close_field"),
+                    };
+                    pull_request.insert(response_key(field), value);
+                }
+                response.insert(response_key(field), serde_json::Value::Object(pull_request));
+            }
+            _ => unreachable!("request was checked by validate_close_field"),
+        }
+    }
+    Ok(serde_json::Value::Object(response))
+}
+
 fn handle_update_pr(
     mock_state: &mut MockState,
     field: &executable::Field,
@@ -1219,13 +1309,6 @@ fn handle_create_pr(
         branch_oid(&base)?.ok_or_else(|| format!("Base branch `{base}` does not exist"))?;
     let head_oid =
         branch_oid(&head)?.ok_or_else(|| format!("Head branch `{head}` does not exist"))?;
-    if mock_state.prs.iter().any(|pr| {
-        pr.state == PullRequestState::Open
-            && pr.head.name == head
-            && !mock_state.cross_repository_prs.contains(&pr.number)
-    }) {
-        return Err(format!("An open pull request already exists for head branch `{head}`"));
-    }
     let number = mock_state.prs.iter().map(|pr| pr.number).max().unwrap_or(0) + 1;
     let mut entry =
         PrEntry::mock(MockPrArgs { number, title, body, head: head.clone(), base: base.clone() });
@@ -1577,6 +1660,31 @@ mod tests {
     }
 
     #[test]
+    fn close_faults_route_only_to_close_operations() {
+        let mut state = MockState {
+            faults: VecDeque::from([FailureKind::ClosePrApplyThenDisconnect, FailureKind::ClosePr]),
+            ..Default::default()
+        };
+
+        for operation in [
+            GraphQlOperation::open_query(["Ghead"], true),
+            GraphQlOperation::CreatePr,
+            GraphQlOperation::UpdatePr,
+        ] {
+            assert_eq!(apply_failure(&mut state, &[operation]), None);
+        }
+        assert_eq!(
+            apply_failure(&mut state, &[GraphQlOperation::ClosePr]),
+            Some(FailureKind::ClosePrApplyThenDisconnect)
+        );
+        assert_eq!(
+            apply_failure(&mut state, &[GraphQlOperation::ClosePr]),
+            Some(FailureKind::ClosePr)
+        );
+        assert!(state.faults.is_empty());
+    }
+
+    #[test]
     fn generic_graphql_failure_matches_any_operation() {
         let mut state =
             MockState { faults: VecDeque::from([FailureKind::GraphQl]), ..Default::default() };
@@ -1626,6 +1734,27 @@ mod tests {
              clientMutationId, pullRequest { number, id, state } } }",
         );
         validate_supported_document(&update, &None).unwrap();
+
+        let close = parse_document(
+            "mutation { op0: closePullRequest(input: { pullRequestId: \"PR_1\", \
+             clientMutationId: \"gherrit:close:PR_1\" }) { clientMutationId, \
+             pullRequest { number, id, state } } }",
+        );
+        validate_supported_document(&close, &None).unwrap();
+
+        let mixed = parse_document(
+            "mutation { close: closePullRequest(input: { pullRequestId: \"PR_1\", \
+             clientMutationId: \"gherrit:close:PR_1\" }) { clientMutationId, \
+             pullRequest { number, id, state } } update: updatePullRequest(input: \
+             { pullRequestId: \"PR_2\", title: \"Updated\", \
+             clientMutationId: \"gherrit:update:PR_2\" }) { clientMutationId, \
+             pullRequest { number, id, state } } }",
+        );
+        validate_supported_document(&mixed, &None).unwrap();
+        assert_eq!(
+            graphql_operations(&mixed, &None).unwrap(),
+            [GraphQlOperation::ClosePr, GraphQlOperation::UpdatePr]
+        );
     }
 
     #[test]
@@ -1668,6 +1797,18 @@ mod tests {
         assert!(validate_supported_document(&multiple_repositories, &None)
             .unwrap_err()
             .contains("exactly one repository root field"));
+
+        let create_and_projection = parse_document(
+            "mutation { create: createPullRequest(input: { repositoryId: \
+             \"REPO_NODE_ID\", baseRefName: \"main\", headRefName: \"Ghead\", \
+             title: \"Title\", clientMutationId: \"create\" }) { clientMutationId } \
+             update: updatePullRequest(input: { pullRequestId: \"PR_1\", \
+             title: \"Updated\", clientMutationId: \"update\" }) { \
+             clientMutationId } }",
+        );
+        assert!(validate_supported_document(&create_and_projection, &None)
+            .unwrap_err()
+            .contains("does not mix pull request creation with final projection"));
 
         let duplicate_mutation = parse_document(
             "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
@@ -1771,6 +1912,23 @@ mod tests {
         assert!(validate_supported_document(&update_without_state, &None)
             .unwrap_err()
             .contains("number, id, state"));
+
+        let close_without_client_id = parse_document(
+            "mutation { closePullRequest(input: { pullRequestId: \"PR_1\" }) { \
+             clientMutationId, pullRequest { number, id, state } } }",
+        );
+        assert!(validate_supported_document(&close_without_client_id, &None)
+            .unwrap_err()
+            .contains("clientMutationId"));
+
+        let close_without_state = parse_document(
+            "mutation { closePullRequest(input: { pullRequestId: \"PR_1\", \
+             clientMutationId: \"close\" }) { clientMutationId, \
+             pullRequest { number, id } } }",
+        );
+        assert!(validate_supported_document(&close_without_state, &None)
+            .unwrap_err()
+            .contains("number, id, state"));
     }
 
     #[test]
@@ -1856,6 +2014,70 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn mixed_projection_applies_close_before_update_in_request_order() {
+        let document = parse_document(
+            "mutation { close: closePullRequest(input: { pullRequestId: \"PR_1\", \
+             clientMutationId: \"gherrit:close:PR_1\" }) { clientMutationId, \
+             pullRequest { number, id, state } } update: updatePullRequest(input: \
+             { pullRequestId: \"PR_2\", title: \"Updated\", \
+             clientMutationId: \"gherrit:update:PR_2\" }) { clientMutationId, \
+             pullRequest { number, id, state } } }",
+        );
+        validate_supported_document(&document, &None).unwrap();
+        let fields =
+            selected_fields(&document.operations.iter().next().unwrap().selection_set, "operation")
+                .unwrap();
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
+        for number in [1, 2] {
+            state.add_pr(PrEntry::mock(MockPrArgs {
+                number,
+                title: "Old".to_string(),
+                body: String::new(),
+                head: format!("Ghead{number}"),
+                base: "main".to_string(),
+            }));
+        }
+
+        handle_close_pr(&mut state, fields[0]).unwrap();
+        handle_update_pr(&mut state, fields[1], &existing_branch).unwrap();
+
+        assert_eq!(state.prs[0].state, PullRequestState::Closed);
+        assert_eq!(state.prs[1].title, "Updated");
+        assert_eq!(state.prs[1].state, PullRequestState::Open);
+    }
+
+    #[test]
+    fn close_handler_changes_exact_open_identity_and_returns_closed_receipt() {
+        let document = parse_document(
+            "mutation { op0: closePullRequest(input: { pullRequestId: \"PR_7\", \
+             clientMutationId: \"gherrit:close:PR_7\" }) { clientMutationId, \
+             pullRequest { number, id, state } } }",
+        );
+        validate_supported_document(&document, &None).unwrap();
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
+        state.add_pr(PrEntry::mock(MockPrArgs {
+            number: 7,
+            title: "Title".to_string(),
+            body: "Body".to_string(),
+            head: "Ghead".to_string(),
+            base: "main".to_string(),
+        }));
+
+        let response = handle_close_pr(&mut state, root_field(&document)).unwrap();
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "clientMutationId": "gherrit:close:PR_7",
+                "pullRequest": { "number": 7, "id": "PR_7", "state": "CLOSED" }
+            })
+        );
+        assert_eq!(state.prs[0].state, PullRequestState::Closed);
+
+        let error = handle_close_pr(&mut state, root_field(&document)).unwrap_err();
+        assert!(error.contains("is not OPEN"), "unexpected error: {error}");
     }
 
     #[test]
@@ -2033,7 +2255,7 @@ mod tests {
     }
 
     #[test]
-    fn create_validates_same_repository_refs_uniqueness_and_numbering() {
+    fn create_allows_duplicate_open_requests_and_preserves_numbering() {
         let document = parse_document(
             "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
              headRepositoryId: \"REPO_NODE_ID\", baseRefName: \"main\", \
@@ -2049,17 +2271,21 @@ mod tests {
             head: "Gnew".to_string(),
             base: "main".to_string(),
         }));
-        state.cross_repository_prs.insert(7);
-
         let response =
             handle_create_pr(&mut state, root_field(&document), &existing_branch).unwrap();
         assert_eq!(response.pointer("/pullRequest/number"), Some(&serde_json::json!(8)));
         assert_eq!(state.prs.len(), 2);
 
-        let error =
-            handle_create_pr(&mut state, root_field(&document), &existing_branch).unwrap_err();
-        assert!(error.contains("already exists"));
-        assert_eq!(state.prs.len(), 2);
+        let response =
+            handle_create_pr(&mut state, root_field(&document), &existing_branch).unwrap();
+        assert_eq!(response.pointer("/pullRequest/number"), Some(&serde_json::json!(9)));
+        assert_eq!(state.prs.len(), 3);
+        assert!(state.prs.iter().all(|pr| pr.state == PullRequestState::Open));
+        assert!(state.prs.iter().all(|pr| pr.head.name == "Gnew"));
+        assert_eq!(
+            state.prs.iter().map(|pr| pr.node_id.as_str()).collect::<Vec<_>>(),
+            ["PR_7", "PR_8", "PR_9"]
+        );
 
         let mut state = MockState::new("owner".to_string(), "repo".to_string());
         let error = handle_create_pr(&mut state, root_field(&document), &|branch| {
@@ -2088,11 +2314,11 @@ mod tests {
         let mut state = MockState::new("owner".to_string(), "repo".to_string());
 
         handle_create_pr(&mut state, fields[0], &existing_branch).unwrap();
-        let error = handle_create_pr(&mut state, fields[1], &existing_branch).unwrap_err();
+        handle_create_pr(&mut state, fields[1], &existing_branch).unwrap();
 
-        assert!(error.contains("already exists"));
-        assert_eq!(state.prs.len(), 1, "the acknowledged first field remains applied");
+        assert_eq!(state.prs.len(), 2, "each acknowledged field remains applied");
         assert_eq!(state.prs[0].title, "First");
+        assert_eq!(state.prs[1].title, "Second");
     }
 
     #[test]

@@ -120,52 +120,6 @@ fn the_first_same_repository_terminal_row_rejects_observation() {
 }
 
 #[test]
-fn two_same_repository_open_rows_reject_before_any_push_or_mutation() {
-    let ctx = testutil::test_context!()
-        .with_remote()
-        .with_initial_commit()
-        .with_mock_github()
-        .with_git_interceptor()
-        .build();
-    ctx.checkout_managed_private("duplicate-open-observation");
-    let id = ctx.commit_with_gherrit_id("Observe every OPEN page before effects");
-    ctx.hook_cmd("pre-push").assert().success();
-    let pushes_before = ctx.recorded_pushes();
-    let requests_before = ctx.github().requests().len();
-    let pull_requests_before = ctx.github().pull_requests();
-    ctx.github().seed_pull_request(testutil::PullRequestSeed {
-        number: 10,
-        title: "Late duplicate".to_owned(),
-        body: String::new(),
-        head: id.clone(),
-        base: "main".to_owned(),
-    });
-    ctx.amend_with_message("Observe the second OPEN row");
-
-    ctx.hook_cmd("pre-push")
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("more than one OPEN pull request"));
-
-    assert_eq!(ctx.recorded_pushes(), pushes_before);
-    assert_eq!(ctx.github().pull_requests().len(), pull_requests_before.len() + 1);
-    assert_eq!(
-        &ctx.github().requests()[requests_before..],
-        vec![
-            vec![open_query(&id)],
-            vec![testutil::GraphQlOperation::OpenQuery {
-                connections: vec![testutil::PullRequestConnectionQuery::after(
-                    id.clone(),
-                    format!("cursor:open:{id}:1"),
-                )],
-                include_repository_facts: false,
-            }],
-        ],
-        "a second local OPEN row must be found before the effect barrier"
-    );
-}
-
-#[test]
 fn landing_automation_on_an_owned_base_blocks_every_new_effect() {
     for (auto_merge, in_merge_queue) in [(true, false), (false, true)] {
         let ctx = testutil::test_context!()
