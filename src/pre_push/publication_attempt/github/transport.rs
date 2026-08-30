@@ -1392,6 +1392,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_update_receipts_are_indeterminate_and_never_replayed() {
+        for state in ["CLOSED", "MERGED"] {
+            let request = update_request(1..=1);
+            let mut response = update_response(1..=1);
+            response["data"]["op0"]["pullRequest"]["state"] = json!(state);
+            let (api_url, server) =
+                scripted_peer(vec![exchange(request, Reply::Json(response))]).await;
+            let updates = PreparedUpdates::for_test(vec![test_update(1)]).unwrap();
+            let error = test_github(&api_url, test_timeouts())
+                .update_pull_requests(updates)
+                .await
+                .unwrap_err();
+            let requests = finish_peer(server).await;
+
+            assert_eq!(requests.len(), 1, "{state} receipt was replayed");
+            assert!(error.to_string().contains("acknowledgement is indeterminate"));
+            assert!(format!("{error:?}").contains("pull request which is not OPEN"));
+        }
+    }
+
+    #[tokio::test]
     async fn a_disconnect_after_mutation_send_is_indeterminate_and_never_replayed() {
         let request = update_request(1..=1);
         let (api_url, server) = scripted_peer(vec![exchange(request, Reply::Disconnect)]).await;
