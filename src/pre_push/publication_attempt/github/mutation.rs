@@ -517,7 +517,7 @@ impl UpdatePullRequest {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "updatePullRequest(input: {{ {fields} }}) {{ clientMutationId, pullRequest {{ number, id }} }}"
+            "updatePullRequest(input: {{ {fields} }}) {{ clientMutationId, pullRequest {{ number, id, state }} }}"
         )
     }
 
@@ -551,6 +551,7 @@ impl ExpectedUpdateReceipt {
         struct UpdatedPullRequest {
             number: u64,
             id: String,
+            state: PullRequestState,
         }
 
         if response.is_null() {
@@ -567,6 +568,9 @@ impl ExpectedUpdateReceipt {
         let identity = PullRequestIdentity::new(updated.number, updated.id)?;
         if identity != self.identity {
             bail!("updatePullRequest returned a different pull request identity");
+        }
+        if updated.state != PullRequestState::Open {
+            bail!("updatePullRequest returned a pull request which is not OPEN");
         }
         Ok(())
     }
@@ -1066,7 +1070,7 @@ mod tests {
             Some("base/\"seven".to_owned()),
         )
         .unwrap();
-        insta::assert_snapshot!(operation.document(), @r###"updatePullRequest(input: { pullRequestId: "PR_\"SEVEN", baseRefName: "base/\"seven", title: "title \" seven", body: "line one\nline two", clientMutationId: "gherrit:update:PR_\"SEVEN" }) { clientMutationId, pullRequest { number, id } }"###);
+        insta::assert_snapshot!(operation.document(), @r###"updatePullRequest(input: { pullRequestId: "PR_\"SEVEN", baseRefName: "base/\"seven", title: "title \" seven", body: "line one\nline two", clientMutationId: "gherrit:update:PR_\"SEVEN" }) { clientMutationId, pullRequest { number, id, state } }"###);
     }
 
     #[test]
@@ -1085,7 +1089,7 @@ mod tests {
             "data": {
                 "op0": {
                     "clientMutationId": update_client_mutation_id(&operation.identity),
-                    "pullRequest": { "number": 7, "id": "PR_SEVEN" },
+                    "pullRequest": { "number": 7, "id": "PR_SEVEN", "state": "OPEN" },
                 },
             },
         });
@@ -1096,7 +1100,7 @@ mod tests {
             "data": {
                 "op0": {
                     "clientMutationId": update_client_mutation_id(&operation.identity),
-                    "pullRequest": { "number": 7, "id": "PR_SEVEN" },
+                    "pullRequest": { "number": 7, "id": "PR_SEVEN", "state": "OPEN" },
                 },
             },
         });
@@ -1107,6 +1111,8 @@ mod tests {
             ("/data/op0/pullRequest/number", json!(8)),
             ("/data/op0/pullRequest/id", json!("")),
             ("/data/op0/pullRequest/id", json!("PR_OTHER")),
+            ("/data/op0/pullRequest/state", json!("CLOSED")),
+            ("/data/op0/pullRequest/state", json!("MERGED")),
         ] {
             let (_, decoder) =
                 update_batch(std::slice::from_ref(&operation)).unwrap().into_request();
