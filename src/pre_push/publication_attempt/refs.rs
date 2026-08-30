@@ -6,7 +6,8 @@
 //! porcelain acknowledgement is the only result which releases the caller.
 //!
 //! A change publication is one indivisible three-ref tuple: candidate head,
-//! owned base, and a new immutable version tag. A pull-request marker is a
+//! owned base, and a new immutable version tag. Public mode may add its public
+//! branch projection to the initial Git stage. A pull-request marker is a
 //! separate create-only transition. Every mutable ref carries the exact lease
 //! implied by the transition, and every new tag carries an absence lease.
 //! Batches remain atomic and are acknowledged only by one complete matching
@@ -20,7 +21,7 @@ use std::{
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::ObjectId;
 
-use super::version::Version;
+use super::{PublicBranch, version::Version};
 use crate::pre_push::{
     destination::{PublicationTarget, PushDestination},
     local::GherritPrId,
@@ -33,11 +34,11 @@ use crate::pre_push::{
 const FIXED_PUSH_OPTIONS: [&str; 5] =
     ["--porcelain", "--atomic", "--no-follow-tags", "--recurse-submodules=no", "--no-signed"];
 
-// Windows command lines are limited to roughly 32 KiB. The variable arguments
-// are ASCII, so byte lengths equal their UTF-16 code-unit lengths before
-// quoting. Reserving half the limit leaves room for the executable, private
-// remote configuration, fixed arguments, quoting, and the terminating NUL. It
-// also bounds POSIX argument encoding conservatively.
+// Windows command lines are limited to roughly 32 KiB. UTF-8 byte length is at
+// least the corresponding UTF-16 code-unit length, including for a Unicode
+// public branch. Reserving half the limit leaves room for the executable,
+// private remote configuration, fixed arguments, quoting, and the terminating
+// NUL. It also bounds POSIX argument encoding conservatively.
 const PUSH_VARIABLE_ARGV_BUDGET_BYTES: usize = 16 * 1024;
 
 /// One non-null candidate-head and owned-base pair.
@@ -148,6 +149,62 @@ pub(super) struct MarkerTransition {
     target: ObjectId,
 }
 
+/// The only two possible transitions for the optional public branch
+/// projection. The branch identity has already been proved disjoint from
+/// GHerrit's owned namespaces and the repository default branch.
+#[derive(Clone, Debug)]
+pub(super) struct PublicBranchTransition(PublicBranchTransitionKind);
+
+#[derive(Clone, Debug)]
+enum PublicBranchTransitionKind {
+    Create { branch: PublicBranch, desired: ObjectId },
+    Advance { branch: PublicBranch, expected: ObjectId, desired: ObjectId },
+}
+
+impl PublicBranchTransition {
+    pub(super) fn create(branch: PublicBranch, desired: ObjectId) -> Result<Self> {
+        if desired.is_null() {
+            bail!("A public branch cannot target a null object ID");
+        }
+        Ok(Self(PublicBranchTransitionKind::Create { branch, desired }))
+    }
+
+    pub(super) fn advance(
+        branch: PublicBranch,
+        expected: ObjectId,
+        desired: ObjectId,
+    ) -> Result<Self> {
+        if expected.is_null() || desired.is_null() {
+            bail!("A public branch transition requires non-null object IDs");
+        }
+        if expected == desired {
+            bail!("A public branch transition cannot advance to its current object ID");
+        }
+        Ok(Self(PublicBranchTransitionKind::Advance { branch, expected, desired }))
+    }
+
+    pub(super) fn branch(&self) -> &PublicBranch {
+        match &self.0 {
+            PublicBranchTransitionKind::Create { branch, .. }
+            | PublicBranchTransitionKind::Advance { branch, .. } => branch,
+        }
+    }
+
+    fn expected(&self) -> LeaseExpectation {
+        match &self.0 {
+            PublicBranchTransitionKind::Create { .. } => LeaseExpectation::Absent,
+            PublicBranchTransitionKind::Advance { expected, .. } => LeaseExpectation::At(*expected),
+        }
+    }
+
+    fn desired(&self) -> ObjectId {
+        match &self.0 {
+            PublicBranchTransitionKind::Create { desired, .. }
+            | PublicBranchTransitionKind::Advance { desired, .. } => *desired,
+        }
+    }
+}
+
 impl MarkerTransition {
     pub(super) fn create(id: GherritPrId, target: ObjectId) -> Result<Self> {
         if target.is_null() {
@@ -188,9 +245,16 @@ struct AtomicUnit {
     semantic_effect: TestPushEffect,
 }
 
+/// Stable semantic projection of one indivisible Git effect for the recovery
+/// oracle. Initial-ref traces retain public projections as real effects.
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::pre_push::publication_attempt) enum TestPushEffect {
+    PublicBranch {
+        branch: String,
+        expected: Option<ObjectId>,
+        desired: ObjectId,
+    },
     Tuple {
         id: GherritPrId,
         expected: Option<PublicationRevision>,
@@ -204,6 +268,30 @@ pub(in crate::pre_push::publication_attempt) enum TestPushEffect {
 }
 
 impl AtomicUnit {
+    fn public_branch(transition: &PublicBranchTransition) -> Self {
+        let destination = format!("refs/heads/{}", transition.branch().as_str());
+        let expectation = transition.expected();
+        let desired = transition.desired();
+        let option = format!("--force-with-lease={destination}:{}", expectation.render());
+        let refspec = format!("{desired}:{destination}");
+        let expected =
+            (destination, ExpectedRefReceipt::new(desired, expectation.receipt_transition()));
+        Self::new(
+            [option],
+            [refspec],
+            [expected],
+            #[cfg(test)]
+            TestPushEffect::PublicBranch {
+                branch: transition.branch().as_str().to_owned(),
+                expected: match transition.expected() {
+                    LeaseExpectation::Absent => None,
+                    LeaseExpectation::At(expected) => Some(expected),
+                },
+                desired,
+            },
+        )
+    }
+
     fn tuple(transition: &TupleTransition) -> Self {
         let id = transition.id().as_str();
         let desired = transition.desired();
@@ -356,6 +444,7 @@ fn require_acknowledgement(outcome: PushOutcome, diagnostic: Option<String>) -> 
 }
 
 /// Renders complete, indivisible change tuples into bounded atomic batches.
+#[cfg(test)]
 pub(super) fn prepare_tuple_pushes(
     destination: &PushDestination,
     transitions: &[TupleTransition],
@@ -363,6 +452,42 @@ pub(super) fn prepare_tuple_pushes(
     prepare_tuple_pushes_with_budget(destination, transitions, PUSH_VARIABLE_ARGV_BUDGET_BYTES)
 }
 
+/// Renders complete change tuples followed by the optional public branch
+/// projection into bounded atomic batches. The public branch therefore
+/// advances only after every earlier tuple batch, while every pull-request
+/// projection remains gated on the complete stage.
+pub(super) fn prepare_initial_pushes(
+    destination: &PushDestination,
+    public_branch: Option<&PublicBranchTransition>,
+    transitions: &[TupleTransition],
+) -> Result<PreparedPushes> {
+    prepare_initial_pushes_with_budget(
+        destination,
+        public_branch,
+        transitions,
+        PUSH_VARIABLE_ARGV_BUDGET_BYTES,
+    )
+}
+
+fn prepare_initial_pushes_with_budget(
+    destination: &PushDestination,
+    public_branch: Option<&PublicBranchTransition>,
+    transitions: &[TupleTransition],
+    budget: usize,
+) -> Result<PreparedPushes> {
+    prepare_units(
+        destination,
+        transitions
+            .iter()
+            .map(AtomicUnit::tuple)
+            .chain(public_branch.into_iter().map(AtomicUnit::public_branch))
+            .collect(),
+        budget,
+        "initial publication",
+    )
+}
+
+#[cfg(test)]
 fn prepare_tuple_pushes_with_budget(
     destination: &PushDestination,
     transitions: &[TupleTransition],
@@ -703,9 +828,12 @@ fn parse_push_receipt_lines<'line>(
         if source != expected_ref.source.to_string()
             || summary.is_empty()
             || !destination.starts_with("refs/")
-            || [source, destination, summary]
-                .into_iter()
-                .any(|field| field.chars().any(char::is_control))
+            // The destination must equal a key derived from a validated Git
+            // ref, so its Unicode data is already checked. Rust classifies
+            // C1 code points as controls even though Git permits their UTF-8
+            // encoding in refs. Reject controls only in the untrusted fields
+            // whose grammar does not otherwise establish them.
+            || [source, summary].into_iter().any(|field| field.chars().any(char::is_control))
             || !seen.insert(destination)
         {
             return None;
@@ -739,6 +867,15 @@ mod tests {
 
     fn create(value: &str, head: u8, base: u8) -> TupleTransition {
         TupleTransition::create(id(value), revision(head, base))
+    }
+
+    fn public_branch(value: &str) -> PublicBranch {
+        PublicBranch::new(
+            crate::manage::PublicBranchName::new(value.to_owned()).unwrap(),
+            &crate::pre_push::destination::DefaultBranch::new("main".to_owned(), object_id(1))
+                .unwrap(),
+        )
+        .unwrap()
     }
 
     fn advance(
@@ -845,6 +982,31 @@ mod tests {
         assert!(PublicationRevision::new(object_id(1), null).is_err());
         assert!(PublicationRevision::new(object_id(1), object_id(1)).is_err());
         assert!(MarkerTransition::create(id("Gone"), null).is_err());
+        assert!(PublicBranchTransition::create(public_branch("release-candidate"), null).is_err());
+        assert!(
+            PublicBranchTransition::advance(
+                public_branch("release-candidate"),
+                null,
+                object_id(2),
+            )
+            .is_err()
+        );
+        assert!(
+            PublicBranchTransition::advance(
+                public_branch("release-candidate"),
+                object_id(1),
+                null,
+            )
+            .is_err()
+        );
+        assert!(
+            PublicBranchTransition::advance(
+                public_branch("release-candidate"),
+                object_id(1),
+                object_id(1),
+            )
+            .is_err()
+        );
         assert!(
             TupleTransition::advance(id("Gone"), revision(2, 1), revision(2, 1), Version::FIRST,)
                 .is_err()
@@ -876,6 +1038,66 @@ mod tests {
             batch.refspecs().collect::<Vec<_>>(),
             [format!("{}:refs/tags/gherrit/Gone/pr", object_id(0x22))]
         );
+    }
+
+    #[test]
+    fn public_branch_creation_and_advancement_have_exact_leases() {
+        let create =
+            PublicBranchTransition::create(public_branch("release-candidate"), object_id(0x22))
+                .unwrap();
+        let create = prepare_initial_pushes(&destination(), Some(&create), &[])
+            .unwrap()
+            .into_batches()
+            .into_vec()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            &create.options().collect::<Vec<_>>()[FIXED_PUSH_OPTIONS.len()..],
+            ["--force-with-lease=refs/heads/release-candidate:"]
+        );
+        assert_eq!(
+            create.refspecs().collect::<Vec<_>>(),
+            [format!("{}:refs/heads/release-candidate", object_id(0x22))]
+        );
+
+        let advance = PublicBranchTransition::advance(
+            public_branch("release-candidate"),
+            object_id(0x11),
+            object_id(0x22),
+        )
+        .unwrap();
+        let advance = prepare_initial_pushes(&destination(), Some(&advance), &[])
+            .unwrap()
+            .into_batches()
+            .into_vec()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            &advance.options().collect::<Vec<_>>()[FIXED_PUSH_OPTIONS.len()..],
+            [format!("--force-with-lease=refs/heads/release-candidate:{}", object_id(0x11))]
+        );
+    }
+
+    #[test]
+    fn public_branch_is_the_last_complete_unit_of_the_initial_git_stage() {
+        let tuple = create("Gone", 2, 1);
+        let public =
+            PublicBranchTransition::create(public_branch("release-candidate"), object_id(2))
+                .unwrap();
+        let tuple_bytes = AtomicUnit::tuple(&tuple).encoded_argv_bytes;
+        let public_bytes = AtomicUnit::public_branch(&public).encoded_argv_bytes;
+        let pushes = prepare_initial_pushes_with_budget(
+            &destination(),
+            Some(&public),
+            &[tuple],
+            tuple_bytes.max(public_bytes),
+        )
+        .unwrap();
+        let effects =
+            pushes.batches().map(PushBatch::semantic_effects_for_test).collect::<Vec<_>>();
+        assert_eq!(effects.len(), 2);
+        assert!(matches!(effects[0], [TestPushEffect::Tuple { .. }]));
+        assert!(matches!(effects[1], [TestPushEffect::PublicBranch { .. }]));
     }
 
     #[test]
@@ -1121,6 +1343,23 @@ mod tests {
         for output in [output.clone(), output.replace('\n', "\r\n")] {
             assert!(receipts_acknowledge(&expected, output.as_bytes()));
         }
+    }
+
+    #[test]
+    fn receipts_accept_validated_public_refs_containing_unicode_c1_data() {
+        let source = object_id(2);
+        let destination_ref = "refs/heads/feature-/\u{85}tail";
+        let transition =
+            PublicBranchTransition::create(public_branch("feature-/\u{85}tail"), source).unwrap();
+        let batch = prepare_initial_pushes(&destination(), Some(&transition), &[])
+            .unwrap()
+            .into_batches()
+            .into_vec()
+            .pop()
+            .unwrap();
+        let output = format!("To private\n*\t{source}:{destination_ref}\t[new branch]\nDone\n");
+
+        assert!(receipts_acknowledge(&batch.expected, output.as_bytes()));
     }
 
     #[test]
