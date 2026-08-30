@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    CreatePreparation, PullRequestIdentity, Repository, RepositoryNodeId,
+    CreatePreparation, PullRequestIdentity, PullRequestNumber, Repository, RepositoryNodeId,
     pull_request::PullRequestIdentityRegistry,
 };
 use crate::pre_push::{
@@ -806,22 +806,24 @@ impl TerminalKinds {
     }
 }
 
-/// Nonempty terminal history for one exact-head connection.
+/// Nonempty terminal history for one exact local-ID connection.
 ///
-/// The lowest-numbered identity is a deterministic representative. The exact
-/// state union and nonzero count are folded independently, so pagination order
-/// cannot change either the classification or its diagnostic.
+/// The lowest pull request number is a deterministic representative. Complete
+/// identities have already been retained by the observation-wide collision
+/// registry, so this folded state keeps only the number it later uses. The
+/// exact state union and nonzero count are folded independently, so pagination
+/// order cannot change either the classification or its diagnostic.
 #[derive(Debug)]
 struct TerminalSummary {
-    representative: PullRequestIdentity,
+    representative: PullRequestNumber,
     kinds: TerminalKinds,
     count: NonZeroUsize,
 }
 
 impl TerminalSummary {
-    fn first(identity: PullRequestIdentity, state: TerminalState) -> Self {
+    fn first(number: PullRequestNumber, state: TerminalState) -> Self {
         Self {
-            representative: identity,
+            representative: number,
             kinds: match state {
                 TerminalState::Closed => TerminalKinds::Closed,
                 TerminalState::Merged => TerminalKinds::Merged,
@@ -830,25 +832,33 @@ impl TerminalSummary {
         }
     }
 
-    fn record_another(
-        &mut self,
-        identity: PullRequestIdentity,
-        state: TerminalState,
-    ) -> Result<()> {
+    fn record_another(&mut self, number: PullRequestNumber, state: TerminalState) -> Result<()> {
         let count =
             self.count.get().checked_add(1).and_then(NonZeroUsize::new).ok_or_else(|| {
                 eyre!("Local pull request terminal history exceeds platform limits")
             })?;
-        if identity.number().get() < self.representative.number().get() {
-            self.representative = identity;
+        if number.get() < self.representative.get() {
+            self.representative = number;
         }
         self.kinds = self.kinds.record(state);
         self.count = count;
         Ok(())
     }
+
+    /// Whether this terminal history makes the visible OPEN row unsafe to use.
+    ///
+    /// Any merge means this change has already landed. Closed history blocks
+    /// only when it predates the OPEN row: a later closed row is a repaired
+    /// duplicate and does not displace the lower-numbered canonical review.
+    fn blocks(&self, open: &OpenPullRequest) -> bool {
+        match self.kinds {
+            TerminalKinds::Merged | TerminalKinds::Both => true,
+            TerminalKinds::Closed => self.representative.get() < open.identity.number().get(),
+        }
+    }
 }
 
-/// Incremental correlation state for one exact-head connection.
+/// Incremental correlation state for one exact local-ID connection.
 #[derive(Debug)]
 struct ConnectionObservation {
     progress: Progress,
@@ -1081,12 +1091,11 @@ impl LocalPullRequestAccumulator {
             match row {
                 DecodedPullRequest::CrossRepository => {}
                 DecodedPullRequest::Terminal { identity, state } => {
+                    let number = identity.number();
                     self.identities.insert_observation(&identity)?;
                     match &mut connection.terminal {
-                        Some(summary) => summary.record_another(identity, state)?,
-                        terminal @ None => {
-                            *terminal = Some(TerminalSummary::first(identity, state))
-                        }
+                        Some(summary) => summary.record_another(number, state)?,
+                        terminal @ None => *terminal = Some(TerminalSummary::first(number, state)),
                     }
                 }
                 DecodedPullRequest::Open(open) => {
@@ -1167,7 +1176,22 @@ impl LocalPullRequestAccumulator {
         let mut terminal_representatives = Vec::new();
 
         for ConnectionSlot { id, observation: connection } in self.connections.into_vec() {
-            if let Some(open) = connection.open {
+            let terminal_is_violation = match (&connection.open, &connection.terminal) {
+                (_, None) => false,
+                (None, Some(_)) => true,
+                (Some(open), Some(terminal)) => terminal.blocks(open),
+            };
+            if terminal_is_violation {
+                let terminal =
+                    connection.terminal.expect("a terminal violation requires terminal evidence");
+                terminal_count =
+                    terminal_count.checked_add(terminal.count.get()).ok_or_else(|| {
+                        eyre!("Local pull request terminal history exceeds platform limits")
+                    })?;
+                if terminal_representatives.len() < MAX_DIAGNOSTIC_IDENTITIES {
+                    terminal_representatives.push((id, terminal));
+                }
+            } else if let Some(open) = connection.open {
                 local.push(LocalPullRequestObservation::Open(
                     ManagedOpenPullRequest::from_observation(
                         default_branch,
@@ -1182,14 +1206,6 @@ impl LocalPullRequestAccumulator {
                         open.has_landing_automation,
                     )?,
                 ));
-            } else if let Some(terminal) = connection.terminal {
-                terminal_count =
-                    terminal_count.checked_add(terminal.count.get()).ok_or_else(|| {
-                        eyre!("Local pull request terminal history exceeds platform limits")
-                    })?;
-                if terminal_representatives.len() < MAX_DIAGNOSTIC_IDENTITIES {
-                    terminal_representatives.push((id, terminal));
-                }
             } else {
                 local.push(LocalPullRequestObservation::Absent(
                     AbsentPullRequest::after_exhaustion(id),
@@ -1202,7 +1218,7 @@ impl LocalPullRequestAccumulator {
                 .into_iter()
                 .map(|(id, summary)| {
                     let id = diagnostic_detail(id.as_str());
-                    let number = summary.representative.number().get();
+                    let number = summary.representative.get();
                     match summary.kinds {
                         TerminalKinds::Closed => format!(
                             "Cannot push GHerrit change '{id}' because PR #{number} is closed. Reopen it or change the commit's gherrit-pr-id to start a new review.\n"
@@ -1613,7 +1629,7 @@ mod tests {
     }
 
     #[test]
-    fn open_wins_history_and_forks_while_local_identities_are_retained() {
+    fn lower_closed_canonical_blocks_a_higher_open_duplicate() {
         let mut terminal = node(1, "TERMINAL", "G", "CLOSED");
         terminal["title"] = json!({ "ignored": true });
         terminal["baseRefOid"] = json!(null);
@@ -1628,7 +1644,7 @@ mod tests {
         let first = decoded_page("G", None, Some(terminal), Some("one"), true);
         let second = decoded_page("G", Some("one"), Some(foreign), Some("two"), false);
         let third = decoded_page("G", Some("two"), Some(open), None, false);
-        let complete = accumulator([id("G")])
+        let error = accumulator([id("G")])
             .unwrap()
             .record_batch(first)
             .unwrap()
@@ -1637,22 +1653,61 @@ mod tests {
             .record_batch(third)
             .unwrap()
             .finish()
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("PR #1 is closed. Reopen it"));
+    }
+
+    #[test]
+    fn lower_open_ignores_a_higher_closed_repaired_duplicate() {
+        let terminal =
+            decoded_page("G", None, Some(node(3, "TERMINAL", "G", "CLOSED")), Some("one"), true);
+        let open = decoded_page("G", Some("one"), Some(node(1, "OPEN", "G", "OPEN")), None, false);
+        let complete = accumulator([id("G")])
+            .unwrap()
+            .record_batch(terminal)
+            .unwrap()
+            .record_batch(open)
+            .unwrap()
+            .finish()
             .unwrap();
 
         let LocalPullRequestObservation::Open(open) = &complete.local()[0] else {
-            panic!("OPEN row must win");
+            panic!("the lowest OPEN row must remain canonical");
         };
-        assert_eq!(open.identity().number().get(), 3);
-        assert_eq!(open.title(), "title 3");
-        assert_eq!(open.body(), "<!-- gherrit-meta: opaque ordinary text -->");
+        assert_eq!(open.identity().number().get(), 1);
+        assert_eq!(open.title(), "title 1");
+        assert_eq!(open.body(), "opaque body 1");
         assert!(open.is_draft());
-        assert_eq!(open.base().kind(), BaseKind::Owned);
+        assert_eq!(open.base().kind(), BaseKind::Default);
         assert_eq!(open.base().oid().to_string(), BASE_OID);
         assert_eq!(open.head_oid().to_string(), HEAD_OID);
-        assert!(open.has_landing_automation());
-
+        assert!(!open.has_landing_automation());
         assert_eq!(complete.identities.number_values(), HashSet::from([1, 3]));
         assert_eq!(complete.identities.node_id_values(), HashSet::from(["TERMINAL", "OPEN"]));
+    }
+
+    #[test]
+    fn any_merged_history_blocks_an_open_duplicate() {
+        for (merged_number, merged_first) in [(1, true), (3, false)] {
+            let merged = node(merged_number, "MERGED", "G", "MERGED");
+            let open = node(2, "OPEN", "G", "OPEN");
+            let (first, second) = if merged_first { (merged, open) } else { (open, merged) };
+            let first = decoded_page("G", None, Some(first), Some("next"), true);
+            let second = decoded_page("G", Some("next"), Some(second), None, false);
+            let error = accumulator([id("G")])
+                .unwrap()
+                .record_batch(first)
+                .unwrap()
+                .record_batch(second)
+                .unwrap()
+                .finish()
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains("is merged"), "number={merged_number}, error={error}");
+        }
     }
 
     #[test]
