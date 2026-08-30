@@ -212,7 +212,7 @@ impl Github {
         Ok(Self { http: builder.build()?, target, timeouts })
     }
 
-    /// Observes every lifecycle state for each change in the sealed stack.
+    /// Observes every OPEN row and proves absence against terminal history.
     pub(in crate::pre_push::publication_attempt) async fn observe_local_pull_requests(
         self,
         local: &LocalStack,
@@ -660,11 +660,38 @@ mod tests {
         LocalStack::for_history_test(default, changes)
     }
 
+    #[derive(Clone, Copy)]
+    enum TestQueryKind {
+        Open,
+        Terminal,
+    }
+
     fn query_request(queries: &[(&str, Option<&str>)], include_repository_facts: bool) -> Value {
+        lifecycle_query_request(queries, include_repository_facts, TestQueryKind::Open)
+    }
+
+    fn terminal_query_request(queries: &[(&str, Option<&str>)]) -> Value {
+        lifecycle_query_request(queries, false, TestQueryKind::Terminal)
+    }
+
+    fn lifecycle_query_request(
+        queries: &[(&str, Option<&str>)],
+        include_repository_facts: bool,
+        kind: TestQueryKind,
+    ) -> Value {
         let repository_facts = if include_repository_facts {
             "id, defaultBranchRef { name, target { oid } }, "
         } else {
             ""
+        };
+        let (states, fields) = match kind {
+            TestQueryKind::Open => (
+                "OPEN",
+                "number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, autoMergeRequest { enabledAt }, isInMergeQueue",
+            ),
+            TestQueryKind::Terminal => {
+                ("CLOSED, MERGED", "number, id, headRefName, state, isCrossRepository")
+            }
         };
         let connections = queries
             .iter()
@@ -674,7 +701,7 @@ mod tests {
                     .map(|cursor| format!(", after: {}", json!(cursor)))
                     .unwrap_or_default();
                 format!(
-                    "op{index}: pullRequests(headRefName: {}, first: 1{after}, states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, autoMergeRequest {{ enabledAt }}, isInMergeQueue }} pageInfo {{ hasNextPage, endCursor }} }}",
+                    "op{index}: pullRequests(headRefName: {}, first: 1{after}, states: [{states}]) {{ nodes {{ {fields} }} pageInfo {{ hasNextPage, endCursor }} }}",
                     json!(id),
                 )
             })
@@ -921,6 +948,7 @@ mod tests {
     async fn facade_paginates_connections_independently() {
         let initial_request = query_request(&[("A", None), ("B", None)], true);
         let next_request = query_request(&[("A", Some("cursor-a"))], false);
+        let terminal_request = terminal_query_request(&[("A", None), ("B", None)]);
         let first = observation_response(
             true,
             vec![
@@ -933,6 +961,13 @@ mod tests {
         let (api_url, server) = scripted_peer(vec![
             exchange(initial_request, Reply::Json(first)),
             exchange(next_request, Reply::Json(second)),
+            exchange(
+                terminal_request,
+                Reply::Json(observation_response(
+                    false,
+                    vec![connection(Vec::new(), None), connection(Vec::new(), None)],
+                )),
+            ),
         ])
         .await;
         let complete = test_github(&api_url, test_timeouts())
@@ -942,7 +977,7 @@ mod tests {
         let (_, complete) = complete.into_parts();
         let requests = finish_peer(server).await;
 
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert!(
             complete
                 .local()
@@ -960,6 +995,8 @@ mod tests {
         let all = query_request(&[("A", None), ("B", None), ("C", None), ("D", None)], true);
         let first_half = query_request(&[("A", None), ("B", None)], true);
         let second_half = query_request(&[("C", None), ("D", None)], false);
+        let first_terminal = terminal_query_request(&[("A", None), ("B", None)]);
+        let second_terminal = terminal_query_request(&[("C", None), ("D", None)]);
         let resource = json!({ "errors": [{ "type": "RESOURCE_LIMITS_EXCEEDED" }] });
         let (api_url, server) = scripted_peer(vec![
             exchange(all, Reply::Json(resource)),
@@ -977,6 +1014,20 @@ mod tests {
                     vec![connection(Vec::new(), None), connection(Vec::new(), None)],
                 )),
             ),
+            exchange(
+                first_terminal,
+                Reply::Json(observation_response(
+                    false,
+                    vec![connection(Vec::new(), None), connection(Vec::new(), None)],
+                )),
+            ),
+            exchange(
+                second_terminal,
+                Reply::Json(observation_response(
+                    false,
+                    vec![connection(Vec::new(), None), connection(Vec::new(), None)],
+                )),
+            ),
         ])
         .await;
         let complete = test_github(&api_url, test_timeouts())
@@ -986,7 +1037,7 @@ mod tests {
         let (_, complete) = complete.into_parts();
         let requests = finish_peer(server).await;
 
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 5);
         assert_eq!(complete.local().len(), 4);
     }
 
@@ -994,10 +1045,13 @@ mod tests {
     async fn transient_query_retries_send_identical_bounded_requests() {
         let request = query_request(&[("A", None)], true);
         let success = observation_response(true, vec![connection(Vec::new(), None)]);
+        let terminal_request = terminal_query_request(&[("A", None)]);
+        let terminal_success = observation_response(false, vec![connection(Vec::new(), None)]);
         let (api_url, server) = scripted_peer(vec![
             exchange(request.clone(), Reply::Status(503)),
             exchange(request.clone(), Reply::Status(429)),
             exchange(request, Reply::Json(success)),
+            exchange(terminal_request, Reply::Json(terminal_success)),
         ])
         .await;
         test_github(&api_url, test_timeouts())
@@ -1006,8 +1060,9 @@ mod tests {
             .unwrap();
         let requests = finish_peer(server).await;
 
-        assert_eq!(requests.len(), 3);
-        assert!(requests.iter().all(|request| request.body == requests[0].body));
+        assert_eq!(requests.len(), 4);
+        assert!(requests[..3].iter().all(|request| request.body == requests[0].body));
+        assert_ne!(requests[3].body, requests[0].body);
         assert!(requests[1].at.duration_since(requests[0].at) >= Duration::from_millis(90));
         assert!(requests[2].at.duration_since(requests[1].at) >= Duration::from_millis(190));
     }
@@ -1060,6 +1115,8 @@ mod tests {
         let both_next = query_request(&[("A", Some("cursor-a")), ("B", Some("cursor-b"))], false);
         let a_next = query_request(&[("A", Some("cursor-a"))], false);
         let b_next = query_request(&[("B", Some("cursor-b"))], false);
+        let a_terminal = terminal_query_request(&[("A", None)]);
+        let b_terminal = terminal_query_request(&[("B", None)]);
         let first = observation_response(
             true,
             vec![
@@ -1074,6 +1131,8 @@ mod tests {
             exchange(both_next, Reply::Json(resource)),
             exchange(a_next, Reply::Json(exhausted())),
             exchange(b_next, Reply::Json(exhausted())),
+            exchange(a_terminal, Reply::Json(exhausted())),
+            exchange(b_terminal, Reply::Json(exhausted())),
         ])
         .await;
         let complete = test_github(&api_url, test_timeouts())
@@ -1083,7 +1142,7 @@ mod tests {
         let (_, complete) = complete.into_parts();
         let requests = finish_peer(server).await;
 
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 6);
         assert!(
             complete
                 .local()
