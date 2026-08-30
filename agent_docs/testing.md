@@ -319,11 +319,14 @@ no OPEN row: its deliberately permissive close operation must be able to show
 the invalid world a mistaken canonical close would produce instead of
 preventing the planner bug by construction. Canonical identity is derived as
 the OPEN subset's lowest number rather than stored independently. Closing a
-row changes its lifecycle to CLOSED rather than deleting its identity.
-Per-query visibility remains separate and may hide individual OPEN rows,
-including the canonical row, without deleting them from the world. The model
-can therefore exercise its own cleanup residue and terminal-only outcome;
-focused adapter tests own MERGED and arbitrary preexisting terminal histories.
+row changes its lifecycle to CLOSED rather than deleting its identity. A
+completed OPEN connection captures its whole returned row set, including an
+empty result. Later closure cannot erase a captured row, and later creation
+cannot add one. Connections for different change IDs remain independent rather
+than pretending to be one backend snapshot. The model can therefore exercise
+omissions, cleanup residue, terminal-only outcomes, and later-created
+duplicates; focused adapter tests own MERGED and arbitrary preexisting terminal
+histories.
 
 A marker may target an older published revision after an amendment. The
 durable Git history supplies current head and owned-base object IDs. A stale
@@ -346,11 +349,12 @@ Final pull request projections | Done | Rejected
 
 Tuple, create, and marker effects carry the stable change ID and their complete
 semantic payload. Closures and updates are addressed by sealed pull request
-identities; the model resolves each requested node ID to a durable OPEN row
-and records the resolved change ID only in its local trace. It compares exact
-effect order and content, applies an allowed durable prefix or alias subset,
-discards all process-local authority, rebuilds a fresh observation, and
-requires the next plan to describe exactly the remaining work.
+identities; the model resolves each requested node ID to its durable pull
+request row, then requires that row to remain OPEN before applying the
+mutation. It records the resolved change ID only in its local trace, compares
+exact effect order and content, applies an allowed durable prefix or alias
+subset, discards all process-local authority, rebuilds a fresh observation,
+and requires the next plan to describe exactly the remaining work.
 
 Concurrency cases derive two plans from independently chosen observations and
 run one complete competing plan while the primary plan is suspended at each
