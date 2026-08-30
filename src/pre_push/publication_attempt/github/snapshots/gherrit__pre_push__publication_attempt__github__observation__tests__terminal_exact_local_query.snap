@@ -1,0 +1,5 @@
+---
+source: src/pre_push/publication_attempt/github/observation.rs
+expression: terminal
+---
+query { repository(owner: "owner", name: "repository") { op0: pullRequests(headRefName: "Gone", first: 1, states: [CLOSED, MERGED]) { nodes { number, id, headRefName, state, isCrossRepository } pageInfo { hasNextPage, endCursor } } } }
