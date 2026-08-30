@@ -2,7 +2,7 @@ use gix::ObjectId;
 
 use super::{
     super::{
-        github::{AbsentPullRequest, ObservedBase, ObservedGithub},
+        github::{AbsentPullRequest, MAX_MUTATION_REQUEST_BYTES, ObservedBase, ObservedGithub},
         history::{ObservedPullRequestMarker, ValidatedChangeHistory},
         refs::TestPushEffect,
     },
@@ -11,7 +11,6 @@ use super::{
 use crate::{
     manage::PublicBranchName,
     pre_push::{
-        batching::MAX_MUTATION_REQUEST_BYTES,
         destination::{ObservedPublicBranch, RepositoryCoordinates},
         local::{GherritPrId, LocalStack},
     },
