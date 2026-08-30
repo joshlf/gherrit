@@ -12,15 +12,13 @@ use std::borrow::Cow;
 use color_eyre::eyre::{Result, bail};
 
 #[cfg(test)]
-use super::github::PreparedUpdates;
-#[cfg(test)]
 use super::refs::prepare_tuple_pushes;
 use super::{
     body::{GeneratedBody, StackBodyRecipes},
     github::{
         AbsentPullRequest, BaseKind, ClosePullRequest, CompleteCreateReceipts,
         CompleteLocalPullRequests, CreatePreparation, CreatePullRequest, Github,
-        LocalPullRequestObservation, ManagedOpenPullRequest, ManagedOpenPullRequestCandidate,
+        LocalPullRequestObservation, ManagedOpenPullRequestCandidate, ManagedOpenPullRequests,
         ObservedGithub, PreparedCreates, PreparedPullRequestProjection, PullRequestIdentity,
         UpdatePullRequest,
     },
@@ -164,27 +162,10 @@ pub(super) trait EffectDriver {
 
     async fn publish_markers(&mut self, pushes: PreparedPushes) -> Result<()>;
 
-    #[cfg(not(test))]
     async fn project_pull_requests(
         &mut self,
         projection: PreparedPullRequestProjection,
     ) -> Result<()>;
-
-    /// Compatibility bridge while the semantic recovery model migrates to
-    /// mixed close/update batches. It fails explicitly if a legacy test driver
-    /// reaches duplicate repair instead of hiding the close effect.
-    #[cfg(test)]
-    async fn project_pull_requests(
-        &mut self,
-        projection: PreparedPullRequestProjection,
-    ) -> Result<()> {
-        self.update_pull_requests(projection).await
-    }
-
-    #[cfg(test)]
-    async fn update_pull_requests(&mut self, _updates: PreparedUpdates) -> Result<()> {
-        bail!("This test effect driver does not implement pull request projection")
-    }
 }
 
 /// The sole production effect driver, bound to the destination and GitHub
@@ -384,7 +365,7 @@ enum ProjectionReality {
 }
 
 struct ExistingReality {
-    pull_request: ManagedOpenPullRequest,
+    pull_request: ManagedOpenPullRequests,
     marker: Option<MarkerTransition>,
 }
 
@@ -394,12 +375,12 @@ struct MissingReality {
 }
 
 enum PendingProjectionEntry {
-    Existing(ManagedOpenPullRequest),
+    Existing(ManagedOpenPullRequests),
     AwaitingCreate(GherritPrId),
 }
 
 enum BoundProjectionEntry {
-    Existing(ManagedOpenPullRequest),
+    Existing(ManagedOpenPullRequests),
     Created { id: GherritPrId, identity: PullRequestIdentity },
 }
 
@@ -548,7 +529,7 @@ fn validate_reality_set(
 
 fn validate_open(
     history: &ValidatedChangeHistory,
-    pull_request: &ManagedOpenPullRequest,
+    pull_request: &ManagedOpenPullRequests,
     desired_base: BaseKind,
     default_branch: &DefaultBranch,
 ) -> Result<()> {
