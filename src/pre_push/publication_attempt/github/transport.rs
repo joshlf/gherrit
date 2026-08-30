@@ -832,7 +832,7 @@ mod tests {
             .enumerate()
             .map(|(index, number)| {
                 format!(
-                    "op{index}: updatePullRequest(input: {{ pullRequestId: \"PR{number}\", title: \"title {number}\", clientMutationId: \"gherrit:update:PR{number}\" }}) {{ clientMutationId, pullRequest {{ number, id }} }}"
+                    "op{index}: updatePullRequest(input: {{ pullRequestId: \"PR{number}\", title: \"title {number}\", clientMutationId: \"gherrit:update:PR{number}\" }}) {{ clientMutationId, pullRequest {{ number, id, state }} }}"
                 )
             })
             .collect::<Vec<_>>()
@@ -848,7 +848,11 @@ mod tests {
                     format!("op{index}"),
                     json!({
                         "clientMutationId": format!("gherrit:update:PR{number}"),
-                        "pullRequest": { "number": number, "id": format!("PR{number}") },
+                        "pullRequest": {
+                            "number": number,
+                            "id": format!("PR{number}"),
+                            "state": "OPEN",
+                        },
                     }),
                 )
             })
