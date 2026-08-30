@@ -597,9 +597,21 @@ fn validate_update_field(field: &executable::Field) -> Result<(), String> {
             "pullRequest" => validate_exact_fields(
                 &field.selection_set,
                 "updatePullRequest.pullRequest",
-                &["number", "id"],
+                &["number", "id", "state"],
             )
-            .map(|_| ())?,
+            .and_then(|fields| {
+                fields
+                    .into_iter()
+                    .find(|field| field.name == "state")
+                    .map(|field| {
+                        validate_scalar_fields(
+                            &field.selection_set,
+                            "updatePullRequest.pullRequest.state",
+                            &[],
+                        )
+                    })
+                    .unwrap_or(Ok(()))
+            })?,
             _ => {
                 return Err(format!(
                     "The mock GitHub API does not support field `{PATH}.{}`",
@@ -1028,6 +1040,9 @@ fn handle_update_pr(
                         "id" => {
                             pull_request.insert(response_key(field), serde_json::json!(node_id));
                         }
+                        "state" => {
+                            pull_request.insert(response_key(field), serde_json::json!(pr.state));
+                        }
                         _ => unreachable!("request was checked by validate_update_field"),
                     }
                 }
@@ -1447,7 +1462,7 @@ mod tests {
         let update = parse_document(
             "mutation { op0: updatePullRequest(input: { pullRequestId: \"PR_1\", \
              title: \"Updated\", clientMutationId: \"gherrit:update:PR_1\" }) { \
-             clientMutationId, pullRequest { number, id } } }",
+             clientMutationId, pullRequest { number, id, state } } }",
         );
         validate_supported_document(&update, &None).unwrap();
     }
@@ -1500,6 +1515,15 @@ mod tests {
         assert!(validate_supported_document(&duplicate_states, &None)
             .unwrap_err()
             .contains("exact local all-state connections"));
+
+        let update_without_state = parse_document(
+            "mutation { updatePullRequest(input: { pullRequestId: \"PR_1\", \
+             title: \"Updated\", clientMutationId: \"update\" }) { \
+             clientMutationId, pullRequest { number, id } } }",
+        );
+        assert!(validate_supported_document(&update_without_state, &None)
+            .unwrap_err()
+            .contains("number, id, state"));
     }
 
     #[test]
@@ -1775,5 +1799,38 @@ mod tests {
         let error =
             handle_update_pr(&mut state, root_field(&update), &existing_branch).unwrap_err();
         assert!(error.contains("head and base branches must differ"));
+    }
+
+    #[test]
+    fn update_handler_returns_closed_state_for_a_closed_pull_request() {
+        let document = parse_document(
+            "mutation { op0: updatePullRequest(input: { pullRequestId: \"PR_3\", \
+             title: \"Updated\", clientMutationId: \"gherrit:update:PR_3\" }) { \
+             clientMutationId, pullRequest { number, id, state } } }",
+        );
+        validate_supported_document(&document, &None).unwrap();
+        let mut state = MockState::new("owner".to_string(), "repo".to_string());
+        state.add_pr(PrEntry {
+            state: PullRequestState::Closed,
+            ..PrEntry::mock(MockPrArgs {
+                number: 3,
+                title: "Old".to_string(),
+                body: "Body".to_string(),
+                head: "Ghead".to_string(),
+                base: "main".to_string(),
+            })
+        });
+
+        let response =
+            handle_update_pr(&mut state, root_field(&document), &existing_branch).unwrap();
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "clientMutationId": "gherrit:update:PR_3",
+                "pullRequest": { "number": 3, "id": "PR_3", "state": "CLOSED" }
+            })
+        );
+        assert_eq!(state.prs[0].title, "Updated");
+        assert_eq!(state.prs[0].state, PullRequestState::Closed);
     }
 }
