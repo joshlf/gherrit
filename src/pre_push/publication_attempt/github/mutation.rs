@@ -35,6 +35,10 @@ fn update_client_mutation_id(identity: &PullRequestIdentity) -> String {
     format!("gherrit:update:{}", identity.node_id().as_str())
 }
 
+fn close_client_mutation_id(identity: &PullRequestIdentity) -> String {
+    format!("gherrit:close:{}", identity.node_id().as_str())
+}
+
 fn response_data(response: UniqueJson, expected_operations: usize) -> Result<Map<String, Value>> {
     let response = response.into_value();
     let response =
@@ -470,7 +474,83 @@ impl CompleteCreateReceipts {
     }
 }
 
+/// One noncanonical OPEN pull request which must be closed.
 #[derive(Debug, Eq, PartialEq)]
+pub(in crate::pre_push::publication_attempt) struct ClosePullRequest {
+    identity: PullRequestIdentity,
+}
+
+impl ClosePullRequest {
+    pub(in crate::pre_push::publication_attempt) fn duplicate(
+        identity: PullRequestIdentity,
+    ) -> Self {
+        Self { identity }
+    }
+
+    fn document(&self) -> String {
+        let client_mutation_id = close_client_mutation_id(&self.identity);
+        let fields = [
+            ("pullRequestId", self.identity.node_id().as_str()),
+            ("clientMutationId", client_mutation_id.as_str()),
+        ]
+        .map(|(name, value)| format!("{name}: {}", json!(value)))
+        .join(", ");
+        format!(
+            "closePullRequest(input: {{ {fields} }}) {{ clientMutationId, pullRequest {{ number, id, state }} }}"
+        )
+    }
+
+    #[cfg(test)]
+    fn into_test(self) -> TestClose {
+        TestClose { identity: self.identity }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ExpectedCloseReceipt {
+    identity: PullRequestIdentity,
+}
+
+impl ExpectedCloseReceipt {
+    fn decode(&self, response: Value) -> Result<()> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Response {
+            client_mutation_id: String,
+            pull_request: Option<ClosedPullRequest>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ClosedPullRequest {
+            number: u64,
+            id: String,
+            state: PullRequestState,
+        }
+
+        if response.is_null() {
+            bail!("GraphQL close mutation response operation is null");
+        }
+        let response: Response = serde_json::from_value(response)
+            .map_err(|_| eyre!("Failed to decode closePullRequest response"))?;
+        if response.client_mutation_id != close_client_mutation_id(&self.identity) {
+            bail!("closePullRequest returned a different clientMutationId");
+        }
+        let closed = response
+            .pull_request
+            .ok_or_else(|| eyre!("closePullRequest returned a null pull request"))?;
+        let identity = PullRequestIdentity::new(closed.number, closed.id)?;
+        if identity != self.identity {
+            bail!("closePullRequest returned a different pull request identity");
+        }
+        if closed.state != PullRequestState::Closed {
+            bail!("closePullRequest returned a pull request which is not CLOSED");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::pre_push::publication_attempt) struct UpdatePullRequest {
     identity: PullRequestIdentity,
     title: Option<String>,
@@ -576,23 +656,77 @@ impl ExpectedUpdateReceipt {
     }
 }
 
-struct PreparedUpdateBatch {
-    request: MutationRequest,
-    serialized_bytes: usize,
-    expected: Box<[ExpectedUpdateReceipt]>,
+enum PullRequestProjectionOperation {
+    Close(ClosePullRequest),
+    Update(UpdatePullRequest),
 }
 
-impl PreparedUpdateBatch {
-    fn into_request(self) -> (MutationRequest, UpdateReceiptDecoder) {
-        (self.request, UpdateReceiptDecoder { expected: self.expected })
+impl PullRequestProjectionOperation {
+    fn identity(&self) -> &PullRequestIdentity {
+        match self {
+            Self::Close(operation) => &operation.identity,
+            Self::Update(operation) => &operation.identity,
+        }
+    }
+
+    fn document(&self) -> String {
+        match self {
+            Self::Close(operation) => operation.document(),
+            Self::Update(operation) => operation.document(),
+        }
+    }
+
+    fn expected_receipt(&self) -> ExpectedProjectionReceipt {
+        match self {
+            Self::Close(operation) => ExpectedProjectionReceipt::Close(ExpectedCloseReceipt {
+                identity: operation.identity.clone(),
+            }),
+            Self::Update(operation) => ExpectedProjectionReceipt::Update(ExpectedUpdateReceipt {
+                identity: operation.identity.clone(),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn into_test(self) -> TestPullRequestProjection {
+        match self {
+            Self::Close(operation) => TestPullRequestProjection::Close(operation.into_test()),
+            Self::Update(operation) => TestPullRequestProjection::Update(operation.into_test()),
+        }
     }
 }
 
-struct UpdateReceiptDecoder {
-    expected: Box<[ExpectedUpdateReceipt]>,
+enum ExpectedProjectionReceipt {
+    Close(ExpectedCloseReceipt),
+    Update(ExpectedUpdateReceipt),
 }
 
-impl UpdateReceiptDecoder {
+impl ExpectedProjectionReceipt {
+    fn decode(&self, response: Value) -> Result<()> {
+        match self {
+            Self::Close(expected) => expected.decode(response),
+            Self::Update(expected) => expected.decode(response),
+        }
+    }
+}
+
+struct PreparedProjectionBatch {
+    request: MutationRequest,
+    serialized_bytes: usize,
+    expected: Box<[ExpectedProjectionReceipt]>,
+}
+
+impl PreparedProjectionBatch {
+    fn into_request(self) -> (MutationRequest, ProjectionReceiptDecoder) {
+        (self.request, ProjectionReceiptDecoder { expected: self.expected })
+    }
+}
+
+struct ProjectionReceiptDecoder {
+    expected: Box<[ExpectedProjectionReceipt]>,
+}
+
+impl ProjectionReceiptDecoder {
     fn decode(self, response: UniqueJson) -> Result<()> {
         let mut data = response_data(response, self.expected.len())?;
         for (index, expected) in self.expected.into_vec().into_iter().enumerate() {
@@ -606,7 +740,9 @@ impl UpdateReceiptDecoder {
     }
 }
 
-fn update_batch(operations: &[UpdatePullRequest]) -> Result<PreparedUpdateBatch> {
+fn projection_batch(
+    operations: &[PullRequestProjectionOperation],
+) -> Result<PreparedProjectionBatch> {
     let mut fields = String::new();
     let mut expected = Vec::with_capacity(operations.len());
     for (index, operation) in operations.iter().enumerate() {
@@ -615,29 +751,38 @@ fn update_batch(operations: &[UpdatePullRequest]) -> Result<PreparedUpdateBatch>
             fields.push(' ');
         }
         fields.push_str(&format!("{alias}: {}", operation.document()));
-        expected.push(ExpectedUpdateReceipt { identity: operation.identity.clone() });
+        expected.push(operation.expected_receipt());
     }
     let (request, serialized_bytes) = serialized_request(fields)?;
-    Ok(PreparedUpdateBatch { request, serialized_bytes, expected: expected.into_boxed_slice() })
+    Ok(PreparedProjectionBatch { request, serialized_bytes, expected: expected.into_boxed_slice() })
 }
 
-fn prepare_update_batches(operations: &[UpdatePullRequest]) -> Result<Box<[PreparedUpdateBatch]>> {
+#[cfg(test)]
+fn update_batch(operations: &[UpdatePullRequest]) -> Result<PreparedProjectionBatch> {
+    projection_batch(
+        &operations.iter().cloned().map(PullRequestProjectionOperation::Update).collect::<Vec<_>>(),
+    )
+}
+
+fn prepare_projection_batches(
+    operations: &[PullRequestProjectionOperation],
+) -> Result<Box<[PreparedProjectionBatch]>> {
     let mut batches = Vec::new();
     let mut start = 0;
     while start < operations.len() {
         let max_end = operations.len().min(start + MAX_MUTATION_ALIASES);
         let mut accepted = None;
         for end in start + 1..=max_end {
-            let batch = update_batch(&operations[start..end])?;
+            let batch = projection_batch(&operations[start..end])?;
             if batch.serialized_bytes > MAX_MUTATION_REQUEST_BYTES {
                 break;
             }
             accepted = Some((end, batch));
         }
         let Some((end, batch)) = accepted else {
-            let bytes = update_batch(&operations[start..start + 1])?.serialized_bytes;
+            let bytes = projection_batch(&operations[start..start + 1])?.serialized_bytes;
             bail!(
-                "GraphQL update mutation at item {start} serializes to {bytes} bytes, which exceeds the {MAX_MUTATION_REQUEST_BYTES}-byte request limit. No mutation was sent."
+                "GraphQL pull request projection at item {start} serializes to {bytes} bytes, which exceeds the {MAX_MUTATION_REQUEST_BYTES}-byte request limit. No mutation was sent."
             );
         };
         batches.push(batch);
@@ -646,57 +791,129 @@ fn prepare_update_batches(operations: &[UpdatePullRequest]) -> Result<Box<[Prepa
     Ok(batches.into_boxed_slice())
 }
 
-/// Every update batch preflighted before the first request can be sent.
+/// Every post-marker pull request effect, preflighted as one batch sequence.
 ///
-/// The empty value is the complete representation of a projection which is
-/// already current; callers do not need a parallel optional-update state.
-pub(in crate::pre_push::publication_attempt) struct PreparedUpdates {
-    batches: Box<[PreparedUpdateBatch]>,
+/// Duplicate closes precede canonical updates in deterministic operation
+/// order, but aliases in one request are independent. An indeterminate
+/// response may leave any complete alias subset durable; a fresh attempt
+/// observes and repairs the remainder. The empty value represents an already
+/// converged projection without a parallel optional state.
+pub(in crate::pre_push::publication_attempt) struct PreparedPullRequestProjection {
+    batches: Box<[PreparedProjectionBatch]>,
     #[cfg(test)]
-    operations: Box<[TestUpdate]>,
+    operations: Box<[TestPullRequestProjection]>,
+    #[cfg(test)]
+    legacy_updates: Option<Box<[TestUpdate]>>,
 }
 
-impl PreparedUpdates {
+impl PreparedPullRequestProjection {
+    /// Test compatibility for pre-duplicate semantic drivers. Production
+    /// planning uses [`Self::prepare`] so closes and updates share batching.
+    #[cfg(test)]
     pub(in crate::pre_push::publication_attempt) fn new(
-        operations: Vec<UpdatePullRequest>,
+        updates: Vec<UpdatePullRequest>,
     ) -> Result<Self> {
+        Self::prepare(Vec::new(), updates)
+    }
+
+    pub(in crate::pre_push::publication_attempt) fn prepare(
+        closes: Vec<ClosePullRequest>,
+        updates: Vec<UpdatePullRequest>,
+    ) -> Result<Self> {
+        let operations = closes
+            .into_iter()
+            .map(PullRequestProjectionOperation::Close)
+            .chain(updates.into_iter().map(PullRequestProjectionOperation::Update))
+            .collect::<Vec<_>>();
         let mut numbers = HashSet::with_capacity(operations.len());
         let mut node_ids = HashSet::with_capacity(operations.len());
         for (index, operation) in operations.iter().enumerate() {
-            if !numbers.insert(operation.identity.number()) {
+            if !numbers.insert(operation.identity().number()) {
                 bail!(
-                    "GraphQL update mutation at item {index} repeats a pull request number. No mutation was sent."
+                    "GraphQL pull request projection at item {index} repeats a pull request number. No mutation was sent."
                 );
             }
-            if !node_ids.insert(operation.identity.node_id()) {
+            if !node_ids.insert(operation.identity().node_id()) {
                 bail!(
-                    "GraphQL update mutation at item {index} repeats a pull request node ID. No mutation was sent."
+                    "GraphQL pull request projection at item {index} repeats a pull request node ID. No mutation was sent."
                 );
             }
         }
-        let batches = prepare_update_batches(&operations)?;
+        let batches = prepare_projection_batches(&operations)?;
         #[cfg(test)]
-        let operations = operations.into_iter().map(UpdatePullRequest::into_test).collect();
+        let legacy_updates = operations
+            .iter()
+            .all(|operation| matches!(operation, PullRequestProjectionOperation::Update(_)))
+            .then(|| {
+                operations
+                    .iter()
+                    .map(|operation| match operation {
+                        PullRequestProjectionOperation::Update(update) => TestUpdate {
+                            identity: update.identity.clone(),
+                            title: update.title.clone(),
+                            body: update.body.clone(),
+                            base_branch: update.base_branch.clone(),
+                        },
+                        PullRequestProjectionOperation::Close(_) => {
+                            unreachable!("the all-update predicate was checked")
+                        }
+                    })
+                    .collect()
+            });
+        #[cfg(test)]
+        let operations =
+            operations.into_iter().map(PullRequestProjectionOperation::into_test).collect();
         Ok(Self {
             batches,
             #[cfg(test)]
             operations,
+            #[cfg(test)]
+            legacy_updates,
         })
     }
 
+    /// Compatibility view used by semantic tests which predate duplicate
+    /// repair. It deliberately rejects a mixed projection instead of hiding
+    /// close effects from those tests.
     #[cfg(test)]
     pub(in crate::pre_push::publication_attempt) fn operations_for_test(&self) -> &[TestUpdate] {
-        &self.operations
+        self.legacy_updates.as_deref().expect("a legacy update view cannot omit duplicate closes")
     }
 
     #[cfg(test)]
     pub(in crate::pre_push::publication_attempt) fn batches_for_test(
         &self,
     ) -> impl ExactSizeIterator<Item = &[TestUpdate]> + '_ {
+        let operations = self.operations_for_test();
+        assert_eq!(
+            self.batches.iter().map(|batch| batch.expected.len()).sum::<usize>(),
+            operations.len(),
+            "semantic update operations must cover the exact prepared batches"
+        );
+        let mut start = 0;
+        self.batches.iter().map(move |batch| {
+            let end = start + batch.expected.len();
+            let batch_operations = &operations[start..end];
+            start = end;
+            batch_operations
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn projection_operations_for_test(
+        &self,
+    ) -> &[TestPullRequestProjection] {
+        &self.operations
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn projection_batches_for_test(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &[TestPullRequestProjection]> + '_ {
         assert_eq!(
             self.batches.iter().map(|batch| batch.expected.len()).sum::<usize>(),
             self.operations.len(),
-            "semantic update operations must cover the exact prepared batches"
+            "semantic projection operations must cover the exact prepared batches"
         );
         let mut start = 0;
         self.batches.iter().map(move |batch| {
@@ -710,7 +927,7 @@ impl PreparedUpdates {
     async fn execute(self, github: &Github) -> Result<()> {
         for batch in self.batches.into_vec() {
             log::trace!(
-                "Sending GraphQL update batch ({} operations, {} bytes)",
+                "Sending GraphQL pull request projection batch ({} operations, {} bytes)",
                 batch.expected.len(),
                 batch.serialized_bytes
             );
@@ -727,7 +944,21 @@ impl PreparedUpdates {
             operations.into_iter().map(TestUpdate::into_operation).collect::<Result<Vec<_>>>()?,
         )
     }
+
+    #[cfg(test)]
+    pub(super) fn for_projection_test(
+        closes: Vec<TestClose>,
+        updates: Vec<TestUpdate>,
+    ) -> Result<Self> {
+        Self::prepare(
+            closes.into_iter().map(|close| ClosePullRequest::duplicate(close.identity)).collect(),
+            updates.into_iter().map(TestUpdate::into_operation).collect::<Result<Vec<_>>>()?,
+        )
+    }
 }
+
+#[cfg(test)]
+pub(in crate::pre_push::publication_attempt) type PreparedUpdates = PreparedPullRequestProjection;
 
 impl Github {
     pub(in crate::pre_push::publication_attempt) async fn create_pull_requests(
@@ -737,11 +968,19 @@ impl Github {
         creates.execute(self).await
     }
 
+    pub(in crate::pre_push::publication_attempt) async fn project_pull_requests(
+        &self,
+        projection: PreparedPullRequestProjection,
+    ) -> Result<()> {
+        projection.execute(self).await
+    }
+
+    #[cfg(test)]
     pub(in crate::pre_push::publication_attempt) async fn update_pull_requests(
         &self,
         updates: PreparedUpdates,
     ) -> Result<()> {
-        updates.execute(self).await
+        self.project_pull_requests(updates).await
     }
 }
 
@@ -764,6 +1003,12 @@ impl TestCreate {
 
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::pre_push::publication_attempt) struct TestClose {
+    pub(in crate::pre_push::publication_attempt) identity: PullRequestIdentity,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::pre_push::publication_attempt) struct TestUpdate {
     pub(in crate::pre_push::publication_attempt) identity: PullRequestIdentity,
     pub(in crate::pre_push::publication_attempt) title: Option<String>,
@@ -776,6 +1021,13 @@ impl TestUpdate {
     fn into_operation(self) -> Result<UpdatePullRequest> {
         UpdatePullRequest::new(self.identity, self.title, self.body, self.base_branch)
     }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::pre_push::publication_attempt) enum TestPullRequestProjection {
+    Close(TestClose),
+    Update(TestUpdate),
 }
 
 #[cfg(test)]
@@ -823,6 +1075,25 @@ mod tests {
             },
         });
         UniqueJson::decode(&serde_json::to_vec(&response).unwrap()).unwrap()
+    }
+
+    fn close(number: u64, node_id: &str) -> ClosePullRequest {
+        ClosePullRequest::duplicate(PullRequestIdentity::new(number, node_id.to_owned()).unwrap())
+    }
+
+    fn close_response(operation: &ClosePullRequest, state: &str) -> Value {
+        json!({
+            "data": {
+                "op0": {
+                    "clientMutationId": close_client_mutation_id(&operation.identity),
+                    "pullRequest": {
+                        "number": operation.identity.number().get(),
+                        "id": operation.identity.node_id().as_str(),
+                        "state": state,
+                    },
+                },
+            },
+        })
     }
 
     #[test]
@@ -1059,6 +1330,112 @@ mod tests {
         };
         assert!(PreparedUpdates::new(vec![update(one.clone()), update(same_number)]).is_err());
         assert!(PreparedUpdates::new(vec![update(one), update(same_node)]).is_err());
+    }
+
+    #[test]
+    fn close_document_and_receipt_require_the_exact_closed_identity() {
+        let operation = close(7, "PR_\"SEVEN");
+        insta::assert_snapshot!(operation.document(), @r###"closePullRequest(input: { pullRequestId: "PR_\"SEVEN", clientMutationId: "gherrit:close:PR_\"SEVEN" }) { clientMutationId, pullRequest { number, id, state } }"###);
+
+        let expected = ExpectedCloseReceipt { identity: operation.identity.clone() };
+        expected.decode(close_response(&operation, "CLOSED")["data"]["op0"].clone()).unwrap();
+        let valid = close_response(&operation, "CLOSED");
+        for (pointer, replacement) in [
+            ("/data/op0/clientMutationId", json!("wrong")),
+            ("/data/op0/pullRequest", Value::Null),
+            ("/data/op0/pullRequest/number", json!(0)),
+            ("/data/op0/pullRequest/number", json!(8)),
+            ("/data/op0/pullRequest/id", json!("")),
+            ("/data/op0/pullRequest/id", json!("PR_OTHER")),
+            ("/data/op0/pullRequest/state", json!("OPEN")),
+            ("/data/op0/pullRequest/state", json!("MERGED")),
+        ] {
+            let mut response = valid.clone();
+            *response.pointer_mut(pointer).unwrap() = replacement;
+            assert!(
+                expected.decode(response["data"]["op0"].clone()).is_err(),
+                "accepted mutation at {pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn closes_and_updates_share_one_ordered_projection_batch() {
+        let close = close(2, "PR_TWO");
+        let update = UpdatePullRequest::new(
+            PullRequestIdentity::new(1, "PR_ONE".to_owned()).unwrap(),
+            Some("canonical title".to_owned()),
+            None,
+            None,
+        )
+        .unwrap();
+        let prepared = PreparedPullRequestProjection::prepare(vec![close], vec![update]).unwrap();
+        assert_eq!(prepared.batches.len(), 1);
+        assert!(matches!(
+            prepared.projection_operations_for_test(),
+            [TestPullRequestProjection::Close(TestClose { identity }), TestPullRequestProjection::Update(TestUpdate { identity: updated, .. })]
+                if identity.number().get() == 2 && updated.number().get() == 1
+        ));
+        assert_eq!(prepared.projection_batches_for_test().len(), 1);
+        let document = prepared.batches[0].request.0["query"].as_str().unwrap();
+        assert!(
+            document.find("closePullRequest").unwrap()
+                < document.find("updatePullRequest").unwrap()
+        );
+    }
+
+    #[test]
+    fn mixed_projection_uses_one_shared_alias_boundary() {
+        let closes = (1..MAX_MUTATION_ALIASES)
+            .map(|number| close(u64::try_from(number).unwrap(), &format!("CLOSE_{number}")))
+            .collect();
+        let updates = (MAX_MUTATION_ALIASES..=MAX_MUTATION_ALIASES + 1)
+            .map(|number| {
+                UpdatePullRequest::new(
+                    PullRequestIdentity::new(
+                        u64::try_from(number).unwrap(),
+                        format!("UPDATE_{number}"),
+                    )
+                    .unwrap(),
+                    Some(format!("title {number}")),
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let prepared = PreparedPullRequestProjection::prepare(closes, updates).unwrap();
+        let batches = prepared.projection_batches_for_test().collect::<Vec<_>>();
+        assert_eq!(batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(), [64, 1]);
+        assert!(matches!(batches[0].last(), Some(TestPullRequestProjection::Update(_))));
+    }
+
+    #[test]
+    fn projection_preflight_rejects_identity_reuse_across_effect_kinds() {
+        let close_operation = close(1, "PR_ONE");
+        let same_number = UpdatePullRequest::new(
+            PullRequestIdentity::new(1, "PR_TWO".to_owned()).unwrap(),
+            Some("title".to_owned()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            PreparedPullRequestProjection::prepare(vec![close_operation], vec![same_number])
+                .is_err()
+        );
+
+        let close_operation = close(1, "PR_ONE");
+        let same_node = UpdatePullRequest::new(
+            PullRequestIdentity::new(2, "PR_ONE".to_owned()).unwrap(),
+            Some("title".to_owned()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            PreparedPullRequestProjection::prepare(vec![close_operation], vec![same_node]).is_err()
+        );
     }
 
     #[test]
