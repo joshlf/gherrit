@@ -60,6 +60,14 @@ fn unpublished_managed_commit(branch: &str) -> testutil::TestContext {
     ctx
 }
 
+fn open_head_query(ctx: &testutil::TestContext) -> testutil::GraphQlOperation {
+    testutil::GraphQlOperation::open_query([ctx.gherrit_id("HEAD").unwrap()], true)
+}
+
+fn terminal_head_query(ctx: &testutil::TestContext) -> testutil::GraphQlOperation {
+    testutil::GraphQlOperation::terminal_query([ctx.gherrit_id("HEAD").unwrap()])
+}
+
 fn configured_remote_url(ctx: &testutil::TestContext, remote: &str) -> String {
     let output = ctx
         .git_cmd()
@@ -527,7 +535,7 @@ fn test_pre_push_edit_failure() {
     let requests = ctx.github().requests();
     assert_eq!(
         &requests[requests_before..],
-        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::UpdatePr],],
+        [vec![open_head_query(&ctx)], vec![testutil::GraphQlOperation::UpdatePr],],
         "an indeterminate update response must stop without replay or continuation"
     );
     let prs = ctx.github().pull_requests();
@@ -586,7 +594,7 @@ fn test_pre_push_pr_list_failure() {
         .failure()
         .stderr(predicate::str::contains("fatal GraphQL errors"));
     ctx.assert_failure_consumed();
-    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]]);
+    assert_eq!(ctx.github().requests(), vec![vec![open_head_query(&ctx)]]);
     assert!(ctx.github().pull_requests().is_empty());
     assert!(ctx.recorded_pushes().is_empty());
 }
@@ -611,7 +619,7 @@ fn test_malformed_observed_pull_request_identity_fails_before_git_publication() 
 
     assert_eq!(ctx.remote_refs("refs"), refs_before);
     assert!(ctx.recorded_pushes().is_empty());
-    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]]);
+    assert_eq!(ctx.github().requests(), vec![vec![open_head_query(&ctx)]]);
 }
 
 #[test]
@@ -627,8 +635,9 @@ fn test_pre_push_pr_list_retries_a_transient_http_failure() {
     assert_eq!(
         ctx.github().requests(),
         [
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
+            vec![open_head_query(&ctx)],
+            vec![open_head_query(&ctx)],
+            vec![terminal_head_query(&ctx)],
             vec![testutil::GraphQlOperation::CreatePr],
             vec![testutil::GraphQlOperation::UpdatePr],
         ]
@@ -652,7 +661,7 @@ fn test_pre_push_pr_list_stops_after_three_transient_http_retries() {
         .stderr(predicate::str::contains("Injected QueryHttp(TooManyRequests) failure"));
 
     ctx.assert_failure_consumed();
-    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]; 4]);
+    assert_eq!(ctx.github().requests(), vec![vec![open_head_query(&ctx)]; 4]);
     assert!(ctx.github().pull_requests().is_empty());
     assert!(ctx.recorded_pushes().is_empty());
 }
@@ -668,8 +677,9 @@ fn test_pre_push_pr_list_retries_a_response_transport_failure() {
     assert_eq!(
         ctx.github().requests(),
         [
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
+            vec![open_head_query(&ctx)],
+            vec![open_head_query(&ctx)],
+            vec![terminal_head_query(&ctx)],
             vec![testutil::GraphQlOperation::CreatePr],
             vec![testutil::GraphQlOperation::UpdatePr],
         ]
@@ -684,7 +694,7 @@ fn test_pre_push_pr_list_stops_after_three_response_transport_retries() {
     ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().failure();
 
     ctx.assert_failure_consumed();
-    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]; 4]);
+    assert_eq!(ctx.github().requests(), vec![vec![open_head_query(&ctx)]; 4]);
     assert!(ctx.github().pull_requests().is_empty());
     assert!(ctx.recorded_pushes().is_empty());
 }
@@ -711,7 +721,11 @@ fn test_pre_push_pr_create_failure() {
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),
-        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::CreatePr],],
+        [
+            vec![open_head_query(&ctx)],
+            vec![terminal_head_query(&ctx)],
+            vec![testutil::GraphQlOperation::CreatePr],
+        ],
         "an indeterminate create response must stop without replay or continuation"
     );
     assert!(ctx.github().pull_requests().is_empty());
@@ -741,7 +755,11 @@ fn test_pre_push_pr_create_service_unavailable_is_not_replayed() {
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),
-        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::CreatePr],],
+        [
+            vec![open_head_query(&ctx)],
+            vec![terminal_head_query(&ctx)],
+            vec![testutil::GraphQlOperation::CreatePr],
+        ],
         "a retryable HTTP response must not replay a mutation request"
     );
     assert!(ctx.github().pull_requests().is_empty());

@@ -327,9 +327,28 @@ fn mixed_established_and_new_stack_publishes_only_the_new_change() {
     let established = ctx.commit_with_gherrit_id("Established root");
     ctx.hook_cmd("pre-push").assert().success();
     let pushes_before = ctx.recorded_pushes().len();
+    let requests_before = ctx.github().requests().len();
 
     let new = ctx.commit_with_gherrit_id("New child");
     ctx.hook_cmd("pre-push").assert().success();
+
+    let requests = ctx.github().requests();
+    let second_attempt_requests = &requests[requests_before..];
+    assert_eq!(
+        &second_attempt_requests[..2],
+        &[
+            vec![testutil::GraphQlOperation::open_query([established.clone(), new.clone()], true,)],
+            vec![testutil::GraphQlOperation::terminal_query([new.clone()])],
+        ],
+        "OPEN observation must finish globally before probing only the missing head"
+    );
+    assert!(second_attempt_requests[2..].iter().flatten().all(|operation| {
+        !matches!(
+            operation,
+            testutil::GraphQlOperation::OpenQuery { .. }
+                | testutil::GraphQlOperation::TerminalQuery { .. }
+        )
+    }));
 
     let pushes = ctx.recorded_pushes();
     let second_attempt = &pushes[pushes_before..];

@@ -492,11 +492,58 @@ pub enum FailureKind {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphQlOperation {
-    Query,
+    OpenQuery { connections: Vec<PullRequestConnectionQuery>, include_repository_facts: bool },
+    TerminalQuery { connections: Vec<PullRequestConnectionQuery> },
     CreatePr,
     UpdatePr,
+}
+
+impl GraphQlOperation {
+    pub fn open_query(
+        connections: impl IntoIterator<Item = impl Into<PullRequestConnectionQuery>>,
+        include_repository_facts: bool,
+    ) -> Self {
+        Self::OpenQuery {
+            connections: connections.into_iter().map(Into::into).collect(),
+            include_repository_facts,
+        }
+    }
+
+    pub fn terminal_query(
+        connections: impl IntoIterator<Item = impl Into<PullRequestConnectionQuery>>,
+    ) -> Self {
+        Self::TerminalQuery { connections: connections.into_iter().map(Into::into).collect() }
+    }
+
+    fn is_query(&self) -> bool {
+        matches!(self, Self::OpenQuery { .. } | Self::TerminalQuery { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestConnectionQuery {
+    head: String,
+    after: Option<String>,
+}
+
+impl PullRequestConnectionQuery {
+    pub fn after(head: impl Into<String>, after: impl Into<String>) -> Self {
+        let head = head.into();
+        let after = after.into();
+        assert!(!head.is_empty(), "a traced pull request head must be nonempty");
+        assert!(!after.is_empty(), "a traced pull request cursor must be nonempty");
+        Self { head, after: Some(after) }
+    }
+}
+
+impl<T: Into<String>> From<T> for PullRequestConnectionQuery {
+    fn from(head: T) -> Self {
+        let head = head.into();
+        assert!(!head.is_empty(), "a traced pull request head must be nonempty");
+        Self { head, after: None }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -505,16 +552,6 @@ pub enum PullRequestState {
     Open,
     Closed,
     Merged,
-}
-
-impl PullRequestState {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            PullRequestState::Open => "OPEN",
-            PullRequestState::Closed => "CLOSED",
-            PullRequestState::Merged => "MERGED",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

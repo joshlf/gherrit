@@ -187,8 +187,10 @@ impl ManagedOpenPullRequest {
     }
 }
 
-/// Proof that an exhausted exact all-state connection had no same-repository
-/// row. Cross-repository rows do not prevent this conclusion.
+/// Proof that both exact lifecycle queries found no same-repository row.
+///
+/// The OPEN connection and the bounded terminal fallback were exhausted.
+/// Cross-repository rows in either connection do not prevent this conclusion.
 #[derive(Debug)]
 pub(in crate::pre_push::publication_attempt) struct AbsentPullRequest {
     id: GherritPrId,
@@ -321,6 +323,38 @@ struct LocalPullRequestQuery {
     after: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PullRequestQueryKind {
+    Open,
+    Terminal,
+}
+
+/// The response shape for one pull request observation request.
+///
+/// Only the OPEN wave can carry repository facts. Encoding that fact in the
+/// variant prevents a terminal request from selecting or accepting them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalPullRequestQueryPhase {
+    Open { include_repository_facts: bool },
+    Terminal,
+}
+
+impl LocalPullRequestQueryPhase {
+    fn kind(self) -> PullRequestQueryKind {
+        match self {
+            Self::Open { .. } => PullRequestQueryKind::Open,
+            Self::Terminal => PullRequestQueryKind::Terminal,
+        }
+    }
+
+    fn includes_repository_facts(self) -> bool {
+        match self {
+            Self::Open { include_repository_facts } => include_repository_facts,
+            Self::Terminal => false,
+        }
+    }
+}
+
 impl LocalPullRequestQuery {
     #[cfg(test)]
     fn new(id: GherritPrId, after: Option<String>) -> Result<Self> {
@@ -335,17 +369,36 @@ impl LocalPullRequestQuery {
 #[derive(Debug, Eq, PartialEq)]
 struct LocalPullRequests {
     coordinates: RepositoryCoordinates,
+    phase: LocalPullRequestQueryPhase,
     queries: Vec<LocalPullRequestQuery>,
-    include_repository_facts: bool,
 }
 
 impl LocalPullRequests {
     const MAX_ALIASES: usize = 64;
 
-    fn new(
+    fn open(
         coordinates: RepositoryCoordinates,
         queries: Vec<LocalPullRequestQuery>,
         include_repository_facts: bool,
+    ) -> Result<Self> {
+        Self::new(
+            coordinates,
+            LocalPullRequestQueryPhase::Open { include_repository_facts },
+            queries,
+        )
+    }
+
+    fn terminal(
+        coordinates: RepositoryCoordinates,
+        queries: Vec<LocalPullRequestQuery>,
+    ) -> Result<Self> {
+        Self::new(coordinates, LocalPullRequestQueryPhase::Terminal, queries)
+    }
+
+    fn new(
+        coordinates: RepositoryCoordinates,
+        phase: LocalPullRequestQueryPhase,
+        queries: Vec<LocalPullRequestQuery>,
     ) -> Result<Self> {
         if queries.is_empty() || queries.len() > Self::MAX_ALIASES {
             bail!("A local pull request query requires between one and 64 aliases");
@@ -359,14 +412,23 @@ impl LocalPullRequests {
                 );
             }
         }
-        Ok(Self { coordinates, queries, include_repository_facts })
+        Ok(Self { coordinates, phase, queries })
     }
 
     fn document(&self) -> String {
-        let repository_facts = if self.include_repository_facts {
+        let repository_facts = if self.phase.includes_repository_facts() {
             "id, defaultBranchRef { name, target { oid } }, "
         } else {
             ""
+        };
+        let (states, fields) = match self.phase.kind() {
+            PullRequestQueryKind::Open => (
+                "OPEN",
+                "number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, autoMergeRequest { enabledAt }, isInMergeQueue",
+            ),
+            PullRequestQueryKind::Terminal => {
+                ("CLOSED, MERGED", "number, id, headRefName, state, isCrossRepository")
+            }
         };
         let connections = self
             .queries
@@ -379,7 +441,7 @@ impl LocalPullRequests {
                     .map(|cursor| format!(", after: {}", json!(cursor)))
                     .unwrap_or_default();
                 format!(
-                    "op{index}: pullRequests(headRefName: {}, first: 1{after}, states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, autoMergeRequest {{ enabledAt }}, isInMergeQueue }} pageInfo {{ hasNextPage, endCursor }} }}",
+                    "op{index}: pullRequests(headRefName: {}, first: 1{after}, states: [{states}]) {{ nodes {{ {fields} }} pageInfo {{ hasNextPage, endCursor }} }}",
                     json!(query.id.as_str()),
                 )
             })
@@ -441,7 +503,7 @@ impl LocalPullRequests {
             eyre!("GitHub local pull request response is missing repository data")
         })?;
 
-        let repository_facts = if self.include_repository_facts {
+        let repository_facts = if self.phase.includes_repository_facts() {
             Some(decode_repository(&mut repository, self.coordinates.clone())?)
         } else {
             if repository.contains_key("id") || repository.contains_key("defaultBranchRef") {
@@ -462,6 +524,7 @@ impl LocalPullRequests {
             bail!("GitHub local pull request response has an incomplete alias set");
         }
 
+        let kind = self.phase.kind();
         let pages = self
             .queries
             .into_iter()
@@ -471,12 +534,13 @@ impl LocalPullRequests {
                 let connection = repository.remove(&alias).ok_or_else(|| {
                     eyre!("GitHub local pull request response is missing operation `{alias}`")
                 })?;
-                decode_connection(query, connection)
+                decode_connection(kind, query, connection)
             })
             .collect::<Result<Vec<_>>>()?;
         debug_assert!(repository.is_empty());
         Ok(LocalPullRequestBatch {
             coordinates: self.coordinates,
+            kind,
             repository: repository_facts,
             pages,
         })
@@ -522,8 +586,8 @@ fn decode_repository(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Connection {
-    nodes: Vec<Node>,
+struct Connection<T> {
+    nodes: Vec<T>,
     page_info: PageInfo,
 }
 
@@ -548,12 +612,12 @@ struct AutoMergeRequest {
     enabled_at: Nullable<String>,
 }
 
-/// The selected wire row keeps projection fields untyped until lifecycle and
-/// repository are known. Fork and terminal rows must have the selected shape,
-/// but their irrelevant projection payload is deliberately not interpreted.
+/// An OPEN-wave row keeps projection fields untyped until repository identity
+/// has been checked. A fork must have the selected shape, but its irrelevant
+/// projection payload is deliberately not interpreted.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Node {
+struct OpenNode {
     number: i64,
     id: String,
     title: Value,
@@ -566,6 +630,18 @@ struct Node {
     is_cross_repository: bool,
     auto_merge_request: Value,
     is_in_merge_queue: Value,
+}
+
+/// A terminal-wave row selects only identity, lifecycle, and repository
+/// relationship. Terminal projection text cannot authorize later work.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerminalNode {
+    number: i64,
+    id: String,
+    head_ref_name: String,
+    state: WirePullRequestState,
+    is_cross_repository: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -602,26 +678,42 @@ struct OpenPullRequest {
 }
 
 fn decode_connection(
+    kind: PullRequestQueryKind,
     query: LocalPullRequestQuery,
     connection: Value,
 ) -> Result<LocalPullRequestPageEvidence> {
-    let connection: Connection = serde_json::from_value(connection)
-        .map_err(|_| eyre!("GitHub returned malformed local pull request connection data"))?;
-    if connection.nodes.len() > 1 {
+    let (nodes, page_info) = match kind {
+        PullRequestQueryKind::Open => {
+            let connection: Connection<OpenNode> =
+                serde_json::from_value(connection).map_err(|_| {
+                    eyre!("GitHub returned malformed OPEN pull request connection data")
+                })?;
+            let rows = connection
+                .nodes
+                .into_iter()
+                .map(|node| decode_open_pull_request(&query.id, node))
+                .collect::<Result<Vec<_>>>()?;
+            (rows, connection.page_info)
+        }
+        PullRequestQueryKind::Terminal => {
+            let connection: Connection<TerminalNode> =
+                serde_json::from_value(connection).map_err(|_| {
+                    eyre!("GitHub returned malformed terminal pull request connection data")
+                })?;
+            let rows = connection
+                .nodes
+                .into_iter()
+                .map(|node| decode_terminal_pull_request(&query.id, node))
+                .collect::<Result<Vec<_>>>()?;
+            (rows, connection.page_info)
+        }
+    };
+    if nodes.len() > 1 {
         let id = diagnostic_detail(query.id.as_str());
-        bail!(
-            "GitHub returned {} rows for '{}' after exactly one was requested",
-            connection.nodes.len(),
-            id
-        );
+        bail!("GitHub returned {} rows for '{}' after exactly one was requested", nodes.len(), id);
     }
-    let row = connection
-        .nodes
-        .into_iter()
-        .next()
-        .map(|node| decode_pull_request(&query.id, node))
-        .transpose()?;
-    let PageInfo { has_next_page, end_cursor } = connection.page_info;
+    let row = nodes.into_iter().next();
+    let PageInfo { has_next_page, end_cursor } = page_info;
     let end = match (has_next_page, row, end_cursor) {
         (true, None, _) => {
             let id = diagnostic_detail(query.id.as_str());
@@ -641,29 +733,34 @@ fn decode_connection(
     Ok(LocalPullRequestPageEvidence { id: query.id, after: query.after, end })
 }
 
-fn decode_pull_request(id: &GherritPrId, node: Node) -> Result<DecodedPullRequest> {
-    let number = u64::try_from(node.number)
-        .map_err(|_| eyre!("GitHub reported an invalid pull request number {}", node.number))?;
-    let identity = PullRequestIdentity::new(number, node.id)?;
-    if node.head_ref_name != id.as_str() {
+fn decode_identity(
+    id: &GherritPrId,
+    number: i64,
+    node_id: String,
+    head_ref_name: &str,
+) -> Result<PullRequestIdentity> {
+    let number = u64::try_from(number)
+        .map_err(|_| eyre!("GitHub reported an invalid pull request number {number}"))?;
+    let identity = PullRequestIdentity::new(number, node_id)?;
+    if head_ref_name != id.as_str() {
         let id = diagnostic_detail(id.as_str());
         bail!(
             "GitHub pull request query for '{}' returned head branch '{}'",
             id,
-            diagnostic_detail(&node.head_ref_name)
+            diagnostic_detail(head_ref_name)
         );
+    }
+    Ok(identity)
+}
+
+fn decode_open_pull_request(id: &GherritPrId, node: OpenNode) -> Result<DecodedPullRequest> {
+    let identity = decode_identity(id, node.number, node.id, &node.head_ref_name)?;
+    if node.state != WirePullRequestState::Open {
+        bail!("GitHub OPEN pull request query returned a non-OPEN row");
     }
 
     if node.is_cross_repository {
         return Ok(DecodedPullRequest::CrossRepository);
-    }
-    let terminal = match node.state {
-        WirePullRequestState::Closed => Some(TerminalState::Closed),
-        WirePullRequestState::Merged => Some(TerminalState::Merged),
-        WirePullRequestState::Open => None,
-    };
-    if let Some(state) = terminal {
-        return Ok(DecodedPullRequest::Terminal { identity, state });
     }
 
     let string = |field: &str, value: Value| match value {
@@ -711,9 +808,29 @@ fn decode_pull_request(id: &GherritPrId, node: Node) -> Result<DecodedPullReques
     }))
 }
 
+fn decode_terminal_pull_request(
+    id: &GherritPrId,
+    node: TerminalNode,
+) -> Result<DecodedPullRequest> {
+    let identity = decode_identity(id, node.number, node.id, &node.head_ref_name)?;
+    let state = match node.state {
+        WirePullRequestState::Closed => TerminalState::Closed,
+        WirePullRequestState::Merged => TerminalState::Merged,
+        WirePullRequestState::Open => {
+            bail!("GitHub terminal pull request query returned an OPEN row")
+        }
+    };
+    if node.is_cross_repository {
+        Ok(DecodedPullRequest::CrossRepository)
+    } else {
+        Ok(DecodedPullRequest::Terminal { identity, state })
+    }
+}
+
 #[derive(Debug)]
 struct LocalPullRequestBatch {
     coordinates: RepositoryCoordinates,
+    kind: PullRequestQueryKind,
     repository: Option<Repository>,
     pages: Vec<LocalPullRequestPageEvidence>,
 }
@@ -739,7 +856,6 @@ enum PageEnd {
 enum Progress {
     Initial,
     Next { cursor: String, seen: HashSet<String> },
-    Exhausted,
 }
 
 impl Progress {
@@ -747,100 +863,55 @@ impl Progress {
         match self {
             Self::Initial => after.is_none(),
             Self::Next { cursor, .. } => after == Some(cursor),
-            Self::Exhausted => false,
         }
     }
 
-    fn advance(self, id: &GherritPrId, next_cursor: Option<String>) -> Result<Self> {
+    /// Records an advancing cursor and reports whether the connection ended.
+    fn accept_end(&mut self, id: &GherritPrId, next_cursor: Option<String>) -> Result<bool> {
         let Some(next_cursor) = next_cursor else {
-            return Ok(Self::Exhausted);
+            return Ok(true);
         };
-        let diagnostic_id = || diagnostic_detail(id.as_str());
-        let mut seen = match self {
-            Self::Initial => HashSet::new(),
-            Self::Next { seen, .. } => seen,
-            Self::Exhausted => bail!(
-                "Local pull request observation returned another page after exhausting '{}'",
-                diagnostic_id()
-            ),
-        };
-        if !seen.insert(next_cursor.clone()) {
-            bail!(
-                "Local pull request observation repeated a pagination cursor for '{}'",
-                diagnostic_id()
-            );
+        match self {
+            Self::Initial => {
+                let seen = HashSet::from([next_cursor.clone()]);
+                *self = Self::Next { cursor: next_cursor, seen };
+            }
+            Self::Next { cursor, seen } => {
+                if !seen.insert(next_cursor.clone()) {
+                    bail!(
+                        "Local pull request observation repeated a pagination cursor for '{}'",
+                        diagnostic_detail(id.as_str())
+                    );
+                }
+                *cursor = next_cursor;
+            }
         }
-        Ok(Self::Next { cursor: next_cursor, seen })
+        Ok(false)
     }
 }
 
-/// Exact set of terminal lifecycle kinds seen for one head.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TerminalKinds {
-    Closed,
-    Merged,
-    Both,
-}
-
-impl TerminalKinds {
-    fn record(self, state: TerminalState) -> Self {
-        match (self, state) {
-            (Self::Closed, TerminalState::Closed) => Self::Closed,
-            (Self::Merged, TerminalState::Merged) => Self::Merged,
-            (Self::Closed | Self::Merged | Self::Both, _) => Self::Both,
-        }
-    }
-}
-
-/// Nonempty terminal history for one exact-head connection.
-///
-/// The lowest-numbered identity is a deterministic representative. The exact
-/// state union and nonzero count are folded independently, so pagination order
-/// cannot change either the classification or its diagnostic.
 #[derive(Debug)]
-struct TerminalSummary {
-    representative: PullRequestIdentity,
-    kinds: TerminalKinds,
-    count: NonZeroUsize,
+enum ConnectionPhase {
+    /// Exhaust every OPEN page before deciding whether a terminal probe is
+    /// needed. At most one same-repository row is retained while pagination
+    /// continues, so a second local row rejects as soon as it is observed.
+    Open {
+        progress: Progress,
+        row: Option<OpenPullRequest>,
+    },
+    /// No same-repository OPEN row was visible. Paginate past fork rows until
+    /// a local terminal row rejects or exhaustion proves absence.
+    Terminal {
+        progress: Progress,
+    },
+    Complete(CompleteConnection),
 }
 
-impl TerminalSummary {
-    fn first(identity: PullRequestIdentity, state: TerminalState) -> Self {
-        Self {
-            representative: identity,
-            kinds: match state {
-                TerminalState::Closed => TerminalKinds::Closed,
-                TerminalState::Merged => TerminalKinds::Merged,
-            },
-            count: NonZeroUsize::MIN,
-        }
-    }
-
-    fn record_another(
-        &mut self,
-        identity: PullRequestIdentity,
-        state: TerminalState,
-    ) -> Result<()> {
-        let count =
-            self.count.get().checked_add(1).and_then(NonZeroUsize::new).ok_or_else(|| {
-                eyre!("Local pull request terminal history exceeds platform limits")
-            })?;
-        if identity.number().get() < self.representative.number().get() {
-            self.representative = identity;
-        }
-        self.kinds = self.kinds.record(state);
-        self.count = count;
-        Ok(())
-    }
-}
-
-/// Incremental correlation state for one exact-head connection.
+/// The only evidence exposed after both lifecycle decisions are complete.
 #[derive(Debug)]
-struct ConnectionObservation {
-    progress: Progress,
-    baseline_row_available: bool,
-    open: Option<OpenPullRequest>,
-    terminal: Option<TerminalSummary>,
+enum CompleteConnection {
+    Open(OpenPullRequest),
+    Absent,
 }
 
 /// One local change and the only observation state which can belong to it.
@@ -850,27 +921,17 @@ struct ConnectionObservation {
 #[derive(Debug)]
 struct ConnectionSlot {
     id: GherritPrId,
-    observation: ConnectionObservation,
-}
-
-impl Default for ConnectionObservation {
-    fn default() -> Self {
-        Self {
-            progress: Progress::Initial,
-            baseline_row_available: true,
-            open: None,
-            terminal: None,
-        }
-    }
+    phase: ConnectionPhase,
 }
 
 /// In-progress evidence for exactly one ordered local change-ID set.
 ///
-/// Each requested ID owns one baseline row. All IDs then share exactly 99
-/// excess rows. A large local stack therefore cannot donate unused baseline
-/// rows to one pathological connection. Because every advancing page must
-/// contain its one requested row, an N-ID observation accepts at most N + 99
-/// rows and at most 2N + 99 pages (one final empty page per connection).
+/// Each requested lifecycle phase owns one baseline row. All phases then share
+/// exactly 99 excess rows. An N-ID observation which terminal-probes K missing
+/// heads therefore accepts at most N + K + 99 rows. A large local stack cannot
+/// donate unused baselines to one pathological connection. Because every
+/// advancing page contains its one requested row and each phase can add at
+/// most one final empty page, the process also has a finite page bound.
 #[derive(Debug)]
 pub(super) struct LocalPullRequestAccumulator {
     coordinates: RepositoryCoordinates,
@@ -936,7 +997,10 @@ impl LocalPullRequestAccumulator {
                 let id = diagnostic_detail(id.as_str());
                 bail!("Local pull request observation requested change '{}' more than once", id);
             }
-            connections.push(ConnectionSlot { id, observation: ConnectionObservation::default() });
+            connections.push(ConnectionSlot {
+                id,
+                phase: ConnectionPhase::Open { progress: Progress::Initial, row: None },
+            });
         }
         if connections.is_empty() {
             bail!("Local pull request observation requires at least one change");
@@ -964,29 +1028,59 @@ impl LocalPullRequestAccumulator {
     /// The alias limit is part of the consumed observation state, so a caller
     /// cannot accidentally reset backoff while progressing through pages.
     pub(super) fn next(self) -> Result<ObservationStep> {
-        let selected = self
-            .connections
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| match &slot.observation.progress {
-                Progress::Initial => {
-                    Some(LocalPullRequestQuery { id: slot.id.clone(), after: None })
-                        .map(|query| (index, query))
+        let select = |kind| {
+            // Initial pages have their phase-local baseline. Once those are
+            // selected freely, query no more than one continued page beyond
+            // the remaining shared budget. That last page is necessary to
+            // distinguish exhaustion from an over-limit row, but a batched
+            // request need not overshoot the limit by a full alias width.
+            let mut continued_pages = self.excess_rows_remaining.saturating_add(1);
+            self.connections.iter().enumerate().filter_map(move |(index, slot)| {
+                let progress = match (&slot.phase, kind) {
+                    (ConnectionPhase::Open { progress, .. }, PullRequestQueryKind::Open)
+                    | (ConnectionPhase::Terminal { progress }, PullRequestQueryKind::Terminal) => {
+                        progress
+                    }
+                    (ConnectionPhase::Open { .. } | ConnectionPhase::Terminal { .. }, _)
+                    | (ConnectionPhase::Complete(_), _) => return None,
+                };
+                if matches!(progress, Progress::Next { .. }) {
+                    continued_pages = continued_pages.checked_sub(1)?;
                 }
-                Progress::Next { cursor, .. } => {
-                    Some(LocalPullRequestQuery { id: slot.id.clone(), after: Some(cursor.clone()) })
-                        .map(|query| (index, query))
-                }
-                Progress::Exhausted => None,
+                let after = match progress {
+                    Progress::Initial => None,
+                    Progress::Next { cursor, .. } => Some(cursor.clone()),
+                };
+                Some((index, LocalPullRequestQuery { id: slot.id.clone(), after }))
             })
-            .take(self.alias_limit.get())
-            .collect::<Vec<_>>();
+        };
+        // Finish the complete OPEN wave before starting any terminal probe.
+        // This keeps ordinary established stacks to one batched read wave and
+        // prevents early missing IDs from serializing later OPEN observations.
+        let open =
+            select(PullRequestQueryKind::Open).take(self.alias_limit.get()).collect::<Vec<_>>();
+        let (kind, selected) = if open.is_empty() {
+            (
+                PullRequestQueryKind::Terminal,
+                select(PullRequestQueryKind::Terminal).take(self.alias_limit.get()).collect(),
+            )
+        } else {
+            (PullRequestQueryKind::Open, open)
+        };
         if selected.is_empty() {
             return self.finish().map(ObservationStep::Complete);
         }
         let (slots, queries): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
-        let request =
-            LocalPullRequests::new(self.coordinates.clone(), queries, self.repository.is_none())?;
+        let request = match kind {
+            PullRequestQueryKind::Open => LocalPullRequests::open(
+                self.coordinates.clone(),
+                queries,
+                self.repository.is_none(),
+            ),
+            PullRequestQueryKind::Terminal => {
+                LocalPullRequests::terminal(self.coordinates.clone(), queries)
+            }
+        }?;
         Ok(ObservationStep::Request(PendingObservationRequest {
             accumulator: self,
             request,
@@ -1016,11 +1110,12 @@ impl LocalPullRequestAccumulator {
         if batch.pages.len() != slots.len() {
             bail!("Local pull request response has an incomplete page set");
         }
+        let kind = batch.kind;
         slots
             .into_vec()
             .into_iter()
             .zip(batch.pages)
-            .try_fold(self, |accumulator, (slot, page)| accumulator.record_page(slot, page))
+            .try_fold(self, |accumulator, (slot, page)| accumulator.record_page(slot, kind, page))
     }
 
     /// Consuming page insertion is the atomic adapter boundary. Any mutation
@@ -1028,6 +1123,7 @@ impl LocalPullRequestAccumulator {
     fn record_page(
         mut self,
         slot_index: usize,
+        kind: PullRequestQueryKind,
         page: LocalPullRequestPageEvidence,
     ) -> Result<Self> {
         let LocalPullRequestPageEvidence { id, after, end } = page;
@@ -1040,22 +1136,38 @@ impl LocalPullRequestAccumulator {
                 diagnostic_detail(id.as_str())
             );
         }
-        let connection = &mut slot.observation;
-        if !connection.progress.expects(after.as_deref()) {
+        let progress = match (&mut slot.phase, kind) {
+            (ConnectionPhase::Open { progress, .. }, PullRequestQueryKind::Open)
+            | (ConnectionPhase::Terminal { progress }, PullRequestQueryKind::Terminal) => progress,
+            (ConnectionPhase::Complete(_), _) => {
+                bail!(
+                    "Local pull request observation returned another page after exhausting '{}'",
+                    diagnostic_detail(id.as_str())
+                )
+            }
+            (ConnectionPhase::Open { .. } | ConnectionPhase::Terminal { .. }, _) => {
+                bail!(
+                    "Local pull request observation returned an unexpected page for '{}'",
+                    diagnostic_detail(id.as_str())
+                )
+            }
+        };
+        if !progress.expects(after.as_deref()) {
             bail!(
-                "Local pull request observation returned an unexpected page cursor for '{}'",
+                "Local pull request observation returned an unexpected page for '{}'",
                 diagnostic_detail(id.as_str())
             );
         }
+        // Every advancing page contains one row, so a phase's free baseline
+        // is available exactly while it is still on its initial page.
+        let uses_baseline = matches!(progress, Progress::Initial);
         let (row, next_cursor) = match end {
             PageEnd::Exhausted { row } => (row, None),
             PageEnd::Advancing { row, next_cursor } => (Some(row), Some(next_cursor)),
         };
 
         if let Some(row) = row {
-            if connection.baseline_row_available {
-                connection.baseline_row_available = false;
-            } else {
+            if !uses_baseline {
                 self.excess_rows_remaining =
                     self.excess_rows_remaining.checked_sub(1).ok_or_else(|| {
                         eyre!(
@@ -1064,32 +1176,68 @@ impl LocalPullRequestAccumulator {
                         )
                     })?;
             }
-            match row {
-                DecodedPullRequest::CrossRepository => {}
-                DecodedPullRequest::Terminal { identity, state } => {
-                    self.identities.insert_observation(&identity)?;
-                    match &mut connection.terminal {
-                        Some(summary) => summary.record_another(identity, state)?,
-                        terminal @ None => {
-                            *terminal = Some(TerminalSummary::first(identity, state))
-                        }
-                    }
-                }
-                DecodedPullRequest::Open(open) => {
+            match (kind, row) {
+                (_, DecodedPullRequest::CrossRepository) => {}
+                (PullRequestQueryKind::Open, DecodedPullRequest::Open(open)) => {
                     self.identities.insert_observation(&open.identity)?;
-                    if connection.open.is_some() {
+                    let ConnectionPhase::Open { row, .. } = &mut slot.phase else {
+                        unreachable!("an OPEN row was already bound to its OPEN phase")
+                    };
+                    if row.replace(open).is_some() {
+                        let id = diagnostic_detail(id.as_str());
                         bail!(
-                            "GitHub has more than one same-repository OPEN pull request for '{}'",
-                            diagnostic_detail(id.as_str())
+                            "Cannot push GHerrit change '{id}' because its exact head has more than one OPEN pull request"
                         );
                     }
-                    connection.open = Some(open);
+                }
+                (
+                    PullRequestQueryKind::Terminal,
+                    DecodedPullRequest::Terminal { identity, state },
+                ) => {
+                    let id = diagnostic_detail(id.as_str());
+                    let number = identity.number().get();
+                    match state {
+                        TerminalState::Closed => bail!(
+                            "Cannot push GHerrit change '{id}' because PR #{number} is closed. Change the commit's gherrit-pr-id to start a new review."
+                        ),
+                        TerminalState::Merged => bail!(
+                            "Cannot push GHerrit change '{id}' because PR #{number} is merged. Change the commit's gherrit-pr-id to start a new review."
+                        ),
+                    }
+                }
+                (PullRequestQueryKind::Open, DecodedPullRequest::Terminal { .. })
+                | (PullRequestQueryKind::Terminal, DecodedPullRequest::Open(_)) => {
+                    bail!("Local pull request response does not match its lifecycle query")
                 }
             }
         }
 
-        let progress = std::mem::replace(&mut connection.progress, Progress::Exhausted);
-        connection.progress = progress.advance(&id, next_cursor)?;
+        let exhausted = match &mut slot.phase {
+            ConnectionPhase::Open { progress, .. } | ConnectionPhase::Terminal { progress } => {
+                progress.accept_end(&id, next_cursor)?
+            }
+            ConnectionPhase::Complete(_) => {
+                unreachable!("a completed connection was rejected before recording its page")
+            }
+        };
+        if exhausted {
+            slot.phase = match &mut slot.phase {
+                ConnectionPhase::Open { row: None, .. } => {
+                    ConnectionPhase::Terminal { progress: Progress::Initial }
+                }
+                ConnectionPhase::Open { row, .. } => {
+                    ConnectionPhase::Complete(CompleteConnection::Open(
+                        row.take().expect("the nonempty OPEN row was checked"),
+                    ))
+                }
+                ConnectionPhase::Terminal { .. } => {
+                    ConnectionPhase::Complete(CompleteConnection::Absent)
+                }
+                ConnectionPhase::Complete(_) => {
+                    unreachable!("a completed connection cannot newly exhaust")
+                }
+            };
+        }
         Ok(self)
     }
 
@@ -1124,7 +1272,7 @@ impl LocalPullRequestAccumulator {
         let mut incomplete = self
             .connections
             .iter()
-            .filter(|slot| !matches!(slot.observation.progress, Progress::Exhausted))
+            .filter(|slot| !matches!(slot.phase, ConnectionPhase::Complete(_)))
             .map(|slot| slot.id.as_str())
             .collect::<Vec<_>>();
         incomplete.sort_unstable();
@@ -1149,65 +1297,33 @@ impl LocalPullRequestAccumulator {
             .ok_or_else(|| eyre!("Local pull request observation omitted repository facts"))?;
         let default_branch = repository.default_branch().name();
         let mut local = Vec::with_capacity(self.connections.len());
-        let mut terminal_count = 0_usize;
-        let mut terminal_representatives = Vec::new();
 
-        for ConnectionSlot { id, observation: connection } in self.connections.into_vec() {
-            if let Some(open) = connection.open {
-                local.push(LocalPullRequestObservation::Open(
-                    ManagedOpenPullRequest::from_observation(
+        for ConnectionSlot { id, phase } in self.connections.into_vec() {
+            let complete = match phase {
+                ConnectionPhase::Complete(complete) => complete,
+                ConnectionPhase::Open { .. } | ConnectionPhase::Terminal { .. } => {
+                    unreachable!("incomplete connections were rejected above")
+                }
+            };
+            let observation = match complete {
+                CompleteConnection::Open(first) => {
+                    LocalPullRequestObservation::Open(ManagedOpenPullRequest::from_observation(
                         default_branch,
                         id,
-                        open.identity,
-                        open.title,
-                        open.body,
-                        open.base_name,
-                        open.base_oid,
-                        open.head_oid,
-                        open.has_landing_automation,
-                    )?,
-                ));
-            } else if let Some(terminal) = connection.terminal {
-                terminal_count =
-                    terminal_count.checked_add(terminal.count.get()).ok_or_else(|| {
-                        eyre!("Local pull request terminal history exceeds platform limits")
-                    })?;
-                if terminal_representatives.len() < MAX_DIAGNOSTIC_IDENTITIES {
-                    terminal_representatives.push((id, terminal));
+                        first.identity,
+                        first.title,
+                        first.body,
+                        first.base_name,
+                        first.base_oid,
+                        first.head_oid,
+                        first.has_landing_automation,
+                    )?)
                 }
-            } else {
-                local.push(LocalPullRequestObservation::Absent(
-                    AbsentPullRequest::after_exhaustion(id),
-                ));
-            }
-        }
-        if terminal_count != 0 {
-            let displayed = terminal_representatives.len();
-            let mut message = terminal_representatives
-                .into_iter()
-                .map(|(id, summary)| {
-                    let id = diagnostic_detail(id.as_str());
-                    let number = summary.representative.number().get();
-                    match summary.kinds {
-                        TerminalKinds::Closed => format!(
-                            "Cannot push GHerrit change '{id}' because PR #{number} is closed. Reopen it or change the commit's gherrit-pr-id to start a new review.\n"
-                        ),
-                        TerminalKinds::Merged => format!(
-                            "Cannot push GHerrit change '{id}' because PR #{number} is merged. Change the commit's gherrit-pr-id to start a new review.\n"
-                        ),
-                        TerminalKinds::Both => format!(
-                            "Cannot push GHerrit change '{id}' because its exact head has both closed and merged pull request history (for example PR #{number}). Reopen a closed pull request if possible or change the commit's gherrit-pr-id to start a new review.\n"
-                        ),
-                    }
-                })
-                .collect::<String>();
-            let omitted = terminal_count - displayed;
-            if omitted != 0 {
-                message
-                    .push_str(&format!("Additional terminal pull requests omitted: {omitted}.\n"));
-            }
-            message.pop();
-            bail!(message);
+                CompleteConnection::Absent => {
+                    LocalPullRequestObservation::Absent(AbsentPullRequest::after_exhaustion(id))
+                }
+            };
+            local.push(observation);
         }
 
         Ok(CompleteLocalPullRequests {
@@ -1248,7 +1364,11 @@ mod tests {
         queries: Vec<LocalPullRequestQuery>,
         include_repository_facts: bool,
     ) -> LocalPullRequests {
-        LocalPullRequests::new(coordinates(), queries, include_repository_facts).unwrap()
+        LocalPullRequests::open(coordinates(), queries, include_repository_facts).unwrap()
+    }
+
+    fn terminal_operation(queries: Vec<LocalPullRequestQuery>) -> LocalPullRequests {
+        LocalPullRequests::terminal(coordinates(), queries).unwrap()
     }
 
     fn node(number: i64, node_id: &str, head: &str, state: &str) -> Value {
@@ -1270,6 +1390,22 @@ mod tests {
 
     fn fork(number: i64, node_id: &str, head: &str) -> Value {
         let mut node = node(number, node_id, head, "OPEN");
+        node["isCrossRepository"] = json!(true);
+        node
+    }
+
+    fn terminal_node(number: i64, node_id: &str, head: &str, state: &str) -> Value {
+        json!({
+            "number": number,
+            "id": node_id,
+            "headRefName": head,
+            "state": state,
+            "isCrossRepository": false,
+        })
+    }
+
+    fn terminal_fork(number: i64, node_id: &str, head: &str, state: &str) -> Value {
+        let mut node = terminal_node(number, node_id, head, state);
         node["isCrossRepository"] = json!(true);
         node
     }
@@ -1326,6 +1462,27 @@ mod tests {
             .unwrap()
     }
 
+    fn decoded_terminal_page(
+        id: &str,
+        after: Option<&str>,
+        row: Option<Value>,
+        next: Option<&str>,
+    ) -> LocalPullRequestBatch {
+        terminal_operation(vec![query(id, after)])
+            .decode_value(response(
+                false,
+                [(
+                    "op0".to_owned(),
+                    connection(
+                        row.into_iter().collect(),
+                        next.is_some(),
+                        next.map_or(Value::Null, |cursor| json!(cursor)),
+                    ),
+                )],
+            ))
+            .unwrap()
+    }
+
     fn record_rows(
         mut accumulator: LocalPullRequestAccumulator,
         id: &str,
@@ -1349,6 +1506,72 @@ mod tests {
             );
             accumulator = accumulator.record_batch(batch)?;
             after = next;
+        }
+        if finish_connection {
+            accumulator = accumulator.record_batch(decoded_terminal_page(id, None, None, None))?;
+        }
+        Ok(accumulator)
+    }
+
+    fn record_terminal_rows(
+        mut accumulator: LocalPullRequestAccumulator,
+        id: &str,
+        start: usize,
+        count: usize,
+        finish_connection: bool,
+    ) -> Result<LocalPullRequestAccumulator> {
+        let mut after: Option<String> = None;
+        for offset in 0..count {
+            let index = start + offset;
+            let next = (!finish_connection || offset + 1 != count)
+                .then(|| format!("terminal-cursor-{id}-{index}"));
+            let row = terminal_fork(
+                i64::try_from(index + 1).unwrap(),
+                &format!("TERMINAL-NODE-{id}-{index}"),
+                id,
+                "CLOSED",
+            );
+            accumulator = accumulator.record_batch(decoded_terminal_page(
+                id,
+                after.as_deref(),
+                Some(row),
+                next.as_deref(),
+            ))?;
+            after = next;
+        }
+        Ok(accumulator)
+    }
+
+    fn many_phase_baselines_at_shared_limit(
+        finish_last_terminal: bool,
+    ) -> Result<LocalPullRequestAccumulator> {
+        let ids = (0..8).map(|index| id(&format!("G{index}"))).collect::<Vec<_>>();
+        let accumulator = record_rows(accumulator(ids).unwrap(), "G0", 0, 100, false, true)?;
+        let accumulator = accumulator.record_batch(decoded_page(
+            "G0",
+            Some("cursor-G0-99"),
+            None,
+            None,
+            false,
+        ))?;
+        let mut accumulator = record_terminal_rows(accumulator, "G0", 1_000, 1, true)?;
+
+        for index in 1..8 {
+            let id = format!("G{index}");
+            accumulator = accumulator.record_batch(decoded_page(
+                &id,
+                None,
+                Some(fork(index + 1, &format!("OPEN-{id}"), &id)),
+                None,
+                false,
+            ))?;
+            let next = (index == 7 && !finish_last_terminal).then_some("terminal-last");
+            accumulator = accumulator.record_batch(decoded_terminal_page(
+                &id,
+                None,
+                Some(terminal_fork(index + 1, &format!("TERMINAL-{id}"), &id, "CLOSED")),
+                next,
+            ))?;
         }
         Ok(accumulator)
     }
@@ -1378,6 +1601,9 @@ mod tests {
 
         let later = operation(vec![query("Gone", Some("next"))], false).document();
         insta::assert_snapshot!("later_exact_local_query", later);
+
+        let terminal = terminal_operation(vec![query("Gone", None)]).document();
+        insta::assert_snapshot!("terminal_exact_local_query", terminal);
     }
 
     #[test]
@@ -1424,9 +1650,42 @@ mod tests {
         );
         let second_response =
             UniqueJson::decode(&serde_json::to_vec(&second_response).unwrap()).unwrap();
-        let ObservationStep::Complete(complete) = second_half.accept(second_response).unwrap()
+        let ObservationStep::Request(first_terminal) = second_half.accept(second_response).unwrap()
         else {
-            panic!("all local connections were exhausted");
+            panic!("missing heads require a terminal probe");
+        };
+        assert!(first_terminal.document().contains("headRefName: \"A\""));
+        assert!(first_terminal.document().contains("headRefName: \"B\""));
+        assert!(first_terminal.document().contains("states: [CLOSED, MERGED]"));
+        let terminal_response = response(
+            false,
+            [
+                ("op0".to_owned(), connection(Vec::new(), false, Value::Null)),
+                ("op1".to_owned(), connection(Vec::new(), false, Value::Null)),
+            ],
+        );
+        let terminal_response =
+            UniqueJson::decode(&serde_json::to_vec(&terminal_response).unwrap()).unwrap();
+        let ObservationStep::Request(second_terminal) =
+            first_terminal.accept(terminal_response).unwrap()
+        else {
+            panic!("two terminal probes remain");
+        };
+        assert!(second_terminal.document().contains("headRefName: \"C\""));
+        assert!(second_terminal.document().contains("headRefName: \"D\""));
+        let terminal_response = response(
+            false,
+            [
+                ("op0".to_owned(), connection(Vec::new(), false, Value::Null)),
+                ("op1".to_owned(), connection(Vec::new(), false, Value::Null)),
+            ],
+        );
+        let terminal_response =
+            UniqueJson::decode(&serde_json::to_vec(&terminal_response).unwrap()).unwrap();
+        let ObservationStep::Complete(complete) =
+            second_terminal.accept(terminal_response).unwrap()
+        else {
+            panic!("all exact-head probes were exhausted");
         };
         assert_eq!(
             kinds(&complete),
@@ -1437,9 +1696,9 @@ mod tests {
     #[test]
     fn constructors_reject_unusable_or_ambiguous_requests() {
         assert!(LocalPullRequestQuery::new(id("Gone"), Some(String::new())).is_err());
-        assert!(LocalPullRequests::new(coordinates(), Vec::new(), true).is_err());
+        assert!(LocalPullRequests::open(coordinates(), Vec::new(), true).is_err());
         assert!(
-            LocalPullRequests::new(
+            LocalPullRequests::open(
                 coordinates(),
                 (0..=LocalPullRequests::MAX_ALIASES)
                     .map(|index| query(&format!("G{index}"), None))
@@ -1449,7 +1708,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            LocalPullRequests::new(
+            LocalPullRequests::open(
                 coordinates(),
                 vec![query("Gone", None), query("Gone", Some("next"))],
                 true,
@@ -1504,6 +1763,43 @@ mod tests {
     }
 
     #[test]
+    fn one_id_accepts_one_baseline_per_phase_plus_99_excess_rows() {
+        let open = decoded_page("G", None, Some(fork(1, "OPEN-FORK", "G")), None, true);
+        let accumulator = accumulator([id("G")]).unwrap().record_batch(open).unwrap();
+        let accumulator = record_terminal_rows(accumulator, "G", 1_000, 100, true).unwrap();
+        assert_eq!(kinds(&accumulator.finish().unwrap()), [("G", "absent")]);
+    }
+
+    #[test]
+    fn terminal_phase_rejects_the_100th_shared_excess_row() {
+        let open = decoded_page("G", None, Some(fork(1, "OPEN-FORK", "G")), None, true);
+        let accumulator = accumulator([id("G")]).unwrap().record_batch(open).unwrap();
+        let accumulator = record_terminal_rows(accumulator, "G", 1_000, 100, false).unwrap();
+        let over_limit = decoded_terminal_page(
+            "G",
+            Some("terminal-cursor-G-1099"),
+            Some(terminal_fork(1_101, "TERMINAL-NODE-G-1100", "G", "CLOSED")),
+            None,
+        );
+        assert!(accumulator.record_batch(over_limit).is_err());
+    }
+
+    #[test]
+    fn phase_baselines_remain_free_after_many_ids_exhaust_shared_excess() {
+        let complete = many_phase_baselines_at_shared_limit(true).unwrap().finish().unwrap();
+        assert_eq!(complete.local().len(), 8);
+
+        let accumulator = many_phase_baselines_at_shared_limit(false).unwrap();
+        let over_limit = decoded_terminal_page(
+            "G7",
+            Some("terminal-last"),
+            Some(terminal_fork(9, "TERMINAL-G7-EXCESS", "G7", "CLOSED")),
+            None,
+        );
+        assert!(accumulator.record_batch(over_limit).is_err());
+    }
+
+    #[test]
     fn the_100th_excess_row_is_rejected() {
         let accumulator =
             record_rows(accumulator([id("G")]).unwrap(), "G", 0, 100, false, true).unwrap();
@@ -1548,11 +1844,45 @@ mod tests {
     }
 
     #[test]
+    fn next_request_can_probe_only_one_continuation_beyond_the_shared_budget() {
+        let accumulator = accumulator([id("A"), id("B"), id("C")])
+            .unwrap()
+            .record_batch(decoded_page(
+                "A",
+                None,
+                Some(fork(1, "A-ONE", "A")),
+                Some("a-next"),
+                true,
+            ))
+            .unwrap()
+            .record_batch(decoded_page(
+                "B",
+                None,
+                Some(fork(2, "B-ONE", "B")),
+                Some("b-next"),
+                false,
+            ))
+            .unwrap();
+        let accumulator = LocalPullRequestAccumulator { excess_rows_remaining: 0, ..accumulator };
+
+        let ObservationStep::Request(request) = accumulator.next().unwrap() else {
+            panic!("continued and initial OPEN pages remain");
+        };
+        assert_eq!(
+            request.request.queries.iter().map(|query| query.id.as_str()).collect::<Vec<_>>(),
+            ["A", "C"],
+            "one continued page may diagnose overflow while free baselines stay batched"
+        );
+    }
+
+    #[test]
     fn maximum_one_id_page_chain_includes_a_final_empty_page() {
         let accumulator =
             record_rows(accumulator([id("G")]).unwrap(), "G", 0, 100, false, true).unwrap();
-        let terminal = decoded_page("G", Some("cursor-G-99"), None, None, false);
-        let complete = accumulator.record_batch(terminal).unwrap().finish().unwrap();
+        let open_end = decoded_page("G", Some("cursor-G-99"), None, None, false);
+        let accumulator = accumulator.record_batch(open_end).unwrap();
+        let terminal_end = decoded_terminal_page("G", None, None, None);
+        let complete = accumulator.record_batch(terminal_end).unwrap().finish().unwrap();
         assert_eq!(kinds(&complete), [("G", "absent")]);
     }
 
@@ -1577,6 +1907,7 @@ mod tests {
         let accumulator = record_rows(accumulator, "B", 1000, 1, false, false).unwrap();
         let batch = LocalPullRequestBatch {
             coordinates: coordinates(),
+            kind: PullRequestQueryKind::Open,
             repository: None,
             pages: vec![
                 LocalPullRequestPageEvidence {
@@ -1597,10 +1928,7 @@ mod tests {
     }
 
     #[test]
-    fn open_wins_history_and_forks_while_local_identities_are_retained() {
-        let mut terminal = node(1, "TERMINAL", "G", "CLOSED");
-        terminal["title"] = json!({ "ignored": true });
-        terminal["baseRefOid"] = json!(null);
+    fn open_wave_ignores_forks_and_skips_terminal_history() {
         let mut foreign = fork(2, "FORK", "G");
         foreign["body"] = json!(["ignored"]);
         foreign["headRefOid"] = json!(17);
@@ -1609,16 +1937,13 @@ mod tests {
         open["baseRefName"] = json!("gherrit-bases/G");
         open["autoMergeRequest"] = json!({ "enabledAt": "now" });
 
-        let first = decoded_page("G", None, Some(terminal), Some("one"), true);
-        let second = decoded_page("G", Some("one"), Some(foreign), Some("two"), false);
-        let third = decoded_page("G", Some("two"), Some(open), None, false);
+        let first = decoded_page("G", None, Some(foreign), Some("two"), true);
+        let second = decoded_page("G", Some("two"), Some(open), None, false);
         let complete = accumulator([id("G")])
             .unwrap()
             .record_batch(first)
             .unwrap()
             .record_batch(second)
-            .unwrap()
-            .record_batch(third)
             .unwrap()
             .finish()
             .unwrap();
@@ -1634,8 +1959,8 @@ mod tests {
         assert_eq!(open.head_oid().to_string(), HEAD_OID);
         assert!(open.has_landing_automation());
 
-        assert_eq!(complete.identities.number_values(), HashSet::from([1, 3]));
-        assert_eq!(complete.identities.node_id_values(), HashSet::from(["TERMINAL", "OPEN"]));
+        assert_eq!(complete.identities.number_values(), HashSet::from([3]));
+        assert_eq!(complete.identities.node_id_values(), HashSet::from(["OPEN"]));
     }
 
     #[test]
@@ -1670,138 +1995,121 @@ mod tests {
         foreign["autoMergeRequest"] = json!("ignored");
         foreign["isInMergeQueue"] = Value::Null;
         let batch = decoded_page("G", None, Some(foreign), None, true);
-        let complete =
-            accumulator([id("G")]).unwrap().record_batch(batch).unwrap().finish().unwrap();
+        let terminal_fork = decoded_terminal_page(
+            "G",
+            None,
+            Some(terminal_fork(2, "TERMINAL_FORK", "G", "CLOSED")),
+            Some("next"),
+        );
+        let terminal_end = decoded_terminal_page("G", Some("next"), None, None);
+        let complete = accumulator([id("G")])
+            .unwrap()
+            .record_batch(batch)
+            .unwrap()
+            .record_batch(terminal_fork)
+            .unwrap()
+            .record_batch(terminal_end)
+            .unwrap()
+            .finish()
+            .unwrap();
         assert_eq!(kinds(&complete), [("G", "absent")]);
     }
 
     #[test]
-    fn terminal_only_diagnostics_are_globally_bounded() {
-        let ids = (0..MAX_DIAGNOSTIC_IDENTITIES + 7)
-            .map(|index| id(&format!("G{}{}", index, "x".repeat(100))))
-            .collect::<Vec<_>>();
-        let mut accumulator = accumulator(ids.clone()).unwrap();
-        for (index, id) in ids.iter().enumerate() {
-            let state = if index == 0 { "CLOSED" } else { "MERGED" };
-            let batch = decoded_page(
-                id.as_str(),
-                None,
-                Some(node(
-                    i64::try_from(index + 1).unwrap(),
-                    &format!("NODE-{index}"),
-                    id.as_str(),
-                    state,
-                )),
-                None,
-                index == 0,
-            );
-            accumulator = accumulator.record_batch(batch).unwrap();
-        }
-        let error = accumulator.finish().unwrap_err().to_string();
-        assert!(error.contains("PR #1 is closed. Reopen it"));
-        assert!(error.contains("PR #2 is merged. Change the commit's gherrit-pr-id"));
-        assert!(error.contains("Additional terminal pull requests omitted: 7."));
-        assert!(!error.contains("PR #21"));
-        assert!(error.len() < 8_000, "diagnostic was {} bytes", error.len());
-    }
-
-    #[test]
-    fn mixed_terminal_history_is_order_independent_and_uses_the_lowest_number() {
-        let observe = |first: Value, second: Value| {
-            let first = decoded_page("G", None, Some(first), Some("next"), true);
-            let second = decoded_page("G", Some("next"), Some(second), None, false);
-            accumulator([id("G")])
-                .unwrap()
-                .record_batch(first)
-                .unwrap()
-                .record_batch(second)
-                .unwrap()
-                .finish()
-                .unwrap_err()
-                .to_string()
+    fn terminal_probe_is_conditional_on_open_wave_absence() {
+        let ObservationStep::Request(open_request) =
+            accumulator([id("G")]).unwrap().next().unwrap()
+        else {
+            panic!("the OPEN wave must run first");
         };
-        let closed_then_merged =
-            observe(node(1, "ONE", "G", "CLOSED"), node(2, "TWO", "G", "MERGED"));
-        let merged_then_closed =
-            observe(node(2, "TWO", "G", "MERGED"), node(1, "ONE", "G", "CLOSED"));
-        let expected = "Cannot push GHerrit change 'G' because its exact head has both closed and merged pull request history (for example PR #1). Reopen a closed pull request if possible or change the commit's gherrit-pr-id to start a new review.\nAdditional terminal pull requests omitted: 1.";
-        assert_eq!(closed_then_merged, expected);
-        assert_eq!(merged_then_closed, expected);
+        assert!(open_request.document().contains("states: [OPEN]"));
+        let empty =
+            response(true, [("op0".to_owned(), connection(Vec::new(), false, Value::Null))]);
+        let empty = UniqueJson::decode(&serde_json::to_vec(&empty).unwrap()).unwrap();
+        let ObservationStep::Request(terminal_request) = open_request.accept(empty).unwrap() else {
+            panic!("an empty OPEN wave must schedule a terminal probe");
+        };
+        assert!(terminal_request.document().contains("states: [CLOSED, MERGED]"));
+
+        let open = accumulator([id("G")])
+            .unwrap()
+            .record_batch(decoded_page("G", None, Some(node(1, "ONE", "G", "OPEN")), None, true))
+            .unwrap();
+        assert_eq!(kinds(&open.finish().unwrap()), [("G", "open")]);
     }
 
     #[test]
-    fn single_terminal_kinds_have_exact_truthful_advice() {
+    fn first_same_repository_terminal_row_rejects_with_truthful_advice() {
         for (state, expected) in [
             (
                 "CLOSED",
-                "Cannot push GHerrit change 'G' because PR #1 is closed. Reopen it or change the commit's gherrit-pr-id to start a new review.",
+                "Cannot push GHerrit change 'G' because PR #1 is closed. Change the commit's gherrit-pr-id to start a new review.",
             ),
             (
                 "MERGED",
                 "Cannot push GHerrit change 'G' because PR #1 is merged. Change the commit's gherrit-pr-id to start a new review.",
             ),
         ] {
-            let batch = decoded_page("G", None, Some(node(1, "ONE", "G", state)), None, true);
-            let error = accumulator([id("G")])
+            let accumulator = accumulator([id("G")])
                 .unwrap()
-                .record_batch(batch)
-                .unwrap()
-                .finish()
+                .record_batch(decoded_page("G", None, None, None, true))
+                .unwrap();
+            let error = accumulator
+                .record_batch(decoded_terminal_page(
+                    "G",
+                    None,
+                    Some(terminal_node(1, "ONE", "G", state)),
+                    Some("unread-history"),
+                ))
                 .unwrap_err()
                 .to_string();
             assert_eq!(error, expected, "state={state}");
+            assert!(!error.contains("Reopen"), "terminal history cannot prove a reusable review");
         }
     }
 
     #[test]
-    fn terminal_history_diagnostic_is_complete_and_actionable() {
-        let a_first =
-            decoded_page("A", None, Some(node(1, "A_ONE", "A", "CLOSED")), Some("next"), true);
-        let a_second =
-            decoded_page("A", Some("next"), Some(node(2, "A_TWO", "A", "MERGED")), None, false);
-        let b = decoded_page("B", None, Some(node(3, "B_ONE", "B", "MERGED")), None, false);
-        let error = accumulator([id("A"), id("B")])
+    fn terminal_rejection_bounds_untrusted_identity_details() {
+        let long_id = format!("G{}", "x".repeat(120));
+        let error = accumulator([id(&long_id)])
             .unwrap()
-            .record_batch(a_first)
+            .record_batch(decoded_page(&long_id, None, None, None, true))
             .unwrap()
-            .record_batch(a_second)
-            .unwrap()
-            .record_batch(b)
-            .unwrap()
-            .finish()
+            .record_batch(decoded_terminal_page(
+                &long_id,
+                None,
+                Some(terminal_node(1, "ONE", &long_id, "MERGED")),
+                None,
+            ))
             .unwrap_err()
             .to_string();
-
-        insta::assert_snapshot!(error, @r###"
-    Cannot push GHerrit change 'A' because its exact head has both closed and merged pull request history (for example PR #1). Reopen a closed pull request if possible or change the commit's gherrit-pr-id to start a new review.
-    Cannot push GHerrit change 'B' because PR #3 is merged. Change the commit's gherrit-pr-id to start a new review.
-    Additional terminal pull requests omitted: 1.
-"###);
+        assert!(error.contains('…'));
+        assert!(error.len() < 300);
     }
 
     #[test]
-    fn a_second_same_repository_open_rejects_across_pages() {
-        let first = decoded_page("G", None, Some(node(1, "ONE", "G", "OPEN")), Some("next"), true);
+    fn a_second_same_repository_open_rejects_after_complete_pagination() {
+        let first = decoded_page("G", None, Some(node(2, "TWO", "G", "OPEN")), Some("next"), true);
         let second =
-            decoded_page("G", Some("next"), Some(node(2, "TWO", "G", "OPEN")), None, false);
-        assert!(
-            accumulator([id("G")])
-                .unwrap()
-                .record_batch(first)
-                .unwrap()
-                .record_batch(second)
-                .is_err()
-        );
+            decoded_page("G", Some("next"), Some(node(1, "ONE", "G", "OPEN")), None, false);
+        let error = accumulator([id("G")])
+            .unwrap()
+            .record_batch(first)
+            .unwrap()
+            .record_batch(second)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("more than one OPEN pull request"));
     }
 
     #[test]
     fn identity_number_node_and_pair_collisions_reject_across_ids_and_pages() {
         for (second_number, second_node) in [(1, "TWO"), (2, "ONE"), (1, "ONE")] {
-            let first = decoded_page("A", None, Some(node(1, "ONE", "A", "CLOSED")), None, true);
+            let first = decoded_page("A", None, Some(node(1, "ONE", "A", "OPEN")), None, true);
             let second = decoded_page(
                 "B",
                 None,
-                Some(node(second_number, second_node, "B", "CLOSED")),
+                Some(node(second_number, second_node, "B", "OPEN")),
                 None,
                 false,
             );
@@ -1818,11 +2126,11 @@ mod tests {
 
         for (second_number, second_node) in [(1, "TWO"), (2, "ONE"), (1, "ONE")] {
             let first =
-                decoded_page("A", None, Some(node(1, "ONE", "A", "CLOSED")), Some("next"), true);
+                decoded_page("A", None, Some(node(1, "ONE", "A", "OPEN")), Some("next"), true);
             let second = decoded_page(
                 "A",
                 Some("next"),
-                Some(node(second_number, second_node, "A", "CLOSED")),
+                Some(node(second_number, second_node, "A", "OPEN")),
                 None,
                 false,
             );
@@ -1839,23 +2147,41 @@ mod tests {
     }
 
     #[test]
-    fn fork_and_terminal_projection_fields_are_not_interpreted() {
-        for mut row in [fork(1, "FORK", "G"), node(1, "TERMINAL", "G", "CLOSED")] {
-            for field in [
-                "title",
-                "body",
-                "baseRefName",
-                "baseRefOid",
-                "headRefOid",
-                "autoMergeRequest",
-                "isInMergeQueue",
-            ] {
-                row[field] = json!({ "arbitrary": [null, 17] });
-            }
-            assert!(
-                operation(vec![query("G", None)], true).decode_value(one_response(row)).is_ok()
-            );
+    fn fork_projection_fields_are_ignored_and_terminal_queries_do_not_select_them() {
+        let mut row = fork(1, "FORK", "G");
+        for field in [
+            "title",
+            "body",
+            "baseRefName",
+            "baseRefOid",
+            "headRefOid",
+            "autoMergeRequest",
+            "isInMergeQueue",
+        ] {
+            row[field] = json!({ "arbitrary": [null, 17] });
         }
+        assert!(operation(vec![query("G", None)], true).decode_value(one_response(row)).is_ok());
+
+        let document = terminal_operation(vec![query("G", None)]).document();
+        assert!(document.contains("states: [CLOSED, MERGED]"));
+        for field in ["title", "body", "baseRefName", "baseRefOid", "headRefOid"] {
+            assert!(!document.contains(field));
+        }
+        assert!(
+            terminal_operation(vec![query("G", None)])
+                .decode_value(response(
+                    false,
+                    [(
+                        "op0".to_owned(),
+                        connection(
+                            vec![terminal_node(1, "TERMINAL", "G", "CLOSED")],
+                            false,
+                            Value::Null,
+                        )
+                    )],
+                ))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2000,6 +2326,10 @@ mod tests {
             .unwrap()
             .record_batch(second)
             .unwrap()
+            .record_batch(decoded_terminal_page("C", None, None, None))
+            .unwrap()
+            .record_batch(decoded_terminal_page("A", None, None, None))
+            .unwrap()
             .finish()
             .unwrap();
 
@@ -2036,7 +2366,7 @@ mod tests {
         );
 
         let other = RepositoryCoordinates::for_test("owner", "other");
-        let foreign = LocalPullRequests::new(other, vec![query("G", None)], true)
+        let foreign = LocalPullRequests::open(other, vec![query("G", None)], true)
             .unwrap()
             .decode_value(response(true, [("op0".to_owned(), empty())]))
             .unwrap();
@@ -2122,7 +2452,7 @@ mod tests {
         let null_alias = serde_json::to_vec(&null_alias).unwrap();
         let error =
             operation(vec![query("G", None)], true).decode(&null_alias).unwrap_err().to_string();
-        assert_eq!(error, "GitHub returned malformed local pull request connection data");
+        assert_eq!(error, "GitHub returned malformed OPEN pull request connection data");
 
         let mut trailing = serde_json::to_vec(&one_response(node(1, "ONE", "G", "OPEN"))).unwrap();
         trailing.extend_from_slice(b" null");
@@ -2140,7 +2470,7 @@ mod tests {
         let error = operation(vec![query("G", None)], true).decode(&unknown).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "GitHub returned malformed local pull request connection data"
+            "GitHub returned malformed OPEN pull request connection data"
         );
         let rendered = format!("{error:?}");
         assert!(!rendered.contains("untrusted"));
