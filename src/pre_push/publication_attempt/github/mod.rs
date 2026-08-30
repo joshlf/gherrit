@@ -8,6 +8,15 @@ use color_eyre::eyre::{Result, bail};
 
 use crate::pre_push::destination::{DefaultBranch, RepositoryCoordinates};
 
+/// Maximum number of mutation fields sent in one GraphQL request.
+pub(in crate::pre_push::publication_attempt) const MAX_MUTATION_ALIASES: usize = 64;
+
+// A 131,072-byte pull-request body made entirely from U+0001 expands to
+// 917,504 bytes after GraphQL-string escaping and then outer-JSON escaping.
+// One MiB accommodates that worst case plus the mutation's other supported
+// fields while retaining a deterministic preflight request limit.
+pub(in crate::pre_push::publication_attempt) const MAX_MUTATION_REQUEST_BYTES: usize = 1024 * 1024;
+
 mod json;
 mod mutation;
 mod observation;

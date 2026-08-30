@@ -14,15 +14,12 @@ use serde_json::{Map, Value, json};
 
 use super::{
     super::{body::GeneratedBody, refs::PublicationRevision},
-    RepositoryNodeId,
+    MAX_MUTATION_ALIASES, MAX_MUTATION_REQUEST_BYTES, RepositoryNodeId,
     json::UniqueJson,
     pull_request::{PullRequestIdentity, PullRequestIdentityRegistry},
     transport::{Github, indeterminate_mutation},
 };
-use crate::pre_push::{
-    batching::{MAX_MUTATION_ALIASES, MAX_MUTATION_REQUEST_BYTES},
-    local::{GherritPrId, PullRequestTitle},
-};
+use crate::pre_push::local::{GherritPrId, PullRequestTitle};
 
 fn owned_base_name(id: &GherritPrId) -> String {
     format!("gherrit-bases/{}", id.as_str())
