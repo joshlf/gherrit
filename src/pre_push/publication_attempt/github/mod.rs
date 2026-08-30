@@ -113,6 +113,7 @@ impl Repository {
         &self.coordinates
     }
 
+    #[cfg(test)]
     pub(super) fn node_id(&self) -> &RepositoryNodeId {
         &self.node_id
     }
