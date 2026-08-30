@@ -28,13 +28,13 @@ pub(super) use mutation::{
 };
 #[cfg(test)]
 pub(in crate::pre_push::publication_attempt) use mutation::{
-    PreparedUpdates, TestCreate, TestPullRequestProjection, TestUpdate,
+    TestClose, TestCreate, TestPullRequestProjection, TestUpdate,
 };
 #[cfg(test)]
 pub(super) use observation::ObservedBase;
 pub(super) use observation::{
     AbsentPullRequest, BaseKind, CompleteLocalPullRequests, LocalPullRequestObservation,
-    ManagedOpenPullRequest, ManagedOpenPullRequestCandidate,
+    ManagedOpenPullRequestCandidate, ManagedOpenPullRequests,
 };
 pub(super) use pull_request::{PullRequestIdentity, PullRequestNumber};
 pub(super) use transport::Github;
