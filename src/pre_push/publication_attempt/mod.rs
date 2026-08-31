@@ -1,10 +1,8 @@
-//! The exact-local publication workflow being prepared behind a private
-//! boundary.
+//! One exact-local publication attempt.
 //!
-//! The parent pre-push module does not call [`run`] until hook validation and
-//! runtime selection are activated. Keeping the candidate workflow here lets
-//! its observation, planning, recovery, and effect boundaries compile and test
-//! together before that switch.
+//! This module captures local intent once, makes the bounded observations
+//! needed to plan from that intent, and consumes the resulting plan through
+//! its acknowledgement-gated effects.
 
 mod body;
 mod github;
@@ -28,7 +26,7 @@ use self::{
     remote::ValidatedPublication,
 };
 use super::{
-    GithubEndpoint,
+    GithubEndpoint, Invocation,
     destination::{DefaultBranch, ObservedPublicBranch, PushDestination, RemoteBranchState},
     local::LocalStack,
 };
@@ -70,6 +68,13 @@ impl ObservedPublicProjection {
     fn into_parts(self) -> (PublicBranch, RemoteBranchState) {
         (self.branch, self.state)
     }
+
+    fn requires_transition_to(&self, desired: ObjectId) -> bool {
+        match self.state {
+            RemoteBranchState::Absent => true,
+            RemoteBranchState::At(current) => current != desired,
+        }
+    }
 }
 
 fn ref_paths_conflict(left: &str, right: &str) -> bool {
@@ -103,6 +108,26 @@ struct ObservedLocalPublication {
     destination: PushDestination,
     stack: LocalStack,
     public_branch: Option<ObservedPublicProjection>,
+}
+
+/// Every observation which authorizes one empty publication plan.
+///
+/// A writable empty public projection can enter this type only after the
+/// named default ref has repeated the default tip used to derive the empty
+/// stack. Empty private and already-current public projections need no
+/// additional evidence because their plan cannot write.
+struct CompleteEmptyPublicationObservation(ObservedLocalPublication);
+
+impl CompleteEmptyPublicationObservation {
+    fn into_local(self) -> ObservedLocalPublication {
+        self.0
+    }
+
+    #[cfg(test)]
+    fn for_plan_test(local: ObservedLocalPublication) -> Self {
+        assert!(local.is_empty(), "empty plan test input must have an empty stack");
+        Self(local)
+    }
 }
 
 /// Every observation which authorizes one nonempty publication plan.
@@ -183,6 +208,28 @@ impl ObservedLocalPublication {
         (self.destination, self.stack, self.public_branch)
     }
 
+    async fn complete_empty_observation(
+        self,
+        repository: &util::Repo,
+    ) -> Result<CompleteEmptyPublicationObservation> {
+        if !self.is_empty() {
+            bail!("empty publication observation received a nonempty local stack");
+        }
+        if self
+            .public_branch
+            .as_ref()
+            .is_some_and(|public| public.requires_transition_to(self.stack.tip()))
+        {
+            remote::require_exact_default(
+                self.stack.default_branch(),
+                repository,
+                &self.destination,
+            )
+            .await?;
+        }
+        Ok(CompleteEmptyPublicationObservation(self))
+    }
+
     #[cfg(test)]
     fn for_plan_test(
         destination: PushDestination,
@@ -197,7 +244,8 @@ impl ObservedLocalPublication {
 
     async fn publish(self, repository: &util::Repo, endpoint: &GithubEndpoint) -> Result<usize> {
         if self.is_empty() {
-            plan::plan_empty_publication(self)?.execute().await?;
+            let observation = self.complete_empty_observation(repository).await?;
+            plan::plan_empty_publication(observation)?.execute().await?;
             return Ok(0);
         }
         if endpoint.is_disabled() {
@@ -228,7 +276,11 @@ impl ObservedLocalPublication {
 /// Callers cannot assemble a destination, observation, client, plan, or
 /// effect. This function derives each value from the supplied repository and
 /// consumes the complete attempt before returning.
-pub(super) async fn run(repository: &util::Repo, endpoint: &GithubEndpoint) -> Result<()> {
+pub(super) async fn run(
+    repository: &util::Repo,
+    endpoint: &GithubEndpoint,
+    invocation: Invocation,
+) -> Result<()> {
     let managed = match LocalPublicationIntent::capture(repository)? {
         LocalPublicationIntent::Unmanaged(branch_name) => {
             log::info!("Branch {} is UNMANAGED. Allowing standard push.", branch_name.yellow());
@@ -236,6 +288,7 @@ pub(super) async fn run(repository: &util::Repo, endpoint: &GithubEndpoint) -> R
         }
         LocalPublicationIntent::Managed(managed) => managed,
     };
+    invocation.require_managed_noop()?;
     let branch_name = managed.branch_name.clone();
     log::info!("Branch {} is MANAGED. Publishing stack...", branch_name.yellow());
 
@@ -261,6 +314,10 @@ pub(super) async fn run(repository: &util::Repo, endpoint: &GithubEndpoint) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_test_endpoint() -> GithubEndpoint {
+        GithubEndpoint::Disabled
+    }
 
     #[test]
     fn local_capture_models_each_checked_management_mode() {
@@ -384,11 +441,51 @@ mod tests {
 
         let observed = managed.observe(&repository, destination).await.unwrap();
         assert!(observed.is_empty());
-        plan::plan_empty_publication(observed).unwrap().execute().await.unwrap();
+        assert_eq!(observed.publish(&repository, &local_test_endpoint()).await.unwrap(), 0);
 
         assert_eq!(
             context.remote_ref_oid(&format!("refs/heads/{BRANCH}")),
             Some(expected.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_public_transition_stops_if_the_named_default_ref_moves() {
+        const BRANCH: &str = "empty-public-observation";
+
+        let context =
+            testutil::TestContextBuilder::new("unused").with_remote().with_initial_commit().build();
+        context.checkout_new("divergent-public-value");
+        context.commit("Divergent public value");
+        let divergent = context.head_oid();
+        context.run_git(&["push", "--no-verify", "origin", &format!("HEAD:refs/heads/{BRANCH}")]);
+        context.run_git(&["checkout", "main"]);
+        context.checkout_new(BRANCH);
+        context
+            .set_config(&format!("branch.{BRANCH}.gherritManaged"), Some(testutil::MANAGED_PUBLIC));
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let LocalPublicationIntent::Managed(managed) =
+            LocalPublicationIntent::capture(&repository).unwrap()
+        else {
+            panic!("the configured public branch must be managed")
+        };
+        let remote = repository.default_remote_name().unwrap();
+        let destination = PushDestination::resolve(&repository, remote).unwrap();
+        let observed = managed.observe(&repository, destination).await.unwrap();
+        assert!(observed.is_empty());
+
+        context
+            .remote_git_cmd()
+            .args(["update-ref", "refs/heads/main", &divergent])
+            .assert()
+            .success();
+        let error =
+            observed.publish(&repository, &local_test_endpoint()).await.unwrap_err().to_string();
+
+        assert!(error.contains("did not provide the exact default branch"), "{error}");
+        assert_eq!(
+            context.remote_ref_oid(&format!("refs/heads/{BRANCH}")).as_deref(),
+            Some(divergent.as_str())
         );
     }
 
@@ -420,7 +517,10 @@ mod tests {
                 .success();
             let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
             let error =
-                run(&repository, &GithubEndpoint::Production).await.unwrap_err().to_string();
+                run(&repository, &GithubEndpoint::Production, Invocation::new(None, None).unwrap())
+                    .await
+                    .unwrap_err()
+                    .to_string();
 
             assert_eq!(
                 error,
