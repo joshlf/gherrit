@@ -21,7 +21,7 @@ fn test_driver_without_github_endpoint_fails_closed() {
 
     ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().failure().stderr(
         predicate::str::contains(
-            "test driver cannot sync PRs without a configured GitHub endpoint",
+            "test driver cannot publish PRs without a configured GitHub endpoint",
         ),
     );
 
