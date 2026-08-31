@@ -87,11 +87,13 @@ fn push_destination_controls_observation_publication_and_github_identity() {
     assert_eq!(ctx.github().pull_requests().len(), 1);
 
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
-    assert_eq!(recorded_remote(&pushes[0]), "gherrit-publication-1");
-    for literal in [&push_destination, &fetch_destination] {
-        assert!(pushes[0].arguments().iter().all(|argument| !argument.contains(literal)));
-        assert!(!format!("{:?}", pushes[0]).contains(literal));
+    assert_eq!(pushes.len(), 2);
+    assert!(pushes.iter().all(|push| recorded_remote(push) == "gherrit-publication-1"));
+    for push in &pushes {
+        for literal in [&push_destination, &fetch_destination] {
+            assert!(push.arguments().iter().all(|argument| !argument.contains(literal)));
+            assert!(!format!("{push:?}").contains(literal));
+        }
     }
 }
 
@@ -174,7 +176,10 @@ fn failed_push_does_not_disclose_the_destination_or_child_diagnostics() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("`git push` failed for GHerrit remote 'origin'"));
+    assert!(
+        stderr.contains("Git publication was rejected without changing the requested refs"),
+        "stderr={stderr:?}"
+    );
     for private in ["private-owner", "private-repository", "private child diagnostic"] {
         assert!(!stderr.contains(private), "stderr disclosed {private:?}: {stderr}");
     }
@@ -212,9 +217,11 @@ fn destination_conditioned_configuration_cannot_capture_the_internal_remote() {
         Some(ctx.head_oid().as_str())
     );
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
-    assert_eq!(recorded_remote(&pushes[0]), "gherrit-publication-1");
-    assert!(pushes[0].arguments().iter().all(|argument| argument != "unplanned-receive-pack"));
+    assert_eq!(pushes.len(), 2);
+    assert!(pushes.iter().all(|push| recorded_remote(push) == "gherrit-publication-1"));
+    assert!(pushes.iter().all(|push| {
+        push.arguments().iter().all(|argument| argument != "unplanned-receive-pack")
+    }));
 }
 
 #[test]
@@ -249,19 +256,22 @@ fn destination_conditioned_configured_remote_proxy_is_preserved_privately() {
         Some(ctx.head_oid().as_str())
     );
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
-    let arguments = pushes[0].arguments();
-    assert!(arguments.iter().any(|argument| {
-        argument == "--config-env=remote.gherrit-publication.proxy=GHERRIT_PRIVATE_REMOTE_PROXY"
-    }));
-    assert!(arguments.iter().any(|argument| {
-        argument
-            == "--config-env=remote.gherrit-publication.proxyAuthMethod=GHERRIT_PRIVATE_REMOTE_PROXY_AUTH_METHOD"
-    }));
-    for private in ["opaque-proxy-secret", "opaque-auth-secret"] {
-        assert!(arguments.iter().all(|argument| !argument.contains(private)));
-        assert!(!format!("{:?}", pushes[0]).contains(private));
-    }
+    assert_eq!(pushes.len(), 2, "initial publication requires tuple and marker pushes");
+    pushes.iter().for_each(|push| {
+        let arguments = push.arguments();
+        assert!(arguments.iter().any(|argument| {
+            argument
+                == "--config-env=remote.gherrit-publication.proxy=GHERRIT_PRIVATE_REMOTE_PROXY"
+        }));
+        assert!(arguments.iter().any(|argument| {
+            argument
+                == "--config-env=remote.gherrit-publication.proxyAuthMethod=GHERRIT_PRIVATE_REMOTE_PROXY_AUTH_METHOD"
+        }));
+        for private in ["opaque-proxy-secret", "opaque-auth-secret"] {
+            assert!(arguments.iter().all(|argument| !argument.contains(private)));
+            assert!(!format!("{push:?}").contains(private));
+        }
+    });
 }
 
 #[test]
@@ -386,12 +396,14 @@ fn inherited_push_configuration_cannot_add_refs_or_server_options() {
     assert_eq!(ctx.remote_ref_oid("refs/tags/unplanned"), None);
 
     let pushes = ctx.recorded_pushes();
-    assert_eq!(pushes.len(), 1);
-    let arguments = pushes[0].arguments();
-    assert!(arguments.windows(2).any(|pair| pair == ["-c", "push.followTags=false"]));
-    assert!(arguments.windows(2).any(|pair| pair == ["-c", "push.recurseSubmodules=no"]));
-    assert!(arguments.windows(2).any(|pair| pair == ["-c", "push.pushOption="]));
-    assert!(arguments.iter().all(|argument| argument != "unplanned-server-option"));
+    assert_eq!(pushes.len(), 2);
+    for push in pushes {
+        let arguments = push.arguments();
+        assert!(arguments.windows(2).any(|pair| pair == ["-c", "push.followTags=false"]));
+        assert!(arguments.windows(2).any(|pair| pair == ["-c", "push.recurseSubmodules=no"]));
+        assert!(arguments.windows(2).any(|pair| pair == ["-c", "push.pushOption="]));
+        assert!(arguments.iter().all(|argument| argument != "unplanned-server-option"));
+    }
 }
 
 #[test]

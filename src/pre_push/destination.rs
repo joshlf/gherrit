@@ -524,23 +524,6 @@ impl PushDestination {
         )
     }
 
-    /// Observes destination refs through the sole bounded execution path.
-    ///
-    /// This compatibility entry point remains for the active legacy runtime.
-    /// The exact-local workflow uses [`Self::observe_refs_from`] so its
-    /// repository binding remains explicit while that workflow is dormant.
-    pub(super) async fn observe_refs(
-        &self,
-        options: impl IntoIterator<Item = String>,
-        ref_patterns: impl IntoIterator<Item = String>,
-    ) -> std::result::Result<subprocess::CommandOutput, subprocess::CommandError> {
-        subprocess::output(
-            self.ls_remote(options, ref_patterns),
-            subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
-        )
-        .await
-    }
-
     /// Observes refs from the exact repository bound to an acquisition plan.
     ///
     /// Keeping the raw `ls-remote` command private prevents callers from
@@ -659,13 +642,6 @@ impl PushDestination {
         Ok(self.repository == RepositoryBinding::new(repository)?)
     }
 
-    pub(super) fn pr_url(&self, pr_number: u64) -> String {
-        format!(
-            "https://github.com/{}/{}/pull/{pr_number}",
-            self.resolved.coordinates.owner, self.resolved.coordinates.repository
-        )
-    }
-
     pub(super) fn repo_url_relative(&self) -> String {
         format!("/{}/{}", self.resolved.coordinates.owner, self.resolved.coordinates.repository)
     }
@@ -688,20 +664,6 @@ impl PushDestination {
         )
         .await?;
         Ok(InitialRemoteObservation { destination: self, refs })
-    }
-
-    /// Observes only the symbolic default for the active legacy runtime.
-    ///
-    /// Keep this path independent from the dormant exact-local observation so
-    /// the preparatory public-branch model does not change active behavior.
-    pub(super) async fn observe_default_branch(&self) -> Result<DefaultBranch> {
-        observe_default_branch_command(
-            self.ls_remote(["--symref".to_string()], ["HEAD".to_string()]),
-            self.configured_remote(),
-            subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
-            subprocess::REMOTE_GIT_STDOUT_LIMIT,
-        )
-        .await
     }
 
     fn initial_observation_command(&self, public_branch: Option<&PublicBranchName>) -> Command {
@@ -843,20 +805,6 @@ impl PushDestination {
         spellings.dedup();
         spellings
     }
-}
-
-async fn observe_default_branch_command(
-    command: Command,
-    configured_remote: &str,
-    timeout: Duration,
-    stdout_limit: usize,
-) -> Result<DefaultBranch> {
-    let output = run_initial_observation(command, configured_remote, timeout, stdout_limit).await?;
-    parse_default_branch(output.stdout()).wrap_err_with(|| {
-        format!(
-            "GHerrit remote '{configured_remote}' did not report one valid symbolic default branch"
-        )
-    })
 }
 
 async fn observe_initial_command(
@@ -1587,6 +1535,7 @@ fn valid_repository_component(component: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+#[cfg(test)]
 fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
     let ParsedInitialRemoteObservation { default_branch, public_branch } =
         parse_initial_remote_observation(output, None)?;
