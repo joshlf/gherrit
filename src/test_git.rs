@@ -32,6 +32,12 @@ struct GitResponse {
     exit_code: i32,
     passthrough: bool,
     report_exit_status: bool,
+    push_stdout: Option<PushStdout>,
+}
+
+#[derive(Deserialize)]
+enum PushStdout {
+    Replace(String),
 }
 
 #[derive(Serialize)]
@@ -66,11 +72,26 @@ pub fn run() -> ExitCode {
         return exit_code(response.exit_code);
     }
 
-    let status = Command::new(env::var("SYSTEM_GIT_PATH").expect("missing system Git path"))
-        .args(&args[1..])
-        .status()
-        .expect("failed to run system Git");
-    let code = status.code().unwrap_or(1);
+    let system_git = env::var("SYSTEM_GIT_PATH").expect("missing system Git path");
+    let code = match response.push_stdout {
+        None => Command::new(system_git)
+            .args(&args[1..])
+            .status()
+            .expect("failed to run system Git")
+            .code()
+            .unwrap_or(1),
+        Some(PushStdout::Replace(replacement)) => {
+            let output = Command::new(system_git)
+                .args(&args[1..])
+                .output()
+                .expect("failed to run system Git");
+            io::stdout().write_all(replacement.as_bytes()).unwrap();
+            io::stderr().write_all(&output.stderr).unwrap();
+            io::stdout().flush().unwrap();
+            io::stderr().flush().unwrap();
+            output.status.code().unwrap_or(1)
+        }
+    };
 
     if response.report_exit_status {
         let completion = GitCompletion { args: &args, exit_code: code };

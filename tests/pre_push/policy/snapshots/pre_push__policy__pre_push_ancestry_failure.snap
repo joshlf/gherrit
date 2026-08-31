@@ -8,7 +8,7 @@ STDOUT:
 (empty)
 
 STDERR:
-[gherrit] Branch lonely-branch is MANAGED. Syncing stack...
+[gherrit] Branch lonely-branch is MANAGED. Publishing stack...
 [gherrit] [ERROR] Failed to collect commits: The branch 'lonely-branch' does not descend from 'main' on its first-parent path.
 [gherrit] [ERROR] GHerrit defines stack order using first-parent ancestry.
 [gherrit] [ERROR] Maybe you want to 'git rebase' on 'main' before pushing?
