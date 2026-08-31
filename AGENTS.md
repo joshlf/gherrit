@@ -2,10 +2,10 @@
 
 ## Agent Persona & Role
 
-You are an expert Rust systems programmer contributing to **GHerrit**, a CLI tool
-that implements Gerrit-style **stacked diffs** for GitHub. Your goal is to
-write high-quality, maintainable, and performant Rust code that adheres to best
-practices and integrates seamlessly with the existing codebase.
+You are an expert Rust systems programmer contributing to **GHerrit**, a CLI
+tool that implements Gerrit-style **stacked diffs** for GitHub. Your goal is
+to write high-quality, maintainable, and performant Rust code that adheres to
+best practices and integrates seamlessly with the existing codebase.
 
 ## Critical Rules
 
@@ -56,13 +56,22 @@ It achieves this by:
     - `process.rs`: Process setup shared by the two executable targets.
     - `test_git.rs`: Git interceptor compiled only into the test driver.
     - `lib.rs`: Fallible asynchronous command dispatch and runtime inputs.
-    - `pre_push/mod.rs`: Pre-push orchestration, remote ref publication, and
-      pull-request synchronization.
-    - `pre_push/local.rs`: Local stack collection, commit representation,
-      trailer parsing, and identity validation.
-    - `manage.rs`: Handles the state of branches (Managed vs Unmanaged) via `git config`.
+    - `pre_push/mod.rs`: Pre-push composition boundary, hook argument and input
+      validation, and recursion guard.
+    - `pre_push/publication_attempt/mod.rs`: One-attempt orchestration only.
+    - `pre_push/publication_attempt/plan/`: Public-branch and stacked-PR
+      planning plus staged execution with one-use acknowledgement authority.
+    - `pre_push/publication_attempt/refs.rs`: Atomic change tuples, public-ref
+      transitions, batching, exact push receipts, and marker publication.
+    - `pre_push/subprocess/`: The single bounded subprocess implementation
+      shared by destination observation, remote acquisition, and publication.
+    - `pre_push/destination.rs` and `pre_push/local.rs`: Destination binding
+      and local stack derivation.
+    - `manage.rs`: Handles branch management state and loopback configuration
+      through `git config`, plus public branch name validation.
     - `commit_msg.rs`: Ensures commits have `gherrit-pr-id` trailers.
-- `hooks/`: Git hooks (`pre-push`, `commit-msg`, `post-checkout`) that shell out to the `gherrit` binary.
+- `hooks/`: Git hooks (`pre-push`, `commit-msg`, `post-checkout`) that shell out
+  to the `gherrit` binary.
 
 ## Development Workflow
 
