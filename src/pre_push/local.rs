@@ -165,16 +165,13 @@ impl LocalChange {
         self.first_parent
     }
 
+    #[cfg(test)]
     pub(super) fn title(&self) -> &str {
         self.title.as_str()
     }
 
     pub(super) fn into_pull_request_content(self) -> (PullRequestTitle, String) {
         (self.title, self.body)
-    }
-
-    pub(super) fn body(&self) -> &str {
-        &self.body
     }
 }
 
@@ -187,14 +184,6 @@ pub(super) struct LocalStack {
 }
 
 impl LocalStack {
-    /// Reads and validates the local managed stack without performing network
-    /// writes.
-    pub(super) fn collect(repo: &util::Repo, default_branch: &DefaultBranch) -> Result<Self> {
-        let head = repo.rev_parse_single("HEAD")?.detach();
-        let branch_name = repo.current_branch().name().unwrap_or("current branch");
-        Self::collect_captured(repo, branch_name, head, default_branch.clone())
-    }
-
     /// Reads and validates one captured local managed stack without re-reading
     /// its branch identity or `HEAD` target.
     pub(super) fn collect_captured(
@@ -666,7 +655,8 @@ mod tests {
 
         let collect = || {
             let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
-            LocalStack::collect(&repository, &supplied_default)
+            let head = repository.rev_parse_single("HEAD").unwrap().detach();
+            LocalStack::collect_captured(&repository, "feature", head, supplied_default.clone())
         };
 
         let accepted = "雪".repeat(MAX_TITLE_SCALARS);
@@ -710,7 +700,7 @@ mod tests {
 
         context.run_git(&["checkout", "main"]);
         context.run_git(&["checkout", "-b", "feature-b"]);
-        let id_b = context.commit_with_gherrit_id("Feature B");
+        context.commit_with_gherrit_id("Feature B");
 
         let captured = LocalStack::collect_captured(
             &repository,
@@ -719,11 +709,8 @@ mod tests {
             default.clone(),
         )
         .unwrap();
-        let current = LocalStack::collect(&repository, &default).unwrap();
-
         assert_eq!(captured.iter().map(|change| change.id().as_str()).collect::<Vec<_>>(), [id_a]);
         assert_eq!(captured.iter().next().unwrap().head(), captured_head);
-        assert_eq!(current.iter().map(|change| change.id().as_str()).collect::<Vec<_>>(), [id_b]);
     }
 
     #[test]
@@ -777,7 +764,9 @@ mod tests {
         std::fs::write(context.repo_path.join(".git/shallow"), format!("{default_tip}\n")).unwrap();
         context.run_git(&["config", "remote.origin.promisor", "true"]);
 
-        let stack = LocalStack::collect(&repository, &supplied_default).unwrap();
+        let stack =
+            LocalStack::collect_captured(&repository, "main", default_tip, supplied_default)
+                .unwrap();
 
         assert!(stack.is_empty());
     }

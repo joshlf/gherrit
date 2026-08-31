@@ -504,21 +504,6 @@ impl Repo {
         Ok(branches.iter().any(|branch| branch == branch_name))
     }
 
-    // Check whether the branch is managed by GHerrit.
-    pub fn is_managed(&self, branch_name: &str) -> Result<bool> {
-        match State::read_from(self, branch_name)? {
-            Some(State::Unmanaged) => Ok(false),
-            Some(State::Private | State::Public) => Ok(true),
-            None => {
-                bail!(
-                    "It is unclear whether branch '{branch_name}' should be managed by GHerrit.\n\
-                    Run 'gherrit manage' to sync it as a GHerrit stack.\n\
-                    Run 'gherrit unmanage' to push it as a standard Git branch."
-                );
-            }
-        }
-    }
-
     pub fn read_current_branch_and_state(&self) -> Result<(String, Option<State>)> {
         let branch_name = self.current_branch();
         let branch_name = match branch_name {
@@ -694,33 +679,50 @@ fn branch_head_snapshot(repo: &gix::Repository) -> Result<Option<BranchHeadSnaps
     Ok(Some(BranchHeadSnapshot { branch_name, target }))
 }
 
-fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
-    // Keep the active legacy path's existing observation and error behavior
-    // until the exact-local workflow is activated. `branch_head_snapshot` is
-    // the single-read path used only by that dormant workflow.
-    if let Some(name) = repo.head()?.referent_name() {
-        let name = name.shorten().to_string();
+/// Determines the logical branch identity from one retained HEAD snapshot.
+fn get_head_state(repo: &gix::Repository, head: &gix::Head<'_>) -> Result<HeadState> {
+    if let Some(name) = head.referent_name() {
+        let name = decode_branch_name(name.shorten().as_ref())?;
         return Ok(HeadState::Attached(name));
     }
 
+    // Try to recover the branch name – we only care about states that detach
+    // HEAD but preserve a branch identity. All other states besides these two
+    // are either unreachable (because they're states in which the HEAD is
+    // considered attached, and so we would have already returned above) or
+    // are states in which we don't have any branch name at all.
     if let Some(InProgress::Rebase) | Some(InProgress::RebaseInteractive) = repo.state() {
         let git_dir = repo.path();
-        let try_read_ref = |path: PathBuf| -> Option<String> {
-            fs::read_to_string(path).ok().map(|content| {
-                content.trim().strip_prefix("refs/heads/").unwrap_or(content.trim()).to_string()
-            })
+        let try_read_ref = |path: PathBuf| -> Result<Option<String>> {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error)
+                        .wrap_err_with(|| format!("Failed to read {}", path.display()));
+                }
+            };
+            let bytes = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+            let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+            let bytes = bytes.strip_prefix(b"refs/heads/").unwrap_or(bytes);
+            Ok(Some(decode_branch_name(bytes)?))
         };
 
-        if let Some(name) = try_read_ref(git_dir.join("rebase-merge/head-name")) {
+        if let Some(name) = try_read_ref(git_dir.join("rebase-merge/head-name"))? {
             return Ok(HeadState::Pending(name));
         }
 
-        if let Some(name) = try_read_ref(git_dir.join("rebase-apply/head-name")) {
+        if let Some(name) = try_read_ref(git_dir.join("rebase-apply/head-name"))? {
             return Ok(HeadState::Pending(name));
         }
     }
 
     Ok(HeadState::Detached)
+}
+
+fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
+    let head = repo.head()?;
+    get_head_state(repo, &head)
 }
 
 fn decode_branch_name(bytes: &[u8]) -> Result<String> {

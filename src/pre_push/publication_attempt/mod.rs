@@ -1,15 +1,8 @@
-//! The exact-local publication workflow being prepared behind a private
-//! boundary.
+//! One exact-local publication attempt.
 //!
-//! The parent pre-push module does not call [`run`] until hook validation and
-//! runtime selection are activated. Keeping the candidate workflow here lets
-//! its observation, planning, recovery, and effect boundaries compile and test
-//! together before that switch.
-
-#![cfg_attr(
-    test,
-    expect(dead_code, reason = "the candidate exact workflow remains dormant until activation")
-)]
+//! This module captures local intent once, makes the bounded observations
+//! needed to plan from that intent, and consumes the resulting plan through
+//! its acknowledgement-gated effects.
 
 mod body;
 mod github;
@@ -30,7 +23,7 @@ use self::{
     history::ValidatedChangeHistory,
 };
 use super::{
-    GithubEndpoint,
+    GithubEndpoint, Invocation,
     destination::{DefaultBranch, ObservedPublicBranch, PushDestination, RemoteBranchState},
     local::LocalStack,
 };
@@ -230,7 +223,11 @@ impl ObservedLocalPublication {
 /// Callers cannot assemble a destination, observation, client, plan, or
 /// effect. This function derives each value from the supplied repository and
 /// consumes the complete attempt before returning.
-pub(super) async fn run(repository: &util::Repo, endpoint: &GithubEndpoint) -> Result<()> {
+pub(super) async fn run(
+    repository: &util::Repo,
+    endpoint: &GithubEndpoint,
+    invocation: Invocation,
+) -> Result<()> {
     let managed = match LocalPublicationIntent::capture(repository)? {
         LocalPublicationIntent::Unmanaged(branch_name) => {
             log::info!("Branch {} is UNMANAGED. Allowing standard push.", branch_name.yellow());
@@ -238,6 +235,7 @@ pub(super) async fn run(repository: &util::Repo, endpoint: &GithubEndpoint) -> R
         }
         LocalPublicationIntent::Managed(managed) => managed,
     };
+    invocation.require_managed_noop()?;
     let branch_name = managed.branch_name.clone();
     log::info!("Branch {} is MANAGED. Publishing stack...", branch_name.yellow());
 
