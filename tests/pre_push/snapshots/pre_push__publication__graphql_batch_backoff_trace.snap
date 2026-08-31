@@ -1,22 +1,60 @@
 ---
 source: tests/pre_push/publication.rs
-assertion_line: 461
 expression: requests
 ---
 [
     [
-        Query,
-        Query,
-        Query,
-        Query,
+        PullRequestQuery {
+            connections: [
+                PullRequestConnectionQuery {
+                    head: "Gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+                    after: None,
+                },
+                PullRequestConnectionQuery {
+                    head: "Gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
+                    after: None,
+                },
+                PullRequestConnectionQuery {
+                    head: "Gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad",
+                    after: None,
+                },
+                PullRequestConnectionQuery {
+                    head: "Gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae",
+                    after: None,
+                },
+            ],
+            include_repository_facts: true,
+        },
     ],
     [
-        Query,
-        Query,
+        PullRequestQuery {
+            connections: [
+                PullRequestConnectionQuery {
+                    head: "Gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+                    after: None,
+                },
+                PullRequestConnectionQuery {
+                    head: "Gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
+                    after: None,
+                },
+            ],
+            include_repository_facts: true,
+        },
     ],
     [
-        Query,
-        Query,
+        PullRequestQuery {
+            connections: [
+                PullRequestConnectionQuery {
+                    head: "Gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad",
+                    after: None,
+                },
+                PullRequestConnectionQuery {
+                    head: "Gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae",
+                    after: None,
+                },
+            ],
+            include_repository_facts: false,
+        },
     ],
     [
         CreatePr,
