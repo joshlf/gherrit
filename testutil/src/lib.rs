@@ -3,7 +3,9 @@ use std::{
     collections::HashMap,
     env,
     ffi::OsString,
-    fmt, fs, panic,
+    fmt, fs,
+    num::NonZeroU32,
+    panic,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -472,33 +474,78 @@ pub enum RedirectStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MalformedJson {
-    DuplicateObjectMember,
-    TrailingValue,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     GraphQl,
     QueryTransport,
     QueryHttp(RetryableHttpStatus),
-    RepositoryFactsHttp(RetryableHttpStatus),
     CreatePr,
-    CreatePrMalformedJson(MalformedJson),
+    CreatePrApplyThenDisconnect,
     CreatePrHttp(RetryableHttpStatus),
     SecondCreatePrHttp(RetryableHttpStatus),
     CreatePrRedirect(RedirectStatus),
+    ClosePr,
+    ClosePrApplyThenDisconnect,
     UpdatePr,
-    UpdatePrMalformedJson(MalformedJson),
+    UpdatePrApplyThenDisconnect,
     UpdatePrConcurrentClose,
     Git(GitOperation),
+    /// Replaces stdout after an otherwise real push. `preceding_pushes`
+    /// counts matching pushes to pass through before applying the fault.
+    GitPushOutput {
+        preceding_pushes: usize,
+        stdout: &'static str,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphQlOperation {
-    Query,
+    PullRequestQuery {
+        connections: Vec<PullRequestConnectionQuery>,
+        include_repository_facts: bool,
+    },
     CreatePr,
+    ClosePr,
     UpdatePr,
+}
+
+impl GraphQlOperation {
+    pub fn pull_request_query(
+        connections: impl IntoIterator<Item = impl Into<PullRequestConnectionQuery>>,
+        include_repository_facts: bool,
+    ) -> Self {
+        Self::PullRequestQuery {
+            connections: connections.into_iter().map(Into::into).collect(),
+            include_repository_facts,
+        }
+    }
+
+    fn is_query(&self) -> bool {
+        matches!(self, Self::PullRequestQuery { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestConnectionQuery {
+    head: String,
+    after: Option<String>,
+}
+
+impl PullRequestConnectionQuery {
+    pub fn after(head: impl Into<String>, after: impl Into<String>) -> Self {
+        let head = head.into();
+        let after = after.into();
+        assert!(!head.is_empty(), "a traced pull request head must be nonempty");
+        assert!(!after.is_empty(), "a traced pull request cursor must be nonempty");
+        Self { head, after: Some(after) }
+    }
+}
+
+impl<T: Into<String>> From<T> for PullRequestConnectionQuery {
+    fn from(head: T) -> Self {
+        let head = head.into();
+        assert!(!head.is_empty(), "a traced pull request head must be nonempty");
+        Self { head, after: None }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -509,32 +556,38 @@ pub enum PullRequestState {
     Merged,
 }
 
-impl PullRequestState {
-    fn as_str(self) -> &'static str {
-        match self {
-            PullRequestState::Open => "OPEN",
-            PullRequestState::Closed => "CLOSED",
-            PullRequestState::Merged => "MERGED",
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestSeed {
+    number: NonZeroU32,
+    title: String,
+    body: String,
+    head: String,
+    base: String,
+}
 
-    fn from_str(state: &str) -> Self {
-        match state {
-            "OPEN" => PullRequestState::Open,
-            "CLOSED" => PullRequestState::Closed,
-            "MERGED" => PullRequestState::Merged,
-            state => panic!("mock pull request has invalid state {state:?}"),
+impl PullRequestSeed {
+    pub fn new(
+        number: usize,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        head: impl Into<String>,
+        base: impl Into<String>,
+    ) -> Self {
+        let number = valid_pull_request_number(number)
+            .expect("a seeded pull request number must be in 1..=GraphQL Int::MAX");
+        Self {
+            number,
+            title: title.into(),
+            body: body.into(),
+            head: head.into(),
+            base: base.into(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PullRequestSeed {
-    pub number: usize,
-    pub title: String,
-    pub body: String,
-    pub head: String,
-    pub base: String,
+fn valid_pull_request_number(number: usize) -> Option<NonZeroU32> {
+    let number = u32::try_from(number).ok().and_then(NonZeroU32::new)?;
+    (number.get() <= i32::MAX as u32).then_some(number)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -542,8 +595,8 @@ pub struct PullRequestSnapshot {
     pub number: usize,
     pub node_id: String,
     pub state: PullRequestState,
-    pub title: Option<String>,
-    pub body: Option<String>,
+    pub title: String,
+    pub body: String,
     pub head: String,
     pub base: String,
 }
@@ -569,11 +622,11 @@ impl From<&mock_server::PrEntry> for PullRequestSnapshot {
         Self {
             number: pr.number,
             node_id: pr.node_id.clone(),
-            state: PullRequestState::from_str(&pr.state),
+            state: pr.state,
             title: pr.title.clone(),
             body: pr.body.clone(),
-            head: pr.head.ref_field.clone(),
-            base: pr.base.ref_field.clone(),
+            head: pr.head.name.clone(),
+            base: pr.base.name.clone(),
         }
     }
 }
@@ -608,17 +661,88 @@ impl MockGithub<'_> {
     }
 
     pub fn seed_pull_request(&self, seed: PullRequestSeed) {
+        let PullRequestSeed { number, title, body, head, base } = seed;
         self.context.mutate_mock_state(|state| {
             let pr = mock_server::PrEntry::mock(mock_server::MockPrArgs {
-                id: u64::try_from(seed.number).expect("pull request number does not fit in u64"),
-                title: seed.title,
-                body: seed.body,
-                head: seed.head,
-                base: seed.base,
-                repo_owner: &state.repo_owner,
-                repo_name: &state.repo_name,
+                number: usize::try_from(number.get())
+                    .expect("the test target must represent GraphQL pull request numbers"),
+                title,
+                body,
+                head,
+                base,
             });
             state.add_pr(pr);
+        });
+    }
+
+    /// Seeds an intentionally malformed GraphQL identity for rejection tests.
+    pub fn seed_pull_request_with_invalid_number(
+        &self,
+        number: usize,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        head: impl Into<String>,
+        base: impl Into<String>,
+    ) {
+        assert!(
+            valid_pull_request_number(number).is_none(),
+            "ordinary pull request numbers must use seed_pull_request"
+        );
+        self.context.mutate_mock_state(|state| {
+            state.add_pr(mock_server::PrEntry::mock(mock_server::MockPrArgs {
+                number,
+                title: title.into(),
+                body: body.into(),
+                head: head.into(),
+                base: base.into(),
+            }));
+        });
+    }
+
+    pub fn seed_cross_repository_pull_request(
+        &self,
+        seed: PullRequestSeed,
+        head_oid: &str,
+        base_oid: &str,
+    ) {
+        for (kind, oid) in [("head", head_oid), ("base", base_oid)] {
+            assert!(
+                oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "cross-repository {kind} object ID must be 40 hexadecimal digits"
+            );
+        }
+        let PullRequestSeed { number, title, body, head, base } = seed;
+        self.context.mutate_mock_state(|state| {
+            let number = usize::try_from(number.get())
+                .expect("the test target must represent GraphQL pull request numbers");
+            let mut pr = mock_server::PrEntry::mock(mock_server::MockPrArgs {
+                number,
+                title,
+                body,
+                head,
+                base,
+            });
+            pr.head.oid = head_oid.to_owned();
+            pr.base.oid = base_oid.to_owned();
+            state.add_pr(pr);
+            state.cross_repository_prs.insert(number);
+        });
+    }
+
+    pub fn set_pull_request_landing_automation(
+        &self,
+        number: usize,
+        auto_merge: bool,
+        in_merge_queue: bool,
+    ) {
+        self.context.mutate_mock_state(|state| {
+            let pr = state
+                .prs
+                .iter_mut()
+                .find(|pr| pr.number == number)
+                .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
+            pr.auto_merge = auto_merge;
+            pr.in_merge_queue = in_merge_queue;
         });
     }
 
@@ -629,18 +753,7 @@ impl MockGithub<'_> {
                 .iter_mut()
                 .find(|pr| pr.number == number)
                 .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
-            pr.state = new_state.as_str().to_string();
-        });
-    }
-
-    pub fn set_pull_request_title(&self, number: usize, new_title: &str) {
-        self.context.mutate_mock_state(|state| {
-            let pr = state
-                .prs
-                .iter_mut()
-                .find(|pr| pr.number == number)
-                .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
-            pr.title = Some(new_title.to_string());
+            pr.state = new_state;
         });
     }
 }
@@ -650,17 +763,21 @@ impl Drop for TestContext {
         // Stop the server before fixture directories and state are released.
         drop(self.mock_server.take());
 
-        let (state_poisoned, pending_faults) = self
+        let (state_poisoned, pending_faults, pending_remote_ref_updates) = self
             .mock_server_state
             .as_ref()
             .map(|state| match state.read() {
-                Ok(state) => (false, state.faults.clone()),
-                Err(poisoned) => (true, poisoned.into_inner().faults.clone()),
+                Ok(state) => (false, state.faults.clone(), state.git.pending_remote_ref_updates()),
+                Err(poisoned) => {
+                    let state = poisoned.into_inner();
+                    (true, state.faults.clone(), state.git.pending_remote_ref_updates())
+                }
             })
             .unwrap_or_default();
         if state_poisoned {
             let message = format!(
-                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}"
+                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}; \
+                 unconsumed scheduled remote ref updates: {pending_remote_ref_updates}"
             );
             if thread::panicking() {
                 eprintln!("{message}");
@@ -669,11 +786,17 @@ impl Drop for TestContext {
             }
             return;
         }
-        if !pending_faults.is_empty() {
+        if !pending_faults.is_empty() || pending_remote_ref_updates != 0 {
             if thread::panicking() {
-                eprintln!("Test fixture also has unconsumed faults: {pending_faults:?}");
+                eprintln!(
+                    "Test fixture also has unconsumed faults: {pending_faults:?}; \
+                     unconsumed scheduled remote ref updates: {pending_remote_ref_updates}"
+                );
             } else {
-                panic!("Test fixture has unconsumed faults: {pending_faults:?}");
+                panic!(
+                    "Test fixture has unconsumed faults: {pending_faults:?}; \
+                     unconsumed scheduled remote ref updates: {pending_remote_ref_updates}"
+                );
             }
         }
     }
@@ -767,7 +890,7 @@ impl TestContext {
         id
     }
 
-    /// Creates a commit with a caller-supplied legacy or scenario identity.
+    /// Creates a commit with a caller-supplied scenario identity.
     pub fn commit_with_explicit_gherrit_id(&self, message: &str, id: &str) {
         assert!(
             !message.lines().any(|line| line.starts_with("gherrit-pr-id: ")),
@@ -855,7 +978,7 @@ impl TestContext {
     }
 
     pub fn configure_managed_public(&self, branch_name: &str) {
-        self.configure_managed(branch_name, MANAGED_PUBLIC, "origin");
+        self.configure_managed(branch_name, MANAGED_PUBLIC, ".");
     }
 
     fn configure_managed(&self, branch_name: &str, state: &str, push_remote: &str) {
@@ -868,7 +991,7 @@ impl TestContext {
 
     pub fn inject_failure(&self, kind: FailureKind) {
         match kind {
-            FailureKind::Git(_) => assert!(
+            FailureKind::Git(_) | FailureKind::GitPushOutput { .. } => assert!(
                 self.has_git_interceptor,
                 "missing test capability: .with_git_interceptor()"
             ),
@@ -879,6 +1002,16 @@ impl TestContext {
 
     pub fn expect_git_failure(&self, operation: GitOperation) {
         self.inject_failure(FailureKind::Git(operation));
+    }
+
+    /// Schedules one remote ref update after observation and immediately
+    /// before GHerrit's next publication push.
+    pub fn update_remote_ref_before_push(&self, ref_name: &str, target: &str) {
+        assert!(self.has_remote, "missing test capability: .with_remote()");
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        self.mutate_mock_state(|state| {
+            state.git.update_remote_ref_before_push(ref_name.to_owned(), target.to_owned());
+        });
     }
 
     fn enqueue_failure(&self, kind: FailureKind) {
@@ -1001,6 +1134,18 @@ impl TestContext {
     pub fn hook_cmd(&self, name: &str) -> TestCommand {
         let mut cmd = self.gherrit_cmd();
         cmd.args(["hook", name]);
+        cmd
+    }
+
+    /// Runs one hook script installed in this fixture with the same hermetic
+    /// environment inherited from a fixture Git process.
+    #[must_use = "command builders do nothing until executed"]
+    pub fn installed_hook_cmd(&self, name: &str) -> TestCommand {
+        let hook = self.repo_path.join(".git/hooks").join(name);
+        assert!(hook.is_file(), "hook {name:?} is not installed");
+        let mut cmd = TestCommand::new(hook);
+        cmd.current_dir(&self.repo_path);
+        self.configure_test_env(&mut cmd);
         cmd
     }
 
@@ -1293,12 +1438,26 @@ fn install_git_interceptor(path: &Path, _gherrit_bin: &Path) {
 fn install_git_interceptor(path: &Path, gherrit_bin: &Path) {
     // `Command::new("git")` resolves native executables without consulting
     // PATHEXT, so a batch-file wrapper named `git.cmd` would be bypassed.
-    fs::copy(gherrit_bin, path.join("git.exe")).unwrap();
+    hard_link_or_copy(gherrit_bin, &path.join("git.exe"));
 }
 
 fn install_gherrit_binary(path: &Path, gherrit_bin: &Path) {
     let gherrit_dst = path.join(if cfg!(windows) { "gherrit.exe" } else { "gherrit" });
-    fs::copy(gherrit_bin, &gherrit_dst).unwrap();
+    hard_link_or_copy(gherrit_bin, &gherrit_dst);
+}
+
+/// Installs a test executable without copying a large Cargo artifact when the
+/// fixture and target directory share a filesystem.
+fn hard_link_or_copy(source: &Path, destination: &Path) {
+    if let Err(link_error) = fs::hard_link(source, destination) {
+        fs::copy(source, destination).unwrap_or_else(|copy_error| {
+            panic!(
+                "failed to install test executable {:?}: hard link failed ({link_error}); \
+                 copy fallback failed ({copy_error})",
+                destination
+            )
+        });
+    }
 }
 
 fn init_git_bare_repo(environment: &TestEnvironment, system_git: &Path, path: &Path) {
@@ -1384,6 +1543,20 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_pull_request_seeds_match_the_graphql_number_domain() {
+        let seed = |number| PullRequestSeed::new(number, "title", "body", "head", "base");
+
+        assert_eq!(seed(1).number.get(), 1);
+        assert_eq!(seed(i32::MAX as usize).number.get(), i32::MAX as u32);
+        for invalid in [0, i32::MAX as usize + 1] {
+            assert!(
+                panic::catch_unwind(|| seed(invalid)).is_err(),
+                "accepted invalid pull request number {invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_management_helpers_write_complete_branch_state() {
         let ctx = TestContextBuilder::new("unused").with_initial_commit().build();
         let assert_state = |branch: &str, state: &str, push_remote: &str| {
@@ -1401,7 +1574,7 @@ mod tests {
 
         ctx.run_git(&["checkout", "main"]);
         ctx.checkout_managed_public("public-stack");
-        assert_state("public-stack", MANAGED_PUBLIC, "origin");
+        assert_state("public-stack", MANAGED_PUBLIC, ".");
     }
 
     #[test]
@@ -1421,6 +1594,28 @@ mod tests {
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .expect("fixture panic must have a string message");
         assert!(message.contains("Git(Var)"), "unexpected teardown panic: {message}");
+    }
+
+    #[test]
+    fn fixture_rejects_an_unconsumed_scheduled_remote_ref_update() {
+        let driver_dir = TempDir::new().unwrap();
+        let driver = driver_dir.path().join("gherrit-test-driver");
+        fs::write(&driver, "test driver placeholder").unwrap();
+
+        let panic = panic::catch_unwind(|| {
+            let ctx = TestContextBuilder::new(&driver).with_remote().with_git_interceptor().build();
+            ctx.update_remote_ref_before_push("refs/tags/race", &"1".repeat(40));
+        })
+        .expect_err("dropping the fixture must reject an unconsumed scheduled update");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("fixture panic must have a string message");
+        assert!(
+            message.contains("unconsumed scheduled remote ref updates: 1"),
+            "unexpected teardown panic: {message}"
+        );
     }
 
     #[test]
