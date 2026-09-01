@@ -152,7 +152,7 @@ impl ManagedOpenPullRequestCandidate {
 /// is always present and duplicates are always ordered by increasing immutable
 /// pull request number.
 #[derive(Debug)]
-pub(in crate::pre_push::publication_attempt) struct ManagedOpenPullRequest {
+pub(in crate::pre_push::publication_attempt) struct ManagedOpenPullRequests {
     id: GherritPrId,
     canonical: ManagedOpenPullRequestCandidate,
     title: Box<str>,
@@ -160,7 +160,7 @@ pub(in crate::pre_push::publication_attempt) struct ManagedOpenPullRequest {
     duplicates: Box<[ManagedOpenPullRequestCandidate]>,
 }
 
-impl ManagedOpenPullRequest {
+impl ManagedOpenPullRequests {
     fn from_observations(
         default_branch: &str,
         id: GherritPrId,
@@ -333,7 +333,7 @@ impl AbsentPullRequest {
 /// Correlated state for one local change, in exact local stack order.
 #[derive(Debug)]
 pub(in crate::pre_push::publication_attempt) enum LocalPullRequestObservation {
-    Open(ManagedOpenPullRequest),
+    Open(ManagedOpenPullRequests),
     Absent(AbsentPullRequest),
 }
 
@@ -1295,7 +1295,7 @@ impl LocalPullRequestAccumulator {
                 }
             } else if !connection.opens.is_empty() {
                 local.push(LocalPullRequestObservation::Open(
-                    ManagedOpenPullRequest::from_observations(
+                    ManagedOpenPullRequests::from_observations(
                         default_branch,
                         id,
                         connection.opens,
