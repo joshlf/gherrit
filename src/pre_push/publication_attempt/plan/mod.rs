@@ -19,20 +19,24 @@ use super::{
     body::{GeneratedBody, StackBodyRecipes},
     github::{
         AbsentPullRequest, BaseKind, ClosePullRequest, CompleteCreateReceipts,
-        CompleteLocalPullRequests, CreatePreparation, CreatePullRequest, Github,
-        LocalPullRequestObservation, ManagedOpenPullRequestCandidate, ManagedOpenPullRequests,
-        PreflightedDuplicateCloses, PreparedCreates, PreparedPullRequestProjection,
-        PullRequestIdentity, UpdatePullRequest,
+        CompleteLocalPullRequests, CreatePreparation, CreatePullRequest, DraftPullRequest, Github,
+        LocalPullRequestObservation, ManagedOpenPullRequestCandidate, PreflightedDuplicateCloses,
+        PreparedCreates, PreparedDraftConversions, PreparedPullRequestProjection,
+        PullRequestIdentity, PullRequestNumber, SelectedOpenPullRequest, UpdatePullRequest,
     },
     history::{Revision, ValidatedChangeHistory},
+    marker::MarkerTemplate,
     refs::{
         MarkerTransition, PreparedPushes, PublicBranchTransition, PublicationRevision,
         TupleTransition, prepare_initial_pushes, prepare_marker_pushes,
     },
 };
-use crate::pre_push::{
-    destination::{DefaultBranch, PushDestination, RemoteBranchState},
-    local::{GherritPrId, LocalChange, LocalStack, PullRequestTitle},
+use crate::{
+    pre_push::{
+        destination::{DefaultBranch, PushDestination, RemoteBranchState},
+        local::{GherritPrId, LocalChange, LocalStack, PullRequestTitle},
+    },
+    util,
 };
 
 enum PlannedPublicBranch {
@@ -124,10 +128,14 @@ impl PublicationPlan {
     /// Executes the one fixed publication sequence without reobservation or
     /// retry. Every later effect remains inaccessible until its preceding
     /// durable acknowledgement has completed.
-    pub(super) async fn execute(self) -> Result<()> {
+    pub(super) async fn execute(self, repository: &util::Repo) -> Result<()> {
         let Self { destination, github, effects } = self;
         effects
-            .execute_with(&mut RemoteEffectDriver { destination: &destination, github: &github })
+            .execute_with(&mut RemoteEffectDriver {
+                repository,
+                destination: &destination,
+                github: &github,
+            })
             .await
     }
 }
@@ -138,6 +146,11 @@ impl PublicationPlan {
 /// continuation. Each operation consumes an already-preflighted value and
 /// returns only the acknowledgement needed to release the next stage.
 pub(super) trait EffectDriver {
+    async fn convert_pull_requests_to_draft(
+        &mut self,
+        conversions: PreparedDraftConversions,
+    ) -> Result<()>;
+
     async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()>;
 
     async fn create_pull_requests(
@@ -145,7 +158,7 @@ pub(super) trait EffectDriver {
         creates: PreparedCreates,
     ) -> Result<CompleteCreateReceipts>;
 
-    async fn publish_markers(&mut self, pushes: PreparedPushes) -> Result<()>;
+    async fn publish_markers(&mut self, markers: Box<[MarkerTemplate]>) -> Result<()>;
 
     async fn project_pull_requests(
         &mut self,
@@ -156,11 +169,19 @@ pub(super) trait EffectDriver {
 /// The sole production effect driver, bound to the destination and GitHub
 /// client retained by the complete publication plan.
 struct RemoteEffectDriver<'attempt> {
+    repository: &'attempt util::Repo,
     destination: &'attempt PushDestination,
     github: &'attempt Github,
 }
 
 impl EffectDriver for RemoteEffectDriver<'_> {
+    async fn convert_pull_requests_to_draft(
+        &mut self,
+        conversions: PreparedDraftConversions,
+    ) -> Result<()> {
+        self.github.convert_pull_requests_to_draft(conversions).await
+    }
+
     async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()> {
         pushes.execute(self.destination).await
     }
@@ -172,7 +193,17 @@ impl EffectDriver for RemoteEffectDriver<'_> {
         self.github.create_pull_requests(creates).await
     }
 
-    async fn publish_markers(&mut self, pushes: PreparedPushes) -> Result<()> {
+    async fn publish_markers(&mut self, markers: Box<[MarkerTemplate]>) -> Result<()> {
+        let markers = markers
+            .into_vec()
+            .into_iter()
+            .map(MarkerTemplate::prepare)
+            .collect::<Result<Vec<_>>>()?;
+        let transitions = markers.iter().map(MarkerTransition::from_prepared).collect::<Vec<_>>();
+        let pushes = prepare_marker_pushes(self.destination, &transitions)?;
+        for marker in markers {
+            marker.materialize(self.repository)?;
+        }
         pushes.execute(self.destination).await
     }
 
@@ -190,8 +221,7 @@ impl EffectDriver for RemoteEffectDriver<'_> {
 /// Test-only pure planning inspects this type; production wraps it in the
 /// consuming [`PublicationPlan`] above.
 pub(super) struct PlannedPublication {
-    initial_ref_pushes: PreparedPushes,
-    after_initial_refs: AfterInitialRefs,
+    draft_safety: DraftSafetyStage,
 }
 
 impl PlannedPublication {
@@ -200,15 +230,40 @@ impl PlannedPublication {
     /// Any error ends the attempt immediately. No later effect is exposed to
     /// the driver, and no effect is retried or reobserved here.
     pub(super) async fn execute_with(self, driver: &mut impl EffectDriver) -> Result<()> {
-        let Self { initial_ref_pushes, after_initial_refs } = self;
+        let Self { draft_safety } = self;
+        let InitialRefsStage { initial_ref_pushes, after_initial_refs } =
+            draft_safety.complete_with(driver).await?;
         driver.publish_initial_refs(initial_ref_pushes).await?;
         let marker_stage = match after_initial_refs {
             AfterInitialRefs::Ready(stage) => *stage,
             AfterInitialRefs::Creates(stage) => stage.complete_with(driver).await?,
         };
-        driver.publish_markers(marker_stage.marker_pushes).await?;
+        driver.publish_markers(marker_stage.markers).await?;
         driver.project_pull_requests(marker_stage.projection).await
     }
+}
+
+/// The first effect stage. Conversion is the only transition that permits a
+/// ready marker-bound root to enter an owned-base protocol prefix.
+struct DraftSafetyStage {
+    conversion: Option<PreparedDraftConversions>,
+    after_draft_safety: InitialRefsStage,
+}
+
+impl DraftSafetyStage {
+    async fn complete_with(self, driver: &mut impl EffectDriver) -> Result<InitialRefsStage> {
+        let Self { conversion, after_draft_safety } = self;
+        if let Some(conversion) = conversion {
+            driver.convert_pull_requests_to_draft(conversion).await?;
+        }
+        Ok(after_draft_safety)
+    }
+}
+
+/// Initial Git refs can be published only after draft safety acknowledges.
+struct InitialRefsStage {
+    initial_ref_pushes: PreparedPushes,
+    after_initial_refs: AfterInitialRefs,
 }
 
 enum AfterInitialRefs {
@@ -222,7 +277,7 @@ enum AfterInitialRefs {
 
 /// Marker work followed by an already-preflighted final projection.
 struct MarkerStage {
-    marker_pushes: PreparedPushes,
+    markers: Box<[MarkerTemplate]>,
     projection: PreparedPullRequestProjection,
 }
 
@@ -256,33 +311,21 @@ impl CreateStage {
 struct ProjectionSeed {
     entries: Box<[PendingProjectionEntry]>,
     recipes: StackBodyRecipes,
-    markers: ReceiptGatedMarkerPushes,
     closes: PreflightedDuplicateCloses,
     default_branch: DefaultBranch,
 }
 
 impl ProjectionSeed {
     fn complete(self, receipts: CompleteCreateReceipts) -> Result<MarkerStage> {
-        let Self { entries, recipes, markers, closes, default_branch } = self;
-        let entries = bind_created_identities(entries, receipts.into_values())?;
+        let Self { entries, recipes, closes, default_branch } = self;
+        let BoundProjection { entries, markers } =
+            bind_created_identities(entries, receipts.into_values())?;
 
         // Receipt-supplied node IDs can still fail exact mutation preflight.
         // Keep markers receipt-gated until the whole projection is prepared.
         let updates = prepare_final_updates(entries, &recipes, default_branch.name())?;
         let projection = closes.prepare_projection(updates)?;
-        Ok(MarkerStage { marker_pushes: markers.authorize(), projection })
-    }
-}
-
-/// Marker bytes which include at least one create-receipt authorization.
-///
-/// Preflight is deliberately allowed before writes, but the prepared value
-/// has no escape hatch except the successful receipt-completion transition.
-struct ReceiptGatedMarkerPushes(PreparedPushes);
-
-impl ReceiptGatedMarkerPushes {
-    fn authorize(self) -> PreparedPushes {
-        self.0
+        Ok(MarkerStage { markers, projection })
     }
 }
 
@@ -351,7 +394,7 @@ enum ProjectionReality {
 
 struct ExistingReality {
     pull_request: ValidatedOpenPullRequest,
-    marker: Option<MarkerTransition>,
+    marker: Option<MarkerTemplate>,
 }
 
 /// The only OPEN pull request fields needed after history and policy
@@ -364,10 +407,37 @@ struct ExistingReality {
 struct ValidatedOpenPullRequest {
     id: GherritPrId,
     identity: PullRequestIdentity,
-    base: BaseKind,
+    base_safety: CanonicalBaseSafety,
     title: Box<str>,
     body: Box<str>,
     duplicates: Box<[PullRequestIdentity]>,
+}
+
+/// The two post-validation base-safety states which later planning can use.
+///
+/// A canonical row is either already safe for its planned topology, or it is
+/// ready on the default branch and must cross the draft barrier before moving
+/// to an owned base. In particular, a ready owned-base row cannot be encoded.
+#[derive(Debug)]
+enum CanonicalBaseSafety {
+    AlreadySafe(BaseKind),
+    DraftBeforeOwned(DraftPullRequest),
+}
+
+impl CanonicalBaseSafety {
+    fn observed_base(&self) -> BaseKind {
+        match self {
+            Self::AlreadySafe(base) => *base,
+            Self::DraftBeforeOwned(_) => BaseKind::Default,
+        }
+    }
+
+    fn draft_conversion(&self) -> Option<&DraftPullRequest> {
+        match self {
+            Self::AlreadySafe(_) => None,
+            Self::DraftBeforeOwned(conversion) => Some(conversion),
+        }
+    }
 }
 
 impl ValidatedOpenPullRequest {
@@ -380,7 +450,7 @@ impl ValidatedOpenPullRequest {
     }
 
     fn base(&self) -> BaseKind {
-        self.base
+        self.base_safety.observed_base()
     }
 
     fn title(&self) -> &str {
@@ -394,17 +464,53 @@ impl ValidatedOpenPullRequest {
     fn duplicate_identities(&self) -> impl Iterator<Item = &PullRequestIdentity> {
         self.duplicates.iter()
     }
+
+    fn draft_conversion(&self) -> Option<&DraftPullRequest> {
+        self.base_safety.draft_conversion()
+    }
 }
 
 struct MissingReality {
     absence: AbsentPullRequest,
     revision: PublicationRevision,
-    marker: MarkerTransition,
+    marker: MarkerOrigin,
+}
+
+/// The validated change facts from which a marker may be bound to one exact
+/// pull-request number. Its private construction prevents pending planning
+/// state from carrying an arbitrary change ID or tag target.
+struct MarkerOrigin {
+    id: GherritPrId,
+    v1: gix::ObjectId,
+}
+
+impl MarkerOrigin {
+    fn from_history(history: &ValidatedChangeHistory) -> Self {
+        let v1 = history
+            .projected_versions()
+            .next()
+            .expect("a projected history always contains at least the proposal")
+            .1
+            .head();
+        Self { id: history.id().clone(), v1 }
+    }
+
+    fn bind(self, number: PullRequestNumber) -> Result<MarkerTemplate> {
+        MarkerTemplate::new(self.id, self.v1, number)
+    }
 }
 
 enum PendingProjectionEntry {
-    Existing(ValidatedOpenPullRequest),
-    AwaitingCreate(GherritPrId),
+    Existing(Box<ExistingReality>),
+    AwaitingCreate { marker: MarkerOrigin },
+}
+
+/// Every stack entry after create receipts have bound all missing identities.
+/// Marker templates remain inseparable from those bindings until the final
+/// projection has been preflighted.
+struct BoundProjection {
+    entries: Box<[BoundProjectionEntry]>,
+    markers: Box<[MarkerTemplate]>,
 }
 
 enum BoundProjectionEntry {
@@ -468,6 +574,7 @@ fn plan_bound_effects(
         pull_requests.into_vec(),
         &default_branch,
     )?;
+    let draft_conversion = prepare_draft_safety(&realities)?;
     let tuple_transitions = histories
         .iter()
         .zip(&desired_revisions)
@@ -481,9 +588,14 @@ fn plan_bound_effects(
     let body_branch = public_branch.as_ref().map(|branch| branch.branch().clone());
     let recipes = StackBodyRecipes::new(destination, body_branch, stack, histories.into_vec())?;
     let after_initial_refs =
-        prepare_projection(destination, realities, recipes, create_preparation, default_branch)?;
+        prepare_projection(realities, recipes, create_preparation, default_branch)?;
 
-    Ok(PlannedPublication { initial_ref_pushes, after_initial_refs })
+    Ok(PlannedPublication {
+        draft_safety: DraftSafetyStage {
+            conversion: draft_conversion,
+            after_draft_safety: InitialRefsStage { initial_ref_pushes, after_initial_refs },
+        },
+    })
 }
 
 #[cfg(test)]
@@ -546,19 +658,13 @@ fn validate_proposal_join(change: &LocalChange, history: &ValidatedChangeHistory
 
 fn validate_open(
     history: &ValidatedChangeHistory,
-    pull_request: ManagedOpenPullRequests,
+    pull_request: SelectedOpenPullRequest,
     desired_base: BaseKind,
     default_branch: &DefaultBranch,
 ) -> Result<ValidatedOpenPullRequest> {
     let id = history.id();
     if history.published_len() == 0 {
         bail!("GHerrit change '{}' has an OPEN pull request but no published history", id.as_str());
-    }
-    if pull_request.duplicate_candidates().next().is_some() {
-        bail!(
-            "GHerrit change '{}' has multiple OPEN pull requests but no authenticated canonical pull request identity",
-            id.as_str()
-        );
     }
     let canonical = pull_request.canonical_candidate();
     validate_open_candidate(history, canonical, default_branch)?;
@@ -571,8 +677,47 @@ fn validate_open(
             id.as_str()
         );
     }
+    let base_safety = if canonical.is_draft() {
+        CanonicalBaseSafety::AlreadySafe(canonical.base().kind())
+    } else if !history.has_pull_request_marker() {
+        bail!(
+            "Unmarked OPEN pull request #{} for '{}' must already be a draft",
+            canonical.identity().number().get(),
+            id.as_str()
+        );
+    } else if canonical.base().kind() == BaseKind::Owned {
+        bail!(
+            "OPEN pull request #{} for '{}' is ready on an owned base",
+            canonical.identity().number().get(),
+            id.as_str()
+        );
+    } else if desired_base == BaseKind::Owned {
+        CanonicalBaseSafety::DraftBeforeOwned(DraftPullRequest::from_observation(
+            id.clone(),
+            canonical.identity().clone(),
+            canonical.head_oid(),
+            default_branch.name().to_owned(),
+            canonical.base().oid(),
+        ))
+    } else {
+        CanonicalBaseSafety::AlreadySafe(BaseKind::Default)
+    };
     for duplicate in pull_request.duplicate_candidates() {
         validate_open_candidate(history, duplicate, default_branch)?;
+        if duplicate.base().kind() != BaseKind::Owned {
+            bail!(
+                "Duplicate OPEN pull request #{} for '{}' must use an owned base",
+                duplicate.identity().number().get(),
+                id.as_str()
+            );
+        }
+        if !duplicate.is_draft() {
+            bail!(
+                "Duplicate OPEN pull request #{} for '{}' must already be a draft",
+                duplicate.identity().number().get(),
+                id.as_str()
+            );
+        }
         if duplicate.has_landing_automation() {
             bail!(
                 "Duplicate OPEN pull request #{} for '{}' cannot use landing automation",
@@ -584,11 +729,37 @@ fn validate_open(
     Ok(ValidatedOpenPullRequest {
         id: pull_request.id().clone(),
         identity: pull_request.identity().clone(),
-        base: pull_request.base().kind(),
+        base_safety,
         title: pull_request.title().into(),
         body: pull_request.body().into(),
         duplicates: pull_request.duplicate_identities().cloned().collect(),
     })
+}
+
+/// The only protocol-reachable conversion is a marker-bound canonical which
+/// was ready on the default branch and now needs an owned base. All other
+/// ready rows are rejected before a Git write can make their topology visible.
+fn prepare_draft_safety(
+    realities: &ProjectionRealities,
+) -> Result<Option<PreparedDraftConversions>> {
+    let mut conversions = Vec::new();
+    let mut retain = |entry: &ExistingReality| {
+        if let Some(conversion) = entry.pull_request.draft_conversion() {
+            conversions.push(conversion.clone());
+        }
+    };
+    match realities {
+        ProjectionRealities::AllExisting(entries) => entries.iter().for_each(&mut retain),
+        ProjectionRealities::NeedsCreate(entries) => {
+            entries.before.iter().for_each(&mut retain);
+            for reality in &entries.after {
+                if let ProjectionReality::Existing(entry) = reality {
+                    retain(entry);
+                }
+            }
+        }
+    }
+    (!conversions.is_empty()).then(|| PreparedDraftConversions::prepare(conversions)).transpose()
 }
 
 fn validate_open_candidate(
@@ -652,22 +823,22 @@ fn build_realities<'history>(
 ) -> Result<ProjectionRealities> {
     let mut realities = ProjectionRealities::new();
     for (index, ((history, desired), pull_request)) in histories.zip(pull_requests).enumerate() {
-        let marker = || {
-            let (_, v1) = history
-                .projected_versions()
-                .next()
-                .expect("every planned change has a projected v1");
-            MarkerTransition::create(history.id().clone(), v1.head())
-        };
+        let marker = history.pull_request_marker();
         match pull_request {
             LocalPullRequestObservation::Open(pull_request) => {
+                let pull_request = pull_request.select(marker.map(|marker| marker.number()))?;
                 let pull_request =
                     validate_open(history, pull_request, desired_base(index), default_branch)?;
-                let marker = (!history.has_pull_request_marker()).then(marker).transpose()?;
+                let marker = marker
+                    .is_none()
+                    .then(|| {
+                        MarkerOrigin::from_history(history).bind(pull_request.identity().number())
+                    })
+                    .transpose()?;
                 realities.push_existing(ExistingReality { pull_request, marker });
             }
             LocalPullRequestObservation::Absent(absence) => {
-                if history.has_pull_request_marker() {
+                if marker.is_some() {
                     bail!(
                         "GHerrit change '{}' has a pull request marker but no OPEN pull request",
                         history.id().as_str()
@@ -676,7 +847,7 @@ fn build_realities<'history>(
                 realities.push_missing(MissingReality {
                     revision: desired,
                     absence,
-                    marker: marker()?,
+                    marker: MarkerOrigin::from_history(history),
                 });
             }
         }
@@ -685,7 +856,6 @@ fn build_realities<'history>(
 }
 
 fn prepare_projection(
-    destination: &PushDestination,
     realities: ProjectionRealities,
     recipes: StackBodyRecipes,
     create_preparation: CreatePreparation,
@@ -693,42 +863,38 @@ fn prepare_projection(
 ) -> Result<AfterInitialRefs> {
     match realities {
         ProjectionRealities::AllExisting(realities) => {
-            let mut marker_transitions = Vec::new();
+            let mut markers = Vec::new();
             let mut closes = Vec::new();
             let entries = realities
                 .into_iter()
-                .map(|reality| {
-                    marker_transitions.extend(reality.marker);
+                .map(|ExistingReality { pull_request, marker }| {
+                    markers.extend(marker);
                     closes.extend(
-                        reality
-                            .pull_request
+                        pull_request
                             .duplicate_identities()
                             .cloned()
                             .map(ClosePullRequest::duplicate),
                     );
-                    BoundProjectionEntry::Existing(reality.pull_request)
+                    BoundProjectionEntry::Existing(pull_request)
                 })
                 .collect::<Box<[_]>>();
-            let marker_pushes = prepare_marker_pushes(destination, &marker_transitions)?;
             let updates = prepare_final_updates(entries, &recipes, default_branch.name())?;
             let projection = PreparedPullRequestProjection::prepare(closes, updates)?;
             drop(create_preparation);
-            Ok(AfterInitialRefs::Ready(Box::new(MarkerStage { marker_pushes, projection })))
+            Ok(AfterInitialRefs::Ready(Box::new(MarkerStage {
+                markers: markers.into_boxed_slice(),
+                projection,
+            })))
         }
-        ProjectionRealities::NeedsCreate(realities) => prepare_create_stage(
-            destination,
-            realities,
-            recipes,
-            create_preparation,
-            default_branch,
-        )
-        .map(Box::new)
-        .map(AfterInitialRefs::Creates),
+        ProjectionRealities::NeedsCreate(realities) => {
+            prepare_create_stage(realities, recipes, create_preparation, default_branch)
+                .map(Box::new)
+                .map(AfterInitialRefs::Creates)
+        }
     }
 }
 
 fn prepare_create_stage(
-    destination: &PushDestination,
     realities: CreateRealities,
     recipes: StackBodyRecipes,
     create_preparation: CreatePreparation,
@@ -740,7 +906,6 @@ fn prepare_create_stage(
         bail!("projection evidence and body recipes have different change counts");
     }
 
-    let mut marker_transitions = Vec::new();
     let mut closes = Vec::new();
     let mut create_operations = Vec::new();
     let mut entries = Vec::with_capacity(realities.len());
@@ -753,43 +918,30 @@ fn prepare_create_stage(
         }
 
         match reality {
-            ProjectionReality::Existing(existing) => {
-                marker_transitions.extend(existing.marker);
+            ProjectionReality::Existing(ExistingReality { pull_request, marker }) => {
                 closes.extend(
-                    existing
-                        .pull_request
-                        .duplicate_identities()
-                        .cloned()
-                        .map(ClosePullRequest::duplicate),
+                    pull_request.duplicate_identities().cloned().map(ClosePullRequest::duplicate),
                 );
-                entries.push(PendingProjectionEntry::Existing(existing.pull_request));
+                entries.push(PendingProjectionEntry::Existing(Box::new(ExistingReality {
+                    pull_request,
+                    marker,
+                })));
             }
-            ProjectionReality::Missing(missing) => {
-                let id = missing.absence.id().clone();
-                marker_transitions.push(missing.marker);
+            ProjectionReality::Missing(MissingReality { absence, revision, marker }) => {
                 create_operations.push(CreatePullRequest::from_absence(
-                    missing.absence,
+                    absence,
                     title.clone(),
                     body,
-                    missing.revision,
+                    revision,
                 ));
-                entries.push(PendingProjectionEntry::AwaitingCreate(id));
+                entries.push(PendingProjectionEntry::AwaitingCreate { marker });
             }
         }
     }
     let closes = PreflightedDuplicateCloses::prepare(closes)?;
-    // Every effect whose complete input is already known is preflighted before
-    // tuple publication can be exposed. Marker bytes stay private until
-    // receipt completion.
-    let marker_pushes = prepare_marker_pushes(destination, &marker_transitions)?;
     let creates = create_preparation.prepare(create_operations)?;
-    let seed = ProjectionSeed {
-        entries: entries.into_boxed_slice(),
-        recipes,
-        markers: ReceiptGatedMarkerPushes(marker_pushes),
-        closes,
-        default_branch,
-    };
+    let seed =
+        ProjectionSeed { entries: entries.into_boxed_slice(), recipes, closes, default_branch };
     Ok(CreateStage { creates, seed })
 }
 
@@ -803,25 +955,27 @@ fn reality_id(reality: &ProjectionReality) -> &GherritPrId {
 fn bind_created_identities(
     entries: Box<[PendingProjectionEntry]>,
     receipts: Box<[(GherritPrId, PullRequestIdentity)]>,
-) -> Result<Box<[BoundProjectionEntry]>> {
+) -> Result<BoundProjection> {
     let expected = entries
         .iter()
-        .filter(|entry| matches!(entry, PendingProjectionEntry::AwaitingCreate(_)))
+        .filter(|entry| matches!(entry, PendingProjectionEntry::AwaitingCreate { .. }))
         .count();
     if expected != receipts.len() {
         bail!("create receipts and missing pull requests have different counts");
     }
 
     let mut receipts = receipts.into_vec().into_iter();
-    let bound = entries
-        .into_vec()
-        .into_iter()
-        .enumerate()
-        .map(|(index, entry)| match entry {
-            PendingProjectionEntry::Existing(pull_request) => {
-                Ok(BoundProjectionEntry::Existing(pull_request))
+    let mut bound = Vec::with_capacity(entries.len());
+    let mut markers = Vec::new();
+    for (index, entry) in entries.into_vec().into_iter().enumerate() {
+        match entry {
+            PendingProjectionEntry::Existing(existing) => {
+                let ExistingReality { pull_request, marker } = *existing;
+                markers.extend(marker);
+                bound.push(BoundProjectionEntry::Existing(pull_request));
             }
-            PendingProjectionEntry::AwaitingCreate(expected_id) => {
+            PendingProjectionEntry::AwaitingCreate { marker } => {
+                let expected_id = marker.id.clone();
                 let (receipt_id, identity) = receipts
                     .next()
                     .expect("receipt count was checked before binding created identities");
@@ -832,12 +986,13 @@ fn bind_created_identities(
                         expected_id.as_str()
                     );
                 }
-                Ok(BoundProjectionEntry::Created { id: expected_id, identity })
+                markers.push(marker.bind(identity.number())?);
+                bound.push(BoundProjectionEntry::Created { id: expected_id, identity });
             }
-        })
-        .collect::<Result<Box<[_]>>>()?;
+        }
+    }
     debug_assert!(receipts.next().is_none());
-    Ok(bound)
+    Ok(BoundProjection { entries: bound.into_boxed_slice(), markers: markers.into_boxed_slice() })
 }
 
 fn prepare_final_updates(

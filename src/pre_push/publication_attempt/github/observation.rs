@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    CreatePreparation, PullRequestIdentity, Repository, RepositoryNodeId,
+    CreatePreparation, PullRequestIdentity, PullRequestNumber, Repository, RepositoryNodeId,
     pull_request::PullRequestIdentityRegistry,
 };
 use crate::pre_push::{
@@ -86,8 +86,11 @@ impl ObservedBase {
 #[derive(Debug)]
 pub(in crate::pre_push::publication_attempt) struct ManagedOpenPullRequestCandidate {
     identity: PullRequestIdentity,
+    title: Box<str>,
+    body: Box<str>,
     head_oid: ObjectId,
     base: ObservedBase,
+    is_draft: bool,
     has_landing_automation: bool,
 }
 
@@ -95,12 +98,18 @@ impl ManagedOpenPullRequestCandidate {
     fn from_observation(
         default_branch: &str,
         id: &GherritPrId,
-        identity: PullRequestIdentity,
-        base_name: String,
-        base_oid: ObjectId,
-        head_oid: ObjectId,
-        has_landing_automation: bool,
+        observation: OpenPullRequest,
     ) -> Result<Self> {
+        let OpenPullRequest {
+            identity,
+            title,
+            body,
+            base_name,
+            base_oid,
+            head_oid,
+            is_draft,
+            has_landing_automation,
+        } = observation;
         let kind = if base_name == default_branch {
             BaseKind::Default
         } else if base_name == owned_base_name(id) {
@@ -115,8 +124,11 @@ impl ManagedOpenPullRequestCandidate {
         };
         Ok(Self {
             identity,
+            title: title.into_boxed_str(),
+            body: body.into_boxed_str(),
             head_oid,
             base: ObservedBase { kind, oid: base_oid },
+            is_draft,
             has_landing_automation,
         })
     }
@@ -129,6 +141,14 @@ impl ManagedOpenPullRequestCandidate {
         self.head_oid
     }
 
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn body(&self) -> &str {
+        &self.body
+    }
+
     pub(in crate::pre_push::publication_attempt) fn base(&self) -> ObservedBase {
         self.base
     }
@@ -136,22 +156,23 @@ impl ManagedOpenPullRequestCandidate {
     pub(in crate::pre_push::publication_attempt) fn has_landing_automation(&self) -> bool {
         self.has_landing_automation
     }
+
+    pub(in crate::pre_push::publication_attempt) fn is_draft(&self) -> bool {
+        self.is_draft
+    }
 }
 
-/// All same-repository OPEN evidence for one exact local change.
+/// All validated same-repository OPEN rows for one exact local change.
 ///
 /// Rows are stored in increasing immutable pull request number order only to
-/// make the representation deterministic. That order does not grant authority
-/// to any row: planning rejects more than one candidate until durable Git
-/// evidence can authenticate an identity.
+/// make the representation deterministic. Observation does not assign
+/// authority to any visible row. The identity-bearing Git marker is joined
+/// only after concurrent Git and GitHub observation have both completed.
 #[derive(Debug)]
 pub(in crate::pre_push::publication_attempt) struct ManagedOpenPullRequests {
     id: GherritPrId,
-    canonical: ManagedOpenPullRequestCandidate,
-    title: Box<str>,
-    body: Box<str>,
-    is_draft: bool,
-    duplicates: Box<[ManagedOpenPullRequestCandidate]>,
+    first: ManagedOpenPullRequestCandidate,
+    later: Box<[ManagedOpenPullRequestCandidate]>,
 }
 
 impl ManagedOpenPullRequests {
@@ -161,50 +182,175 @@ impl ManagedOpenPullRequests {
         mut observations: Vec<OpenPullRequest>,
     ) -> Result<Self> {
         observations.sort_unstable_by_key(|open| open.identity.number().get());
-        let mut observations = observations.into_iter();
-        let canonical = observations.next().expect("the nonempty OPEN collection was checked");
-        let OpenPullRequest {
-            identity,
-            title,
-            body,
-            base_name,
-            base_oid,
-            head_oid,
-            is_draft,
-            has_landing_automation,
-        } = canonical;
-        let canonical = ManagedOpenPullRequestCandidate::from_observation(
-            default_branch,
-            &id,
-            identity,
-            base_name,
-            base_oid,
-            head_oid,
-            has_landing_automation,
-        )?;
-        let duplicates = observations
-            .map(|open| {
-                ManagedOpenPullRequestCandidate::from_observation(
-                    default_branch,
-                    &id,
-                    open.identity,
-                    open.base_name,
-                    open.base_oid,
-                    open.head_oid,
-                    open.has_landing_automation,
-                )
-            })
-            .collect::<Result<Box<[_]>>>()?;
-        Ok(Self {
-            id,
-            canonical,
-            title: title.into_boxed_str(),
-            body: body.into_boxed_str(),
-            is_draft,
-            duplicates,
-        })
+        let mut candidates = observations.into_iter().map(|open| {
+            ManagedOpenPullRequestCandidate::from_observation(default_branch, &id, open)
+        });
+        let first = candidates
+            .next()
+            .transpose()?
+            .ok_or_else(|| eyre!("An OPEN pull request collection cannot be empty"))?;
+        let later = candidates.collect::<Result<Box<[_]>>>()?;
+        Ok(Self { id, first, later })
     }
 
+    pub(in crate::pre_push::publication_attempt) fn id(&self) -> &GherritPrId {
+        &self.id
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn candidates(
+        &self,
+    ) -> impl Iterator<Item = &ManagedOpenPullRequestCandidate> {
+        std::iter::once(&self.first).chain(self.later.iter())
+    }
+
+    /// Joins fully-paginated OPEN evidence to the marker value read from the
+    /// exact local history. A marker omission fails closed; an unmarked change
+    /// deterministically supplies only a contender for the marker CAS.
+    pub(in crate::pre_push::publication_attempt) fn select(
+        self,
+        marker: Option<PullRequestNumber>,
+    ) -> Result<SelectedOpenPullRequest> {
+        let Self { id, first, later } = self;
+        let (canonical, duplicates) = match marker {
+            None => (first, later),
+            Some(number) if first.identity().number() == number => (first, later),
+            Some(number) => {
+                let mut later = later.into_vec();
+                let selected = later
+                    .iter()
+                    .position(|candidate| candidate.identity().number() == number)
+                    .ok_or_else(|| {
+                        eyre!(
+                            "GHerrit change '{}' marker selects OPEN pull request #{} which GitHub did not return",
+                            id.as_str(),
+                            number.get()
+                        )
+                    })?;
+                let canonical = later.remove(selected);
+                let duplicates = std::iter::once(first).chain(later).collect::<Box<[_]>>();
+                (canonical, duplicates)
+            }
+        };
+        Ok(SelectedOpenPullRequest { id, canonical, duplicates })
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn for_plan_test(
+        id: GherritPrId,
+        identity: PullRequestIdentity,
+        head_oid: ObjectId,
+        base: ObservedBase,
+        title: &str,
+        body: &str,
+        has_landing_automation: bool,
+    ) -> Self {
+        Self {
+            id,
+            first: ManagedOpenPullRequestCandidate {
+                identity,
+                title: title.into(),
+                body: body.into(),
+                head_oid,
+                base,
+                is_draft: true,
+                has_landing_automation,
+            },
+            later: Box::new([]),
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn with_canonical_draft_for_plan_test(
+        mut self,
+        is_draft: bool,
+    ) -> Self {
+        assert!(self.later.is_empty());
+        self.first.is_draft = is_draft;
+        self
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn with_duplicates_for_plan_test(
+        self,
+        duplicates: Vec<(PullRequestIdentity, ObjectId, ObservedBase, bool)>,
+    ) -> Self {
+        self.with_detailed_duplicates_for_plan_test(
+            duplicates
+                .into_iter()
+                .map(|(identity, head_oid, base, has_landing_automation)| {
+                    (identity, head_oid, base, has_landing_automation, true)
+                })
+                .collect(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn with_detailed_duplicates_for_plan_test(
+        mut self,
+        duplicates: Vec<(PullRequestIdentity, ObjectId, ObservedBase, bool, bool)>,
+    ) -> Self {
+        let mut numbers = std::iter::once(&self.first)
+            .chain(self.later.iter())
+            .map(|candidate| candidate.identity.number())
+            .collect::<HashSet<_>>();
+        let mut node_ids = std::iter::once(&self.first)
+            .chain(self.later.iter())
+            .map(|candidate| candidate.identity.node_id().as_str())
+            .collect::<HashSet<_>>();
+        for (identity, ..) in &duplicates {
+            assert!(
+                numbers.insert(identity.number()),
+                "plan-test candidates must have distinct numbers"
+            );
+            assert!(
+                node_ids.insert(identity.node_id().as_str()),
+                "plan-test duplicate identities must have distinct node IDs"
+            );
+        }
+        let mut candidates = std::iter::once(self.first)
+            .chain(self.later.into_vec())
+            .chain(duplicates.into_iter().map(
+                |(identity, head_oid, base, has_landing_automation, is_draft)| {
+                    ManagedOpenPullRequestCandidate {
+                        identity,
+                        title: "duplicate".into(),
+                        body: "duplicate".into(),
+                        head_oid,
+                        base,
+                        has_landing_automation,
+                        is_draft,
+                    }
+                },
+            ))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|candidate| candidate.identity.number().get());
+        let mut candidates = candidates.into_iter();
+        self.first = candidates.next().expect("the existing first candidate is retained");
+        self.later = candidates.collect();
+        self
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn set_all_drafts_for_plan_test(
+        &mut self,
+        is_draft: bool,
+    ) {
+        for candidate in std::iter::once(&mut self.first).chain(self.later.iter_mut()) {
+            candidate.is_draft = is_draft;
+        }
+    }
+}
+
+/// OPEN evidence after it has been joined to an optional Git marker number.
+#[derive(Debug)]
+pub(in crate::pre_push::publication_attempt) struct SelectedOpenPullRequest {
+    id: GherritPrId,
+    canonical: ManagedOpenPullRequestCandidate,
+    duplicates: Box<[ManagedOpenPullRequestCandidate]>,
+}
+
+impl SelectedOpenPullRequest {
     pub(in crate::pre_push::publication_attempt) fn id(&self) -> &GherritPrId {
         &self.id
     }
@@ -213,30 +359,12 @@ impl ManagedOpenPullRequests {
         self.canonical.identity()
     }
 
-    pub(in crate::pre_push::publication_attempt) fn base(&self) -> ObservedBase {
-        self.canonical.base()
-    }
-
-    #[cfg(test)]
-    pub(in crate::pre_push::publication_attempt) fn head_oid(&self) -> ObjectId {
-        self.canonical.head_oid()
-    }
-
     pub(in crate::pre_push::publication_attempt) fn title(&self) -> &str {
-        &self.title
+        self.canonical.title()
     }
 
     pub(in crate::pre_push::publication_attempt) fn body(&self) -> &str {
-        &self.body
-    }
-
-    pub(in crate::pre_push::publication_attempt) fn is_draft(&self) -> bool {
-        self.is_draft
-    }
-
-    #[cfg(test)]
-    pub(in crate::pre_push::publication_attempt) fn has_landing_automation(&self) -> bool {
-        self.canonical.has_landing_automation()
+        self.canonical.body()
     }
 
     pub(in crate::pre_push::publication_attempt) fn canonical_candidate(
@@ -256,64 +384,10 @@ impl ManagedOpenPullRequests {
     ) -> impl Iterator<Item = &PullRequestIdentity> {
         self.duplicate_candidates().map(ManagedOpenPullRequestCandidate::identity)
     }
-
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::pre_push::publication_attempt) fn for_plan_test(
-        id: GherritPrId,
-        identity: PullRequestIdentity,
-        head_oid: ObjectId,
-        base: ObservedBase,
-        title: &str,
-        body: &str,
-        is_draft: bool,
-        has_landing_automation: bool,
-    ) -> Self {
-        Self {
-            id,
-            canonical: ManagedOpenPullRequestCandidate {
-                identity,
-                head_oid,
-                base,
-                has_landing_automation,
-            },
-            title: title.into(),
-            body: body.into(),
-            is_draft,
-            duplicates: Box::new([]),
-        }
-    }
-
-    #[cfg(test)]
-    pub(in crate::pre_push::publication_attempt) fn with_duplicates_for_plan_test(
-        mut self,
-        duplicates: Vec<(PullRequestIdentity, ObjectId, ObservedBase, bool)>,
-    ) -> Self {
-        let mut previous_number = self.canonical.identity.number().get();
-        let mut node_ids = HashSet::from([self.canonical.identity.node_id().as_str()]);
-        for (identity, ..) in &duplicates {
-            assert!(
-                identity.number().get() > previous_number,
-                "plan-test duplicate identities must follow canonical number order"
-            );
-            assert!(
-                node_ids.insert(identity.node_id().as_str()),
-                "plan-test duplicate identities must have distinct node IDs"
-            );
-            previous_number = identity.number().get();
-        }
-        self.duplicates = duplicates
-            .into_iter()
-            .map(|(identity, head_oid, base, has_landing_automation)| {
-                ManagedOpenPullRequestCandidate { identity, head_oid, base, has_landing_automation }
-            })
-            .collect();
-        self
-    }
 }
 
-/// Proof that an exhausted exact OPEN connection had no same-repository row.
-/// Cross-repository rows do not prevent this conclusion.
+/// Proof that an exhausted exact OPEN-only connection had no same-repository
+/// row. Cross-repository rows do not prevent this conclusion.
 #[derive(Debug)]
 pub(in crate::pre_push::publication_attempt) struct AbsentPullRequest {
     id: GherritPrId,
@@ -417,9 +491,7 @@ impl CompleteLocalPullRequests {
         let mut identities = PullRequestIdentityRegistry::default();
         for observation in &local {
             if let LocalPullRequestObservation::Open(pull_request) = observation {
-                for candidate in std::iter::once(pull_request.canonical_candidate())
-                    .chain(pull_request.duplicate_candidates())
-                {
+                for candidate in pull_request.candidates() {
                     identities.insert_observation(candidate.identity())?;
                 }
             }
@@ -1257,10 +1329,10 @@ mod tests {
             "headRefName": head,
             "headRefOid": HEAD_OID,
             "state": state,
-            "isDraft": true,
             "isCrossRepository": false,
             "autoMergeRequest": null,
             "isInMergeQueue": false,
+            "isDraft": false,
         })
     }
 
@@ -1374,6 +1446,14 @@ mod tests {
 
         let later = operation(vec![query("Gone", Some("next"))], false).document();
         insta::assert_snapshot!("later_exact_local_query", later);
+    }
+
+    #[test]
+    fn document_queries_open_rows_and_no_terminal_states() {
+        let document = operation(vec![query("G", None)], true).document();
+        assert!(document.contains("states: [OPEN]"));
+        assert!(!document.contains("CLOSED"));
+        assert!(!document.contains("MERGED"));
     }
 
     #[test]
@@ -1630,7 +1710,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_opens_are_retained_in_deterministic_number_order() {
+    fn open_observation_retains_rows_in_order_without_assigning_authority() {
         let first = decoded_page("G", None, Some(node(2, "TWO", "G", "OPEN")), Some("next"), true);
         let second =
             decoded_page("G", Some("next"), Some(node(1, "ONE", "G", "OPEN")), None, false);
@@ -1645,11 +1725,104 @@ mod tests {
         let LocalPullRequestObservation::Open(open) = &complete.local()[0] else {
             panic!("G must have OPEN rows");
         };
-        assert_eq!(open.identity().number().get(), 1);
         assert_eq!(
-            open.duplicate_identities().map(|identity| identity.number().get()).collect::<Vec<_>>(),
-            [2]
+            open.candidates()
+                .map(|candidate| candidate.identity().number().get())
+                .collect::<Vec<_>>(),
+            [1, 2],
         );
+    }
+
+    fn observed_open_numbers(first: u32, rest: &[u32]) -> ManagedOpenPullRequests {
+        let head = ObjectId::from_hex(HEAD_OID.as_bytes()).unwrap();
+        let base = ObservedBase::for_plan_test(BaseKind::Default, head);
+        ManagedOpenPullRequests::for_plan_test(
+            id("G"),
+            PullRequestIdentity::for_plan_test(first, &format!("NODE-{first}")),
+            head,
+            base,
+            "title",
+            "body",
+            false,
+        )
+        .with_duplicates_for_plan_test(
+            rest.iter()
+                .map(|number| {
+                    (
+                        PullRequestIdentity::for_plan_test(*number, &format!("NODE-{number}")),
+                        head,
+                        base,
+                        false,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn marker_selects_the_exact_open_row_above_or_below_duplicates() {
+        for marker in [1, 9] {
+            let selected = observed_open_numbers(9, &[1, 5])
+                .select(Some(PullRequestNumber::for_test(marker)))
+                .unwrap();
+            assert_eq!(selected.identity().number().get(), marker);
+            assert_eq!(
+                selected
+                    .duplicate_identities()
+                    .map(|identity| identity.number().get())
+                    .collect::<Vec<_>>(),
+                if marker == 1 { vec![5, 9] } else { vec![1, 5] },
+            );
+        }
+    }
+
+    #[test]
+    fn marker_omission_fails_closed_even_when_another_open_row_is_visible() {
+        let error = observed_open_numbers(1, &[9])
+            .select(Some(PullRequestNumber::for_test(4)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("marker selects OPEN pull request #4"));
+    }
+
+    #[test]
+    fn unmarked_rows_have_a_deterministic_lowest_number_contender() {
+        let selected = observed_open_numbers(9, &[5, 1]).select(None).unwrap();
+        assert_eq!(selected.identity().number().get(), 1);
+        assert_eq!(
+            selected
+                .duplicate_identities()
+                .map(|identity| identity.number().get())
+                .collect::<Vec<_>>(),
+            [5, 9],
+        );
+    }
+
+    #[test]
+    fn exhausted_empty_open_connection_is_absent_while_unmarked_rows_are_selectable() {
+        let empty = decoded_page("Absent", None, None, None, true);
+        let complete =
+            accumulator([id("Absent")]).unwrap().record_batch(empty).unwrap().finish().unwrap();
+        assert!(matches!(complete.local(), [LocalPullRequestObservation::Absent(_)]));
+
+        let selected = observed_open_numbers(3, &[7]).select(None).unwrap();
+        assert_eq!(selected.identity().number().get(), 3);
+    }
+
+    #[test]
+    fn open_evidence_retains_draft_state() {
+        let mut row = node(1, "ONE", "G", "OPEN");
+        row["isDraft"] = json!(true);
+        let complete = accumulator([id("G")])
+            .unwrap()
+            .record_batch(decoded_page("G", None, Some(row), None, true))
+            .unwrap()
+            .finish()
+            .unwrap();
+        let LocalPullRequestObservation::Open(open) = complete.local().first().unwrap() else {
+            panic!("G must have OPEN rows");
+        };
+        assert!(open.candidates().next().unwrap().is_draft());
     }
 
     #[test]
@@ -1804,6 +1977,8 @@ mod tests {
                 "/data/repository/op0/nodes/0/headRefOid",
                 json!("0000000000000000000000000000000000000000"),
             ),
+            ("/data/repository/op0/nodes/0/isDraft", Value::Null),
+            ("/data/repository/op0/nodes/0/isDraft", json!("yes")),
             ("/data/repository/op0/nodes/0/autoMergeRequest", json!({})),
             ("/data/repository/op0/nodes/0/isInMergeQueue", json!("no")),
         ];
@@ -1815,6 +1990,16 @@ mod tests {
                 "accepted invalid {pointer}"
             );
         }
+
+        let mut missing_draft = one_response(node(1, "ONE", "G", "OPEN"));
+        missing_draft["data"]["repository"]["op0"]["nodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("isDraft");
+        assert!(
+            operation(vec![query("G", None)], true).decode_value(missing_draft).is_err(),
+            "accepted an OPEN row without isDraft"
+        );
 
         for (auto_merge_request, has_auto_merge_request) in [
             (Value::Null, false),
@@ -1834,7 +2019,10 @@ mod tests {
                 let LocalPullRequestObservation::Open(open) = &complete.local()[0] else {
                     panic!("G must be open");
                 };
-                assert_eq!(open.has_landing_automation(), has_auto_merge_request || in_queue);
+                assert_eq!(
+                    open.candidates().any(ManagedOpenPullRequestCandidate::has_landing_automation),
+                    has_auto_merge_request || in_queue
+                );
             }
         }
     }

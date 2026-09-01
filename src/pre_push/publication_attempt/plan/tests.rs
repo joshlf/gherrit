@@ -3,10 +3,10 @@ use gix::ObjectId;
 use super::{
     super::{
         github::{
-            AbsentPullRequest, MAX_MUTATION_REQUEST_BYTES, ObservedBase, ObservedGithub,
-            TestPullRequestProjection,
+            AbsentPullRequest, MAX_MUTATION_REQUEST_BYTES, ManagedOpenPullRequests, ObservedBase,
+            ObservedGithub, PullRequestNumber, TestPullRequestProjection,
         },
-        history::{ObservedPullRequestMarker, ValidatedChangeHistory},
+        history::ValidatedChangeHistory,
         refs::TestPushEffect,
     },
     *,
@@ -57,19 +57,6 @@ fn default_branch(name: &str, tip: ObjectId) -> DefaultBranch {
     DefaultBranch::new(name.to_owned(), tip).expect("valid test default branch")
 }
 
-fn validated_history(
-    id: GherritPrId,
-    published: &[(ObjectId, ObjectId)],
-    proposal: (ObjectId, ObjectId),
-    has_pull_request_marker: bool,
-) -> ValidatedChangeHistory {
-    let marker = has_pull_request_marker.then(|| {
-        let v1 = published.first().expect("a marked test history must have v1").0;
-        ObservedPullRequestMarker::for_plan_test(v1)
-    });
-    ValidatedChangeHistory::for_plan_test(id, published, proposal, marker)
-}
-
 #[test]
 fn public_branch_cannot_conflict_with_the_default_branch_ref_path() {
     for (public, default) in [
@@ -106,15 +93,15 @@ fn public_branch_plan_retains_exactly_the_observed_transition_state() {
 #[derive(Clone)]
 struct HistorySpec {
     published: Vec<(ObjectId, ObjectId)>,
-    marker: bool,
+    marker: Option<u32>,
 }
 
 impl HistorySpec {
     fn absent() -> Self {
-        Self { published: Vec::new(), marker: false }
+        Self { published: Vec::new(), marker: None }
     }
 
-    fn current(head: ObjectId, first_parent: ObjectId, marker: bool) -> Self {
+    fn current(head: ObjectId, first_parent: ObjectId, marker: Option<u32>) -> Self {
         Self { published: vec![(head, first_parent)], marker }
     }
 }
@@ -135,8 +122,8 @@ struct OpenSpec {
     base: ObjectId,
     title: Option<String>,
     body: Option<String>,
-    is_draft: bool,
     landing_automation: bool,
+    is_draft: bool,
 }
 
 impl OpenSpec {
@@ -149,9 +136,14 @@ impl OpenSpec {
             base,
             title: None,
             body: None,
-            is_draft: true,
             landing_automation: false,
+            is_draft: true,
         }
+    }
+
+    fn ready(mut self) -> Self {
+        self.is_draft = false;
+        self
     }
 }
 
@@ -199,11 +191,11 @@ fn inputs_with_repository(
         .iter()
         .zip(&local)
         .map(|(spec, (change_id, head, first_parent, _, _))| {
-            validated_history(
+            ValidatedChangeHistory::for_plan_test(
                 change_id.clone(),
                 &spec.history.published,
                 (*head, *first_parent),
-                spec.history.marker,
+                spec.history.marker.map(PullRequestNumber::for_test),
             )
         })
         .collect::<Vec<_>>()
@@ -224,9 +216,9 @@ fn inputs_with_repository(
                     ObservedBase::for_plan_test(open.base_kind, open.base),
                     &title,
                     &body,
-                    open.is_draft,
                     open.landing_automation,
-                );
+                )
+                .with_canonical_draft_for_plan_test(open.is_draft);
                 let duplicates = match &spec.pull_request {
                     PullRequestSpec::OpenWithDuplicates(_, duplicates) => duplicates
                         .iter()
@@ -236,13 +228,14 @@ fn inputs_with_repository(
                                 duplicate.head,
                                 ObservedBase::for_plan_test(duplicate.base_kind, duplicate.base),
                                 duplicate.landing_automation,
+                                duplicate.is_draft,
                             )
                         })
                         .collect(),
                     PullRequestSpec::Absent | PullRequestSpec::Open(_) => Vec::new(),
                 };
                 LocalPullRequestObservation::Open(
-                    observed.with_duplicates_for_plan_test(duplicates),
+                    observed.with_detailed_duplicates_for_plan_test(duplicates),
                 )
             }
         })
@@ -316,15 +309,19 @@ fn tuple_count(pushes: &PreparedPushes) -> usize {
         .count()
 }
 
-fn marker_destinations(pushes: &PreparedPushes) -> Vec<String> {
-    marker_refspecs(pushes)
-        .into_iter()
-        .map(|refspec| refspec.split_once(':').unwrap().1.to_owned())
-        .collect()
+fn initial_ref_pushes(plan: &PlannedPublication) -> &PreparedPushes {
+    &plan.draft_safety.after_draft_safety.initial_ref_pushes
 }
 
-fn marker_refspecs(pushes: &PreparedPushes) -> Vec<String> {
-    pushes.batches().flat_map(|batch| batch.refspecs()).map(str::to_owned).collect()
+fn marker_facts(stage: &MarkerStage) -> Vec<(String, ObjectId, u32)> {
+    stage
+        .markers
+        .iter()
+        .map(|marker| {
+            let (id, v1, number) = marker.test_parts();
+            (id.as_str().to_owned(), v1, number.get())
+        })
+        .collect()
 }
 
 fn tuple_for_test(history: &ValidatedChangeHistory) -> Option<Result<TupleTransition>> {
@@ -332,14 +329,14 @@ fn tuple_for_test(history: &ValidatedChangeHistory) -> Option<Result<TupleTransi
 }
 
 fn ready(plan: PlannedPublication) -> MarkerStage {
-    match plan.after_initial_refs {
+    match plan.draft_safety.after_draft_safety.after_initial_refs {
         AfterInitialRefs::Ready(stage) => *stage,
         AfterInitialRefs::Creates(_) => panic!("expected an all-existing projection"),
     }
 }
 
 fn creates(plan: PlannedPublication) -> CreateStage {
-    match plan.after_initial_refs {
+    match plan.draft_safety.after_draft_safety.after_initial_refs {
         AfterInitialRefs::Creates(stage) => *stage,
         AfterInitialRefs::Ready(_) => panic!("expected a create-dependent projection"),
     }
@@ -365,7 +362,7 @@ fn current_open(
 ) -> EntrySpec {
     EntrySpec {
         id: change_id,
-        history: HistorySpec::current(proposal_head, proposal_parent, marker),
+        history: HistorySpec::current(proposal_head, proposal_parent, marker.then_some(number)),
         pull_request: PullRequestSpec::Open(OpenSpec::new(number, proposal_head, base_kind, base)),
     }
 }
@@ -377,7 +374,12 @@ fn single_desired_body() -> String {
         default,
         [(id("Gone"), oid(20), oid(10), desired_title("Gone"), desired_body("Gone"))],
     );
-    let history = validated_history(id("Gone"), &[(oid(20), oid(10))], (oid(20), oid(10)), true);
+    let history = ValidatedChangeHistory::for_plan_test(
+        id("Gone"),
+        &[(oid(20), oid(10))],
+        (oid(20), oid(10)),
+        Some(PullRequestNumber::for_test(7)),
+    );
     StackBodyRecipes::new(&destination, None, stack, vec![history])
         .unwrap()
         .final_bodies(&[(id("Gone"), super::super::github::PullRequestNumber::for_test(7))])
@@ -398,29 +400,29 @@ fn planner_accepts_exactly_the_four_supported_local_realities() {
         pull_request: PullRequestSpec::Absent,
     }])
     .unwrap();
-    assert_eq!(tuple_count(&fresh.initial_ref_pushes), 1);
+    assert_eq!(tuple_count(initial_ref_pushes(&fresh)), 1);
     let fresh = creates(fresh);
     assert_eq!(fresh.creates.operations_for_test()[0].id, id("Gfresh"));
 
     let recovery = plan(&[EntrySpec {
         id: "Grecovery",
-        history: HistorySpec::current(oid(20), oid(10), false),
+        history: HistorySpec::current(oid(20), oid(10), None),
         pull_request: PullRequestSpec::Absent,
     }])
     .unwrap();
-    assert_eq!(tuple_count(&recovery.initial_ref_pushes), 0);
+    assert_eq!(tuple_count(initial_ref_pushes(&recovery)), 0);
     assert_eq!(creates(recovery).creates.operations_for_test().len(), 1);
 
     let unmarked =
         plan(&[current_open("Gunmarked", oid(20), oid(10), false, 7, BaseKind::Owned, oid(10))])
             .unwrap();
     let unmarked = ready(unmarked);
-    assert_eq!(marker_destinations(&unmarked.marker_pushes), ["refs/tags/gherrit/Gunmarked/pr"]);
+    assert_eq!(marker_facts(&unmarked), [("Gunmarked".to_owned(), oid(20), 7)]);
 
     let marked =
         plan(&[current_open("Gmarked", oid(20), oid(10), true, 7, BaseKind::Default, oid(10))])
             .unwrap();
-    assert!(marker_destinations(&ready(marked).marker_pushes).is_empty());
+    assert!(marker_facts(&ready(marked)).is_empty());
 
     let unexplained = plan(&[EntrySpec {
         id: "Gunexplained",
@@ -433,7 +435,7 @@ fn planner_accepts_exactly_the_four_supported_local_realities() {
 
     let marked_absent = plan(&[EntrySpec {
         id: "Gmarkedabsent",
-        history: HistorySpec::current(oid(20), oid(10), true),
+        history: HistorySpec::current(oid(20), oid(10), Some(7)),
         pull_request: PullRequestSpec::Absent,
     }])
     .err()
@@ -617,7 +619,12 @@ fn all_counts_and_ordered_joins_are_checked_before_planning() {
                 histories = histories
                     .into_vec()
                     .into_iter()
-                    .chain([validated_history(id("Gextra"), &[], (oid(99), oid(98)), false)])
+                    .chain([ValidatedChangeHistory::for_plan_test(
+                        id("Gextra"),
+                        &[],
+                        (oid(99), oid(98)),
+                        None,
+                    )])
                     .collect::<Vec<_>>()
                     .into_boxed_slice();
                 CompleteLocalPullRequests::for_plan_test(
@@ -713,13 +720,13 @@ fn repository_default_and_proposal_facts_must_match() {
 
     let Inputs { destination, stack, mut histories, pull_requests } =
         inputs(std::slice::from_ref(&spec));
-    histories[0] = validated_history(id("Gone"), &[], (oid(99), oid(10)), false);
+    histories[0] = ValidatedChangeHistory::for_plan_test(id("Gone"), &[], (oid(99), oid(10)), None);
     let error = plan_private_effects(destination, stack, histories, pull_requests).err().unwrap();
     assert!(error.to_string().contains("local proposal and first parent"));
 
     let Inputs { destination, stack, mut histories, pull_requests } =
         inputs(std::slice::from_ref(&spec));
-    histories[0] = validated_history(id("Gone"), &[], (oid(20), oid(99)), false);
+    histories[0] = ValidatedChangeHistory::for_plan_test(id("Gone"), &[], (oid(20), oid(99)), None);
     let error = plan_private_effects(destination, stack, histories, pull_requests).err().unwrap();
     assert!(error.to_string().contains("local proposal and first parent"));
 }
@@ -729,7 +736,6 @@ fn open_for_validation(
     head: ObjectId,
     base_kind: BaseKind,
     base: ObjectId,
-    is_draft: bool,
     landing_automation: bool,
 ) -> ManagedOpenPullRequests {
     ManagedOpenPullRequests::for_plan_test(
@@ -739,9 +745,18 @@ fn open_for_validation(
         ObservedBase::for_plan_test(base_kind, base),
         "Test change",
         "observed body",
-        is_draft,
         landing_automation,
     )
+}
+
+fn validate_observed_open(
+    history: &ValidatedChangeHistory,
+    observed: ManagedOpenPullRequests,
+    desired_base: BaseKind,
+    default_branch: &DefaultBranch,
+) -> Result<ValidatedOpenPullRequest> {
+    let selected = observed.select(history.pull_request_marker().map(|marker| marker.number()))?;
+    validate_open(history, selected, desired_base, default_branch)
 }
 
 #[test]
@@ -749,38 +764,44 @@ fn every_published_owned_head_and_base_pair_is_independently_valid() {
     let heads = [oid(101), oid(102), oid(103)];
     let bases = [oid(201), oid(202), oid(203)];
     let published = heads.into_iter().zip(bases).collect::<Vec<_>>();
-    let history = validated_history(id("Ghistory"), &published, (oid(20), oid(10)), true);
+    let history = ValidatedChangeHistory::for_plan_test(
+        id("Ghistory"),
+        &published,
+        (oid(20), oid(10)),
+        Some(PullRequestNumber::for_test(7)),
+    );
     let default = default_branch(DEFAULT_NAME, oid(10));
 
     for head in heads {
         for base in bases {
-            let pull_request =
-                open_for_validation(&history, head, BaseKind::Owned, base, true, false);
-            validate_open(&history, pull_request, BaseKind::Owned, &default).unwrap();
+            let pull_request = open_for_validation(&history, head, BaseKind::Owned, base, false);
+            validate_observed_open(&history, pull_request, BaseKind::Owned, &default).unwrap();
         }
     }
 
-    let proposal = open_for_validation(&history, oid(20), BaseKind::Owned, bases[0], true, false);
-    assert!(validate_open(&history, proposal, BaseKind::Owned, &default).is_err());
+    let proposal = open_for_validation(&history, oid(20), BaseKind::Owned, bases[0], false);
+    assert!(validate_observed_open(&history, proposal, BaseKind::Owned, &default).is_err());
 
-    let wrong_owned =
-        open_for_validation(&history, heads[0], BaseKind::Owned, oid(999), true, false);
-    assert!(validate_open(&history, wrong_owned, BaseKind::Owned, &default).is_err());
+    let wrong_owned = open_for_validation(&history, heads[0], BaseKind::Owned, oid(999), false);
+    assert!(validate_observed_open(&history, wrong_owned, BaseKind::Owned, &default).is_err());
 
     let exact_default =
-        open_for_validation(&history, heads[0], BaseKind::Default, default.tip(), true, false);
-    validate_open(&history, exact_default, BaseKind::Default, &default).unwrap();
-    let wrong_default =
-        open_for_validation(&history, heads[0], BaseKind::Default, oid(999), true, false);
-    assert!(validate_open(&history, wrong_default, BaseKind::Default, &default).is_err());
+        open_for_validation(&history, heads[0], BaseKind::Default, default.tip(), false);
+    validate_observed_open(&history, exact_default, BaseKind::Default, &default).unwrap();
+    let wrong_default = open_for_validation(&history, heads[0], BaseKind::Default, oid(999), false);
+    assert!(validate_observed_open(&history, wrong_default, BaseKind::Default, &default).is_err());
 }
 
 #[test]
 fn marker_base_and_landing_automation_rules_form_the_exact_truth_table() {
     let default = default_branch(DEFAULT_NAME, oid(10));
     for marker in [false, true] {
-        let history =
-            validated_history(id("Gtruth"), &[(oid(20), oid(10))], (oid(20), oid(10)), marker);
+        let history = ValidatedChangeHistory::for_plan_test(
+            id("Gtruth"),
+            &[(oid(20), oid(10))],
+            (oid(20), oid(10)),
+            marker.then(|| PullRequestNumber::for_test(7)),
+        );
         for observed in [BaseKind::Default, BaseKind::Owned] {
             for desired in [BaseKind::Default, BaseKind::Owned] {
                 for landing_automation in [false, true] {
@@ -789,10 +810,10 @@ fn marker_base_and_landing_automation_rules_form_the_exact_truth_table() {
                         oid(20),
                         observed,
                         oid(10),
-                        true,
                         landing_automation,
                     );
-                    let accepted = validate_open(&history, pull_request, desired, &default).is_ok();
+                    let accepted =
+                        validate_observed_open(&history, pull_request, desired, &default).is_ok();
                     let expected = (marker || observed == BaseKind::Owned)
                         && (!landing_automation
                             || (observed == BaseKind::Default && desired == BaseKind::Default));
@@ -807,24 +828,84 @@ fn marker_base_and_landing_automation_rules_form_the_exact_truth_table() {
 }
 
 #[test]
-fn multiple_opens_fail_closed_without_authenticated_identity() {
-    let canonical = OpenSpec::new(1, oid(20), BaseKind::Default, oid(10));
-    let duplicates = vec![
-        OpenSpec::new(2, oid(20), BaseKind::Owned, oid(10)),
-        OpenSpec::new(3, oid(20), BaseKind::Default, oid(10)),
-    ];
-    let spec = EntrySpec {
-        id: "Gone",
-        history: HistorySpec::current(oid(20), oid(10), true),
-        pull_request: PullRequestSpec::OpenWithDuplicates(canonical, duplicates),
-    };
+fn only_a_marker_bound_ready_default_canonical_can_cross_draft_safety() {
+    let default = default_branch(DEFAULT_NAME, oid(10));
+    let marked = ValidatedChangeHistory::for_plan_test(
+        id("Gdraft"),
+        &[(oid(20), oid(10))],
+        (oid(20), oid(10)),
+        Some(PullRequestNumber::for_test(7)),
+    );
+    let mut movable =
+        open_for_validation(&marked, oid(20), BaseKind::Default, default.tip(), false);
+    movable.set_all_drafts_for_plan_test(false);
+    assert!(
+        validate_observed_open(&marked, movable, BaseKind::Owned, &default)
+            .unwrap()
+            .draft_conversion()
+            .is_some()
+    );
 
-    let error = plan(&[spec]).err().expect("multiple OPEN rows must fail");
-    assert!(error.to_string().contains("multiple OPEN pull requests"));
+    let mut stays_root =
+        open_for_validation(&marked, oid(20), BaseKind::Default, default.tip(), false);
+    stays_root.set_all_drafts_for_plan_test(false);
+    assert!(
+        validate_observed_open(&marked, stays_root, BaseKind::Default, &default)
+            .unwrap()
+            .draft_conversion()
+            .is_none()
+    );
+
+    let ready_owned = open_for_validation(&marked, oid(20), BaseKind::Owned, oid(10), false)
+        .with_detailed_duplicates_for_plan_test(Vec::new());
+    let mut ready_owned = ready_owned;
+    ready_owned.set_all_drafts_for_plan_test(false);
+    let error =
+        validate_observed_open(&marked, ready_owned, BaseKind::Owned, &default).unwrap_err();
+    assert_eq!(error.to_string(), "OPEN pull request #7 for 'Gdraft' is ready on an owned base");
+
+    let unmarked = ValidatedChangeHistory::for_plan_test(
+        id("Gunmarked"),
+        &[(oid(20), oid(10))],
+        (oid(20), oid(10)),
+        None,
+    );
+    let mut unmarked_ready =
+        open_for_validation(&unmarked, oid(20), BaseKind::Owned, oid(10), false);
+    unmarked_ready.set_all_drafts_for_plan_test(false);
+    assert!(validate_observed_open(&unmarked, unmarked_ready, BaseKind::Owned, &default).is_err());
 }
 
 #[test]
-fn ambiguity_fails_even_when_the_lowest_projection_is_current() {
+fn duplicate_opens_close_before_the_canonical_update_in_one_projection_batch() {
+    let canonical = OpenSpec::new(1, oid(20), BaseKind::Default, oid(10));
+    let duplicates = vec![
+        OpenSpec::new(2, oid(20), BaseKind::Owned, oid(10)),
+        OpenSpec::new(3, oid(20), BaseKind::Owned, oid(10)),
+    ];
+    let spec = EntrySpec {
+        id: "Gone",
+        history: HistorySpec::current(oid(20), oid(10), Some(1)),
+        pull_request: PullRequestSpec::OpenWithDuplicates(canonical, duplicates),
+    };
+
+    let stage = ready(plan(&[spec]).unwrap());
+    let operations = stage.projection.projection_operations_for_test();
+    assert!(matches!(
+        operations,
+        [
+            TestPullRequestProjection::Close(close_two),
+            TestPullRequestProjection::Close(close_three),
+            TestPullRequestProjection::Update(update),
+        ] if close_two.identity.number().get() == 2
+            && close_three.identity.number().get() == 3
+            && update.identity.number().get() == 1
+    ));
+    assert_eq!(stage.projection.projection_batches_for_test().len(), 1);
+}
+
+#[test]
+fn duplicate_repair_does_not_invent_a_canonical_update() {
     let canonical = OpenSpec {
         body: Some(single_desired_body()),
         ..OpenSpec::new(7, oid(20), BaseKind::Default, oid(10))
@@ -832,147 +913,174 @@ fn ambiguity_fails_even_when_the_lowest_projection_is_current() {
     let duplicate = OpenSpec::new(8, oid(20), BaseKind::Owned, oid(10));
     let spec = EntrySpec {
         id: "Gone",
-        history: HistorySpec::current(oid(20), oid(10), true),
+        history: HistorySpec::current(oid(20), oid(10), Some(7)),
         pull_request: PullRequestSpec::OpenWithDuplicates(canonical, vec![duplicate]),
     };
 
-    assert!(
-        plan(&[spec])
-            .err()
-            .expect("multiple OPEN rows must fail")
-            .to_string()
-            .contains("multiple OPEN pull requests")
-    );
+    let stage = ready(plan(&[spec]).unwrap());
+    assert!(matches!(
+        stage.projection.projection_operations_for_test(),
+        [TestPullRequestProjection::Close(close)]
+            if close.identity.number().get() == 8
+    ));
 }
 
 #[test]
-fn markerless_multiple_opens_also_fail_closed() {
+fn markerless_multiple_opens_are_repairable_after_every_candidate_validates() {
     let canonical = OpenSpec::new(1, oid(20), BaseKind::Owned, oid(10));
     let duplicate = OpenSpec::new(2, oid(20), BaseKind::Owned, oid(10));
     let spec = EntrySpec {
         id: "Gone",
-        history: HistorySpec::current(oid(20), oid(10), false),
+        history: HistorySpec::current(oid(20), oid(10), None),
         pull_request: PullRequestSpec::OpenWithDuplicates(canonical, vec![duplicate]),
     };
 
-    assert!(
-        plan(&[spec])
-            .err()
-            .expect("multiple OPEN rows must fail")
-            .to_string()
-            .contains("multiple OPEN pull requests")
-    );
+    let stage = ready(plan(&[spec]).unwrap());
+    assert_eq!(marker_facts(&stage), [("Gone".to_owned(), oid(20), 1)]);
+    assert!(matches!(
+        stage.projection.projection_operations_for_test(),
+        [
+            TestPullRequestProjection::Close(close),
+            TestPullRequestProjection::Update(update),
+        ] if close.identity.number().get() == 2
+            && update.identity.number().get() == 1
+            && update.base_branch.as_deref() == Some(DEFAULT_NAME)
+    ));
 }
 
 #[test]
-fn duplicate_details_cannot_make_unauthenticated_selection_safe() {
+fn every_duplicate_must_have_valid_history_base_and_inert_landing_state() {
     let default = default_branch(DEFAULT_NAME, oid(10));
-    let history = validated_history(id("Gone"), &[(oid(20), oid(10))], (oid(20), oid(10)), true);
+    let history = ValidatedChangeHistory::for_plan_test(
+        id("Gone"),
+        &[(oid(20), oid(10))],
+        (oid(20), oid(10)),
+        Some(PullRequestNumber::for_test(7)),
+    );
     for desired in [BaseKind::Default, BaseKind::Owned] {
         for duplicate in [
             (identity(8, "BAD_HEAD"), oid(99), BaseKind::Owned, oid(10), false),
             (identity(8, "BAD_BASE"), oid(20), BaseKind::Owned, oid(99), false),
+            (identity(8, "DEFAULT_BASE"), oid(20), BaseKind::Default, oid(10), false),
             (identity(8, "AUTO_DEFAULT"), oid(20), BaseKind::Default, oid(10), true),
             (identity(8, "AUTO_OWNED"), oid(20), BaseKind::Owned, oid(10), true),
         ] {
+            let node_id = duplicate.0.node_id_for_test().to_owned();
             let candidate =
-                open_for_validation(&history, oid(20), BaseKind::Default, oid(10), true, false)
+                open_for_validation(&history, oid(20), BaseKind::Default, oid(10), false)
                     .with_duplicates_for_plan_test(vec![(
                         duplicate.0,
                         duplicate.1,
                         ObservedBase::for_plan_test(duplicate.2, duplicate.3),
                         duplicate.4,
                     )]);
-            let error = validate_open(&history, candidate, desired, &default).unwrap_err();
-            assert!(error.to_string().contains("no authenticated canonical"));
+            assert!(
+                validate_observed_open(&history, candidate, desired, &default).is_err(),
+                "accepted duplicate {} with desired base {desired:?}",
+                node_id
+            );
         }
     }
 
-    let invalid_last =
-        open_for_validation(&history, oid(20), BaseKind::Default, oid(10), true, false)
-            .with_duplicates_for_plan_test(vec![
-                (
-                    identity(8, "VALID_FIRST"),
-                    oid(20),
-                    ObservedBase::for_plan_test(BaseKind::Owned, oid(10)),
-                    false,
-                ),
-                (
-                    identity(9, "INVALID_LAST"),
-                    oid(20),
-                    ObservedBase::for_plan_test(BaseKind::Default, oid(10)),
-                    true,
-                ),
-            ]);
-    let error = validate_open(&history, invalid_last, BaseKind::Default, &default).unwrap_err();
-    assert!(error.to_string().contains("no authenticated canonical"));
+    let invalid_last = open_for_validation(&history, oid(20), BaseKind::Default, oid(10), false)
+        .with_duplicates_for_plan_test(vec![
+            (
+                identity(8, "VALID_FIRST"),
+                oid(20),
+                ObservedBase::for_plan_test(BaseKind::Owned, oid(10)),
+                false,
+            ),
+            (
+                identity(9, "INVALID_LAST"),
+                oid(20),
+                ObservedBase::for_plan_test(BaseKind::Default, oid(10)),
+                true,
+            ),
+        ]);
+    let error =
+        validate_observed_open(&history, invalid_last, BaseKind::Default, &default).unwrap_err();
+    assert!(error.to_string().contains("#9"));
+
+    let ready_duplicate = open_for_validation(&history, oid(20), BaseKind::Default, oid(10), false)
+        .with_detailed_duplicates_for_plan_test(vec![(
+            identity(8, "READY_DUPLICATE"),
+            oid(20),
+            ObservedBase::for_plan_test(BaseKind::Owned, oid(10)),
+            false,
+            false,
+        )]);
+    let error =
+        validate_observed_open(&history, ready_duplicate, BaseKind::Default, &default).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Duplicate OPEN pull request #8 for 'Gone' must already be a draft"
+    );
 }
 
 #[test]
 fn tuple_selection_uses_only_absence_or_a_changed_current_revision() {
-    let absent = validated_history(id("Gabsent"), &[], (oid(20), oid(10)), false);
+    let absent =
+        ValidatedChangeHistory::for_plan_test(id("Gabsent"), &[], (oid(20), oid(10)), None);
     assert!(tuple_for_test(&absent).unwrap().is_ok());
 
-    let current =
-        validated_history(id("Gcurrent"), &[(oid(20), oid(10))], (oid(20), oid(10)), false);
+    let current = ValidatedChangeHistory::for_plan_test(
+        id("Gcurrent"),
+        &[(oid(20), oid(10))],
+        (oid(20), oid(10)),
+        None,
+    );
     assert!(tuple_for_test(&current).is_none());
 
-    let changed = validated_history(
+    let changed = ValidatedChangeHistory::for_plan_test(
         id("Gchanged"),
         &[(oid(101), oid(201)), (oid(102), oid(202)), (oid(101), oid(201))],
         (oid(20), oid(10)),
-        false,
+        None,
     );
     let transition = tuple_for_test(&changed).unwrap().unwrap();
     let pushes = prepare_tuple_pushes(&PushDestination::for_test(), &[transition]).unwrap();
     let refspecs = pushes.batches().flat_map(|batch| batch.refspecs()).collect::<Vec<_>>();
     assert!(refspecs.iter().any(|value| value.ends_with("refs/tags/gherrit/Gchanged/v4")));
 
-    let reused_noncurrent = validated_history(
+    let reused_noncurrent = ValidatedChangeHistory::for_plan_test(
         id("Greused"),
         &[(oid(101), oid(201)), (oid(102), oid(202))],
         (oid(101), oid(201)),
-        false,
+        None,
     );
     assert!(tuple_for_test(&reused_noncurrent).is_some());
 
-    let reused_current = validated_history(
+    let reused_current = ValidatedChangeHistory::for_plan_test(
         id("Greused"),
         &[(oid(101), oid(201)), (oid(102), oid(202)), (oid(101), oid(201))],
         (oid(101), oid(201)),
-        false,
+        None,
     );
     assert!(tuple_for_test(&reused_current).is_none());
 }
 
 #[test]
-fn every_new_marker_targets_v1() {
+fn every_new_marker_targets_v1_and_names_the_canonical_identity() {
     let existing = EntrySpec {
         id: "Gexisting",
-        history: HistorySpec { published: vec![(oid(101), oid(10))], marker: false },
+        history: HistorySpec { published: vec![(oid(101), oid(10))], marker: None },
         pull_request: PullRequestSpec::Open(OpenSpec::new(7, oid(101), BaseKind::Owned, oid(10))),
     };
     let existing = plan(&[existing]).unwrap();
-    assert_eq!(tuple_count(&existing.initial_ref_pushes), 1);
-    assert_eq!(
-        marker_refspecs(&ready(existing).marker_pushes),
-        [format!("{}:refs/tags/gherrit/Gexisting/pr", oid(101))]
-    );
+    assert_eq!(tuple_count(initial_ref_pushes(&existing)), 1);
+    assert_eq!(marker_facts(&ready(existing)), [("Gexisting".to_owned(), oid(101), 7)]);
 
     let absent = EntrySpec {
         id: "Gabsent",
-        history: HistorySpec { published: vec![(oid(101), oid(10))], marker: false },
+        history: HistorySpec { published: vec![(oid(101), oid(10))], marker: None },
         pull_request: PullRequestSpec::Absent,
     };
     let absent = plan(&[absent]).unwrap();
-    assert_eq!(tuple_count(&absent.initial_ref_pushes), 1);
+    assert_eq!(tuple_count(initial_ref_pushes(&absent)), 1);
     let absent = creates(absent);
     assert_eq!(absent.creates.operations_for_test()[0].head_oid, oid(20));
     let absent = absent.complete_for_test(receipts(&[("Gabsent", 8, "PR_8")])).unwrap();
-    assert_eq!(
-        marker_refspecs(&absent.marker_pushes),
-        [format!("{}:refs/tags/gherrit/Gabsent/pr", oid(101))]
-    );
+    assert_eq!(marker_facts(&absent), [("Gabsent".to_owned(), oid(101), 8)]);
 }
 
 fn mixed_specs() -> [EntrySpec; 4] {
@@ -986,7 +1094,7 @@ fn mixed_specs() -> [EntrySpec; 4] {
         current_open("Gthree", oid(22), oid(21), false, 33, BaseKind::Owned, oid(21)),
         EntrySpec {
             id: "Gfour",
-            history: HistorySpec::current(oid(23), oid(22), false),
+            history: HistorySpec::current(oid(23), oid(22), None),
             pull_request: PullRequestSpec::Absent,
         },
     ]
@@ -996,9 +1104,9 @@ fn mixed_specs() -> [EntrySpec; 4] {
 fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
     let plan =
         plan_with_public_branch(&mixed_specs(), Some("release-candidate".to_owned())).unwrap();
-    assert_eq!(tuple_count(&plan.initial_ref_pushes), 1);
+    assert_eq!(tuple_count(initial_ref_pushes(&plan)), 1);
     assert_eq!(
-        plan.initial_ref_pushes
+        initial_ref_pushes(&plan)
             .batches()
             .flat_map(|batch| batch.semantic_effects_for_test())
             .filter(|effect| matches!(effect, TestPushEffect::PublicBranch { .. }))
@@ -1030,8 +1138,12 @@ fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
         .complete_for_test(receipts(&[("Gtwo", 22, "PR_22"), ("Gfour", 44, "PR_44")]))
         .unwrap();
     assert_eq!(
-        marker_destinations(&final_stage.marker_pushes),
-        ["refs/tags/gherrit/Gtwo/pr", "refs/tags/gherrit/Gthree/pr", "refs/tags/gherrit/Gfour/pr",]
+        marker_facts(&final_stage),
+        [
+            ("Gtwo".to_owned(), oid(21), 22),
+            ("Gthree".to_owned(), oid(22), 33),
+            ("Gfour".to_owned(), oid(23), 44),
+        ]
     );
     let updates = update_operations(&final_stage.projection);
     assert_eq!(
@@ -1058,11 +1170,11 @@ fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
 }
 
 #[test]
-fn ambiguous_existing_rows_prevent_a_mixed_create_plan() {
+fn create_receipts_preserve_known_duplicate_closes_in_the_final_projection() {
     let specs = [
         EntrySpec {
             id: "Gexisting",
-            history: HistorySpec::current(oid(20), oid(10), true),
+            history: HistorySpec::current(oid(20), oid(10), Some(1)),
             pull_request: PullRequestSpec::OpenWithDuplicates(
                 OpenSpec::new(1, oid(20), BaseKind::Default, oid(10)),
                 vec![OpenSpec::new(2, oid(20), BaseKind::Owned, oid(10))],
@@ -1074,13 +1186,19 @@ fn ambiguous_existing_rows_prevent_a_mixed_create_plan() {
             pull_request: PullRequestSpec::Absent,
         },
     ];
-    assert!(
-        plan(&specs)
-            .err()
-            .expect("multiple OPEN rows must fail")
-            .to_string()
-            .contains("multiple OPEN pull requests")
-    );
+    let stage = creates(plan(&specs).unwrap());
+    let final_stage = stage.complete_for_test(receipts(&[("Gmissing", 3, "PR_3")])).unwrap();
+
+    assert!(matches!(
+        final_stage.projection.projection_operations_for_test(),
+        [
+            TestPullRequestProjection::Close(close),
+            TestPullRequestProjection::Update(existing),
+            TestPullRequestProjection::Update(created),
+        ] if close.identity.number().get() == 2
+            && existing.identity.number().get() == 1
+            && created.identity.number().get() == 3
+    ));
 }
 
 #[test]
@@ -1176,13 +1294,13 @@ fn exact_update_preflight_after_receipts_still_precedes_marker_release() {
 }
 
 #[test]
-fn ambiguity_precedes_unreachable_close_preflight() {
-    let mut duplicate = OpenSpec::new(2, oid(20), BaseKind::Default, oid(10));
+fn known_duplicate_closes_are_preflighted_before_a_create_dependent_plan_escapes() {
+    let mut duplicate = OpenSpec::new(2, oid(20), BaseKind::Owned, oid(10));
     duplicate.node = "N".repeat(MAX_MUTATION_REQUEST_BYTES);
     let specs = [
         EntrySpec {
             id: "Gexisting",
-            history: HistorySpec::current(oid(20), oid(10), true),
+            history: HistorySpec::current(oid(20), oid(10), Some(1)),
             pull_request: PullRequestSpec::OpenWithDuplicates(
                 OpenSpec::new(1, oid(20), BaseKind::Default, oid(10)),
                 vec![duplicate],
@@ -1196,7 +1314,12 @@ fn ambiguity_precedes_unreachable_close_preflight() {
     ];
 
     let error = plan(&specs).err().expect("known close preflight must prevent a staged plan");
-    assert!(error.to_string().contains("multiple OPEN pull requests"));
+    assert!(error.to_string().contains("GraphQL pull request projection at item 0 serializes to"));
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("exceeds the {MAX_MUTATION_REQUEST_BYTES}-byte request limit"))
+    );
 }
 
 #[test]
@@ -1224,7 +1347,7 @@ fn graphql_stages_are_preflighted_before_a_tuple_plan_can_escape() {
     let oversized_node = "N".repeat(MAX_MUTATION_REQUEST_BYTES);
     let spec = EntrySpec {
         id: "Gupdate",
-        history: HistorySpec { published: vec![(oid(101), oid(10))], marker: true },
+        history: HistorySpec { published: vec![(oid(101), oid(10))], marker: Some(7) },
         pull_request: PullRequestSpec::Open(OpenSpec {
             number: 7,
             node: oversized_node,
@@ -1233,8 +1356,8 @@ fn graphql_stages_are_preflighted_before_a_tuple_plan_can_escape() {
             base: oid(10),
             title: Some("stale title".to_owned()),
             body: None,
-            is_draft: true,
             landing_automation: false,
+            is_draft: true,
         }),
     };
     let error = plan(&[spec]).err().unwrap();
@@ -1258,12 +1381,12 @@ fn existing_projection_emits_exact_desired_values_for_differing_fields() {
             base: oid(10),
             title: title_differs.then(|| "stale title".to_owned()),
             body: Some(if body_differs { "stale body".to_owned() } else { desired_body.clone() }),
-            is_draft: true,
             landing_automation: false,
+            is_draft: true,
         };
         let spec = EntrySpec {
             id: "Gone",
-            history: HistorySpec::current(oid(20), oid(10), true),
+            history: HistorySpec::current(oid(20), oid(10), Some(7)),
             pull_request: PullRequestSpec::Open(open),
         };
         let stage = ready(plan(&[spec]).unwrap());
@@ -1302,7 +1425,7 @@ fn body_comparison_normalizes_only_crlf_pairs() {
 
     let spec = EntrySpec {
         id: "Gone",
-        history: HistorySpec::current(oid(20), oid(10), true),
+        history: HistorySpec::current(oid(20), oid(10), Some(7)),
         pull_request: PullRequestSpec::Open(OpenSpec {
             number: 7,
             node: "PR_7".to_owned(),
@@ -1311,8 +1434,8 @@ fn body_comparison_normalizes_only_crlf_pairs() {
             base: oid(10),
             title: None,
             body: Some(desired.replace('\n', "\r\n")),
-            is_draft: true,
             landing_automation: false,
+            is_draft: true,
         }),
     };
     let stage = ready(plan(&[spec]).unwrap());
@@ -1321,6 +1444,7 @@ fn body_comparison_normalizes_only_crlf_pairs() {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EffectBoundary {
+    DraftSafety,
     InitialRefs,
     Creates,
     Markers,
@@ -1343,6 +1467,13 @@ struct CreateAttempt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+struct MarkerAttempt {
+    id: String,
+    v1: String,
+    number: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 struct UpdateAttempt {
     number: u32,
     node_id: String,
@@ -1359,15 +1490,17 @@ enum ProjectionAttempt {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 enum DurableEffectAttempt {
+    DraftSafety(Box<[u32]>),
     InitialRefs(Box<[GitBatchAttempt]>),
     Creates(Box<[CreateAttempt]>),
-    Markers(Box<[GitBatchAttempt]>),
+    Markers(Box<[MarkerAttempt]>),
     Projection(Box<[ProjectionAttempt]>),
 }
 
 impl DurableEffectAttempt {
     fn boundary(&self) -> EffectBoundary {
         match self {
+            Self::DraftSafety(_) => EffectBoundary::DraftSafety,
             Self::InitialRefs(_) => EffectBoundary::InitialRefs,
             Self::Creates(_) => EffectBoundary::Creates,
             Self::Markers(_) => EffectBoundary::Markers,
@@ -1421,6 +1554,18 @@ impl ScriptedEffectDriver {
 }
 
 impl EffectDriver for ScriptedEffectDriver {
+    async fn convert_pull_requests_to_draft(
+        &mut self,
+        conversions: PreparedDraftConversions,
+    ) -> Result<()> {
+        let attempts = conversions
+            .operations_for_test()
+            .iter()
+            .map(|operation| operation.identity.number().get())
+            .collect();
+        self.record(DurableEffectAttempt::DraftSafety(attempts))
+    }
+
     async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()> {
         let attempts = Self::push_attempts(&pushes);
         if attempts.is_empty() {
@@ -1458,8 +1603,18 @@ impl EffectDriver for ScriptedEffectDriver {
         Ok(CompleteCreateReceipts::for_plan_test(receipts))
     }
 
-    async fn publish_markers(&mut self, pushes: PreparedPushes) -> Result<()> {
-        let attempts = Self::push_attempts(&pushes);
+    async fn publish_markers(&mut self, markers: Box<[MarkerTemplate]>) -> Result<()> {
+        let attempts: Box<[MarkerAttempt]> = markers
+            .iter()
+            .map(|marker| {
+                let (id, v1, number) = marker.test_parts();
+                MarkerAttempt {
+                    id: id.as_str().to_owned(),
+                    v1: v1.to_string(),
+                    number: number.get(),
+                }
+            })
+            .collect();
         if attempts.is_empty() {
             Ok(())
         } else {
@@ -1513,9 +1668,32 @@ fn fresh_execution_plan() -> PlannedPublication {
 fn all_existing_execution_plan() -> PlannedPublication {
     plan(&[EntrySpec {
         id: "Gexisting",
-        history: HistorySpec { published: vec![(oid(101), oid(10))], marker: false },
+        history: HistorySpec { published: vec![(oid(101), oid(10))], marker: None },
         pull_request: PullRequestSpec::Open(OpenSpec::new(7, oid(101), BaseKind::Owned, oid(10))),
     }])
+    .unwrap()
+}
+
+fn ready_root_moving_to_owned_base_execution_plan() -> PlannedPublication {
+    plan(&[
+        EntrySpec {
+            id: "Gparent",
+            history: HistorySpec::current(oid(20), oid(10), Some(7)),
+            pull_request: PullRequestSpec::Open(OpenSpec::new(
+                7,
+                oid(20),
+                BaseKind::Default,
+                oid(10),
+            )),
+        },
+        EntrySpec {
+            id: "Gmove",
+            history: HistorySpec::current(oid(11), oid(10), Some(8)),
+            pull_request: PullRequestSpec::Open(
+                OpenSpec::new(8, oid(11), BaseKind::Default, oid(10)).ready(),
+            ),
+        },
+    ])
     .unwrap()
 }
 
@@ -1565,6 +1743,32 @@ async fn durable_effect_barriers_release_only_the_next_reachable_stage() {
 }
 
 #[tokio::test]
+async fn draft_safety_precedes_every_git_and_github_publication_effect() {
+    let (result, acknowledged) =
+        execute_scripted(ready_root_moving_to_owned_base_execution_plan(), None).await;
+    result.unwrap();
+    acknowledged.assert_consumed();
+    assert_eq!(
+        acknowledged.attempts.iter().map(DurableEffectAttempt::boundary).collect::<Vec<_>>(),
+        [EffectBoundary::DraftSafety, EffectBoundary::InitialRefs, EffectBoundary::Projection]
+    );
+    assert!(matches!(
+        acknowledged.attempts.first(),
+        Some(DurableEffectAttempt::DraftSafety(numbers)) if numbers.as_ref() == [8]
+    ));
+
+    let (result, interrupted) = execute_scripted(
+        ready_root_moving_to_owned_base_execution_plan(),
+        Some(EffectBoundary::DraftSafety),
+    )
+    .await;
+    let error = result.expect_err("draft-safety failure must stop the attempt");
+    interrupted.assert_consumed();
+    assert_eq!(interrupted.attempts, acknowledged.attempts[..1]);
+    assert!(error.to_string().contains("DraftSafety"));
+}
+
+#[tokio::test]
 async fn all_existing_publication_skips_create_without_reordering_effects() {
     let (result, driver) = execute_scripted(all_existing_execution_plan(), None).await;
     result.unwrap();
@@ -1580,7 +1784,7 @@ async fn all_existing_publication_skips_create_without_reordering_effects() {
 async fn empty_effect_stages_cross_without_attempting_a_durable_write() {
     let plan = plan(&[EntrySpec {
         id: "Gone",
-        history: HistorySpec::current(oid(20), oid(10), true),
+        history: HistorySpec::current(oid(20), oid(10), Some(7)),
         pull_request: PullRequestSpec::Open(OpenSpec {
             number: 7,
             node: "PR_7".to_owned(),
@@ -1589,8 +1793,8 @@ async fn empty_effect_stages_cross_without_attempting_a_durable_write() {
             base: oid(10),
             title: None,
             body: Some(single_desired_body()),
-            is_draft: true,
             landing_automation: false,
+            is_draft: true,
         }),
     }])
     .unwrap();
