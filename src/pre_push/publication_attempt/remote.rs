@@ -501,6 +501,10 @@ impl RawExactLocalChange {
 }
 
 /// Exact annotated-tag evidence for the immutable pull-request marker.
+///
+/// `tag` is the unpeeled annotated tag object. `v1` is the mandatory peeled
+/// commit advertised beside it. The source ref is retained so a missing tag
+/// object can join the one exact acquisition with history aliases.
 #[derive(Debug)]
 pub(super) struct RawPullRequestMarker {
     tag: ObjectId,

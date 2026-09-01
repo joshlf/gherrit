@@ -16,7 +16,7 @@ impl PullRequestNumber {
     pub(in crate::pre_push::publication_attempt) const MAX: Self =
         Self(NonZeroU32::new(i32::MAX as u32).expect("GraphQL Int maximum is nonzero"));
 
-    fn new(value: u64) -> Result<Self> {
+    pub(in crate::pre_push::publication_attempt) fn new(value: u64) -> Result<Self> {
         let value = u32::try_from(value)
             .ok()
             .and_then(NonZeroU32::new)
