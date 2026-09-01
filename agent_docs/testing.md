@@ -37,13 +37,15 @@ The suite establishes that GHerrit:
 - creates every pull request on its permanent owned-base key;
 - selects the lowest visible OPEN pull request number as canonical, closes
   every higher visible duplicate, and projects only the canonical row;
+- rejects any MERGED row or a CLOSED row below the canonical OPEN row while
+  ignoring higher CLOSED cleanup residue;
 - converges roots to the exact default branch and nonroots to their own bases;
 - emits no action when durable state already matches local intent;
 - remains safe after interruption at every externally committed effect;
 - remains safe when protocol-conforming publishers operate on disjoint or
   overlapping change IDs;
 - fails closed when marked pull request existence is not visible;
-- rejects closed or merged local history when no OPEN pull request exists; and
+- rejects terminal-only local history; and
 - preserves every immutable version position through amendments, rebases,
   reorders, adjacent repeated revisions, and nonconsecutive revision reuse.
 
@@ -67,8 +69,7 @@ The suite establishes that:
 - Git publication uses complete atomic tuples and exact leases;
 - public-ref creation and advancement use exact absence/value leases and the
   same bounded initial-ref batching boundary;
-- GitHub exhausts OPEN connections for the exact local IDs and probes terminal
-  history only for IDs without a visible same-repository OPEN row;
+- GitHub exhausts one all-lifecycle connection for every exact local ID;
 - GraphQL aliases, cursors, errors, nullable fields, and partial mutation
   outcomes are decoded conservatively;
 - create and mixed final-projection receipts identify the exact planned pull
@@ -126,7 +127,7 @@ Coverage is organized around product risks rather than source files.
 | Local intent is misunderstood | Pure stack/policy cases and focused real-Git discovery |
 | Unrelated repository state affects publication | Exact-request contracts and unrelated-state invariance |
 | The wrong refs are published | Pure tuple decisions and real atomic-push/lease contracts |
-| GitHub state is misclassified | Pure local outcome tables and OPEN-first GraphQL contracts |
+| GitHub state is misclassified | Pure local outcome tables and all-lifecycle GraphQL contracts |
 | A create targets the wrong PR | Exact receipt tables and one scripted mutation contract |
 | A retry repeats or loses work | Durable-prefix recovery model and focused lost-ack contracts |
 | A stale read grants unsafe authority | Visibility schedules and marker-aware planner tables |
@@ -152,8 +153,7 @@ remote symbolic HEAD + exact public ref --/                 |
                                                             +-> empty public stack
                                                             |            |
                                                             +-> exact local refs, tags, graph --+
-                                                            +-> exact local OPEN PRs -----------+
-                                                                + conditional terminal probes -+
+                                                            +-> exact local lifecycle PRs -----+
                                                                                                |
                                                                                      publication plan
                                                                                                |
@@ -169,21 +169,20 @@ snapshot. Safety comes from validated immutable history, exact leases, safe
 owned-base creates, monotone canonical selection, durable markers, and one-use
 acknowledgement gates.
 
-The evidence set contains no repository-wide OPEN rows, nonlocal histories,
-nonlocal graph roots, or retained terminal lookup table. Complete OPEN
-pagination produces a nonempty set with one canonical minimum or starts a
-bounded CLOSED/MERGED probe. The probe yields sealed absence or rejects the
-first same-repository terminal row before the planner runs.
+The evidence set contains no repository-wide pull request rows, nonlocal
+histories, or nonlocal graph roots. Complete all-lifecycle pagination yields
+sealed absence or one ordered decision. The lowest same-repository row must be
+OPEN, any MERGED row rejects, higher CLOSED rows are completed cleanup, and
+higher OPEN rows are repairable duplicates.
 
 Exact acknowledgement of all required initial Git batches—including the
 optional public effect—releases pull request creation. An initially observed
-validated nonempty OPEN set authorizes its one marker; a newly created pull
+validated canonical OPEN row authorizes its one marker; a newly created pull
 request authorizes its marker only through an exact create receipt. Exact
 acknowledgement of every marker push releases one final GraphQL projection
-which closes duplicates and updates canonical rows. If an earlier
-tuple batch succeeds but the final public-containing batch fails atomically,
-the earlier tuples remain durable and a fresh attempt plans only the remaining
-work.
+which closes duplicates and updates canonical rows. If an earlier tuple batch
+succeeds but the final public-containing batch fails atomically, the earlier
+tuples remain durable and a fresh attempt plans only the remaining work.
 
 An indeterminate write ends the attempt. The same attempt does not retry the
 mutation, roll back, or reobserve. A fresh process reconstructs all authority
@@ -240,11 +239,10 @@ The Git boundary owns:
 The GitHub boundary owns:
 
 - repository identity and default-branch observation;
-- independently paginated OPEN connections filtered by exact local head names;
-- bounded terminal probes only after an OPEN connection has no
-  same-repository row;
-- conversion of the completed waves into sealed `Absent`, validated nonempty
-  canonical-plus-duplicates OPEN evidence, or a terminal-only rejection;
+- independently paginated all-lifecycle connections filtered by exact local
+  head names;
+- conversion of each exhausted connection into sealed `Absent`, validated
+  canonical-plus-duplicates OPEN evidence, or a lifecycle rejection;
 - stable owned-base create mutations and exact receipts;
 - exact duplicate-close mutations and CLOSED receipts; and
 - minimal canonical update mutations and exact OPEN receipts.
@@ -299,7 +297,7 @@ DurableWorld
 
 PublishedChange
   ordered published revisions
-  zero or more pull request rows with OPEN or CLOSED lifecycle
+  zero or more pull request rows with OPEN, CLOSED, or MERGED lifecycle
   optional change-level marker
 
 LocalIntent
@@ -317,13 +315,16 @@ production stage machine cannot publish it until at least one OPEN identity is
 durable. The independent service model nevertheless represents a marker with
 no OPEN row: its deliberately permissive close operation must be able to show
 the invalid world a mistaken canonical close would produce instead of
-preventing the planner bug by construction. Canonical identity is derived as
-the OPEN subset's lowest number rather than stored independently. Closing a
-row changes its lifecycle to CLOSED rather than deleting its identity.
-Per-query visibility remains separate and may hide individual OPEN rows,
-including the canonical row, without deleting them from the world. The model
-can therefore exercise its own cleanup residue and terminal-only outcome;
-focused adapter tests own MERGED and arbitrary preexisting terminal histories.
+preventing the planner bug by construction. Canonical identity is derived
+only after the complete lifecycle row set is ordered: the lowest row must be
+OPEN, any MERGED row rejects, and only higher CLOSED rows are admissible.
+Closing a row changes its lifecycle to CLOSED rather than deleting its
+identity. A completed connection captures its whole returned row set,
+including lifecycle and an empty result. Later lifecycle changes cannot alter
+a captured row, and later creation cannot add one. Connections for different
+change IDs remain independent rather than pretending to be one backend
+snapshot. The model can therefore exercise omissions, cleanup residue,
+terminal history, reopen, merge, and later-created duplicates.
 
 A marker may target an older published revision after an amendment. The
 durable Git history supplies current head and owned-base object IDs. A stale
@@ -346,11 +347,12 @@ Final pull request projections | Done | Rejected
 
 Tuple, create, and marker effects carry the stable change ID and their complete
 semantic payload. Closures and updates are addressed by sealed pull request
-identities; the model resolves each requested node ID to a durable OPEN row
-and records the resolved change ID only in its local trace. It compares exact
-effect order and content, applies an allowed durable prefix or alias subset,
-discards all process-local authority, rebuilds a fresh observation, and
-requires the next plan to describe exactly the remaining work.
+identities; the model resolves each requested node ID to its durable pull
+request row, then requires that row to remain OPEN before applying the
+mutation. It records the resolved change ID only in its local trace, compares
+exact effect order and content, applies an allowed durable prefix or alias
+subset, discards all process-local authority, rebuilds a fresh observation,
+and requires the next plan to describe exactly the remaining work.
 
 Concurrency cases derive two plans from independently chosen observations and
 run one complete competing plan while the primary plan is suspended at each
@@ -467,17 +469,16 @@ responses fail automatically.
 
 Contracts cover:
 
-- one OPEN alias per exact local head name and terminal aliases only after
-  OPEN absence;
+- one all-lifecycle alias per exact local head name;
 - repository facts on the first request only;
 - independent pagination where aliases advance at different rates;
 - fork-only pages followed to exhaustion;
-- OPEN pages followed independently to exhaustion;
-- terminal probes skipped whenever a same-repository OPEN row exists;
-- fork-only terminal pages followed until same-repository rejection or sealed
-  absence;
+- lifecycle pages followed independently to exhaustion;
+- fork-only pages followed until sealed absence or same-repository evidence;
 - multiple OPEN rows selecting the lowest number independently of pagination
   order while retaining higher identities for closure;
+- lower CLOSED and every MERGED row rejecting while higher CLOSED rows remain
+  admissible cleanup residue;
 - repeated local identity components rejecting ambiguity;
 - wrong returned head names and object IDs;
 - missing, null, duplicate, and extra aliases;
@@ -769,11 +770,11 @@ assert failure and exact absence of further Git or GitHub writes.
 
 ### GitHub protocol evidence
 
-The scripted transport proves exact local OPEN-first queries, complete
-independent pagination, conditional terminal probes, repository/default
-agreement, fork filtering, terminal-only rejection, stable owned-base creates,
-complete alias receipts, and mixed exact duplicate-closure and minimal
-canonical-update projections.
+The scripted transport proves exact local all-lifecycle queries, complete
+independent pagination, repository/default agreement, fork filtering,
+lifecycle ordering and rejection, stable owned-base creates, complete alias
+receipts, and mixed exact duplicate-closure and minimal canonical-update
+projections.
 
 A one-shot visibility expectation hides a known OPEN pull request for exactly
 one local-ID observation without removing it from fake durable state. It proves
