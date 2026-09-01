@@ -2,7 +2,10 @@ use gix::ObjectId;
 
 use super::{
     super::{
-        github::{AbsentPullRequest, MAX_MUTATION_REQUEST_BYTES, ObservedBase, ObservedGithub},
+        github::{
+            AbsentPullRequest, MAX_MUTATION_REQUEST_BYTES, ObservedBase, ObservedGithub,
+            TestPullRequestProjection,
+        },
         history::{ObservedPullRequestMarker, ValidatedChangeHistory},
         refs::TestPushEffect,
     },
@@ -33,6 +36,21 @@ fn id(value: &str) -> GherritPrId {
 
 fn identity(number: u32, node: &str) -> PullRequestIdentity {
     PullRequestIdentity::for_plan_test(number, node)
+}
+
+fn update_operations(
+    projection: &PreparedPullRequestProjection,
+) -> Vec<&super::super::github::TestUpdate> {
+    projection
+        .projection_operations_for_test()
+        .iter()
+        .map(|operation| match operation {
+            TestPullRequestProjection::Update(update) => update,
+            TestPullRequestProjection::Close(_) => {
+                panic!("this update-focused fixture cannot emit duplicate closes")
+            }
+        })
+        .collect()
 }
 
 fn default_branch(name: &str, tip: ObjectId) -> DefaultBranch {
@@ -199,7 +217,7 @@ fn inputs_with_repository(
             PullRequestSpec::Open(open) | PullRequestSpec::OpenWithDuplicates(open, _) => {
                 let title = open.title.clone().unwrap_or_else(|| desired_title(spec.id));
                 let body = open.body.clone().unwrap_or_else(|| desired_body(spec.id));
-                let observed = ManagedOpenPullRequest::for_plan_test(
+                let observed = ManagedOpenPullRequests::for_plan_test(
                     id(spec.id),
                     identity(open.number, &open.node),
                     open.head,
@@ -713,8 +731,8 @@ fn open_for_validation(
     base: ObjectId,
     is_draft: bool,
     landing_automation: bool,
-) -> ManagedOpenPullRequest {
-    ManagedOpenPullRequest::for_plan_test(
+) -> ManagedOpenPullRequests {
+    ManagedOpenPullRequests::for_plan_test(
         history.id().clone(),
         identity(7, "PR_7"),
         head,
@@ -1015,12 +1033,12 @@ fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
         marker_destinations(&final_stage.marker_pushes),
         ["refs/tags/gherrit/Gtwo/pr", "refs/tags/gherrit/Gthree/pr", "refs/tags/gherrit/Gfour/pr",]
     );
-    let updates = final_stage.projection.operations_for_test();
+    let updates = update_operations(&final_stage.projection);
     assert_eq!(
         updates.iter().map(|update| update.identity.number().get()).collect::<Vec<_>>(),
         [11, 22, 33, 44]
     );
-    for update in updates {
+    for update in &updates {
         let body = update.body.as_deref().expect("every stale or created body is updated");
         for number in [11, 22, 33, 44] {
             assert!(body.contains(&format!("#{number}")));
@@ -1088,7 +1106,7 @@ fn root_and_nonroot_creates_share_the_owned_key_but_only_root_moves_final_base()
 
     let final_stage =
         stage.complete_for_test(receipts(&[("Groot", 1, "PR_1"), ("Gtip", 2, "PR_2")])).unwrap();
-    let updates = final_stage.projection.operations_for_test();
+    let updates = update_operations(&final_stage.projection);
     assert_eq!(updates.len(), 2);
     assert_eq!(updates[0].base_branch.as_deref(), Some(DEFAULT_NAME));
     assert_eq!(updates[1].base_branch, None);
@@ -1103,10 +1121,9 @@ fn a_marked_pull_request_moved_below_the_root_returns_to_its_owned_base() {
     ];
 
     let stage = ready(plan(&specs).unwrap());
-    let moved = stage
-        .projection
-        .operations_for_test()
-        .iter()
+    let moved = stage.projection;
+    let moved = update_operations(&moved)
+        .into_iter()
         .find(|update| update.identity.number().get() == 2)
         .expect("the moved pull request requires a projection update");
     assert_eq!(moved.base_branch.as_deref(), Some("gherrit-bases/Gmoved"));
@@ -1250,7 +1267,7 @@ fn existing_projection_emits_exact_desired_values_for_differing_fields() {
             pull_request: PullRequestSpec::Open(open),
         };
         let stage = ready(plan(&[spec]).unwrap());
-        let updates = stage.projection.operations_for_test();
+        let updates = update_operations(&stage.projection);
         assert_eq!(updates.len(), usize::from(mask != 0), "mask={mask:03b}");
         if let Some(update) = updates.first() {
             assert_eq!(
@@ -1299,7 +1316,7 @@ fn body_comparison_normalizes_only_crlf_pairs() {
         }),
     };
     let stage = ready(plan(&[spec]).unwrap());
-    assert!(stage.projection.operations_for_test().is_empty());
+    assert!(stage.projection.projection_operations_for_test().is_empty());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1307,7 +1324,7 @@ enum EffectBoundary {
     InitialRefs,
     Creates,
     Markers,
-    Updates,
+    Projection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -1335,11 +1352,17 @@ struct UpdateAttempt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+enum ProjectionAttempt {
+    Close { number: u32, node_id: String },
+    Update(UpdateAttempt),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 enum DurableEffectAttempt {
     InitialRefs(Box<[GitBatchAttempt]>),
     Creates(Box<[CreateAttempt]>),
     Markers(Box<[GitBatchAttempt]>),
-    Updates(Box<[UpdateAttempt]>),
+    Projection(Box<[ProjectionAttempt]>),
 }
 
 impl DurableEffectAttempt {
@@ -1348,7 +1371,7 @@ impl DurableEffectAttempt {
             Self::InitialRefs(_) => EffectBoundary::InitialRefs,
             Self::Creates(_) => EffectBoundary::Creates,
             Self::Markers(_) => EffectBoundary::Markers,
-            Self::Updates(_) => EffectBoundary::Updates,
+            Self::Projection(_) => EffectBoundary::Projection,
         }
     }
 }
@@ -1444,22 +1467,33 @@ impl EffectDriver for ScriptedEffectDriver {
         }
     }
 
-    async fn update_pull_requests(&mut self, updates: PreparedUpdates) -> Result<()> {
-        let attempts = updates
-            .operations_for_test()
+    async fn project_pull_requests(
+        &mut self,
+        projection: PreparedPullRequestProjection,
+    ) -> Result<()> {
+        let attempts = projection
+            .projection_operations_for_test()
             .iter()
-            .map(|update| UpdateAttempt {
-                number: update.identity.number().get(),
-                node_id: update.identity.node_id_for_test().to_owned(),
-                title: update.title.clone(),
-                body: update.body.as_deref().map(Self::body_lines),
-                base_branch: update.base_branch.clone(),
+            .map(|operation| match operation {
+                TestPullRequestProjection::Close(close) => ProjectionAttempt::Close {
+                    number: close.identity.number().get(),
+                    node_id: close.identity.node_id_for_test().to_owned(),
+                },
+                TestPullRequestProjection::Update(update) => {
+                    ProjectionAttempt::Update(UpdateAttempt {
+                        number: update.identity.number().get(),
+                        node_id: update.identity.node_id_for_test().to_owned(),
+                        title: update.title.clone(),
+                        body: update.body.as_deref().map(Self::body_lines),
+                        base_branch: update.base_branch.clone(),
+                    })
+                }
             })
             .collect::<Box<[_]>>();
         if attempts.is_empty() {
             Ok(())
         } else {
-            self.record(DurableEffectAttempt::Updates(attempts))
+            self.record(DurableEffectAttempt::Projection(attempts))
         }
     }
 }
@@ -1505,7 +1539,7 @@ async fn durable_effect_barriers_release_only_the_next_reachable_stage() {
             EffectBoundary::InitialRefs,
             EffectBoundary::Creates,
             EffectBoundary::Markers,
-            EffectBoundary::Updates,
+            EffectBoundary::Projection,
         ]
     );
     insta::assert_yaml_snapshot!("acknowledged_publication_effects", acknowledged.attempts);
@@ -1514,7 +1548,7 @@ async fn durable_effect_barriers_release_only_the_next_reachable_stage() {
         EffectBoundary::InitialRefs,
         EffectBoundary::Creates,
         EffectBoundary::Markers,
-        EffectBoundary::Updates,
+        EffectBoundary::Projection,
     ] {
         let (result, interrupted) = execute_scripted(fresh_execution_plan(), Some(boundary)).await;
         let error = result.expect_err("the configured durable effect must interrupt the attempt");
@@ -1537,7 +1571,7 @@ async fn all_existing_publication_skips_create_without_reordering_effects() {
     driver.assert_consumed();
     assert_eq!(
         driver.attempts.iter().map(DurableEffectAttempt::boundary).collect::<Vec<_>>(),
-        [EffectBoundary::InitialRefs, EffectBoundary::Markers, EffectBoundary::Updates]
+        [EffectBoundary::InitialRefs, EffectBoundary::Markers, EffectBoundary::Projection]
     );
     insta::assert_yaml_snapshot!("all_existing_publication_effects", driver.attempts);
 }
