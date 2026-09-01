@@ -23,12 +23,16 @@ use super::{
     github::{
         AbsentPullRequest, BaseKind, CompleteCreateReceipts, CompleteLocalPullRequests,
         LocalPullRequestObservation, ManagedOpenPullRequests, ObservedBase, PreparedCreates,
-        PreparedPullRequestProjection, PullRequestIdentity, TestClose, TestCreate,
-        TestPullRequestProjection, TestUpdate,
+        PreparedDraftConversions, PreparedPullRequestProjection, PullRequestIdentity,
+        PullRequestNumber, TestClose, TestCreate, TestDraft, TestPullRequestProjection, TestUpdate,
     },
-    history::{ObservedPullRequestMarker, ValidatedChangeHistory},
+    history::ValidatedChangeHistory,
+    marker::MarkerTemplate,
     plan::{EffectDriver, PlannedPublication, plan_effects},
-    refs::{PreparedPushes, PublicationRevision, TestPushEffect},
+    refs::{
+        MarkerTransition, PreparedPushes, PublicationRevision, TestPushEffect,
+        prepare_marker_pushes,
+    },
 };
 use crate::{
     manage::PublicBranchName,
@@ -131,10 +135,6 @@ impl PublishedHistory {
     fn push(&mut self, revision: LiteralRevision) {
         self.later.push(revision);
     }
-
-    fn contains_head(&self, head: ObjectId) -> bool {
-        self.iter().any(|revision| revision.head == head)
-    }
 }
 
 /// Literal durable fields of one pull request row.
@@ -176,12 +176,16 @@ impl PullRequest {
     fn base(&self) -> BaseKind {
         self.open_fields().expect("the modeled row is OPEN").2
     }
+
+    fn is_draft(&self) -> bool {
+        self.open_fields().expect("the modeled row is OPEN").3
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PublishedChange {
     history: PublishedHistory,
-    marker: Option<ObjectId>,
+    marker: Option<PullRequestNumber>,
     pull_requests: Vec<PullRequest>,
 }
 
@@ -214,17 +218,10 @@ struct ObservedOpenFields {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ObservedPullRequestRow {
     identity: PullRequestIdentity,
-    state: ObservedPullRequestState,
+    fields: ObservedOpenFields,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ObservedPullRequestState {
-    Open(ObservedOpenFields),
-    Closed,
-    Merged,
-}
-
-/// Completed all-lifecycle connection results captured before planning.
+/// Completed OPEN-only connection results captured before planning.
 ///
 /// An absent change ID observes the current durable rows. A present entry is
 /// the whole response captured earlier, including its membership, lifecycle,
@@ -237,7 +234,7 @@ struct QueryVisibility {
 }
 
 impl QueryVisibility {
-    /// Captures one complete but stale index result which omits exact rows.
+    /// Captures one complete but stale OPEN index result which omits exact rows.
     ///
     /// This is not a coherent snapshot of `world`: GitHub visibility may lag
     /// independently of durable state, including by omitting an older row
@@ -279,7 +276,7 @@ impl QueryVisibility {
             let rows = world.current_rows(&id);
             assert!(
                 visibility.captured.insert(id, rows.into_boxed_slice()).is_none(),
-                "one query captures one all-lifecycle connection per change"
+                "one query captures one OPEN-only connection per change"
             );
         }
         visibility
@@ -299,12 +296,7 @@ impl QueryVisibility {
         let mut rows = world.current_rows(&id);
         let fields = rows
             .iter_mut()
-            .filter_map(|row| match &mut row.state {
-                ObservedPullRequestState::Open(fields) => {
-                    Some((row.identity.number().get(), fields))
-                }
-                ObservedPullRequestState::Closed | ObservedPullRequestState::Merged => None,
-            })
+            .map(|row| (row.identity.number().get(), &mut row.fields))
             .min_by_key(|(number, _)| *number)
             .expect("a historical observation contains an OPEN row")
             .1;
@@ -414,26 +406,45 @@ impl DurableWorld {
                 title: title.to_owned(),
                 body: body.to_owned(),
                 base: BaseKind::Owned,
-                is_draft: false,
+                is_draft: true,
             },
         });
         self.assert_well_formed();
     }
 
-    fn mark_for_setup(&mut self, id: &GherritPrId, target: ObjectId, base: BaseKind) {
+    fn mark_for_setup(&mut self, id: &GherritPrId, base: BaseKind) {
         let change = self.published_mut(id).expect("a marker requires published history");
-        assert!(change.history.contains_head(target), "a marker targets immutable history");
-        assert!(change.marker.replace(target).is_none(), "test setup cannot move a marker");
         let canonical = change
             .pull_requests
             .iter_mut()
             .filter(|pull_request| pull_request.open_fields().is_some())
             .min_by_key(|pull_request| pull_request.identity.number().get())
             .expect("a marker requires an OPEN identity");
+        assert!(
+            change.marker.replace(canonical.identity.number()).is_none(),
+            "test setup cannot move a marker"
+        );
         let PullRequestState::Open { base: current, .. } = &mut canonical.state else {
             unreachable!("the canonical OPEN row was selected")
         };
         *current = base;
+        self.assert_well_formed();
+    }
+
+    fn make_marker_canonical_ready_for_setup(&mut self, id: &GherritPrId) {
+        let change = self.published_mut(id).expect("a ready PR requires published history");
+        let marker = change.marker.expect("only a marker-bound canonical may become ready");
+        let canonical = change
+            .pull_requests
+            .iter_mut()
+            .find(|pull_request| pull_request.identity.number() == marker)
+            .expect("the setup marker names its canonical pull request");
+        let PullRequestState::Open { base, is_draft, .. } = &mut canonical.state else {
+            panic!("only an OPEN marker canonical may become ready")
+        };
+        assert_eq!(*base, BaseKind::Default, "only a default-base canonical may become ready");
+        assert!(*is_draft, "the setup transition consumes a draft canonical");
+        *is_draft = false;
         self.assert_well_formed();
     }
 
@@ -466,7 +477,7 @@ impl DurableWorld {
             title: title.to_owned(),
             body: body.to_owned(),
             base,
-            is_draft: false,
+            is_draft: true,
         };
         self.assert_well_formed();
     }
@@ -522,32 +533,32 @@ impl DurableWorld {
         change
             .pull_requests
             .iter()
-            .map(|pull_request| {
-                let state = match &pull_request.state {
-                    PullRequestState::Open { title, body, base, is_draft } => {
-                        ObservedPullRequestState::Open(ObservedOpenFields {
-                            head_oid: current.head,
-                            base: *base,
-                            base_oid: match base {
-                                BaseKind::Default => self.default_tip,
-                                BaseKind::Owned => current.first_parent,
-                            },
-                            title: title.clone(),
-                            body: body.clone(),
-                            is_draft: *is_draft,
-                        })
-                    }
-                    PullRequestState::Closed => ObservedPullRequestState::Closed,
-                    PullRequestState::Merged => ObservedPullRequestState::Merged,
+            .filter_map(|pull_request| {
+                let PullRequestState::Open { title, body, base, is_draft } = &pull_request.state
+                else {
+                    return None;
                 };
-                ObservedPullRequestRow { identity: pull_request.identity.clone(), state }
+                Some(ObservedPullRequestRow {
+                    identity: pull_request.identity.clone(),
+                    fields: ObservedOpenFields {
+                        head_oid: current.head,
+                        base: *base,
+                        base_oid: match base {
+                            BaseKind::Default => self.default_tip,
+                            BaseKind::Owned => current.first_parent,
+                        },
+                        title: title.clone(),
+                        body: body.clone(),
+                        is_draft: *is_draft,
+                    },
+                })
             })
             .collect()
     }
 
-    /// Returns every lifecycle row seen by this one query.
+    /// Returns every OPEN row seen by this one query.
     ///
-    /// A captured connection is an earlier completed all-lifecycle result, so
+    /// A captured connection is an earlier completed OPEN-only result, so
     /// neither later lifecycle changes nor later creation changes its rows. An
     /// uncaptured connection observes current durable rows. Keeping only that
     /// materialization rule shared makes the duplicate oracle and production
@@ -581,7 +592,7 @@ impl DurableWorld {
                         })
                     })
             }),
-            "each captured lifecycle connection has unique durable rows for its queried change"
+            "each captured OPEN connection has unique durable rows for its queried change"
         );
         let destination = PushDestination::for_test();
         let local_default =
@@ -612,17 +623,17 @@ impl DurableWorld {
             .iter()
             .map(|local| {
                 let (published, marker) = match self.published(&local.id) {
-                    None => (Vec::new(), false),
+                    None => (Vec::new(), None),
                     Some(change) => (
                         change
                             .history
                             .iter()
                             .map(|revision| (revision.head, revision.first_parent))
                             .collect(),
-                        change.marker.is_some(),
+                        change.marker,
                     ),
                 };
-                validated_history(
+                ValidatedChangeHistory::for_plan_test(
                     local.id.clone(),
                     &published,
                     (local.desired.head, local.desired.first_parent),
@@ -631,18 +642,15 @@ impl DurableWorld {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let observations = intent
+        let pull_requests = intent
             .iter()
             .map(|local| self.observe_pull_request(&local.id, visibility))
             .collect::<Result<Vec<_>>>()?;
-        let (pull_requests, terminal_identities): (Vec<_>, Vec<_>) =
-            observations.into_iter().unzip();
-        let terminal_identities = terminal_identities.into_iter().flatten().collect::<Vec<_>>();
         let pull_requests = CompleteLocalPullRequests::for_plan_test(
             RepositoryCoordinates::for_test("owner", "repo"),
             observed_default,
             pull_requests,
-            &terminal_identities,
+            &[],
         )?;
         let local =
             ObservedLocalPublication::for_plan_test(destination, stack, observed_public_branch);
@@ -667,12 +675,12 @@ impl DurableWorld {
             .collect::<HashSet<_>>();
         assert!(
             emitted.is_subset(&expected_closes),
-            "the planner may close only higher identities visible to its observation"
+            "the planner may close only noncanonical identities visible to its observation"
         );
         if report.outcome == AttemptOutcome::Acknowledged {
             assert_eq!(
                 emitted, expected_closes,
-                "an acknowledged projection closes every higher visible identity"
+                "an acknowledged projection closes every visible noncanonical identity"
             );
         }
         Ok(report)
@@ -686,14 +694,16 @@ impl DurableWorld {
         intent
             .iter()
             .flat_map(|local| {
-                let visible = self
-                    .observed_rows(&local.id, visibility)
-                    .into_iter()
-                    .filter(|row| matches!(&row.state, ObservedPullRequestState::Open(_)))
-                    .collect::<Vec<_>>();
-                let canonical = visible.iter().map(|row| row.identity.number().get()).min();
+                let visible = self.observed_rows(&local.id, visibility);
+                let canonical =
+                    self.published(&local.id).and_then(|change| change.marker).or_else(|| {
+                        visible
+                            .iter()
+                            .min_by_key(|row| row.identity.number().get())
+                            .map(|row| row.identity.number())
+                    });
                 visible.into_iter().filter_map(move |row| {
-                    (Some(row.identity.number().get()) != canonical).then_some(row.identity)
+                    (Some(row.identity.number()) != canonical).then_some(row.identity)
                 })
             })
             .collect()
@@ -713,56 +723,41 @@ impl DurableWorld {
         &self,
         id: &GherritPrId,
         visibility: &QueryVisibility,
-    ) -> Result<(LocalPullRequestObservation, Vec<PullRequestIdentity>)> {
+    ) -> Result<LocalPullRequestObservation> {
         let mut visible = self.observed_rows(id, visibility);
         visible.sort_by_key(|row| row.identity.number().get());
         let Some(first) = visible.first() else {
-            return Ok((
-                LocalPullRequestObservation::Absent(AbsentPullRequest::for_plan_test(id.clone())),
-                Vec::new(),
-            ));
+            return Ok(LocalPullRequestObservation::Absent(AbsentPullRequest::for_plan_test(
+                id.clone(),
+            )));
         };
-        if visible.iter().any(|row| matches!(&row.state, ObservedPullRequestState::Merged))
-            || !matches!(&first.state, ObservedPullRequestState::Open(_))
-        {
-            bail!("Terminal pull request history makes the exact local change unsafe");
-        }
-        let terminal_identities = visible
-            .iter()
-            .filter(|row| matches!(&row.state, ObservedPullRequestState::Closed))
-            .map(|row| row.identity.clone())
-            .collect();
-        let mut open = visible.into_iter().filter_map(|row| match row.state {
-            ObservedPullRequestState::Open(fields) => Some((row.identity, fields)),
-            ObservedPullRequestState::Closed | ObservedPullRequestState::Merged => None,
-        });
-        let (canonical_identity, canonical_fields) =
-            open.next().expect("the lowest lifecycle row was checked as OPEN");
-        Ok((
-            LocalPullRequestObservation::Open(
-                ManagedOpenPullRequests::for_plan_test(
-                    id.clone(),
-                    canonical_identity,
-                    canonical_fields.head_oid,
-                    ObservedBase::for_plan_test(canonical_fields.base, canonical_fields.base_oid),
-                    &canonical_fields.title,
-                    &canonical_fields.body,
-                    canonical_fields.is_draft,
-                    false,
-                )
-                .with_duplicates_for_plan_test(
-                    open.map(|(identity, fields)| {
+        let first = first.clone();
+        Ok(LocalPullRequestObservation::Open(
+            ManagedOpenPullRequests::for_plan_test(
+                id.clone(),
+                first.identity,
+                first.fields.head_oid,
+                ObservedBase::for_plan_test(first.fields.base, first.fields.base_oid),
+                &first.fields.title,
+                &first.fields.body,
+                false,
+            )
+            .with_canonical_draft_for_plan_test(first.fields.is_draft)
+            .with_detailed_duplicates_for_plan_test(
+                visible
+                    .into_iter()
+                    .skip(1)
+                    .map(|row| {
                         (
-                            identity,
-                            fields.head_oid,
-                            ObservedBase::for_plan_test(fields.base, fields.base_oid),
+                            row.identity,
+                            row.fields.head_oid,
+                            ObservedBase::for_plan_test(row.fields.base, row.fields.base_oid),
                             false,
+                            row.fields.is_draft,
                         )
                     })
                     .collect(),
-                ),
             ),
-            terminal_identities,
         ))
     }
 
@@ -803,12 +798,6 @@ impl DurableWorld {
                     "the allocation cursor follows every durable identity"
                 );
             }
-            if let Some(marker) = published.marker {
-                assert!(
-                    published.history.contains_head(marker),
-                    "an immutable marker targets published history"
-                );
-            }
         }
     }
 }
@@ -831,19 +820,6 @@ fn oid(value: u16) -> ObjectId {
     let mut bytes = [0_u8; 20];
     bytes[18..].copy_from_slice(&value.to_be_bytes());
     ObjectId::from_bytes_or_panic(&bytes)
-}
-
-fn validated_history(
-    id: GherritPrId,
-    published: &[(ObjectId, ObjectId)],
-    proposal: (ObjectId, ObjectId),
-    has_pull_request_marker: bool,
-) -> ValidatedChangeHistory {
-    let marker = has_pull_request_marker.then(|| {
-        let v1 = published.first().expect("a marked test history must have v1").0;
-        ObservedPullRequestMarker::for_plan_test(v1)
-    });
-    ValidatedChangeHistory::for_plan_test(id, published, proposal, marker)
 }
 
 fn local_change(
@@ -899,7 +875,8 @@ impl InitialRefEffect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MarkerEffect {
     id: GherritPrId,
-    target: ObjectId,
+    v1: ObjectId,
+    number: PullRequestNumber,
 }
 
 /// One GitHub projection request annotated only after resolving its node ID.
@@ -917,6 +894,7 @@ enum ProjectionEffect {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct AttemptTrace {
+    drafts: EffectBatches<TestDraft>,
     initial_refs: EffectBatches<InitialRefEffect>,
     creates: EffectBatches<TestCreate>,
     markers: EffectBatches<MarkerEffect>,
@@ -925,7 +903,8 @@ struct AttemptTrace {
 
 impl AttemptTrace {
     fn is_empty(&self) -> bool {
-        self.initial_refs.is_empty()
+        self.drafts.is_empty()
+            && self.initial_refs.is_empty()
             && self.creates.is_empty()
             && self.markers.is_empty()
             && self.projections.is_empty()
@@ -957,6 +936,7 @@ enum GitStop {
 
 #[derive(Clone, Debug)]
 enum Interruption {
+    Draft { batch: usize, applied_aliases: Box<[usize]> },
     InitialRefs { batch: usize, stop: GitStop },
     Create { batch: usize, applied_aliases: Box<[usize]> },
     Marker { batch: usize, stop: GitStop },
@@ -971,6 +951,7 @@ struct AttemptReport {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EffectStage {
+    Draft,
     InitialRefs,
     Create,
     Marker,
@@ -985,6 +966,7 @@ enum EffectStage {
 /// later serialized batch remains.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompetitionBoundary {
+    AfterDraftSafety,
     AfterInitialRefs,
     AfterCreates,
     AfterMarkers,
@@ -1058,6 +1040,9 @@ impl<'world> WorldDriver<'world> {
 
     fn take_interruption(&mut self, stage: EffectStage, batch: usize) -> Option<Interruption> {
         let matches = match self.interruption.as_ref() {
+            Some(Interruption::Draft { batch: stopped, .. }) => {
+                stage == EffectStage::Draft && *stopped == batch
+            }
             Some(Interruption::InitialRefs { batch: stopped, .. }) => {
                 stage == EffectStage::InitialRefs && *stopped == batch
             }
@@ -1184,6 +1169,47 @@ fn validated_aliases(aliases: &[usize], batch_len: usize) -> HashSet<usize> {
 }
 
 impl EffectDriver for WorldDriver<'_> {
+    async fn convert_pull_requests_to_draft(
+        &mut self,
+        conversions: PreparedDraftConversions,
+    ) -> Result<()> {
+        assert!(
+            !conversions.operations_for_test().is_empty(),
+            "a draft-safety stage must contain a conversion"
+        );
+        let batch_count = conversions.batches_for_test().len();
+        for (index, batch) in conversions.batches_for_test().enumerate() {
+            let batch = batch.to_vec().into_boxed_slice();
+            self.trace.drafts.push(batch.clone());
+            let interruption = self.take_interruption(EffectStage::Draft, index);
+            let selected = match &interruption {
+                Some(Interruption::Draft { applied_aliases, .. }) => {
+                    Some(validated_aliases(applied_aliases, batch.len()))
+                }
+                _ => None,
+            };
+            let mut exact = true;
+            for (alias, draft) in batch.iter().enumerate() {
+                if selected.as_ref().is_some_and(|selected| !selected.contains(&alias)) {
+                    continue;
+                }
+                exact &= self.world.apply_effect(&ExternalEffect::Draft(draft.clone()))
+                    == EffectOutcome::Acknowledged;
+            }
+            if interruption.is_some() || !exact {
+                return self.stop(StopReason::Indeterminate);
+            }
+            if index + 1 < batch_count {
+                self.run_competition_at(CompetitionBoundary::BetweenBatches {
+                    stage: EffectStage::Draft,
+                    completed_batch: index,
+                })
+                .await?;
+            }
+        }
+        self.run_competition_at(CompetitionBoundary::AfterDraftSafety).await
+    }
+
     async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()> {
         let batch_count = pushes.batches().len();
         for (index, batch) in pushes.batches().enumerate() {
@@ -1279,15 +1305,39 @@ impl EffectDriver for WorldDriver<'_> {
         Ok(receipts)
     }
 
-    async fn publish_markers(&mut self, pushes: PreparedPushes) -> Result<()> {
+    async fn publish_markers(&mut self, markers: Box<[MarkerTemplate]>) -> Result<()> {
+        let templates = markers
+            .iter()
+            .map(|marker| {
+                let (id, v1, number) = marker.test_parts();
+                (id.clone(), (v1, number))
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(templates.len(), markers.len(), "a marker stage cannot repeat a change ID");
+        let transitions = markers
+            .iter()
+            .map(|marker| {
+                let (id, _, number) = marker.test_parts();
+                let mut bytes = [0_u8; 20];
+                bytes[16..].copy_from_slice(&number.get().to_be_bytes());
+                MarkerTransition::create(id.clone(), ObjectId::from_bytes_or_panic(&bytes))
+                    .expect("a marker test target is non-null")
+            })
+            .collect::<Vec<_>>();
+        let destination = PushDestination::for_test();
+        let pushes = prepare_marker_pushes(&destination, &transitions)?;
         let batch_count = pushes.batches().len();
         for (index, batch) in pushes.batches().enumerate() {
             let effects = batch
                 .semantic_effects_for_test()
                 .iter()
                 .map(|effect| match effect {
-                    TestPushEffect::Marker { id, target } => {
-                        MarkerEffect { id: id.clone(), target: *target }
+                    TestPushEffect::Marker { id, .. } => {
+                        let (v1, number) = templates
+                            .get(id)
+                            .copied()
+                            .expect("every prepared marker ref came from one template");
+                        MarkerEffect { id: id.clone(), v1, number }
                     }
                     TestPushEffect::Tuple { .. } => {
                         panic!("the marker stage cannot contain tuple effects")
@@ -1298,10 +1348,15 @@ impl EffectDriver for WorldDriver<'_> {
                 })
                 .collect::<Box<[_]>>();
             assert!(
-                effects
-                    .iter()
-                    .all(|effect| { self.world.open_pull_requests(&effect.id).next().is_some() }),
-                "the production stage may publish a marker only after an OPEN receipt"
+                effects.iter().all(|effect| {
+                    self.world.published(&effect.id).is_some_and(|change| {
+                        change
+                            .pull_requests
+                            .iter()
+                            .any(|pull_request| pull_request.identity.number() == effect.number)
+                    })
+                }),
+                "the production stage may publish a marker only after its identity exists"
             );
             self.trace.markers.push(effects.clone());
             if let Some(Interruption::Marker { stop, .. }) =
@@ -1337,15 +1392,26 @@ impl EffectDriver for WorldDriver<'_> {
                 .collect::<Box<[_]>>();
             assert!(
                 batch.iter().all(|effect| {
-                    let resolved_id = match effect {
-                        ProjectionEffect::Close { resolved_id, .. }
-                        | ProjectionEffect::Update(UpdateEffect { resolved_id, .. }) => resolved_id,
-                    };
-                    resolved_id.as_ref().is_none_or(|id| {
-                        self.world.published(id).is_some_and(|change| change.marker.is_some())
-                    })
+                    match effect {
+                        ProjectionEffect::Close { resolved_id, operation } => {
+                            resolved_id.as_ref().is_none_or(|id| {
+                                self.world.published(id).is_some_and(|change| {
+                                    change
+                                        .marker
+                                        .is_some_and(|number| number != operation.identity.number())
+                                })
+                            })
+                        }
+                        ProjectionEffect::Update(UpdateEffect { resolved_id, operation }) => {
+                            resolved_id.as_ref().is_none_or(|id| {
+                                self.world.published(id).is_some_and(|change| {
+                                    change.marker == Some(operation.identity.number())
+                                })
+                            })
+                        }
+                    }
                 }),
-                "the production stage may project only after the change marker"
+                "the production stage may update only the marker identity and close only noncanonical identities"
             );
             self.trace.projections.push(batch.clone());
             let interruption = self.take_interruption(EffectStage::Projection, index);
@@ -1401,6 +1467,7 @@ impl EffectOutcome {
 
 #[derive(Clone, Debug)]
 enum ExternalEffect {
+    Draft(TestDraft),
     InitialRef(InitialRefEffect),
     Create(TestCreate),
     Marker(MarkerEffect),
@@ -1417,6 +1484,7 @@ enum ExternalTarget {
 impl ExternalEffect {
     fn target(&self) -> ExternalTarget {
         match self {
+            Self::Draft(effect) => ExternalTarget::Change(effect.id.clone()),
             Self::InitialRef(InitialRefEffect::Tuple(effect)) => {
                 ExternalTarget::Change(effect.id.clone())
             }
@@ -1464,6 +1532,7 @@ impl DurableWorld {
         let before = self.clone();
         let target = effect.target();
         let outcome = match effect {
+            ExternalEffect::Draft(effect) => self.apply_draft(effect),
             ExternalEffect::InitialRef(effect) => self.apply_initial_ref(effect),
             ExternalEffect::Create(effect) => self.apply_create(effect),
             ExternalEffect::Marker(effect) => self.apply_marker(effect),
@@ -1490,6 +1559,42 @@ impl DurableWorld {
             }
         }
         outcome
+    }
+
+    fn apply_draft(&mut self, effect: &TestDraft) -> EffectOutcome {
+        let default_tip = self.default_tip;
+        let Some(change) = self.changes.get_mut(&effect.id) else {
+            return EffectOutcome::Indeterminate;
+        };
+        let current = change.history.last();
+        let Some(pull_request) = change.pull_requests.iter_mut().find(|pull_request| {
+            pull_request.identity.node_id_for_test() == effect.identity.node_id_for_test()
+        }) else {
+            return EffectOutcome::Indeterminate;
+        };
+        let PullRequestState::Open { base, is_draft, .. } = &mut pull_request.state else {
+            return EffectOutcome::Indeterminate;
+        };
+        if *is_draft {
+            // GitHub does not promise that converting an already-draft PR is
+            // idempotent. A stale publisher therefore cannot use a second
+            // conversion as an acknowledgement barrier.
+            return EffectOutcome::Indeterminate;
+        }
+        let (base_branch, base_oid) = match base {
+            BaseKind::Default => (DEFAULT_BRANCH.to_owned(), default_tip),
+            BaseKind::Owned => (owned_base_name(&effect.id), current.first_parent),
+        };
+        *is_draft = true;
+        if pull_request.identity == effect.identity
+            && effect.head_oid == current.head
+            && effect.base_branch == base_branch
+            && effect.base_oid == base_oid
+        {
+            EffectOutcome::Acknowledged
+        } else {
+            EffectOutcome::Indeterminate
+        }
     }
 
     fn apply_initial_ref(&mut self, effect: &InitialRefEffect) -> EffectOutcome {
@@ -1574,7 +1679,7 @@ impl DurableWorld {
                 title: effect.title.clone(),
                 body: effect.body.clone(),
                 base: BaseKind::Owned,
-                is_draft: false,
+                is_draft: true,
             },
         });
         if effect.head_oid == current.head && effect.base_oid == current.first_parent {
@@ -1587,16 +1692,16 @@ impl DurableWorld {
     fn apply_marker(&mut self, effect: &MarkerEffect) -> EffectOutcome {
         let change =
             self.published_mut(&effect.id).expect("a planned marker has published history");
-        if !change.history.contains_head(effect.target) {
+        if change.history.first.head != effect.v1 {
             return EffectOutcome::Rejected;
         }
         match change.marker {
             None => {
-                change.marker = Some(effect.target);
+                change.marker = Some(effect.number);
                 EffectOutcome::Acknowledged
             }
-            Some(target) => {
-                if target == effect.target {
+            Some(number) => {
+                if number == effect.number {
                     EffectOutcome::Acknowledged
                 } else {
                     EffectOutcome::Rejected
@@ -1660,7 +1765,8 @@ impl DurableWorld {
                     == effect.operation.identity.node_id_for_test()
             })
             .expect("a resolved update belongs to a durable pull request");
-        let PullRequestState::Open { title, body, base: current_base, .. } = &mut pull_request.state
+        let PullRequestState::Open { title, body, base: current_base, .. } =
+            &mut pull_request.state
         else {
             return EffectOutcome::Indeterminate;
         };
@@ -1738,8 +1844,8 @@ impl DurableWorld {
             }
             assert!(
                 new.pull_requests.starts_with(&old.pull_requests)
-                    || matches!(effect, ExternalEffect::Projection(_)),
-                "only projection may mutate an existing pull request row"
+                    || matches!(effect, ExternalEffect::Draft(_) | ExternalEffect::Projection(_)),
+                "only draft conversion or projection may mutate an existing pull request row"
             );
             assert_eq!(
                 new.pull_requests.len(),
@@ -2140,7 +2246,14 @@ fn assert_create_retry_finishes_projection(
 ) {
     let expected_markers = intent
         .iter()
-        .map(|local| MarkerEffect { id: local.id.clone(), target: local.desired.head })
+        .map(|local| {
+            let published = world.published(&local.id).expect("every local change is published");
+            MarkerEffect {
+                id: local.id.clone(),
+                v1: published.history.first.head,
+                number: published.marker.expect("the retry establishes the marker"),
+            }
+        })
         .collect::<Box<[_]>>();
     assert_eq!(
         flatten(&retry.trace.markers),
@@ -2169,7 +2282,7 @@ fn assert_create_retry_finishes_projection(
         .iter()
         .map(|local| {
             let published = world.published(&local.id).expect("every local change is published");
-            validated_history(
+            ValidatedChangeHistory::for_plan_test(
                 local.id.clone(),
                 &published
                     .history
@@ -2177,7 +2290,7 @@ fn assert_create_retry_finishes_projection(
                     .map(|revision| (revision.head, revision.first_parent))
                     .collect::<Vec<_>>(),
                 (local.desired.head, local.desired.first_parent),
-                true,
+                published.marker,
             )
         })
         .collect();
@@ -2209,7 +2322,7 @@ fn assert_create_retry_finishes_projection(
             "{label}: each final update targets its exact local change"
         );
         let published = world.published(&local.id).expect("every local change is published");
-        let target = published.marker.expect("the retry establishes the marker");
+        let number = published.marker.expect("the retry establishes the marker");
         let pull_request = world
             .open_pull_request(&local.id)
             .expect("every durable change retains a canonical OPEN row");
@@ -2217,7 +2330,11 @@ fn assert_create_retry_finishes_projection(
             update.operation.identity, pull_request.identity,
             "{label}: each final update uses the durable OPEN identity"
         );
-        assert_eq!(target, local.desired.head, "{label}: a marker targets the exact local head");
+        assert_eq!(
+            number,
+            pull_request.identity.number(),
+            "{label}: a marker names the canonical pull request"
+        );
         assert_eq!(
             pull_request.base(),
             if index == 0 { BaseKind::Default } else { BaseKind::Owned },
@@ -2247,7 +2364,37 @@ struct UpdateAlternatives {
 fn establish_marked(world: &mut DurableWorld, change: &LocalChange, base: BaseKind, body: &str) {
     world.publish_for_setup(&change.id, change.desired);
     world.open_for_setup(&change.id, &change.title, body);
-    world.mark_for_setup(&change.id, change.desired.head, base);
+    world.mark_for_setup(&change.id, base);
+}
+
+fn ready_root_moving_to_owned_base() -> (DurableWorld, LocalIntent, PullRequestIdentity) {
+    let default = oid(1);
+    let old_move = local_change(
+        "Gmove",
+        LiteralRevision { head: oid(10), first_parent: default },
+        "Move",
+        "Old move body",
+    );
+    let old_intent = LocalIntent::new(default, [old_move.clone()]);
+    let parent = local_change(
+        "Gparent",
+        LiteralRevision { head: oid(20), first_parent: default },
+        "Parent",
+        "Parent body",
+    );
+    let moved = local_change(
+        "Gmove",
+        LiteralRevision { head: oid(21), first_parent: parent.desired.head },
+        "Move",
+        "Moved body",
+    );
+    let intent = LocalIntent::new(default, [parent.clone(), moved]);
+    let mut world = DurableWorld::for_intents(default, &[&old_intent, &intent]);
+    establish_marked(&mut world, &parent, BaseKind::Default, "Parent body");
+    establish_marked(&mut world, &old_move, BaseKind::Default, "Old move body");
+    world.make_marker_canonical_ready_for_setup(&old_move.id);
+    let identity = world.identity(&old_move.id);
+    (world, intent, identity)
 }
 
 fn assert_projection_matches_update(world: &DurableWorld, update: &UpdateEffect) {
@@ -2273,8 +2420,8 @@ fn assert_projection_matches_update(world: &DurableWorld, update: &UpdateEffect)
 }
 
 /// Compares the facts which commute when disjoint publishers allocate pull
-/// request identities in different orders. Generated navigation bodies embed
-/// those identities, so neither identities nor bodies are expected to match.
+/// request identities in different orders. Markers and generated navigation
+/// bodies embed those identities, so neither is expected to match literally.
 fn assert_same_histories_markers_bases_and_titles(left: &DurableWorld, right: &DurableWorld) {
     assert_eq!(left.default_tip, right.default_tip);
     assert_eq!(left.public_branches, right.public_branches);
@@ -2282,7 +2429,8 @@ fn assert_same_histories_markers_bases_and_titles(left: &DurableWorld, right: &D
     for (id, left_change) in &left.changes {
         let right_change = right.changes.get(id).expect("both worlds publish the same IDs");
         assert_eq!(left_change.history, right_change.history);
-        assert_eq!(left_change.marker, right_change.marker);
+        assert_eq!(left_change.marker, left.open_pull_request(id).map(|pr| pr.identity.number()));
+        assert_eq!(right_change.marker, right.open_pull_request(id).map(|pr| pr.identity.number()));
         match (left.open_pull_request(id), right.open_pull_request(id)) {
             (None, None) => {}
             (Some(left), Some(right)) => {
@@ -2421,14 +2569,15 @@ fn literal_services_do_not_enforce_cross_backend_stage_policy() {
     assert_eq!(
         marker_world.apply_effect(&ExternalEffect::Marker(MarkerEffect {
             id: marker_only.first.id.clone(),
-            target: marker_only.first.desired.head,
+            v1: marker_only.first.desired.head,
+            number: PullRequestNumber::for_test(777),
         })),
         EffectOutcome::Acknowledged,
         "Git can publish a marker without observing GitHub lifecycle"
     );
     assert_eq!(
         marker_world.published(&marker_only.first.id).unwrap().marker,
-        Some(marker_only.first.desired.head)
+        Some(PullRequestNumber::for_test(777))
     );
 }
 
@@ -2514,6 +2663,57 @@ async fn every_small_attempt_prefix_restarts_from_literal_durable_state() {
 
     let done = completed.run_attempt(&intent, &QueryVisibility::default(), None).await.unwrap();
     assert!(done.trace.is_empty());
+}
+
+#[tokio::test]
+async fn draft_safety_is_the_first_barrier_and_stale_conversions_stop_there() {
+    let (initial, intent, identity) = ready_root_moving_to_owned_base();
+    assert!(!initial.exact_open_pull_request(&identity).unwrap().is_draft());
+
+    for applied_aliases in [Box::new([]) as Box<[usize]>, Box::new([0])] {
+        let applied = !applied_aliases.is_empty();
+        let mut world = initial.clone();
+        let stopped = world
+            .run_attempt(
+                &intent,
+                &QueryVisibility::default(),
+                Some(Interruption::Draft { batch: 0, applied_aliases }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped.outcome, AttemptOutcome::Stopped(StopReason::Indeterminate));
+        assert_eq!(flatten(&stopped.trace.drafts).len(), 1);
+        assert!(stopped.trace.initial_refs.is_empty());
+        assert!(stopped.trace.creates.is_empty());
+        assert!(stopped.trace.markers.is_empty());
+        assert!(stopped.trace.projections.is_empty());
+        assert_eq!(world.exact_open_pull_request(&identity).unwrap().is_draft(), applied);
+
+        let retry = run_acknowledged_retry(&mut world, &intent, "draft-interruption").await;
+        assert_eq!(retry.trace.drafts.is_empty(), applied);
+        assert_quiescent(&mut world, &intent, "draft-interruption").await;
+    }
+
+    let primary = initial.plan(&intent, &QueryVisibility::default()).unwrap();
+    let competing = initial.plan(&intent, &QueryVisibility::default()).unwrap();
+    let mut world = initial;
+    let (primary, competing) = execute_with_competition(
+        &mut world,
+        primary,
+        competing,
+        CompetitionBoundary::AfterDraftSafety,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(primary.outcome, AttemptOutcome::Acknowledged);
+    assert_eq!(competing.outcome, AttemptOutcome::Stopped(StopReason::Indeterminate));
+    assert_eq!(flatten(&competing.trace.drafts).len(), 1);
+    assert!(competing.trace.initial_refs.is_empty());
+    assert!(competing.trace.creates.is_empty());
+    assert!(competing.trace.markers.is_empty());
+    assert!(competing.trace.projections.is_empty());
+    assert_quiescent(&mut world, &intent, "competing-draft-conversion").await;
 }
 
 #[tokio::test]
@@ -3126,7 +3326,7 @@ async fn hidden_open_rows_retry_only_the_unmarked_stable_create_key() {
     let hidden_marked =
         QueryVisibility::hiding_identities(&world, [world.identity(&id("Ghidden"))]);
     let error = world.plan(&intent, &hidden_marked).err().unwrap();
-    assert!(error.to_string().contains("Terminal pull request history"));
+    assert!(error.to_string().contains("marker but no OPEN pull request"));
 }
 
 #[tokio::test]
@@ -3156,7 +3356,6 @@ async fn stale_open_oids_and_body_bytes_do_not_advance_with_durable_writes() {
         world.open_for_setup(&local.id, &local.title, &local.commit_body);
         world.mark_for_setup(
             &local.id,
-            local.desired.head,
             if index == 0 { BaseKind::Default } else { BaseKind::Owned },
         );
     }
@@ -3226,7 +3425,7 @@ async fn independently_lagged_head_and_base_history_slots_are_safe() {
         initial.publish_for_setup(&old.id, old.desired);
         initial.publish_for_setup(&new.id, new.desired);
         initial.open_for_setup(&old.id, &old.title, "provisional");
-        initial.mark_for_setup(&old.id, old.desired.head, base);
+        initial.mark_for_setup(&old.id, base);
     }
 
     for head_slot in 0..2 {
@@ -3273,7 +3472,8 @@ async fn reorder_keeps_old_markers_and_projects_exact_new_stack_positions() {
     let mut world = DurableWorld::for_intents(default, &[&old_intent, &new_intent]);
     world.publish_for_setup(&id("Gmove"), old_root);
     world.open_for_setup(&id("Gmove"), "Old root", "Old root body");
-    world.mark_for_setup(&id("Gmove"), old_root.head, BaseKind::Default);
+    world.mark_for_setup(&id("Gmove"), BaseKind::Default);
+    let old_marker = world.published(&id("Gmove")).unwrap().marker;
     let stale = QueryVisibility::stale(&world, [id("Gmove")]);
 
     let attempt = world.run_attempt(&new_intent, &stale, None).await.unwrap();
@@ -3295,8 +3495,8 @@ async fn reorder_keeps_old_markers_and_projects_exact_new_stack_positions() {
     insta::assert_yaml_snapshot!("reorder_exact_final_updates", update_snapshot(&attempt.trace));
     assert_eq!(
         world.published(&id("Gmove")).unwrap().marker,
-        Some(old_root.head),
-        "the immutable marker remains on the older published version"
+        old_marker,
+        "the immutable marker keeps the same canonical pull request"
     );
     assert!(
         world
@@ -3329,7 +3529,7 @@ async fn stale_nonroot_visibility_can_project_a_root_without_touching_its_old_pa
     world.publish_for_setup(&id("Gparent"), old_parent);
     world.publish_for_setup(&id("Gmove"), old_child);
     world.open_for_setup(&id("Gmove"), "Old child", "Old child body");
-    world.mark_for_setup(&id("Gmove"), old_child.head, BaseKind::Owned);
+    world.mark_for_setup(&id("Gmove"), BaseKind::Owned);
     let parent_before = world.published(&id("Gparent")).cloned();
     let stale = QueryVisibility::stale(&world, [id("Gmove")]);
 
@@ -3427,12 +3627,12 @@ async fn competing_publishers_resume_across_every_authority_barrier() {
     )
     .await
     .unwrap();
-    assert_eq!(primary.outcome, AttemptOutcome::Acknowledged);
     assert_eq!(competing.outcome, AttemptOutcome::Acknowledged);
+    assert_eq!(primary.outcome, AttemptOutcome::Stopped(StopReason::Rejected));
     assert_eq!(world.open_pull_requests(&id("Gcreatemarker")).count(), 2);
-    assert!(
-        flatten(&primary.trace.markers).len() == 1 && update_effects(&primary.trace).len() == 1
-    );
+    assert!(flatten(&primary.trace.markers).len() == 1 && primary.trace.projections.is_empty());
+    assert_eq!(flatten(&competing.trace.markers).len(), 1);
+    assert_eq!(update_effects(&competing.trace).len(), 1);
     run_acknowledged_retry(&mut world, &intent, "same-key-duplicate").await;
     assert_quiescent(&mut world, &intent, "same-key-duplicate").await;
 
@@ -3619,10 +3819,10 @@ async fn competing_publishers_interleave_between_marker_batches() {
     .await
     .unwrap();
     assert_eq!(competing.outcome, AttemptOutcome::Acknowledged);
-    assert_eq!(primary.outcome, AttemptOutcome::Stopped(StopReason::Rejected));
+    assert_eq!(primary.outcome, AttemptOutcome::Acknowledged);
     assert_eq!(primary.trace.markers.len(), 2);
-    assert!(primary.trace.projections.is_empty());
-    assert_eq!(world.published(last_id).unwrap().marker, Some(oid(600)));
+    assert!(!primary.trace.projections.is_empty());
+    assert_eq!(world.published(last_id).unwrap().marker, Some(world.identity(last_id).number()));
     assert_restart_converges(world, &old_marker_intent, "between-marker-batches").await;
 }
 
@@ -3643,13 +3843,15 @@ async fn stale_create_batches_append_duplicates_and_converge() {
         )
         .await
         .unwrap();
-        assert_eq!(primary.outcome, AttemptOutcome::Acknowledged);
         assert_eq!(competing.outcome, AttemptOutcome::Acknowledged);
+        assert_eq!(primary.outcome, AttemptOutcome::Stopped(StopReason::Rejected));
         assert_eq!(
             primary.trace.creates.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
             [1, 1, 1]
         );
         assert_eq!(competing.trace.creates.len(), 3);
+        assert!(!primary.trace.markers.is_empty());
+        assert!(primary.trace.projections.is_empty());
         run_acknowledged_retry(&mut world, &create_intent, "stale-create-batches").await;
         assert_quiescent(&mut world, &create_intent, "stale-create-batches").await;
     }
@@ -3691,14 +3893,14 @@ async fn fresh_and_stale_create_batches_append_duplicates_and_converge() {
         )
         .await
         .unwrap();
-        assert_eq!(primary.outcome, AttemptOutcome::Acknowledged);
         assert_eq!(competing.outcome, AttemptOutcome::Acknowledged);
+        assert_eq!(primary.outcome, AttemptOutcome::Stopped(StopReason::Rejected));
         assert_eq!(primary.trace.creates.len(), 3);
         assert_eq!(
             competing.trace.creates.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
             vec![1; 2 - completed_batch]
         );
-        assert!(!primary.trace.markers.is_empty() && !primary.trace.projections.is_empty());
+        assert!(!primary.trace.markers.is_empty() && primary.trace.projections.is_empty());
         assert_eq!(flatten(&competing.trace.markers).len(), 3);
         assert_eq!(update_effects(&competing.trace).len(), 3);
         run_acknowledged_retry(&mut world, &create_intent, "fresh-create-batches").await;
@@ -3848,40 +4050,27 @@ async fn competing_publishers_interleave_between_projection_requests() {
 }
 
 #[tokio::test]
-async fn competing_different_marker_targets_release_only_the_winners_projection() {
+async fn competing_different_marker_numbers_release_only_the_winners_projection() {
     let default = oid(1);
-    let old_revision = LiteralRevision { head: oid(40), first_parent: default };
-    let new_revision = LiteralRevision { head: oid(41), first_parent: default };
-    let old_intent = root_intent(default, "Gmarkerrace", old_revision);
-    let new_intent = root_intent(default, "Gmarkerrace", new_revision);
-    let mut initial = DurableWorld::for_intents(default, &[&old_intent, &new_intent]);
-    initial.publish_for_setup(&id("Gmarkerrace"), old_revision);
+    let revision = LiteralRevision { head: oid(40), first_parent: default };
+    let intent = root_intent(default, "Gmarkerrace", revision);
+    let mut initial = DurableWorld::for_intents(default, &[&intent]);
+    initial.publish_for_setup(&id("Gmarkerrace"), revision);
     initial.open_for_setup(&id("Gmarkerrace"), "provisional", "provisional");
+    initial.open_for_setup(&id("Gmarkerrace"), "other", "other");
+    let lower = initial.identity(&id("Gmarkerrace"));
+    let higher = initial.latest_identity(&id("Gmarkerrace"));
+    let higher_only = QueryVisibility::hiding_identities(&initial, [lower.clone()]);
 
-    let mut advanced = initial.clone();
-    let advance = advanced
-        .run_attempt(
-            &new_intent,
-            &QueryVisibility::default(),
-            Some(Interruption::Marker {
-                batch: 0,
-                stop: GitStop::Indeterminate { applied: false },
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(flatten(&advance.trace.initial_refs).len(), 1);
-    assert_eq!(advanced.published(&id("Gmarkerrace")).unwrap().marker, None);
-
-    for old_is_primary in [true, false] {
-        let old_plan = initial.plan(&old_intent, &QueryVisibility::default()).unwrap();
-        let new_plan = advanced.plan(&new_intent, &QueryVisibility::default()).unwrap();
-        let (primary, competing, primary_intent, winning_target) = if old_is_primary {
-            (old_plan, new_plan, &old_intent, new_revision.head)
+    for lower_is_primary in [true, false] {
+        let lower_plan = initial.plan(&intent, &QueryVisibility::default()).unwrap();
+        let higher_plan = initial.plan(&intent, &higher_only).unwrap();
+        let (primary, competing, winning_number) = if lower_is_primary {
+            (lower_plan, higher_plan, higher.number())
         } else {
-            (new_plan, old_plan, &new_intent, old_revision.head)
+            (higher_plan, lower_plan, lower.number())
         };
-        let mut world = advanced.clone();
+        let mut world = initial.clone();
         let (primary, competing) = execute_with_competition(
             &mut world,
             primary,
@@ -3895,11 +4084,11 @@ async fn competing_different_marker_targets_release_only_the_winners_projection(
         assert_eq!(
             primary.outcome,
             AttemptOutcome::Stopped(StopReason::Rejected),
-            "the immutable marker with the other target rejects the suspended publisher"
+            "the immutable marker with another canonical number rejects the suspended publisher"
         );
         assert!(primary.trace.projections.is_empty());
-        assert_eq!(world.published(&id("Gmarkerrace")).unwrap().marker, Some(winning_target));
-        assert_restart_converges(world, primary_intent, "different-marker-targets").await;
+        assert_eq!(world.published(&id("Gmarkerrace")).unwrap().marker, Some(winning_number));
+        assert_restart_converges(world, &intent, "different-marker-numbers").await;
     }
 }
 
@@ -3967,11 +4156,11 @@ async fn disjoint_and_identical_publishers_have_only_protocol_outcomes() {
         AttemptOutcome::Acknowledged
     );
     let after_first = same_world.clone();
-    assert_eq!(
-        same_world.execute_plan(same_b, None).await.unwrap().outcome,
-        AttemptOutcome::Acknowledged,
-        "the service accepts both same-key creates"
-    );
+    let same_b = same_world.execute_plan(same_b, None).await.unwrap();
+    assert_eq!(same_b.outcome, AttemptOutcome::Stopped(StopReason::Rejected));
+    assert_eq!(flatten(&same_b.trace.creates).len(), 1);
+    assert_eq!(flatten(&same_b.trace.markers).len(), 1);
+    assert!(same_b.trace.projections.is_empty());
     assert_ne!(same_world, after_first, "the second create appends a durable row");
     run_acknowledged_retry(&mut same_world, &same_intent, "identical-create-race").await;
     assert_quiescent(&mut same_world, &same_intent, "identical-create-race").await;
@@ -4216,68 +4405,72 @@ async fn stale_precomputed_projection_lands_safely_and_fresh_intent_repairs_it()
     );
 }
 
+fn marked_root_with_duplicate()
+-> (DurableWorld, LocalIntent, PullRequestIdentity, PullRequestIdentity) {
+    let default = oid(1);
+    let revision = LiteralRevision { head: oid(2), first_parent: default };
+    let intent = root_intent(default, "Glifecycle", revision);
+    let mut world = DurableWorld::for_intents(default, &[&intent]);
+    world.publish_for_setup(&intent.first.id, revision);
+    world.open_for_setup(&intent.first.id, "canonical", "canonical body");
+    let canonical = world.identity(&intent.first.id);
+    world.open_for_setup(&intent.first.id, "duplicate", "duplicate body");
+    let duplicate = world.latest_identity(&intent.first.id);
+    world.mark_for_setup(&intent.first.id, BaseKind::Default);
+    (world, intent, canonical, duplicate)
+}
+
 #[test]
-fn all_lifecycle_rows_have_one_exhaustive_canonical_selection_rule() {
-    for (label, terminal_is_lower, merged, accepted) in [
-        ("lower-closed", true, false, false),
-        ("higher-closed", false, false, true),
-        ("lower-merged", true, true, false),
-        ("higher-merged", false, true, false),
-    ] {
-        let default = oid(1);
-        let revision = LiteralRevision { head: oid(2), first_parent: default };
-        let intent = root_intent(default, "Glifecycle", revision);
-        let mut world = DurableWorld::for_intents(default, &[&intent]);
-        world.publish_for_setup(&intent.first.id, revision);
-        world.open_for_setup(&intent.first.id, "first", "first body");
-        let first = world.latest_identity(&intent.first.id);
-        if terminal_is_lower {
-            if merged {
-                world.merge_for_setup(&first);
-            } else {
-                world.close_for_setup(&first);
-            }
-            world.open_for_setup(&intent.first.id, "second", "second body");
-        } else {
-            world.open_for_setup(&intent.first.id, "second", "second body");
-            let second = world.latest_identity(&intent.first.id);
-            if merged {
-                world.merge_for_setup(&second);
-            } else {
-                world.close_for_setup(&second);
-            }
-        }
-
-        let result = world.plan(&intent, &QueryVisibility::default());
-        match (accepted, result) {
-            (true, Ok(_)) => {}
-            (true, Err(error)) => panic!("{label}: {error}"),
-            (false, Err(error)) => {
-                assert!(error.to_string().contains("Terminal pull request history"), "{label}");
-            }
-            (false, Ok(_)) => panic!("{label}: unsafe lifecycle history was accepted"),
-        }
-    }
-
+fn terminal_duplicates_are_absent_from_open_only_observation() {
     for merged in [false, true] {
-        let default = oid(1);
-        let revision = LiteralRevision { head: oid(2), first_parent: default };
-        let intent = root_intent(default, "Gterminalonly", revision);
-        let mut world = DurableWorld::for_intents(default, &[&intent]);
-        world.publish_for_setup(&intent.first.id, revision);
-        world.open_for_setup(&intent.first.id, "terminal", "terminal body");
-        let identity = world.identity(&intent.first.id);
+        let (mut world, intent, _, duplicate) = marked_root_with_duplicate();
         if merged {
-            world.merge_for_setup(&identity);
+            world.merge_for_setup(&duplicate);
         } else {
-            world.close_for_setup(&identity);
+            world.close_for_setup(&duplicate);
+        }
+        assert!(
+            world.plan(&intent, &QueryVisibility::default()).is_ok(),
+            "a terminal duplicate is absent from the OPEN-only connection"
+        );
+    }
+}
+
+#[test]
+fn a_terminal_marker_canonical_cannot_be_replaced_by_a_visible_duplicate() {
+    for merged in [false, true] {
+        let (mut world, intent, canonical, _) = marked_root_with_duplicate();
+        if merged {
+            world.merge_for_setup(&canonical);
+        } else {
+            world.close_for_setup(&canonical);
         }
         let error = world
             .plan(&intent, &QueryVisibility::default())
             .err()
-            .expect("terminal-only history must reject");
-        assert!(error.to_string().contains("Terminal pull request history"));
+            .expect("the marker identity is absent")
+            .to_string();
+        assert!(
+            error.contains("marker selects OPEN pull request #100"),
+            "a visible duplicate cannot stand in for the absent marker identity: {error}"
+        );
     }
+}
+
+#[test]
+fn an_unmarked_terminal_row_has_no_durable_authority() {
+    let default = oid(1);
+    let revision = LiteralRevision { head: oid(2), first_parent: default };
+    let intent = root_intent(default, "Gunmarked", revision);
+    let mut world = DurableWorld::for_intents(default, &[&intent]);
+    world.publish_for_setup(&intent.first.id, revision);
+    world.open_for_setup(&intent.first.id, "unmarked", "unmarked body");
+    let unmarked = world.identity(&intent.first.id);
+    world.close_for_setup(&unmarked);
+    assert!(
+        world.plan(&intent, &QueryVisibility::default()).is_ok(),
+        "an unmarked terminal row has no durable authority and is absent from OPEN observation"
+    );
 }
 
 #[test]
@@ -4289,8 +4482,14 @@ fn a_closed_canonical_can_reopen_without_changing_its_identity() {
     world.publish_for_setup(&intent.first.id, revision);
     world.open_for_setup(&intent.first.id, "closed", "closed body");
     let identity = world.identity(&intent.first.id);
+    world.mark_for_setup(&intent.first.id, BaseKind::Default);
     world.close_for_setup(&identity);
-    assert!(world.plan(&intent, &QueryVisibility::default()).is_err());
+    let error = world
+        .plan(&intent, &QueryVisibility::default())
+        .err()
+        .expect("the marker identity is absent")
+        .to_string();
+    assert!(error.contains("marker but no OPEN pull request"));
 
     world.reopen_for_setup(&identity, "reopened", "reopened body", BaseKind::Owned);
     assert_eq!(world.identity(&intent.first.id), identity);
@@ -4321,7 +4520,7 @@ fn three_open_root() -> (DurableWorld, LocalIntent, [PullRequestIdentity; 3]) {
     for suffix in ["first", "second", "third"] {
         world.open_for_setup(&intent.first.id, &format!("stale {suffix}"), "stale body");
     }
-    world.mark_for_setup(&intent.first.id, revision.head, BaseKind::Default);
+    world.mark_for_setup(&intent.first.id, BaseKind::Default);
     let identities = world
         .open_pull_requests(&intent.first.id)
         .map(|row| row.identity.clone())
@@ -4332,7 +4531,7 @@ fn three_open_root() -> (DurableWorld, LocalIntent, [PullRequestIdentity; 3]) {
 }
 
 #[tokio::test]
-async fn complete_stale_lifecycle_connection_survives_duplicate_cleanup() {
+async fn complete_stale_open_connection_survives_duplicate_cleanup() {
     let (mut world, intent, identities) = three_open_root();
     let stale = QueryVisibility::stale(&world, [intent.first.id.clone()]);
     world.open_for_setup(&intent.first.id, "later duplicate", "later body");
@@ -4392,7 +4591,7 @@ async fn complete_stale_lifecycle_connection_survives_duplicate_cleanup() {
 }
 
 #[tokio::test]
-async fn empty_captured_lifecycle_connection_excludes_a_later_create() {
+async fn empty_captured_open_connection_excludes_a_later_create() {
     let default = oid(1);
     let revision = LiteralRevision { head: oid(2), first_parent: default };
     let intent = root_intent(default, "Gemptycapture", revision);
@@ -4406,9 +4605,13 @@ async fn empty_captured_lifecycle_connection_excludes_a_later_create() {
     assert_eq!(stale.outcome, AttemptOutcome::Acknowledged);
     assert_eq!(flatten(&stale.trace.creates).len(), 1);
     assert_eq!(world.open_pull_requests(&intent.first.id).count(), 2);
-    assert_eq!(world.identity(&intent.first.id), earlier_identity);
 
     let later_identity = world.latest_identity(&intent.first.id);
+    assert_eq!(
+        world.published(&intent.first.id).unwrap().marker,
+        Some(later_identity.number()),
+        "the create receipt binds the marker even when an older row was omitted"
+    );
     let repair = world.run_attempt(&intent, &QueryVisibility::default(), None).await.unwrap();
     assert_eq!(repair.outcome, AttemptOutcome::Acknowledged);
     assert!(matches!(
@@ -4416,8 +4619,8 @@ async fn empty_captured_lifecycle_connection_excludes_a_later_create() {
         [
             ProjectionEffect::Close { operation, .. },
             ProjectionEffect::Update(update),
-        ] if operation.identity == later_identity
-            && update.operation.identity == earlier_identity
+        ] if operation.identity == earlier_identity
+            && update.operation.identity == later_identity
     ));
     assert_quiescent(&mut world, &intent, "empty-captured-connection").await;
 }
@@ -4452,7 +4655,7 @@ async fn mixed_duplicate_projection_recovers_from_every_alias_subset() {
                 .collect::<Vec<_>>(),
             [("close", 101), ("close", 102), ("update", 100)]
         );
-        assert_eq!(world.published(&intent.first.id).unwrap().marker, Some(oid(2)));
+        assert_eq!(world.published(&intent.first.id).unwrap().marker, Some(identities[0].number()));
         let converged =
             assert_restart_converges(world, &intent, &format!("alias-mask-{mask:03b}")).await;
         assert_eq!(converged.open_pull_requests(&intent.first.id).count(), 1);
@@ -4470,7 +4673,7 @@ async fn mixed_projection_multibatch_prefix_converges() {
     for index in 0..66 {
         initial.open_for_setup(&intent.first.id, &format!("stale {index}"), "stale body");
     }
-    initial.mark_for_setup(&intent.first.id, revision.head, BaseKind::Default);
+    initial.mark_for_setup(&intent.first.id, BaseKind::Default);
 
     let cases = [
         ("first-none", 0, Box::new([]) as Box<[usize]>),
@@ -4503,18 +4706,31 @@ async fn mixed_projection_multibatch_prefix_converges() {
 }
 
 #[tokio::test]
-async fn captured_connections_never_authorize_closing_an_unseen_lower_row() {
+async fn captured_open_connections_never_authorize_unseen_rows() {
     let (initial, intent, identities) = three_open_root();
-    for (label, hidden) in
-        [("lower", vec![identities[0].clone()]), ("higher", vec![identities[2].clone()])]
-    {
-        let mut world = initial.clone();
-        let visibility = QueryVisibility::hiding_identities(&world, hidden);
-        world.run_attempt(&intent, &visibility, None).await.unwrap();
-        assert!(world.exact_open_pull_request(&identities[0]).is_some());
-        let converged = assert_restart_converges(world, &intent, label).await;
-        assert_eq!(converged.identity(&intent.first.id), identities[0]);
-    }
+    let mut marker_hidden = initial.clone();
+    let visibility = QueryVisibility::hiding_identities(&marker_hidden, [identities[0].clone()]);
+    let before = marker_hidden.clone();
+    let error = marker_hidden.run_attempt(&intent, &visibility, None).await.unwrap_err();
+    assert!(error.to_string().contains("marker selects OPEN pull request #100"));
+    assert_eq!(marker_hidden, before, "an omitted marker identity fails before effects");
+
+    let mut duplicate_hidden = initial.clone();
+    let visibility = QueryVisibility::hiding_identities(&duplicate_hidden, [identities[2].clone()]);
+    let attempt = duplicate_hidden.run_attempt(&intent, &visibility, None).await.unwrap();
+    assert_eq!(attempt.outcome, AttemptOutcome::Acknowledged);
+    assert!(duplicate_hidden.exact_open_pull_request(&identities[0]).is_some());
+    assert!(duplicate_hidden.exact_open_pull_request(&identities[2]).is_some());
+    assert!(matches!(
+        flatten(&attempt.trace.projections).as_ref(),
+        [
+            ProjectionEffect::Close { operation, .. },
+            ProjectionEffect::Update(update),
+        ] if operation.identity == identities[1]
+            && update.operation.identity == identities[0]
+    ));
+    let converged = assert_restart_converges(duplicate_hidden, &intent, "hidden-duplicate").await;
+    assert_eq!(converged.identity(&intent.first.id), identities[0]);
 
     let mut all_hidden = initial;
     let visibility = QueryVisibility::hiding_identities(&all_hidden, identities);
@@ -4535,10 +4751,11 @@ async fn delayed_create_after_root_retarget_is_repaired_as_a_duplicate() {
     world.run_attempt(&intent, &QueryVisibility::default(), None).await.unwrap();
     assert_eq!(world.open_pull_request(&intent.first.id).unwrap().base(), BaseKind::Default);
 
-    assert_eq!(
-        world.execute_plan(stale, None).await.unwrap().outcome,
-        AttemptOutcome::Acknowledged
-    );
+    let stale = world.execute_plan(stale, None).await.unwrap();
+    assert_eq!(stale.outcome, AttemptOutcome::Stopped(StopReason::Rejected));
+    assert_eq!(flatten(&stale.trace.creates).len(), 1);
+    assert_eq!(flatten(&stale.trace.markers).len(), 1);
+    assert!(stale.trace.projections.is_empty());
     assert_eq!(world.open_pull_requests(&intent.first.id).count(), 2);
     let retry = run_acknowledged_retry(&mut world, &intent, "delayed-root-create").await;
     assert!(matches!(
@@ -4583,8 +4800,8 @@ async fn stale_update_stops_when_its_exact_selected_row_was_closed() {
     );
 
     let error = world.run_attempt(&intent, &QueryVisibility::default(), None).await.unwrap_err();
-    assert!(error.to_string().contains("Terminal pull request history"));
-    assert_eq!(world, before, "terminal-only history cannot trigger recreation");
+    assert!(error.to_string().contains("marker but no OPEN pull request"));
+    assert_eq!(world, before, "an absent marker identity cannot trigger recreation");
 }
 
 #[tokio::test]
@@ -4613,6 +4830,6 @@ async fn stale_update_stops_when_its_exact_selected_row_was_merged() {
     assert_eq!(world, before, "a stale OPEN result cannot update a MERGED row");
 
     let error = world.run_attempt(&intent, &QueryVisibility::default(), None).await.unwrap_err();
-    assert!(error.to_string().contains("Terminal pull request history"));
-    assert_eq!(world, before, "MERGED history cannot trigger recreation");
+    assert!(error.to_string().contains("marker but no OPEN pull request"));
+    assert_eq!(world, before, "an absent marker identity cannot trigger recreation");
 }

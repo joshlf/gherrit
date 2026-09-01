@@ -21,7 +21,7 @@ use std::{
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::ObjectId;
 
-use super::{PublicBranch, version::Version};
+use super::{PublicBranch, marker::PreparedMarker, version::Version};
 use crate::pre_push::{
     destination::{PublicationTarget, PushDestination},
     local::GherritPrId,
@@ -139,7 +139,8 @@ impl TupleTransition {
     }
 }
 
-/// One absent pull-request marker to create at an exact published head.
+/// One absent pull-request marker ref to create at an exact local annotated
+/// tag object.
 ///
 /// No update variant exists because marker tags are immutable. A caller which
 /// observes an existing marker must validate it rather than overwrite it.
@@ -206,6 +207,15 @@ impl PublicBranchTransition {
 }
 
 impl MarkerTransition {
+    /// Converts a preflighted immutable tag object into the existing
+    /// create-only ref transition. The absence lease is deliberately still
+    /// attached here, so equal templates acknowledge the same tag OID and a
+    /// different pull-request number conflicts rather than overwriting it.
+    pub(super) fn from_prepared(marker: &PreparedMarker) -> Self {
+        Self { id: marker.id().clone(), target: marker.tag() }
+    }
+
+    #[cfg(test)]
     pub(super) fn create(id: GherritPrId, target: ObjectId) -> Result<Self> {
         if target.is_null() {
             bail!("Git pull-request markers require a non-null target");
