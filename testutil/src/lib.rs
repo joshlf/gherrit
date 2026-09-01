@@ -504,6 +504,7 @@ pub enum GraphQlOperation {
         include_repository_facts: bool,
     },
     CreatePr,
+    DraftPr,
     ClosePr,
     UpdatePr,
 }
@@ -583,6 +584,18 @@ impl PullRequestSeed {
             base: base.into(),
         }
     }
+
+    fn into_mock(self) -> mock_server::PrEntry {
+        let Self { number, title, body, head, base } = self;
+        mock_server::PrEntry::mock(mock_server::MockPrArgs {
+            number: usize::try_from(number.get())
+                .expect("the test target must represent GraphQL pull request numbers"),
+            title,
+            body,
+            head,
+            base,
+        })
+    }
 }
 
 fn valid_pull_request_number(number: usize) -> Option<NonZeroU32> {
@@ -595,6 +608,7 @@ pub struct PullRequestSnapshot {
     pub number: usize,
     pub node_id: String,
     pub state: PullRequestState,
+    pub is_draft: bool,
     pub title: String,
     pub body: String,
     pub head: String,
@@ -623,6 +637,7 @@ impl From<&mock_server::PrEntry> for PullRequestSnapshot {
             number: pr.number,
             node_id: pr.node_id.clone(),
             state: pr.state,
+            is_draft: pr.is_draft,
             title: pr.title.clone(),
             body: pr.body.clone(),
             head: pr.head.name.clone(),
@@ -661,17 +676,17 @@ impl MockGithub<'_> {
     }
 
     pub fn seed_pull_request(&self, seed: PullRequestSeed) {
-        let PullRequestSeed { number, title, body, head, base } = seed;
         self.context.mutate_mock_state(|state| {
-            let pr = mock_server::PrEntry::mock(mock_server::MockPrArgs {
-                number: usize::try_from(number.get())
-                    .expect("the test target must represent GraphQL pull request numbers"),
-                title,
-                body,
-                head,
-                base,
-            });
-            state.add_pr(pr);
+            state.add_pr(seed.into_mock());
+        });
+    }
+
+    /// Seeds a row before existing rows in the connection. This models an
+    /// earlier pull request which a stale observation omitted and which later
+    /// becomes visible before the already-marked row during pagination.
+    pub fn seed_earlier_pull_request(&self, seed: PullRequestSeed) {
+        self.context.mutate_mock_state(|state| {
+            state.prs.insert(0, seed.into_mock());
         });
     }
 

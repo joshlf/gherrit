@@ -212,7 +212,7 @@ impl Github {
         Ok(Self { http: builder.build()?, target, timeouts })
     }
 
-    /// Observes every lifecycle state for each change in the sealed stack.
+    /// Observes every OPEN pull-request row for each change in the sealed stack.
     pub(in crate::pre_push::publication_attempt) async fn observe_local_pull_requests(
         self,
         local: &LocalStack,
@@ -471,7 +471,8 @@ mod tests {
         super::{
             MAX_MUTATION_REQUEST_BYTES, PullRequestIdentity,
             mutation::{
-                PreparedCreates, PreparedPullRequestProjection, TestClose, TestCreate, TestUpdate,
+                DraftPullRequest, PreparedCreates, PreparedDraftConversions,
+                PreparedPullRequestProjection, TestClose, TestCreate, TestUpdate,
             },
             observation::LocalPullRequestObservation,
             pull_request::PullRequestIdentityRegistry,
@@ -676,7 +677,7 @@ mod tests {
                     .map(|cursor| format!(", after: {}", json!(cursor)))
                     .unwrap_or_default();
                 format!(
-                    "op{index}: pullRequests(headRefName: {}, first: 1{after}, states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, autoMergeRequest {{ enabledAt }}, isInMergeQueue }} pageInfo {{ hasNextPage, endCursor }} }}",
+                    "op{index}: pullRequests(headRefName: {}, first: 1{after}, states: [OPEN]) {{ nodes {{ number, id, title, body, baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, autoMergeRequest {{ enabledAt }}, isInMergeQueue, isDraft }} pageInfo {{ hasNextPage, endCursor }} }}",
                     json!(id),
                 )
             })
@@ -710,6 +711,7 @@ mod tests {
             "headRefName": head,
             "headRefOid": null,
             "state": "OPEN",
+            "isDraft": true,
             "isCrossRepository": true,
             "autoMergeRequest": null,
             "isInMergeQueue": null,
@@ -788,13 +790,49 @@ mod tests {
         }
     }
 
+    fn test_draft() -> DraftPullRequest {
+        DraftPullRequest::from_observation(
+            id("Gdraft"),
+            PullRequestIdentity::new(7, "PR7".to_owned()).unwrap(),
+            oid(10),
+            "main".to_owned(),
+            oid(1),
+        )
+    }
+
+    fn draft_request() -> Value {
+        json!({
+            "query": "mutation { op0: convertPullRequestToDraft(input: { pullRequestId: \"PR7\", clientMutationId: \"gherrit:draft:PR7\" }) { clientMutationId, pullRequest { number, id, state, isDraft, headRefName, headRefOid, baseRefName, baseRefOid } } }"
+        })
+    }
+
+    fn draft_response() -> Value {
+        json!({
+            "data": {
+                "op0": {
+                    "clientMutationId": "gherrit:draft:PR7",
+                    "pullRequest": {
+                        "number": 7,
+                        "id": "PR7",
+                        "state": "OPEN",
+                        "isDraft": true,
+                        "headRefName": "Gdraft",
+                        "headRefOid": oid(10).to_string(),
+                        "baseRefName": "main",
+                        "baseRefOid": oid(1).to_string(),
+                    },
+                },
+            },
+        })
+    }
+
     fn create_request(specifications: &[(&str, u64)]) -> Value {
         let fields = specifications
             .iter()
             .enumerate()
             .map(|(index, (id, _))| {
                 format!(
-                    "op{index}: createPullRequest(input: {{ repositoryId: \"REPOSITORY_NODE\", headRepositoryId: \"REPOSITORY_NODE\", baseRefName: \"gherrit-bases/{id}\", headRefName: \"{id}\", title: \"title {id}\", body: \"body {id}\", clientMutationId: \"gherrit:create:{id}\" }}) {{ clientMutationId, pullRequest {{ number, id, state, headRefName, headRefOid, headRepository {{ id }}, baseRefName, baseRefOid, baseRepository {{ id }} }} }}"
+                    "op{index}: createPullRequest(input: {{ repositoryId: \"REPOSITORY_NODE\", headRepositoryId: \"REPOSITORY_NODE\", baseRefName: \"gherrit-bases/{id}\", headRefName: \"{id}\", title: \"title {id}\", body: \"body {id}\", draft: true, clientMutationId: \"gherrit:create:{id}\" }}) {{ clientMutationId, pullRequest {{ number, id, state, isDraft, headRefName, headRefOid, headRepository {{ id }}, baseRefName, baseRefOid, baseRepository {{ id }} }} }}"
                 )
             })
             .collect::<Vec<_>>()
@@ -815,6 +853,7 @@ mod tests {
                             "number": number,
                             "id": node_id,
                             "state": "OPEN",
+                            "isDraft": true,
                             "headRefName": id,
                             "headRefOid": oid(*head).to_string(),
                             "headRepository": { "id": "REPOSITORY_NODE" },
@@ -1487,6 +1526,39 @@ mod tests {
                 .unwrap();
         let error = test_github(&api_url, test_timeouts())
             .project_pull_requests(updates)
+            .await
+            .unwrap_err();
+        let requests = finish_peer(server).await;
+
+        assert_eq!(requests.len(), 1);
+        assert!(error.to_string().contains("acknowledgement is indeterminate"));
+    }
+
+    #[tokio::test]
+    async fn draft_conversion_receipt_failure_is_indeterminate_and_never_replayed() {
+        let mut response = draft_response();
+        response["data"]["op0"]["pullRequest"]["isDraft"] = json!(false);
+        let (api_url, server) =
+            scripted_peer(vec![exchange(draft_request(), Reply::Json(response))]).await;
+        let conversions = PreparedDraftConversions::prepare(vec![test_draft()]).unwrap();
+        let error = test_github(&api_url, test_timeouts())
+            .convert_pull_requests_to_draft(conversions)
+            .await
+            .unwrap_err();
+        let requests = finish_peer(server).await;
+
+        assert_eq!(requests.len(), 1);
+        assert!(error.to_string().contains("acknowledgement is indeterminate"));
+        assert!(format!("{error:?}").contains("did not return an OPEN draft pull request"));
+    }
+
+    #[tokio::test]
+    async fn draft_conversion_disconnect_is_indeterminate_and_never_replayed() {
+        let (api_url, server) =
+            scripted_peer(vec![exchange(draft_request(), Reply::Disconnect)]).await;
+        let conversions = PreparedDraftConversions::prepare(vec![test_draft()]).unwrap();
+        let error = test_github(&api_url, test_timeouts())
+            .convert_pull_requests_to_draft(conversions)
             .await
             .unwrap_err();
         let requests = finish_peer(server).await;
