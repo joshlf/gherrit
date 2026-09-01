@@ -31,21 +31,23 @@ The suite establishes that GHerrit:
   immutable-version tuple;
 - represents a changed public branch as one real initial-ref effect, ordered
   after every tuple and retained in its complete atomic batch;
-- records established pull request existence with a separate immutable marker;
+- records the canonical pull request number in a separate immutable annotated
+  marker;
 - withholds duplicate cleanup and final pull request projection until every
   required marker is exactly acknowledged;
-- creates every pull request on its permanent owned-base key;
-- selects the lowest visible OPEN pull request number as canonical, closes
-  every higher visible duplicate, and projects only the canonical row;
-- rejects any MERGED row or a CLOSED row below the canonical OPEN row while
-  ignoring higher CLOSED cleanup residue;
+- creates every pull request as a draft on its permanent owned-base key;
+- uses the marker-bound OPEN row as canonical, closes every other visible OPEN
+  row, and never promotes a duplicate merely because of number ordering;
+- lets an unmarked lowest visible OPEN number contend deterministically for
+  the marker lease without treating it as canonical first;
+- converts a ready root to draft before any publication which will make it a
+  nonroot, and never marks a pull request ready automatically;
 - converges roots to the exact default branch and nonroots to their own bases;
 - emits no action when durable state already matches local intent;
 - remains safe after interruption at every externally committed effect;
 - remains safe when protocol-conforming publishers operate on disjoint or
   overlapping change IDs;
-- fails closed when marked pull request existence is not visible;
-- rejects terminal-only local history; and
+- fails closed when a marker-bound pull request is not in the OPEN result; and
 - preserves every immutable version position through amendments, rebases,
   reorders, adjacent repeated revisions, and nonconsecutive revision reuse.
 
@@ -65,15 +67,16 @@ The suite establishes that:
 - local Git history and branch state are derived accurately;
 - remote Git observation requests only the exact default and local change
   namespaces plus the configured public branch when public mode requires it;
-- exact absence, immutable history, and marker state survive byte parsing;
+- exact absence, immutable history, and annotated marker identity survive byte
+  parsing and bounded object decoding;
 - Git publication uses complete atomic tuples and exact leases;
 - public-ref creation and advancement use exact absence/value leases and the
   same bounded initial-ref batching boundary;
-- GitHub exhausts one all-lifecycle connection for every exact local ID;
+- GitHub exhausts one OPEN-only connection for every exact local ID;
 - GraphQL aliases, cursors, errors, nullable fields, and partial mutation
   outcomes are decoded conservatively;
-- create and mixed final-projection receipts identify the exact planned pull
-  requests and lifecycle states;
+- draft-conversion, create, and mixed final-projection receipts identify the
+  exact planned pull requests and draft/lifecycle states;
 - installed hooks are complete, executable, and forward exact arguments; and
 - supported platforms agree on process, path, and filesystem behavior.
 
@@ -127,7 +130,7 @@ Coverage is organized around product risks rather than source files.
 | Local intent is misunderstood | Pure stack/policy cases and focused real-Git discovery |
 | Unrelated repository state affects publication | Exact-request contracts and unrelated-state invariance |
 | The wrong refs are published | Pure tuple decisions and real atomic-push/lease contracts |
-| GitHub state is misclassified | Pure local outcome tables and all-lifecycle GraphQL contracts |
+| GitHub state is misclassified | Pure marker-join tables and OPEN-only GraphQL contracts |
 | A create targets the wrong PR | Exact receipt tables and one scripted mutation contract |
 | A retry repeats or loses work | Durable-prefix recovery model and focused lost-ack contracts |
 | A stale read grants unsafe authority | Visibility schedules and marker-aware planner tables |
@@ -153,10 +156,12 @@ remote symbolic HEAD + exact public ref --/                 |
                                                             +-> empty public stack
                                                             |            |
                                                             +-> exact local refs, tags, graph --+
-                                                            +-> exact local lifecycle PRs -----+
+                                                            +-> exact local OPEN PRs ----------+
                                                                                                |
                                                                                      publication plan
                                                                                                |
+                                      required draft conversions
+                                                            |
                                       initial Git batches: tuples, then optional public effect
                                                             |
                                                             +-> GraphQL creates -> marker batches
@@ -166,21 +171,24 @@ remote symbolic HEAD + exact public ref --/                 |
 "Exact" means that every requested Git name or namespace and every requested
 GraphQL connection is covered. It does not mean that Git and GitHub form a
 snapshot. Safety comes from validated immutable history, exact leases, safe
-owned-base creates, monotone canonical selection, durable markers, and one-use
+draft owned-base creates, Git-authenticated canonical identity, and one-use
 acknowledgement gates.
 
 The evidence set contains no repository-wide pull request rows, nonlocal
-histories, or nonlocal graph roots. Complete all-lifecycle pagination yields
-sealed absence or one ordered decision. The lowest same-repository row must be
-OPEN, any MERGED row rejects, higher CLOSED rows are completed cleanup, and
-higher OPEN rows are repairable duplicates.
+histories, or nonlocal graph roots. Complete OPEN-only pagination yields sealed
+absence or a validated same-repository row set. The independently observed
+marker either selects one exact canonical number or is absent. Without a
+marker, the lowest number is only a deterministic lease contender. With a
+marker, every visible row except its exact number is a repairable duplicate;
+if its number is absent, planning fails closed.
 
-Exact acknowledgement of all required initial Git batches—including the
+Exact acknowledgement of all required draft conversions releases initial Git
+publication. Exact acknowledgement of all required initial Git batches—including the
 optional public effect—releases pull request creation. An initially observed
-validated canonical OPEN row authorizes its one marker; a newly created pull
-request authorizes its marker only through an exact create receipt. Exact
+validated contender supplies one marker template; a newly created pull request
+supplies its marker identity only through an exact create receipt. Exact
 acknowledgement of every marker push releases one final GraphQL projection
-which closes duplicates and updates canonical rows. If an earlier tuple batch
+which closes noncanonical rows and updates canonical rows. If an earlier tuple batch
 succeeds but the final public-containing batch fails atomically, the earlier
 tuples remain durable and a fresh attempt plans only the remaining work.
 
@@ -201,12 +209,14 @@ The pure core distinguishes:
 - ordered local changes, each with change ID, head, literal first parent,
   title, and body;
 - absent or nonempty local published histories;
-- exact current heads, owned bases, immutable versions, and optional markers;
-- one exact planner input: sealed `Absent` or validated `Open`;
+- exact current heads, owned bases, immutable versions, and an optional marker
+  carrying the canonical pull request number;
+- one exact planner input: sealed `Absent` or a validated nonempty OPEN row set
+  joined with that optional marker;
 - pull request identities as coupled number and GraphQL node ID values;
 - desired complete projections and minimal update masks;
-- whole tuple, public-branch, create, and marker effects with stable
-  identities;
+- whole draft-conversion, tuple, public-branch, create, and marker effects with
+  stable identities;
 - minimal update effects addressed by sealed pull request identities; and
 - one-use stage values which encode acknowledgement authority.
 
@@ -230,20 +240,21 @@ The Git boundary owns:
 - exact optional public-branch presence or authoritative absence in the
   bounded initial observation;
 - exact local version and marker namespace observation;
-- bounded acquisition from advertised local version refs;
+- bounded acquisition from advertised local version and marker refs;
 - atomic publication of complete three-ref tuples with exact leases; and
 - public-branch creation or advancement with an exact lease, ordered after all
   tuple units in the initial Git stage; and
-- separate create-only marker publication with absence leases.
+- separate create-only annotated-marker publication with absence leases.
 
 The GitHub boundary owns:
 
 - repository identity and default-branch observation;
-- independently paginated all-lifecycle connections filtered by exact local
-  head names;
-- conversion of each exhausted connection into sealed `Absent`, validated
-  canonical-plus-duplicates OPEN evidence, or a lifecycle rejection;
-- stable owned-base create mutations and exact receipts;
+- independently paginated OPEN-only connections filtered by exact local head
+  names;
+- conversion of each exhausted connection into sealed `Absent` or a validated
+  nonempty row set, followed by the pure marker-number join;
+- exact draft-conversion mutations and receipts before initial Git publication;
+- stable draft owned-base create mutations and exact receipts;
 - exact duplicate-close mutations and CLOSED receipts; and
 - minimal canonical update mutations and exact OPEN receipts.
 
@@ -298,7 +309,7 @@ DurableWorld
 PublishedChange
   ordered published revisions
   zero or more pull request rows with OPEN, CLOSED, or MERGED lifecycle
-  optional change-level marker
+  optional change-level marker carrying one pull request number
 
 LocalIntent
   optional public branch and desired tip
@@ -310,43 +321,46 @@ LocalChange
   title and body
 ```
 
-The marker belongs to the change, not to a selected pull request. The
-production stage machine cannot publish it until at least one OPEN identity is
-durable. The independent service model nevertheless represents a marker with
-no OPEN row: its deliberately permissive close operation must be able to show
-the invalid world a mistaken canonical close would produce instead of
-preventing the planner bug by construction. Canonical identity is derived
-only after the complete lifecycle row set is ordered: the lowest row must be
-OPEN, any MERGED row rejects, and only higher CLOSED rows are admissible.
+The marker belongs to the change and authenticates one exact pull request
+number. The production stage machine cannot publish it until an observed OPEN
+contender or exact create receipt supplies that number. The independent world
+still permits a marker whose numbered row is CLOSED, MERGED, or omitted from
+one observation; the planner must fail closed instead of allowing the model to
+hide a mistaken identity rule. Without a marker, the lowest visible OPEN
+number is only a deterministic contender. With a marker, its exact visible
+OPEN row is canonical and every other visible OPEN row is noncanonical.
 Closing a row changes its lifecycle to CLOSED rather than deleting its
-identity. A completed connection captures its whole returned row set,
-including lifecycle and an empty result. Later lifecycle changes cannot alter
-a captured row, and later creation cannot add one. Connections for different
-change IDs remain independent rather than pretending to be one backend
-snapshot. The model can therefore exercise omissions, cleanup residue,
-terminal history, reopen, merge, and later-created duplicates.
+identity.
 
-A marker may target an older published revision after an amendment. The
-durable Git history supplies current head and owned-base object IDs. A stale
-query result separately retains the exact head and base object IDs and literal
-projection bytes which that query returned; the immutable pull request
-identity remains coupled to the durable row. The two object IDs may lag to
-different immutable history positions. The model can therefore prove that
-writes do not retroactively refresh an observation and that a complete body
-patch reaches an exact no-action retry without deriving desired state inside
-the fake world.
+A completed connection captures its complete returned OPEN row set, including
+an empty result. Later lifecycle changes cannot alter a captured row, and
+later creation cannot add one. Connections for different change IDs remain
+independent rather than pretending to be one backend snapshot. The model can
+therefore exercise omissions, cleanup residue, canonical closure or merge, and
+later-created duplicates without downloading terminal history in the
+production observation.
+
+Every marker's tag object peels to the first published revision and retains its
+number through later amendments. Durable Git history supplies current head and
+owned-base object IDs. A stale query result separately retains the exact head
+and base object IDs, draft state, landing state, and literal projection bytes
+which that query returned; the immutable pull request identity remains coupled
+to the durable row. The model can therefore prove that writes do not
+retroactively refresh an observation and that a complete body patch reaches an
+exact no-action retry without deriving desired state inside the fake world.
 
 The production planner exposes typed test effects. Initial Git effects retain
 their complete atomic grouping; a public effect is never removed from a trace
 or inferred from branch mode:
 
 ```text
-Initial Git batches (Tuples + optional PublicBranch) | Creates | Markers |
-Final pull request projections | Done | Rejected
+Draft conversions | Initial Git batches (Tuples + optional PublicBranch) |
+Creates | Markers | Final pull request projections | Done | Rejected
 ```
 
-Tuple, create, and marker effects carry the stable change ID and their complete
-semantic payload. Closures and updates are addressed by sealed pull request
+Draft-conversion, tuple, create, and marker effects carry the stable change ID
+and their complete semantic payload. Creates always add draft owned-base rows.
+Conversions, closures, and updates are addressed by sealed pull request
 identities; the model resolves each requested node ID to its durable pull
 request row, then requires that row to remain OPEN before applying the
 mutation. It records the resolved change ID only in its local trace, compares
@@ -364,8 +378,8 @@ OPEN creates even for one base-sensitive request key. This proves safety
 without relying on GitHub's current duplicate refusal and includes the weaker
 case in which a later owned-base create lands after a root retarget. The model
 also accepts a close for any exactly addressed OPEN row. A separate oracle
-proves that the planner emits closes for exactly the higher identities in its
-observation, so the service model cannot hide a mistaken canonical choice. It
+proves that the planner emits closes for exactly the noncanonical identities in
+its observation, so the service model cannot hide a mistaken canonical choice. It
 stops an attempt whose effect is rejected or indeterminate, then retries the
 selected stable intent from a fresh observation. This explores concurrency
 without giving either planner access to the other's process-local state or
@@ -376,13 +390,15 @@ Required bounded scenarios include:
 1. A fresh root: tuple, create, marker, final base/body update, then `Done`.
 2. Two missing pull requests: every meaningful subset of complete create
    aliases, then every marker and canonical-update prefix.
-3. Amendment and reorder: an old marker target remains immutable while a new
-   version and changed local position converge without recreating or
-   remarking an established pull request.
+3. Amendment and reorder: the marker remains the same annotated tag on `v1`
+   while a new version and changed local position converge without recreating
+   or remarking an established pull request; a ready root becoming nonroot
+   crosses the draft-conversion barrier before any Git tuple changes.
 4. Visibility: hiding an unmarked provisional OPEN row repeats only the
    owned-base create key; hiding a marked OPEN row rejects without a create;
-   hiding a lower canonical row cannot authorize closing it and later complete
-   visibility reselects it over a higher row.
+   hiding the marker-bound canonical row cannot authorize closing or replacing
+   it, and later complete visibility restores its projection regardless of
+   duplicate number ordering.
 5. Duplicate cleanup: every meaningful subset of mixed close and canonical
    update aliases, every serialized projection-request prefix, and a fresh
    retry which emits exactly the remaining work.
@@ -394,8 +410,8 @@ Required bounded scenarios include:
    one changes the refs; pushes with different desired tuples from the same
    observation admit one exact-lease winner and stop the loser; a delayed
    same-key create and a delayed owned-base create after a root retarget can
-   each become a higher duplicate; a fresh attempt closes either without
-   touching the lower canonical identity; and
+   each become a noncanonical duplicate; a fresh attempt closes either without
+   touching the marker-bound canonical identity; and
    different navigation projections for the same tuple are safe
    last-writer-wins updates which converge after one local intent stabilizes.
 7. Public projection: absent, already-desired, and divergent public refs;
@@ -436,14 +452,19 @@ policy in pure tests.
 Use temporary repositories and a real bare remote to cover:
 
 - symbolic default discovery and exact target agreement;
-- exact local head, owned-base, version, and marker namespace parsing;
+- exact local head, owned-base, version, and annotated-marker namespace
+  parsing, including mandatory peel-to-`v1` framing;
+- header-first marker kind and size bounds plus byte-exact canonical marker
+  decoding;
 - exact public branch presence and authoritative absence in the initial
   observation;
 - authoritative absence for requested names;
 - absence of unrelated head or tag requests;
-- source-ref-only object acquisition without local ref effects;
+- source-ref-only object acquisition for exact local version and marker refs
+  without local ref effects;
 - complete atomic tuple pushes and exact head/base leases;
-- immutable version and marker absence leases;
+- immutable version and marker absence leases, including same-identity no-op
+  and different-identity marker races;
 - identical competing tuple pushes where one changes the refs and both receive
   exact usable acknowledgements despite the second push's stale leases;
 - conflicting competing tuple pushes where one wins and the other receives an
@@ -469,16 +490,15 @@ responses fail automatically.
 
 Contracts cover:
 
-- one all-lifecycle alias per exact local head name;
+- one OPEN-only alias per exact local head name;
 - repository facts on the first request only;
 - independent pagination where aliases advance at different rates;
 - fork-only pages followed to exhaustion;
-- lifecycle pages followed independently to exhaustion;
+- OPEN pages followed independently to exhaustion;
 - fork-only pages followed until sealed absence or same-repository evidence;
-- multiple OPEN rows selecting the lowest number independently of pagination
-  order while retaining higher identities for closure;
-- lower CLOSED and every MERGED row rejecting while higher CLOSED rows remain
-  admissible cleanup residue;
+- multiple OPEN rows retained independently of pagination order so the pure
+  join can select a marker-bound number or an unmarked deterministic
+  contender;
 - repeated local identity components rejecting ambiguity;
 - wrong returned head names and object IDs;
 - missing, null, duplicate, and extra aliases;
@@ -486,12 +506,13 @@ Contracts cover:
 - fatal partial data plus errors;
 - resource-limit backoff without consuming a cursor;
 - bounded transient query retry;
-- stable owned-base create documents;
-- exact create-key and object-ID receipts;
+- exact draft-conversion documents and OPEN/draft identity receipts;
+- stable draft owned-base create documents;
+- exact create-key, object-ID, and draft-state receipts;
 - receipt identity uniqueness scoped to the exact local rows and create
   aliases retained by one attempt;
 - exact close documents, bounded batches, and CLOSED identity receipts;
-- minimal update documents and exact OPEN identity receipts;
+- minimal update documents and exact OPEN identity/draft-state receipts;
 - mixed close-before-update projection documents whose alias-count and byte
   limits preserve every operation exactly once across batches; and
 - arbitrary subsets of complete nullable mutation aliases.
@@ -512,10 +533,10 @@ System tests are reserved for complete process claims:
 - root/default and nonroot/self-owned final pull request bases;
 - one installed-hook rejection which blocks the enclosing push before every
   external write;
-- focused recovery after lost tuple, create, marker, and final-projection
-  acknowledgements;
+- focused recovery after lost draft-conversion, tuple, create, marker, and
+  final-projection acknowledgements;
 - one delayed-create race where a root has already left its owned base and the
-  next attempt closes only the higher duplicate;
+  next attempt closes only the noncanonical duplicate;
 - one overlapping two-publisher race where an exact-lease loser performs no
   later GitHub write; and
 - platform-specific executable discovery and process behavior.
@@ -692,8 +713,8 @@ repeating the primary owner's full matrix.
 | Empty stack avoids GitHub | Orchestration unit | One installed-hook scenario |
 | Exact local Git names | Git adapter | One complete publication trace |
 | Version and marker normalization | Pure planner | Bare-remote ref assertions |
-| Pull request history classification | Pure table | GraphQL pagination contracts |
-| Pull request text and navigation | Pure renderer | One lifecycle snapshot |
+| Pull request marker join and draft state | Pure table | GraphQL pagination contracts |
+| Pull request text and navigation | Pure renderer | One projection snapshot |
 | Minimal update masks | Pure planner | GraphQL encoding contract |
 | Tuple, public, and marker decisions | Pure planner | Real atomic-push contracts |
 | Restart convergence | Semantic world | Focused lost-ack composition |
@@ -726,28 +747,35 @@ refs/tags/gherrit/G/vN       -> H
 
 The tuple is one indivisible effect. An optional public-branch transition is a
 separate, visible effect at the end of the initial Git stage. The independently
-optional `refs/tags/gherrit/G/pr` marker is a later create-only effect. Pure
-tests cover every meaningful durable prefix and exact complete-alias subset
-before rebuilding the planner from observation.
+optional `refs/tags/gherrit/G/pr` marker is a later create-only annotated tag
+which peels to `v1` and records the canonical pull request number. Required
+draft conversions form an earlier GraphQL barrier. Pure tests cover every
+meaningful durable prefix and exact complete-alias subset before rebuilding the
+planner from observation.
 
 Focused planner tables own the complete relation among published history,
-marker state, sealed absence or a nonempty OPEN set, canonical identity,
-duplicate identities, root status, landing automation, and desired projection.
-Correlation tables separately own terminal-only history rejection. In
-particular the tests prove:
+marker identity, sealed absence or a nonempty OPEN set, canonical identity,
+duplicate identities, root status, draft state, landing automation, and
+desired projection. In particular the tests prove:
 
 - absent plus marker absence is the only create authority;
 - absent plus marker presence fails closed;
 - every OPEN row passes history, base, and landing-state validation before any
   duplicate can be closed;
-- every noncanonical duplicate rejects landing automation even when it is
-  already based on the default branch;
-- the lowest OPEN number is canonical regardless of response order;
-- OPEN without a marker remains on the owned base and authorizes one marker;
-- terminal-only history never reaches the planner;
+- every unmarked contender and noncanonical duplicate must be draft on its
+  owned base and reject landing automation;
+- a marker selects its exact OPEN number regardless of response order or
+  duplicate number ordering;
+- without a marker, the lowest OPEN number is only a deterministic contender;
+- a marker whose exact number is absent from the OPEN set fails closed;
+- canonical draft-owned, draft-default, and ready-default states are accepted,
+  while ready-owned is unrepresentable;
+- only a ready-default canonical row whose desired base is owned requires the
+  draft-conversion barrier;
 - an unexplained OPEN head is rejected;
-- every create uses `G` and `gherrit-bases/G`;
-- every higher OPEN identity becomes an exact closure after the marker barrier;
+- every create uses `G` and `gherrit-bases/G` with `draft: true`;
+- every noncanonical OPEN identity becomes an exact closure after the marker
+  barrier;
   and
 - final root and nonroot bases apply only to the canonical identity.
 
@@ -755,11 +783,11 @@ particular the tests prove:
 
 Git fixtures seed real commits and establish published tuples in one ref
 transaction. They accept literal base object IDs and independently optional
-marker targets. They never infer a base from another change's current head or
-a marker from pull request state.
+marker identities. They never infer a base from another change's current head
+or a marker number from pull request state.
 
-After publication, tests inspect the bare remote and assert all tuple and
-public refs and object IDs. Lost-ack tests perform a real successful atomic
+After publication, tests inspect the bare remote and assert all tuple, public,
+and marker refs, peeled targets, strict tag bytes, and object IDs. Lost-ack tests perform a real successful atomic
 push and replace or corrupt only its acknowledgement. They prove that each
 batch leaves a complete atomic-unit prefix, that earlier tuple batches may
 remain after a later public-containing batch fails, and that no GitHub action
@@ -770,11 +798,10 @@ assert failure and exact absence of further Git or GitHub writes.
 
 ### GitHub protocol evidence
 
-The scripted transport proves exact local all-lifecycle queries, complete
-independent pagination, repository/default agreement, fork filtering,
-lifecycle ordering and rejection, stable owned-base creates, complete alias
-receipts, and mixed exact duplicate-closure and minimal canonical-update
-projections.
+The scripted transport proves exact local OPEN-only queries, complete
+independent pagination, repository/default agreement, fork filtering, exact
+draft conversion, stable draft owned-base creates, complete alias receipts,
+and mixed exact duplicate-closure and minimal canonical-update projections.
 
 A one-shot visibility expectation hides a known OPEN pull request for exactly
 one local-ID observation without removing it from fake durable state. It proves
@@ -782,8 +809,9 @@ these recovery cases:
 
 - an unmarked omission repeats only the stable owned-base key;
 - a marked omission produces no create and fails closed; and
-- omission of a lower canonical row never authorizes its closure, while later
-  complete visibility selects it and closes visible higher rows.
+- omission of the marker-bound canonical row never authorizes its closure or
+  replacement, while later complete visibility restores it and closes every
+  visible noncanonical row.
 
 Large pull request populations with other head names must leave the GraphQL
 documents, local evidence set, planner result, and mutation trace unchanged.
@@ -798,13 +826,13 @@ Retained process scenarios prove:
    empty public local intent projects only its public branch.
 2. One-change, two-change, and mixed established/new stacks publish literal
    complete tuples and correct final bases.
-3. A lifecycle trace retains complete initial batches, including the optional
-   public effect after all tuples, then orders create, marker publication, and
-   one final projection stage whose close aliases precede canonical-update
-   aliases in each request.
+3. A lifecycle trace orders required draft conversions before complete initial
+   batches, retains the optional public effect after all tuples, then orders
+   create, marker publication, and one final projection stage whose close
+   aliases precede canonical-update aliases in each request.
 4. Incomplete tuples, unsafe bases, and owned-base landing automation reject
    before every write.
-5. Lost tuple, public, create, marker, and final-projection acknowledgements
+5. Lost draft-conversion, tuple, public, create, marker, and final-projection acknowledgements
    leave safe durable prefixes; fresh invocations converge without
    confirmation reads or mutation retries.
 6. Exact local Git and GitHub reads overlap after stack derivation, and no
@@ -812,9 +840,9 @@ Retained process scenarios prove:
 7. Two overlapping publishers prove that identical publication receives an
    acknowledged no-op while a publisher with a conflicting desired tuple loses
    its exact lease and stops before every later GitHub stage.
-8. A delayed stale create after a root retarget produces a higher OPEN row;
-   the next fresh invocation closes only that duplicate and retains the lower
-   canonical identity.
+8. A delayed stale create after a root retarget produces a noncanonical OPEN
+   row; the next fresh invocation closes only that duplicate and retains the
+   marker-bound canonical identity.
 
 Complete readable snapshots show results, traces, refs, and pull requests.
 Structural assertions remain mandatory for literal object IDs, tuple
