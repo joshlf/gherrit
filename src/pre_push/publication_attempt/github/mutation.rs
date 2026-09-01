@@ -884,20 +884,9 @@ pub(in crate::pre_push::publication_attempt) struct PreparedPullRequestProjectio
     batches: Box<[PreparedProjectionBatch]>,
     #[cfg(test)]
     operations: Box<[TestPullRequestProjection]>,
-    #[cfg(test)]
-    legacy_updates: Option<Box<[TestUpdate]>>,
 }
 
 impl PreparedPullRequestProjection {
-    /// Test compatibility for pre-duplicate semantic drivers. Production
-    /// planning uses [`Self::prepare`] so closes and updates share batching.
-    #[cfg(test)]
-    pub(in crate::pre_push::publication_attempt) fn new(
-        updates: Vec<UpdatePullRequest>,
-    ) -> Result<Self> {
-        Self::prepare(Vec::new(), updates)
-    }
-
     pub(in crate::pre_push::publication_attempt) fn prepare(
         closes: Vec<ClosePullRequest>,
         updates: Vec<UpdatePullRequest>,
@@ -914,61 +903,12 @@ impl PreparedPullRequestProjection {
         validate_projection_identities(&operations)?;
         let batches = prepare_projection_batches(&operations)?;
         #[cfg(test)]
-        let legacy_updates = operations
-            .iter()
-            .all(|operation| matches!(operation, PullRequestProjectionOperation::Update(_)))
-            .then(|| {
-                operations
-                    .iter()
-                    .map(|operation| match operation {
-                        PullRequestProjectionOperation::Update(update) => TestUpdate {
-                            identity: update.identity.clone(),
-                            title: update.title.clone(),
-                            body: update.body.clone(),
-                            base_branch: update.base_branch.clone(),
-                        },
-                        PullRequestProjectionOperation::Close(_) => {
-                            unreachable!("the all-update predicate was checked")
-                        }
-                    })
-                    .collect()
-            });
-        #[cfg(test)]
         let operations =
             operations.into_iter().map(PullRequestProjectionOperation::into_test).collect();
         Ok(Self {
             batches,
             #[cfg(test)]
             operations,
-            #[cfg(test)]
-            legacy_updates,
-        })
-    }
-
-    /// Compatibility view used by semantic tests which predate duplicate
-    /// repair. It deliberately rejects a mixed projection instead of hiding
-    /// close effects from those tests.
-    #[cfg(test)]
-    pub(in crate::pre_push::publication_attempt) fn operations_for_test(&self) -> &[TestUpdate] {
-        self.legacy_updates.as_deref().expect("a legacy update view cannot omit duplicate closes")
-    }
-
-    #[cfg(test)]
-    pub(in crate::pre_push::publication_attempt) fn batches_for_test(
-        &self,
-    ) -> impl ExactSizeIterator<Item = &[TestUpdate]> + '_ {
-        let operations = self.operations_for_test();
-        assert_eq!(
-            self.batches.iter().map(|batch| batch.expected.len()).sum::<usize>(),
-            operations.len(),
-            "semantic update operations must cover the exact prepared batches"
-        );
-        let mut start = 0;
-        self.batches.iter().map(move |batch| {
-            let end = start + batch.expected.len();
-            let batch_operations = &operations[start..end];
-            start = end;
-            batch_operations
         })
     }
 
@@ -1012,13 +952,6 @@ impl PreparedPullRequestProjection {
     }
 
     #[cfg(test)]
-    pub(super) fn for_test(operations: Vec<TestUpdate>) -> Result<Self> {
-        Self::new(
-            operations.into_iter().map(TestUpdate::into_operation).collect::<Result<Vec<_>>>()?,
-        )
-    }
-
-    #[cfg(test)]
     pub(super) fn for_projection_test(
         closes: Vec<TestClose>,
         updates: Vec<TestUpdate>,
@@ -1029,9 +962,6 @@ impl PreparedPullRequestProjection {
         )
     }
 }
-
-#[cfg(test)]
-pub(in crate::pre_push::publication_attempt) type PreparedUpdates = PreparedPullRequestProjection;
 
 impl Github {
     pub(in crate::pre_push::publication_attempt) async fn create_pull_requests(
@@ -1046,14 +976,6 @@ impl Github {
         projection: PreparedPullRequestProjection,
     ) -> Result<()> {
         projection.execute(self).await
-    }
-
-    #[cfg(test)]
-    pub(in crate::pre_push::publication_attempt) async fn update_pull_requests(
-        &self,
-        updates: PreparedUpdates,
-    ) -> Result<()> {
-        self.project_pull_requests(updates).await
     }
 }
 
@@ -1101,6 +1023,16 @@ impl TestUpdate {
 pub(in crate::pre_push::publication_attempt) enum TestPullRequestProjection {
     Close(TestClose),
     Update(TestUpdate),
+}
+
+#[cfg(test)]
+impl TestPullRequestProjection {
+    fn identity(&self) -> &PullRequestIdentity {
+        match self {
+            Self::Close(close) => &close.identity,
+            Self::Update(update) => &update.identity,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1315,18 +1247,18 @@ mod tests {
                 .unwrap()
             })
             .collect::<Vec<_>>();
-        let prepared = PreparedUpdates::new(operations).unwrap();
+        let prepared = PreparedPullRequestProjection::prepare(Vec::new(), operations).unwrap();
         assert_eq!(prepared.batches.len(), 2);
         assert_eq!(prepared.batches[0].expected.len(), MAX_MUTATION_ALIASES);
         assert_eq!(prepared.batches[1].expected.len(), 1);
-        let semantic_batches = prepared.batches_for_test().collect::<Vec<_>>();
+        let semantic_batches = prepared.projection_batches_for_test().collect::<Vec<_>>();
         assert_eq!(
             semantic_batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
             [MAX_MUTATION_ALIASES, 1]
         );
-        assert_eq!(semantic_batches[0][0].identity.number().get(), 1);
+        assert_eq!(semantic_batches[0][0].identity().number().get(), 1);
         assert_eq!(
-            semantic_batches[1][0].identity.number().get(),
+            semantic_batches[1][0].identity().number().get(),
             u32::try_from(MAX_MUTATION_ALIASES + 1).unwrap()
         );
 
@@ -1344,7 +1276,7 @@ mod tests {
             MAX_MUTATION_REQUEST_BYTES
         );
         exact.body.as_mut().unwrap().push('x');
-        assert!(PreparedUpdates::new(vec![exact]).is_err());
+        assert!(PreparedPullRequestProjection::prepare(Vec::new(), vec![exact]).is_err());
 
         let mut late_oversized = (1..=MAX_MUTATION_ALIASES)
             .map(|number| {
@@ -1370,7 +1302,7 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(PreparedUpdates::new(late_oversized).is_err());
+        assert!(PreparedPullRequestProjection::prepare(Vec::new(), late_oversized).is_err());
     }
 
     #[test]
@@ -1393,7 +1325,12 @@ mod tests {
             .is_err()
         );
 
-        assert!(PreparedUpdates::new(Vec::new()).unwrap().operations_for_test().is_empty());
+        assert!(
+            PreparedPullRequestProjection::prepare(Vec::new(), Vec::new())
+                .unwrap()
+                .projection_operations_for_test()
+                .is_empty()
+        );
         let one = PullRequestIdentity::new(1, "ONE".to_owned()).unwrap();
         assert!(UpdatePullRequest::new(one.clone(), None, None, None).is_err());
         let same_number = PullRequestIdentity::new(1, "TWO".to_owned()).unwrap();
@@ -1401,8 +1338,20 @@ mod tests {
         let update = |identity| {
             UpdatePullRequest::new(identity, Some("title".to_owned()), None, None).unwrap()
         };
-        assert!(PreparedUpdates::new(vec![update(one.clone()), update(same_number)]).is_err());
-        assert!(PreparedUpdates::new(vec![update(one), update(same_node)]).is_err());
+        assert!(
+            PreparedPullRequestProjection::prepare(
+                Vec::new(),
+                vec![update(one.clone()), update(same_number)]
+            )
+            .is_err()
+        );
+        assert!(
+            PreparedPullRequestProjection::prepare(
+                Vec::new(),
+                vec![update(one), update(same_node)]
+            )
+            .is_err()
+        );
     }
 
     #[test]
