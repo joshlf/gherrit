@@ -3,7 +3,7 @@ fn pull_request_query(head: &str) -> testutil::GraphQlOperation {
 }
 
 #[test]
-fn non_open_pr_blocks_all_mutations() {
+fn merged_marker_bound_pr_fails_closed_without_mutations() {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_initial_commit()
@@ -16,6 +16,13 @@ fn non_open_pr_blocks_all_mutations() {
     ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
 
     let pr = ctx.github().pull_requests().pop().expect("created pull request");
+    ctx.github().seed_pull_request(testutil::PullRequestSeed::new(
+        2,
+        "Visible but unmarked duplicate",
+        "",
+        pr.head.clone(),
+        pr.base.clone(),
+    ));
     ctx.github().set_pull_request_state(pr.number, testutil::PullRequestState::Merged);
 
     let refs_before = ctx.remote_refs("refs");
@@ -27,7 +34,7 @@ fn non_open_pr_blocks_all_mutations() {
     testutil::assert_failure_snapshot!(
         ctx,
         ctx.hook_cmd("pre-push"),
-        "non_open_pr_blocks_mutations",
+        "merged_marker_bound_pr_fails_closed_without_mutations",
     );
 
     assert_eq!(ctx.remote_refs("refs"), refs_before);
@@ -48,7 +55,7 @@ fn non_open_pr_blocks_all_mutations() {
 }
 
 #[test]
-fn complete_all_lifecycle_connection_precedes_terminal_rejection() {
+fn terminal_rows_are_excluded_from_open_only_observation() {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_initial_commit()
@@ -87,43 +94,32 @@ fn complete_all_lifecycle_connection_precedes_terminal_rejection() {
         ctx.github().set_pull_request_state(number, state);
     }
 
-    ctx.hook_cmd("pre-push")
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "both closed and merged pull request history (for example PR #11)",
-        ))
-        .stderr(predicates::str::contains("Additional terminal pull requests omitted: 1"));
+    ctx.hook_cmd("pre-push").assert().success();
 
     assert_eq!(
         ctx.github().requests(),
         vec![
             vec![pull_request_query(&id)],
-            vec![testutil::GraphQlOperation::PullRequestQuery {
-                connections: vec![testutil::PullRequestConnectionQuery::after(
-                    id.clone(),
-                    format!("cursor:{id}:1"),
-                )],
-                include_repository_facts: false,
-            }],
-            vec![testutil::GraphQlOperation::PullRequestQuery {
-                connections: vec![testutil::PullRequestConnectionQuery::after(
-                    id.clone(),
-                    format!("cursor:{id}:2"),
-                )],
-                include_repository_facts: false,
-            }],
-            vec![testutil::GraphQlOperation::PullRequestQuery {
-                connections: vec![testutil::PullRequestConnectionQuery::after(
-                    id.clone(),
-                    format!("cursor:{id}:3"),
-                )],
-                include_repository_facts: false,
-            }],
+            vec![testutil::GraphQlOperation::CreatePr],
+            vec![testutil::GraphQlOperation::UpdatePr],
         ],
-        "every lifecycle row must be captured before terminal evidence rejects"
+        "terminal rows must neither appear in nor paginate the OPEN-only observation"
     );
-    assert!(ctx.recorded_pushes().is_empty());
+    assert_eq!(ctx.recorded_pushes().len(), 2);
+    assert_eq!(
+        ctx.github()
+            .pull_requests()
+            .into_iter()
+            .map(|pull_request| (pull_request.number, pull_request.state))
+            .collect::<Vec<_>>(),
+        [
+            (9, testutil::PullRequestState::Closed),
+            (10, testutil::PullRequestState::Merged),
+            (11, testutil::PullRequestState::Closed),
+            (12, testutil::PullRequestState::Merged),
+            (13, testutil::PullRequestState::Open),
+        ]
+    );
 }
 
 #[test]

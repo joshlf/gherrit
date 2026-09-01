@@ -238,11 +238,12 @@ next version.
 
 Before writing, GHerrit observes the exact default branch, the optional public
 branch, and only the owned Git namespaces and GitHub connections for IDs in
-the local stack. It exhausts one logical GitHub connection per ID, including
-open, closed, and merged pull requests. This keeps network and backend work
-proportional to the local stack and its history rather than to unrelated
-repository state. It validates and plans the complete stack before publishing
-any prefix.
+the local stack. It exhausts one OPEN-only GitHub connection per ID. Terminal
+rows are not downloaded: an immutable Git marker identifies the canonical
+pull request number, and an absent marker-bound OPEN row makes the attempt fail
+closed. This keeps network and backend work proportional to the local stack
+and currently relevant rows rather than to unrelated repository state. It
+validates and plans the complete stack before publishing any prefix.
 
 Before the first network wait, GHerrit captures the logical local branch, its
 checked management intent, and its exact `HEAD` object as one attempt input.
@@ -265,22 +266,30 @@ operation, and all initial Git batches must be acknowledged before GHerrit
 creates or updates a pull request. An empty public stack still projects its
 branch tip but does not authenticate to GitHub.
 
-Pull-request existence uses a separate immutable marker,
-`refs/tags/gherrit/G/pr`. GHerrit can create this marker only after observing
-the PR or receiving its exact create acknowledgement. The marker is a second
-Git barrier: final GitHub projection is unavailable until the marker push is
-acknowledged. A crash or lost acknowledgement can therefore leave only safe
-states—a complete old or new tuple, a public branch at its prior or desired
-tip, a PR on its permanent owned base, or a completed marker. GHerrit does not
-roll effects back or retry ambiguous writes within the same attempt; the next
-invocation reconstructs authority from Git and exact local PR observations.
+Canonical pull request identity uses a separate immutable annotated marker,
+`refs/tags/gherrit/G/pr`, which records one pull request number and targets the
+first published revision. Without a marker, the lowest visible OPEN number is
+only a deterministic contender. GHerrit can construct that contender's marker
+after observing it or after receiving an exact create acknowledgement. The
+fixed marker ref's absence lease admits only one different tag object. The
+acknowledged marker—not number ordering—permanently selects the canonical
+pull request.
 
-If more than one valid same-repository open pull request has the same
-`gherrit-pr-id` head, the lowest-numbered pull request is canonical. After the
-marker barrier, GHerrit closes the higher-numbered duplicates and applies the
-desired base, title, body, and navigation only to the canonical pull request.
-This makes an earlier lost create acknowledgement repairable without letting
-an incompletely observed pull request be closed.
+Every create is a draft on its permanent owned base. If a marker-bound ready
+root will become a nonroot, GHerrit first converts it to draft and requires an
+exact acknowledgement before any Git write. The marker is a later Git barrier:
+final GitHub projection is unavailable until its push is acknowledged. After
+that barrier, GHerrit closes every other visible OPEN pull request regardless
+of number and applies the desired base, title, body, and navigation only to the
+marker-bound canonical row. GHerrit never marks a pull request ready
+automatically.
+
+A crash or lost acknowledgement can therefore leave only safe states—a draft
+conversion, a complete old or new tuple, a public branch at its prior or
+desired tip, a draft pull request on its permanent owned base, or a completed
+marker. GHerrit does not roll effects back or retry ambiguous writes within
+the same attempt; the next invocation reconstructs authority from Git and
+exact local OPEN observations.
 
 #### `pre-push` Hook
 

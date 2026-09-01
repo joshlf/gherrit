@@ -64,15 +64,9 @@ expression: acknowledged.attempts
       head: "0000000000000000000000000000000000000014"
       base: 000000000000000000000000000000000000000a
 - Markers:
-    - options:
-        - "--porcelain"
-        - "--atomic"
-        - "--no-follow-tags"
-        - "--recurse-submodules=no"
-        - "--no-signed"
-        - "--force-with-lease=refs/tags/gherrit/Gfresh/pr:"
-      refspecs:
-        - "0000000000000000000000000000000000000014:refs/tags/gherrit/Gfresh/pr"
+    - id: Gfresh
+      v1: "0000000000000000000000000000000000000014"
+      number: 100
 - Projection:
     - Update:
         number: 100

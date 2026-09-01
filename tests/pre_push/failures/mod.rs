@@ -544,7 +544,7 @@ fn test_pre_push_edit_failure() {
 }
 
 #[test]
-fn update_receipt_rejects_a_concurrent_close_and_retry_observes_terminal_history() {
+fn update_receipt_rejects_a_concurrent_close_and_retry_fails_closed() {
     let ctx =
         testutil::test_context!().with_remote().with_initial_commit().with_mock_github().build();
     ctx.checkout_managed_private("feature-concurrent-close");
@@ -576,11 +576,14 @@ fn update_receipt_rejects_a_concurrent_close_and_retry_observes_terminal_history
     let refs_before_retry = ctx.remote_refs("refs");
     let pull_requests_before_retry = ctx.github().pull_requests();
 
-    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains("PR #1 is closed"));
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has a pull request marker but no OPEN pull request"));
     assert_eq!(
         &ctx.github().requests()[requests_before_retry..],
         [vec![head_query(&ctx)]],
-        "the retry must recover the terminal PR from durable history"
+        "the retry must stop when OPEN-only observation omits the marker-bound PR"
     );
     assert_eq!(ctx.remote_refs("refs"), refs_before_retry);
     assert_eq!(ctx.github().pull_requests(), pull_requests_before_retry);

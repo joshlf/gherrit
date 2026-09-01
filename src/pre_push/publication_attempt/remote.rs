@@ -21,9 +21,7 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::{ObjectId, bstr::ByteSlice as _};
 
 use super::{
-    history::{
-        ExternalGraphRoot, GraphLoadError, PreparedExactLocalHistories, ValidatedChangeHistory,
-    },
+    history::{GraphLoadError, PreparedExactLocalHistories, ValidatedChangeHistory},
     version::Version,
 };
 use crate::{
@@ -214,10 +212,11 @@ impl ExactLocalObservation<'_, '_, '_> {
     /// Consumes this exact observation through one straight-line graph load.
     ///
     /// Complete and invalid evidence return without constructing acquisition
-    /// input. A missing advertised root negotiates its exact aliases. A
-    /// missing ancestor refetches that causal root only for a repository which
-    /// was already promisor; an ordinary repository fails before network I/O.
-    /// One successful fetch permits exactly one authoritative final reload.
+    /// input. Missing advertised state negotiates one bounded payload of all
+    /// exact external-history aliases and marker refs. A missing ancestor uses
+    /// the same payload in refetch mode only for a repository which was
+    /// already promisor; an ordinary repository fails before network I/O. One
+    /// successful fetch permits exactly one authoritative final reload.
     async fn validate_histories(self) -> Result<Box<[ValidatedChangeHistory]>> {
         let Self { local, repository, destination, raw } = self;
         let prepared = PreparedExactLocalHistories::prepare(raw, local, repository)?;
@@ -228,7 +227,8 @@ impl ExactLocalObservation<'_, '_, '_> {
             }
             Err(GraphLoadError::Invalid(error)) => return Err(error),
             Err(GraphLoadError::MissingAdvertisedRoot(missing)) => {
-                ExactAcquisition::Negotiated(missing.root())
+                let _ = missing;
+                ExactAcquisition::Negotiated
             }
             Err(GraphLoadError::MissingAncestor(missing)) => {
                 if !repository.has_promisor_remote()? {
@@ -238,11 +238,17 @@ impl ExactLocalObservation<'_, '_, '_> {
                         missing.root().oid()
                     );
                 }
-                ExactAcquisition::Refetch(missing.root())
+                ExactAcquisition::Refetch
+            }
+            Err(GraphLoadError::MissingMarkerObject(_)) => {
+                // The acquisition payload includes every marker source ref as
+                // well as every external graph alias, so this remains the
+                // same one bounded fetch boundary as missing history.
+                ExactAcquisition::Negotiated
             }
         };
 
-        acquire(repository, destination, request).await?;
+        acquire(repository, destination, request, &prepared).await?;
         // This second and final load is authoritative. There is deliberately
         // no loop or reclassification after the one acquisition attempt.
         let graph = prepared.load_graph().map_err(GraphLoadError::into_report)?;
@@ -274,10 +280,11 @@ pub(super) async fn observe_and_validate_histories(
 async fn acquire(
     repository: &util::Repo,
     destination: &PushDestination,
-    request: ExactAcquisition<'_>,
+    request: ExactAcquisition,
+    prepared: &PreparedExactLocalHistories<'_, '_>,
 ) -> Result<()> {
-    let (root, mode) = request.into_parts();
-    let input = prepare_fetch_input(root)?;
+    let mode = request.into_mode();
+    let input = prepare_fetch_input(prepared.acquisition_source_refs())?;
     if !destination.belongs_to(repository)? {
         bail!("Exact Git acquisition received a destination from a different repository");
     }
@@ -325,23 +332,24 @@ fn remote_command_failure(
     )
 }
 
-enum ExactAcquisition<'root> {
-    Negotiated(&'root ExternalGraphRoot),
-    Refetch(&'root ExternalGraphRoot),
+enum ExactAcquisition {
+    Negotiated,
+    Refetch,
 }
 
-impl<'root> ExactAcquisition<'root> {
-    fn into_parts(self) -> (&'root ExternalGraphRoot, ExactObjectFetchMode) {
+impl ExactAcquisition {
+    fn into_mode(self) -> ExactObjectFetchMode {
         match self {
-            Self::Negotiated(root) => (root, ExactObjectFetchMode::Negotiated),
-            Self::Refetch(root) => (root, ExactObjectFetchMode::Refetch),
+            Self::Negotiated => ExactObjectFetchMode::Negotiated,
+            Self::Refetch => ExactObjectFetchMode::Refetch,
         }
     }
 }
 
-fn prepare_fetch_input(root: &ExternalGraphRoot) -> Result<RegularFileStdin> {
+fn prepare_fetch_input<'a>(source_refs: impl Iterator<Item = &'a str>) -> Result<RegularFileStdin> {
+    let source_refs = source_refs.collect::<Vec<_>>();
     checked_payload_length(
-        root.source_refs().map(|source_ref| {
+        source_refs.iter().map(|source_ref| {
             u64::try_from(source_ref.len())
                 .map_err(|_| eyre!("Exact acquisition source-ref length overflowed"))
         }),
@@ -352,17 +360,17 @@ fn prepare_fetch_input(root: &ExternalGraphRoot) -> Result<RegularFileStdin> {
     // file. The builder owns GHerrit's writable handle and removes the name
     // before ownership crosses the subprocess boundary.
     let mut input = RegularFileStdinBuilder::new()?;
-    write_fetch_payload(root, &mut input)
+    write_fetch_payload(source_refs, &mut input)
         .wrap_err("Failed to prepare bounded exact Git acquisition input")?;
     input.finish().map_err(Into::into)
 }
 
 fn write_fetch_payload(
-    root: &ExternalGraphRoot,
+    source_refs: impl IntoIterator<Item = impl AsRef<str>>,
     output: &mut impl std::io::Write,
 ) -> std::io::Result<()> {
-    for source_ref in root.source_refs() {
-        output.write_all(source_ref.as_bytes())?;
+    for source_ref in source_refs {
+        output.write_all(source_ref.as_ref().as_bytes())?;
         output.write_all(b"\n")?;
     }
     Ok(())
@@ -418,7 +426,7 @@ pub(super) struct RawExactLocalChange {
     candidate_head: Option<ObjectId>,
     owned_base: Option<ObjectId>,
     versions: Box<[RawVersionRef]>,
-    pull_request_marker: Option<ObjectId>,
+    pull_request_marker: Option<RawPullRequestMarker>,
 }
 
 /// The components of one consumed raw exact-local change.
@@ -427,7 +435,7 @@ pub(super) struct RawExactLocalChangeParts {
     pub(super) candidate_head: Option<ObjectId>,
     pub(super) owned_base: Option<ObjectId>,
     pub(super) versions: Box<[RawVersionRef]>,
-    pub(super) pull_request_marker: Option<ObjectId>,
+    pub(super) pull_request_marker: Option<RawPullRequestMarker>,
 }
 
 impl RawExactLocalChange {
@@ -462,8 +470,36 @@ impl RawExactLocalChange {
     }
 
     #[cfg(test)]
-    pub(super) fn pull_request_marker(&self) -> Option<ObjectId> {
-        self.pull_request_marker
+    pub(super) fn pull_request_marker(&self) -> Option<&RawPullRequestMarker> {
+        self.pull_request_marker.as_ref()
+    }
+}
+
+/// Exact annotated-tag evidence for the immutable pull-request marker.
+///
+/// `tag` is the unpeeled annotated tag object. `v1` is the mandatory peeled
+/// commit advertised beside it. The source ref is retained so a missing tag
+/// object can join the one exact acquisition with history aliases.
+#[derive(Debug)]
+pub(super) struct RawPullRequestMarker {
+    tag: ObjectId,
+    v1: ObjectId,
+    source_ref: Box<str>,
+}
+
+impl RawPullRequestMarker {
+    pub(super) fn into_parts(self) -> (ObjectId, ObjectId, Box<str>) {
+        (self.tag, self.v1, self.source_ref)
+    }
+
+    #[cfg(test)]
+    pub(super) fn tag(&self) -> ObjectId {
+        self.tag
+    }
+
+    #[cfg(test)]
+    pub(super) fn v1(&self) -> ObjectId {
+        self.v1
     }
 }
 
@@ -578,7 +614,13 @@ struct PendingChange {
     candidate_head: Option<ObjectId>,
     owned_base: Option<ObjectId>,
     versions: BTreeMap<Version, RawVersionRef>,
-    pull_request_marker: Option<ObjectId>,
+    pull_request_marker: PendingPullRequestMarker,
+}
+
+#[derive(Default)]
+struct PendingPullRequestMarker {
+    tag: Option<ObjectId>,
+    v1: Option<ObjectId>,
 }
 
 fn parse_query<'id>(
@@ -662,15 +704,15 @@ fn parse_query<'id>(
             let index = requested.get(id.as_str().as_bytes()).ok_or_else(|| {
                 eyre!("remote advertised managed tags for an unrequested GHerrit change")
             })?;
-            if record.peeled {
-                bail!(
-                    "remote managed tag for GHerrit change '{}' is annotated rather than lightweight",
-                    id.as_str()
-                );
-            }
             let change = &mut pending[*index];
             match tag {
                 ManagedTag::Version(version) => {
+                    if record.peeled {
+                        bail!(
+                            "remote managed version tag for GHerrit change '{}' is annotated rather than lightweight",
+                            id.as_str()
+                        );
+                    }
                     let source_ref = str::from_utf8(record.name)
                         .expect("a validated managed version ref is ASCII")
                         .into();
@@ -684,10 +726,14 @@ fn parse_query<'id>(
                     }
                 }
                 ManagedTag::PullRequestMarker => {
-                    if change.pull_request_marker.replace(record.object_id).is_some() {
+                    let slot = if record.peeled {
+                        &mut change.pull_request_marker.v1
+                    } else {
+                        &mut change.pull_request_marker.tag
+                    };
+                    if slot.replace(record.object_id).is_some() {
                         bail!(
-                            "remote advertised the pull-request marker for GHerrit change '{}' more than once",
-                            id.as_str()
+                            "remote advertised the same pull-request marker framing record more than once"
                         );
                     }
                 }
@@ -710,17 +756,35 @@ fn parse_query<'id>(
         bail!("exact local observation omitted the default branch");
     }
 
-    Ok(ids
+    ids
         .into_iter()
         .zip(pending)
-        .map(|(id, pending)| RawExactLocalChange {
-            id: id.clone(),
-            candidate_head: pending.candidate_head,
-            owned_base: pending.owned_base,
-            versions: pending.versions.into_values().collect(),
-            pull_request_marker: pending.pull_request_marker,
+        .map(|(id, pending)| {
+            let pull_request_marker = match (pending.pull_request_marker.tag, pending.pull_request_marker.v1) {
+                (None, None) => None,
+                (Some(tag), Some(v1)) => Some(RawPullRequestMarker {
+                    tag,
+                    v1,
+                    source_ref: format!("refs/tags/gherrit/{}/pr", id.as_str()).into(),
+                }),
+                (Some(_), None) => bail!(
+                    "remote pull-request marker for GHerrit change '{}' is lightweight or omitted its peeled v1 commit",
+                    id.as_str()
+                ),
+                (None, Some(_)) => bail!(
+                    "remote pull-request marker for GHerrit change '{}' omitted its unpeeled annotated tag object",
+                    id.as_str()
+                ),
+            };
+            Ok(RawExactLocalChange {
+                id: id.clone(),
+                candidate_head: pending.candidate_head,
+                owned_base: pending.owned_base,
+                versions: pending.versions.into_values().collect(),
+                pull_request_marker,
+            })
         })
-        .collect())
+        .collect()
 }
 
 fn is_requested_tail_match(
@@ -1388,15 +1452,11 @@ mod tests {
     }
 
     #[test]
-    fn exact_acquisition_payload_contains_only_the_causal_roots_aliases() {
-        let root = ExternalGraphRoot::for_test(
-            ObjectId::from_hex(HEAD.as_bytes()).unwrap(),
-            "refs/tags/gherrit/A/v1",
-            &["refs/tags/gherrit/A/v3"],
-        );
+    fn exact_acquisition_payload_contains_only_the_requested_source_refs() {
+        let refs = ["refs/tags/gherrit/A/v1", "refs/tags/gherrit/A/v3"];
         let mut payload = Vec::new();
 
-        write_fetch_payload(&root, &mut payload).unwrap();
+        write_fetch_payload(refs, &mut payload).unwrap();
 
         assert_eq!(payload, b"refs/tags/gherrit/A/v1\nrefs/tags/gherrit/A/v3\n");
         assert!(!payload.windows(HEAD.len()).any(|bytes| bytes == HEAD.as_bytes()));
@@ -1405,7 +1465,7 @@ mod tests {
                 .windows(b"refs/tags/gherrit/B/v1".len())
                 .any(|bytes| { bytes == b"refs/tags/gherrit/B/v1" })
         );
-        let _sealed = prepare_fetch_input(&root).unwrap();
+        let _sealed = prepare_fetch_input(refs.iter().copied()).unwrap();
     }
 
     #[test]
@@ -1489,7 +1549,8 @@ mod tests {
              {HEAD}\trefs/heads/Gone\n\
              {BASE}\trefs/heads/gherrit-bases/Gone\n\
              {HEAD}\trefs/tags/gherrit/Gone/v1\n\
-             {MARKER}\trefs/tags/gherrit/Gone/pr\n"
+             {MARKER}\trefs/tags/gherrit/Gone/pr\n\
+             {HEAD}\trefs/tags/gherrit/Gone/pr^{{}}\n"
         )
     }
 
@@ -1570,6 +1631,7 @@ mod tests {
              {BASE}\trefs/heads/gherrit-bases/First\n\
              {DEFAULT}\trefs/heads/main\n\
              {MARKER}\trefs/tags/gherrit/Second/pr\n\
+             {BASE}\trefs/tags/gherrit/Second/pr^{{}}\n\
              {HEAD}\trefs/heads/Second\n\
              {BASE}\trefs/tags/gherrit/Second/v1\n"
         );
@@ -1584,7 +1646,8 @@ mod tests {
         );
         assert_eq!(changes[0].owned_base().unwrap().to_string(), BASE);
         assert_eq!(changes[1].candidate_head().unwrap().to_string(), HEAD);
-        assert_eq!(changes[1].pull_request_marker().unwrap().to_string(), MARKER);
+        assert_eq!(changes[1].pull_request_marker().unwrap().tag().to_string(), MARKER);
+        assert_eq!(changes[1].pull_request_marker().unwrap().v1().to_string(), BASE);
         assert_eq!(
             changes[1]
                 .versions()
@@ -1610,7 +1673,7 @@ mod tests {
         assert_eq!(change.candidate_head(), None);
         assert_eq!(change.owned_base(), None);
         assert_eq!(change.versions().len(), 0);
-        assert_eq!(change.pull_request_marker(), None);
+        assert!(change.pull_request_marker().is_none());
 
         assert!(decode(&ids, [b"".as_slice()]).is_err());
         let moved = format!("{HEAD}\trefs/heads/main\n");
@@ -1698,7 +1761,7 @@ mod tests {
         assert_eq!(change.candidate_head(), None);
         assert_eq!(change.owned_base(), None);
         assert_eq!(change.versions().len(), 0);
-        assert_eq!(change.pull_request_marker(), None);
+        assert!(change.pull_request_marker().is_none());
 
         let duplicate_noise = format!(
             "{DEFAULT}\trefs/heads/main\n\
@@ -1717,11 +1780,11 @@ mod tests {
         assert_eq!(change.candidate_head(), None);
         assert_eq!(change.owned_base(), None);
         assert_eq!(change.versions().len(), 0);
-        assert_eq!(change.pull_request_marker(), None);
+        assert!(change.pull_request_marker().is_none());
     }
 
     #[test]
-    fn rejects_duplicate_refs_and_all_peeled_owned_refs() {
+    fn rejects_duplicate_refs_and_peeled_non_marker_refs() {
         let ids = [id("Gone")];
         for records in [
             format!("{HEAD}\trefs/heads/Gone\n{BASE}\trefs/heads/Gone\n"),
@@ -1733,11 +1796,46 @@ mod tests {
             format!("{HEAD}\trefs/heads/Gone^{{}}\n"),
             format!("{HEAD}\trefs/heads/gherrit-bases/Gone^{{}}\n"),
             format!("{HEAD}\trefs/tags/gherrit/Gone/v1\n{BASE}\trefs/tags/gherrit/Gone/v1^{{}}\n"),
-            format!("{HEAD}\trefs/tags/gherrit/Gone/pr\n{BASE}\trefs/tags/gherrit/Gone/pr^{{}}\n"),
         ] {
             let output = format!("{DEFAULT}\trefs/heads/main\n{records}");
             assert!(decode(&ids, [output.as_bytes()]).is_err(), "accepted {output:?}");
         }
+    }
+
+    #[test]
+    fn marker_requires_one_unpeeled_tag_and_one_peeled_v1_commit() {
+        let ids = [id("Gone")];
+        let framed = format!(
+            "{DEFAULT}\trefs/heads/main\n\
+             {MARKER}\trefs/tags/gherrit/Gone/pr\n\
+             {HEAD}\trefs/tags/gherrit/Gone/pr^{{}}\n"
+        );
+        let observed = decode(&ids, [framed.as_bytes()]).unwrap();
+        let marker = observed.iter().next().unwrap().pull_request_marker().unwrap();
+        assert_eq!(marker.tag().to_string(), MARKER);
+        assert_eq!(marker.v1().to_string(), HEAD);
+
+        let unpeeled_only =
+            format!("{DEFAULT}\trefs/heads/main\n{MARKER}\trefs/tags/gherrit/Gone/pr\n");
+        assert_eq!(
+            decode(&ids, [unpeeled_only.as_bytes()]).unwrap_err().to_string(),
+            "remote pull-request marker for GHerrit change 'Gone' is lightweight or omitted its peeled v1 commit"
+        );
+
+        let peeled_only =
+            format!("{DEFAULT}\trefs/heads/main\n{HEAD}\trefs/tags/gherrit/Gone/pr^{{}}\n");
+        assert_eq!(
+            decode(&ids, [peeled_only.as_bytes()]).unwrap_err().to_string(),
+            "remote pull-request marker for GHerrit change 'Gone' omitted its unpeeled annotated tag object"
+        );
+
+        let duplicate_peeled = format!(
+            "{DEFAULT}\trefs/heads/main\n{MARKER}\trefs/tags/gherrit/Gone/pr\n{HEAD}\trefs/tags/gherrit/Gone/pr^{{}}\n{BASE}\trefs/tags/gherrit/Gone/pr^{{}}\n"
+        );
+        assert_eq!(
+            decode(&ids, [duplicate_peeled.as_bytes()]).unwrap_err().to_string(),
+            "exact local observation returned the same remote ref record more than once"
+        );
     }
 
     #[test]
@@ -1786,14 +1884,15 @@ mod tests {
             "{DEFAULT}\trefs/heads/main\n\
              {HEAD}\trefs/heads/Gone\n\
              {BASE}\trefs/tags/gherrit/Gone/v3\n\
-             {MARKER}\trefs/tags/gherrit/Gone/pr\n"
+             {MARKER}\trefs/tags/gherrit/Gone/pr\n\
+             {BASE}\trefs/tags/gherrit/Gone/pr^{{}}\n"
         );
         let observed = decode(&ids, [output.as_bytes()]).unwrap();
         let change = observed.iter().next().unwrap();
         assert_eq!(change.candidate_head().unwrap().to_string(), HEAD);
         assert_eq!(change.owned_base(), None);
         assert_eq!(change.versions().next().unwrap().version().get(), 3);
-        assert_eq!(change.pull_request_marker().unwrap().to_string(), MARKER);
+        assert_eq!(change.pull_request_marker().unwrap().tag().to_string(), MARKER);
     }
 
     #[test]

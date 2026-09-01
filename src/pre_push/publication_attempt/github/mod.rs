@@ -23,19 +23,20 @@ mod pull_request;
 mod transport;
 
 pub(super) use mutation::{
-    ClosePullRequest, CompleteCreateReceipts, CreatePullRequest, PreflightedDuplicateCloses,
-    PreparedCreates, PreparedPullRequestProjection, UpdatePullRequest,
+    ClosePullRequest, CompleteCreateReceipts, CreatePullRequest, DraftPullRequest,
+    PreflightedDuplicateCloses, PreparedCreates, PreparedDraftConversions,
+    PreparedPullRequestProjection, UpdatePullRequest,
 };
 #[cfg(test)]
 pub(in crate::pre_push::publication_attempt) use mutation::{
-    TestClose, TestCreate, TestPullRequestProjection, TestUpdate,
+    TestClose, TestCreate, TestDraft, TestPullRequestProjection, TestUpdate,
 };
-#[cfg(test)]
-pub(super) use observation::ObservedBase;
 pub(super) use observation::{
     AbsentPullRequest, BaseKind, CompleteLocalPullRequests, LocalPullRequestObservation,
-    ManagedOpenPullRequestCandidate, ManagedOpenPullRequests,
+    ManagedOpenPullRequestCandidate, SelectedOpenPullRequest,
 };
+#[cfg(test)]
+pub(super) use observation::{ManagedOpenPullRequests, ObservedBase};
 pub(super) use pull_request::{PullRequestIdentity, PullRequestNumber};
 pub(super) use transport::Github;
 
