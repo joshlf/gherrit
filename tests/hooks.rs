@@ -206,7 +206,7 @@ fn composite_hook_observes_complete_internal_pushes_and_unterminated_output() {
     ctx.git_cmd().env("GHERRIT_HOOK_LOG", &log).arg("push").assert().success();
 
     assert!(ctx.remote_ref_oid(&format!("refs/heads/{id}")).is_some());
-    assert!(ctx.remote_ref_oid(&format!("refs/tags/gherrit/{id}/pr")).is_some());
+    let marker = ctx.remote_ref_oid(&format!("refs/tags/gherrit/{id}/pr")).unwrap();
     assert_eq!(ctx.github().pull_requests().len(), 1);
     assert_eq!(
         fs::read_to_string(log).unwrap(),
@@ -218,7 +218,7 @@ fn composite_hook_observes_complete_internal_pushes_and_unterminated_output() {
              record:gherrit-publication:{head} {head} refs/tags/gherrit/{id}/v1 {null}\n\
              policy:gherrit-publication\n\
              enter:gherrit-publication\n\
-             record:gherrit-publication:{head} {head} refs/tags/gherrit/{id}/pr {null}\n\
+             record:gherrit-publication:{marker} {marker} refs/tags/gherrit/{id}/pr {null}\n\
              policy:gherrit-publication\n\
              policy:.\n"
         )

@@ -64,6 +64,7 @@ pub struct PrEntry {
     pub body: String,
     pub head: BranchState,
     pub base: BranchState,
+    pub is_draft: bool,
     pub auto_merge: bool,
     pub in_merge_queue: bool,
 }
@@ -87,6 +88,7 @@ impl PrEntry {
             body,
             head: BranchState { name: head, oid: String::new() },
             base: BranchState { name: base, oid: String::new() },
+            is_draft: true,
             auto_merge: false,
             in_merge_queue: false,
         }
@@ -223,6 +225,7 @@ fn graphql_operations(
                     GraphQlOperation::PullRequestQuery { connections, include_repository_facts }
                 }
                 "createPullRequest" => GraphQlOperation::CreatePr,
+                "convertPullRequestToDraft" => GraphQlOperation::DraftPr,
                 "closePullRequest" => GraphQlOperation::ClosePr,
                 "updatePullRequest" => GraphQlOperation::UpdatePr,
                 _ => continue,
@@ -356,9 +359,13 @@ fn validate_input_fields(
                 "The mock GitHub API does not support input field `{path}.input.{name}`"
             ));
         }
-        if !matches!(&**value, ast::Value::String(_)) {
+        let supported_type = match name.as_str() {
+            "draft" => matches!(&**value, ast::Value::Boolean(_)),
+            _ => matches!(&**value, ast::Value::String(_)),
+        };
+        if !supported_type {
             return Err(format!(
-                "The mock GitHub API only supports inline string values at `{path}.input.{name}`"
+                "The mock GitHub API does not support this value at `{path}.input.{name}`"
             ));
         }
     }
@@ -407,11 +414,11 @@ fn validate_pull_request_states(field: &executable::Field) -> Result<(), String>
         })
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| {
-            "The mock GitHub API requires an exact production pull request lifecycle query"
+            "The mock GitHub API requires an exact production OPEN-only pull-request query"
                 .to_string()
         })?;
-    if states != ["OPEN", "CLOSED", "MERGED"] {
-        return Err("The mock GitHub API requires states: [OPEN, CLOSED, MERGED]".to_string());
+    if states != ["OPEN"] {
+        return Err("The mock GitHub API requires states: [OPEN]".to_string());
     }
     Ok(())
 }
@@ -467,6 +474,7 @@ fn validate_pull_requests_field(
                         "headRefName",
                         "headRefOid",
                         "state",
+                        "isDraft",
                         "isCrossRepository",
                         "autoMergeRequest",
                         "isInMergeQueue",
@@ -579,6 +587,7 @@ fn validate_create_field(field: &executable::Field) -> Result<(), String> {
             "headRefName",
             "title",
             "body",
+            "draft",
             "clientMutationId",
         ],
     )?;
@@ -592,6 +601,9 @@ fn validate_create_field(field: &executable::Field) -> Result<(), String> {
         "clientMutationId",
     ] {
         required_string_field(input, required, PATH)?;
+    }
+    if get_bool_field(input, "draft") != Some(true) {
+        return Err("The mock GitHub API requires draft pull request creation".to_string());
     }
 
     for field in
@@ -607,6 +619,7 @@ fn validate_create_field(field: &executable::Field) -> Result<(), String> {
                         "number",
                         "id",
                         "state",
+                        "isDraft",
                         "headRefName",
                         "headRefOid",
                         "headRepository",
@@ -722,6 +735,46 @@ fn validate_close_field(field: &executable::Field) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_draft_field(field: &executable::Field) -> Result<(), String> {
+    const PATH: &str = "convertPullRequestToDraft";
+    validate_argument_names(field, PATH, &["input"])?;
+    let input = input_object(field, PATH)?;
+    validate_input_fields(input, PATH, &["pullRequestId", "clientMutationId"])?;
+    required_string_field(input, "pullRequestId", PATH)?;
+    required_string_field(input, "clientMutationId", PATH)?;
+    for field in
+        validate_exact_fields(&field.selection_set, PATH, &["clientMutationId", "pullRequest"])?
+    {
+        match field.name.as_str() {
+            "clientMutationId" => {}
+            "pullRequest" => {
+                for selected in validate_exact_fields(
+                    &field.selection_set,
+                    "convertPullRequestToDraft.pullRequest",
+                    &[
+                        "number",
+                        "id",
+                        "state",
+                        "isDraft",
+                        "headRefName",
+                        "headRefOid",
+                        "baseRefName",
+                        "baseRefOid",
+                    ],
+                )? {
+                    validate_scalar_fields(
+                        &selected.selection_set,
+                        "convertPullRequestToDraft.pullRequest.scalar",
+                        &[],
+                    )?;
+                }
+            }
+            _ => unreachable!("the exact draft conversion field set was checked"),
+        }
+    }
+    Ok(())
+}
+
 fn validate_supported_document(
     document: &ExecutableDocument,
     variables: &GraphQlVariables,
@@ -748,14 +801,19 @@ fn validate_supported_document(
     let has_projection = fields
         .iter()
         .any(|field| matches!(field.name.as_str(), "closePullRequest" | "updatePullRequest"));
-    if has_create && has_projection {
+    let has_draft_conversion = fields.iter().any(|field| field.name == "convertPullRequestToDraft");
+    if has_create && (has_projection || has_draft_conversion) {
         return Err("The mock GitHub API does not mix pull request creation with final projection"
             .to_string());
+    }
+    if has_draft_conversion && has_projection {
+        return Err("The mock GitHub API requires draft safety before final projection".to_string());
     }
     for field in fields {
         match field.name.as_str() {
             "repository" => validate_repository_field(field, variables)?,
             "createPullRequest" => validate_create_field(field)?,
+            "convertPullRequestToDraft" => validate_draft_field(field)?,
             "closePullRequest" => validate_close_field(field)?,
             "updatePullRequest" => validate_update_field(field)?,
             _ => {
@@ -857,6 +915,9 @@ async fn graphql(
                         "createPullRequest" => {
                             handle_create_pr(&mut mock_state, field, &branch_oid)
                         }
+                        "convertPullRequestToDraft" => {
+                            handle_draft_pr(&mut mock_state, field, &branch_oid)
+                        }
                         "closePullRequest" => handle_close_pr(&mut mock_state, field),
                         "updatePullRequest" => {
                             handle_update_pr(&mut mock_state, field, &branch_oid, false)
@@ -889,6 +950,9 @@ async fn graphql(
 
                 let result = match field.name.as_str() {
                     "createPullRequest" => handle_create_pr(&mut mock_state, field, &branch_oid),
+                    "convertPullRequestToDraft" => {
+                        handle_draft_pr(&mut mock_state, field, &branch_oid)
+                    }
                     "closePullRequest" => handle_close_pr(&mut mock_state, field),
                     "updatePullRequest" => {
                         handle_update_pr(&mut mock_state, field, &branch_oid, concurrent_close)
@@ -1107,6 +1171,13 @@ fn get_string_field(obj: &[(Name, Node<ast::Value>)], key: &str) -> Option<Strin
     })
 }
 
+fn get_bool_field(obj: &[(Name, Node<ast::Value>)], key: &str) -> Option<bool> {
+    obj.iter().find(|(name, _)| name == key).and_then(|(_, value)| match &**value {
+        ast::Value::Boolean(value) => Some(*value),
+        _ => None,
+    })
+}
+
 fn required_string_field(
     input: &[(Name, Node<ast::Value>)],
     key: &str,
@@ -1114,6 +1185,57 @@ fn required_string_field(
 ) -> Result<String, String> {
     get_string_field(input, key)
         .ok_or_else(|| format!("The mock GitHub API requires string field `{path}.input.{key}`"))
+}
+
+fn handle_draft_pr(
+    mock_state: &mut MockState,
+    field: &executable::Field,
+    branch_oid: &dyn Fn(&str) -> Result<Option<String>, String>,
+) -> Result<serde_json::Value, String> {
+    const PATH: &str = "convertPullRequestToDraft";
+    let input = input_object(field, PATH)?;
+    let node_id = required_string_field(input, "pullRequestId", PATH)?;
+    let client_mutation_id = required_string_field(input, "clientMutationId", PATH)?;
+    let Some(pr) = mock_state.prs.iter_mut().find(|pr| pr.node_id == node_id) else {
+        return Err(format!("Pull request node `{node_id}` does not exist"));
+    };
+    if pr.state != PullRequestState::Open {
+        return Err(format!("Pull request node `{node_id}` is not OPEN and cannot become a draft"));
+    }
+    let head_oid = branch_oid(&pr.head.name)?.unwrap_or_else(|| pr.head.oid.clone());
+    let base_oid = branch_oid(&pr.base.name)?.unwrap_or_else(|| pr.base.oid.clone());
+    pr.is_draft = true;
+
+    let mut response = serde_json::Map::new();
+    for field in selected_fields(&field.selection_set, PATH)? {
+        match field.name.as_str() {
+            "clientMutationId" => {
+                response.insert(response_key(field), serde_json::json!(client_mutation_id));
+            }
+            "pullRequest" => {
+                let mut pull_request = serde_json::Map::new();
+                for field in
+                    selected_fields(&field.selection_set, "convertPullRequestToDraft.pullRequest")?
+                {
+                    let value = match field.name.as_str() {
+                        "number" => serde_json::json!(pr.number),
+                        "id" => serde_json::json!(pr.node_id),
+                        "state" => serde_json::json!(pr.state),
+                        "isDraft" => serde_json::json!(pr.is_draft),
+                        "headRefName" => serde_json::json!(pr.head.name),
+                        "headRefOid" => serde_json::json!(head_oid),
+                        "baseRefName" => serde_json::json!(pr.base.name),
+                        "baseRefOid" => serde_json::json!(base_oid),
+                        _ => unreachable!("request was checked by validate_draft_field"),
+                    };
+                    pull_request.insert(response_key(field), value);
+                }
+                response.insert(response_key(field), serde_json::Value::Object(pull_request));
+            }
+            _ => unreachable!("request was checked by validate_draft_field"),
+        }
+    }
+    Ok(serde_json::Value::Object(response))
 }
 
 fn handle_close_pr(
@@ -1242,6 +1364,9 @@ fn handle_create_pr(
     let head = required_string_field(input, "headRefName", PATH)?;
     let title = required_string_field(input, "title", PATH)?;
     let body = required_string_field(input, "body", PATH)?;
+    if get_bool_field(input, "draft") != Some(true) {
+        return Err("The mock GitHub API requires draft pull request creation".to_string());
+    }
     let client_mutation_id = required_string_field(input, "clientMutationId", PATH)?;
 
     if repository_id != "REPO_NODE_ID" {
@@ -1279,6 +1404,7 @@ fn handle_create_pr(
                         "number" => serde_json::json!(number),
                         "id" => serde_json::json!(node_id),
                         "state" => serde_json::json!("OPEN"),
+                        "isDraft" => serde_json::json!(true),
                         "headRefName" => serde_json::json!(head),
                         "headRefOid" => serde_json::json!(head_oid),
                         "headRepository" | "baseRepository" => {
@@ -1365,8 +1491,11 @@ fn handle_repository_query(
                         )
                     })
                     .transpose()?;
-                let matching_prs =
-                    mock_state.prs.iter().filter(|pr| pr.head.name == head).collect::<Vec<_>>();
+                let matching_prs = mock_state
+                    .prs
+                    .iter()
+                    .filter(|pr| pr.head.name == head && pr.state == PullRequestState::Open)
+                    .collect::<Vec<_>>();
                 let offset = after
                     .as_deref()
                     .map(|raw_cursor| {
@@ -1488,6 +1617,7 @@ fn project_pr_node(
             "headRefOid" => serde_json::json!(head_oid),
             "state" => serde_json::json!(pr.state),
             "isCrossRepository" => serde_json::json!(is_cross_repository),
+            "isDraft" => serde_json::json!(pr.is_draft),
             "autoMergeRequest" => {
                 if pr.auto_merge {
                     serde_json::json!({ "enabledAt": "2026-01-01T00:00:00Z" })
@@ -1536,9 +1666,9 @@ mod tests {
         parse_document(&format!(
             "query {{ repository(owner: \"owner\", name: \"repo\") {{ {facts}\
              op0: pullRequests(headRefName: \"Ghead\", first: 1{after}, \
-             states: [OPEN, CLOSED, MERGED]) {{ nodes {{ number, id, title, body, \
+             states: [OPEN]) {{ nodes {{ number, id, title, body, \
              baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, \
-             autoMergeRequest {{ enabledAt }}, isInMergeQueue }} \
+             autoMergeRequest {{ enabledAt }}, isInMergeQueue, isDraft }} \
              pageInfo {{ hasNextPage, endCursor }} }} }} }}"
         ))
     }
@@ -1620,10 +1750,10 @@ mod tests {
              repository(owner: $owner, name: $name) { id, \
              defaultBranchRef { name, target { oid } }, \
              op0: pullRequests(headRefName: \"Ghead\", first: 1, \
-             states: [OPEN, CLOSED, MERGED]) { \
+             states: [OPEN]) { \
              nodes { number, id, title, body, baseRefName, baseRefOid, headRefName, \
              headRefOid, state, isCrossRepository, autoMergeRequest { enabledAt }, \
-             isInMergeQueue } pageInfo { hasNextPage, endCursor } } } }",
+             isInMergeQueue, isDraft } pageInfo { hasNextPage, endCursor } } } }",
         );
         validate_supported_document(&query_with_variables, &variables).unwrap();
         validate_supported_document(&exact_local_document(None, false), &None).unwrap();
@@ -1632,9 +1762,9 @@ mod tests {
             "mutation { op0: createPullRequest(input: { repositoryId: \
              \"REPO_NODE_ID\", headRepositoryId: \"REPO_NODE_ID\", \
              baseRefName: \"main\", headRefName: \"Ghead\", \
-             title: \"Title\", body: \"Body\", clientMutationId: \
+             title: \"Title\", body: \"Body\", draft: true, clientMutationId: \
              \"gherrit:create:Ghead\" }) { clientMutationId, pullRequest { \
-             number, id, state, headRefName, headRefOid, headRepository { id }, \
+             number, id, state, isDraft, headRefName, headRefOid, headRepository { id }, \
              baseRefName, baseRefOid, baseRepository { id } } } }",
         );
         validate_supported_document(&create, &None).unwrap();
@@ -1734,14 +1864,9 @@ mod tests {
             .unwrap_err()
             .contains("duplicate response key `createPullRequest`"));
 
-        for states in [
-            "[OPEN]",
-            "[CLOSED, MERGED]",
-            "[OPEN, OPEN]",
-            "[MERGED, CLOSED, OPEN]",
-            "[CLOSED]",
-            "[MERGED]",
-        ] {
+        for states in
+            ["[CLOSED, MERGED]", "[OPEN, OPEN]", "[MERGED, CLOSED, OPEN]", "[CLOSED]", "[MERGED]"]
+        {
             let unsupported_states = parse_document(&format!(
                 "query {{ repository(owner: \"owner\", name: \"repo\") {{ \
                  op0: pullRequests(headRefName: \"Ghead\", first: 1, \
@@ -1750,13 +1875,13 @@ mod tests {
             ));
             assert!(validate_supported_document(&unsupported_states, &None)
                 .unwrap_err()
-                .contains("states: [OPEN, CLOSED, MERGED]"));
+                .contains("states: [OPEN]"));
         }
 
         let incomplete_node_fields = parse_document(
             "query { repository(owner: \"owner\", name: \"repo\") { \
              op0: pullRequests(headRefName: \"Ghead\", first: 1, \
-             states: [OPEN, CLOSED, MERGED]) { \
+             states: [OPEN]) { \
              nodes { number, id, headRefName, state, isCrossRepository } \
              pageInfo { hasNextPage, endCursor } } } }",
         );
@@ -1814,24 +1939,24 @@ mod tests {
             "query ProductionPullRequests($owner: String!, $name: String!) { \
              repository(owner: $owner, name: $name) { \
              op0: pullRequests(headRefName: \"Ghead\", first: 1, \
-             states: [OPEN, CLOSED, MERGED]) { \
+             states: [OPEN]) { \
              nodes { number, id, title, body, baseRefName, baseRefOid, headRefName, \
              headRefOid, state, isCrossRepository, autoMergeRequest { enabledAt }, \
-             isInMergeQueue } pageInfo { hasNextPage, endCursor } } } }",
+             isInMergeQueue, isDraft } pageInfo { hasNextPage, endCursor } } } }",
         );
         let error = validate_supported_document(&document, &None).unwrap_err();
         assert!(error.contains("variable `$owner`"), "unexpected error: {error}");
     }
 
     #[test]
-    fn repository_response_projects_the_exact_all_lifecycle_contract() {
+    fn repository_response_projects_the_exact_open_contract() {
         let document = parse_document(
             "query { repository(owner: \"owner\", name: \"repo\") { \
              id, defaultBranchRef { name, target { oid } } \
              op0: pullRequests(headRefName: \"Ghead\", first: 1, \
-             states: [OPEN, CLOSED, MERGED]) { nodes { number, id, title, body, \
+             states: [OPEN]) { nodes { number, id, title, body, \
              baseRefName, baseRefOid, headRefName, headRefOid, state, \
-             isCrossRepository, autoMergeRequest { enabledAt }, isInMergeQueue } \
+             isCrossRepository, autoMergeRequest { enabledAt }, isInMergeQueue, isDraft } \
              pageInfo { hasNextPage, endCursor } } } }",
         );
         validate_supported_document(&document, &None).unwrap();
@@ -1877,6 +2002,7 @@ mod tests {
                         "headRefName": "Ghead",
                         "headRefOid": "2222222222222222222222222222222222222222",
                         "state": "OPEN",
+                        "isDraft": true,
                         "isCrossRepository": true,
                         "autoMergeRequest": { "enabledAt": "2026-01-01T00:00:00Z" },
                         "isInMergeQueue": true
@@ -2021,52 +2147,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(second["op0"]["nodes"][0]["number"], 2);
-        assert_eq!(second["op0"]["pageInfo"]["hasNextPage"], true);
-        assert_eq!(second["op0"]["pageInfo"]["endCursor"], "cursor:Ghead:2");
-
-        let third = exact_local_document(Some("cursor:Ghead:2"), false);
-        validate_supported_document(&third, &None).unwrap();
-        let third = handle_repository_query(
-            &state,
-            root_field(&third),
-            &None,
-            &|| panic!("later pages must not request repository facts"),
-            &branch_oid,
-        )
-        .unwrap();
-        assert_eq!(
-            third["op0"]["nodes"][0],
-            serde_json::json!({
-                "number": 3,
-                "id": "PR_3",
-                "title": "Closed",
-                "body": "Not projected",
-                "baseRefName": "main",
-                "baseRefOid": "3333333333333333333333333333333333333333",
-                "headRefName": "Ghead",
-                "headRefOid": "2222222222222222222222222222222222222222",
-                "state": "CLOSED",
-                "isCrossRepository": false,
-                "autoMergeRequest": null,
-                "isInMergeQueue": false,
-            })
-        );
-        assert_eq!(third["op0"]["pageInfo"]["hasNextPage"], true);
-        assert_eq!(third["op0"]["pageInfo"]["endCursor"], "cursor:Ghead:3");
-
-        let fourth = exact_local_document(Some("cursor:Ghead:3"), false);
-        let fourth = handle_repository_query(
-            &state,
-            root_field(&fourth),
-            &None,
-            &|| panic!("later pages must not request repository facts"),
-            &branch_oid,
-        )
-        .unwrap();
-        assert_eq!(fourth["op0"]["nodes"][0]["number"], 4);
-        assert_eq!(fourth["op0"]["nodes"][0]["state"], "MERGED");
-        assert_eq!(fourth["op0"]["pageInfo"]["hasNextPage"], false);
-        assert!(fourth["op0"]["pageInfo"]["endCursor"].is_null());
+        assert_eq!(second["op0"]["pageInfo"]["hasNextPage"], false);
+        assert!(second["op0"]["pageInfo"]["endCursor"].is_null());
 
         let wrong_head = exact_local_document(Some("cursor:Gother:1"), false);
         let error = handle_repository_query(
@@ -2098,15 +2180,15 @@ mod tests {
         for query in [
             "query { repository(owner: \"other\", name: \"repo\") { \
              op0: pullRequests(headRefName: \"Ghead\", first: 1, \
-             states: [OPEN, CLOSED, MERGED]) { nodes { number, id, title, body, \
+             states: [OPEN]) { nodes { number, id, title, body, \
              baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, \
-             autoMergeRequest { enabledAt }, isInMergeQueue } \
+             autoMergeRequest { enabledAt }, isInMergeQueue, isDraft } \
              pageInfo { hasNextPage, endCursor } } } }",
             "query { repository(owner: \"owner\", name: \"other\") { \
              op0: pullRequests(headRefName: \"Ghead\", first: 1, \
-             states: [OPEN, CLOSED, MERGED]) { nodes { number, id, title, body, \
+             states: [OPEN]) { nodes { number, id, title, body, \
              baseRefName, baseRefOid, headRefName, headRefOid, state, isCrossRepository, \
-             autoMergeRequest { enabledAt }, isInMergeQueue } \
+             autoMergeRequest { enabledAt }, isInMergeQueue, isDraft } \
              pageInfo { hasNextPage, endCursor } } } }",
         ] {
             let document = parse_document(query);
@@ -2132,7 +2214,7 @@ mod tests {
         let document = parse_document(
             "mutation { createPullRequest(input: { repositoryId: \"REPO_NODE_ID\", \
              headRepositoryId: \"REPO_NODE_ID\", baseRefName: \"main\", \
-             headRefName: \"Gnew\", title: \"Title\", body: \"Body\", \
+             headRefName: \"Gnew\", title: \"Title\", body: \"Body\", draft: true, \
              clientMutationId: \"create\" }) { \
              pullRequest { number } } }",
         );
@@ -2154,6 +2236,7 @@ mod tests {
         assert_eq!(response.pointer("/pullRequest/number"), Some(&serde_json::json!(9)));
         assert_eq!(state.prs.len(), 3);
         assert!(state.prs.iter().all(|pr| pr.state == PullRequestState::Open));
+        assert!(state.prs.iter().all(|pr| pr.is_draft));
         assert!(state.prs.iter().all(|pr| pr.head.name == "Gnew"));
         assert_eq!(
             state.prs.iter().map(|pr| pr.node_id.as_str()).collect::<Vec<_>>(),
@@ -2175,11 +2258,11 @@ mod tests {
             "mutation { first: createPullRequest(input: { repositoryId: \
              \"REPO_NODE_ID\", headRepositoryId: \"REPO_NODE_ID\", \
              baseRefName: \"main\", headRefName: \"Gnew\", \
-             title: \"First\", body: \"First body\", clientMutationId: \"first\" }) { \
+             title: \"First\", body: \"First body\", draft: true, clientMutationId: \"first\" }) { \
              clientMutationId } second: createPullRequest(input: { \
              repositoryId: \"REPO_NODE_ID\", \
              headRepositoryId: \"REPO_NODE_ID\", baseRefName: \"main\", \
-             headRefName: \"Gnew\", title: \"Second\", body: \"Second body\", clientMutationId: \
+             headRefName: \"Gnew\", title: \"Second\", body: \"Second body\", draft: true, clientMutationId: \
              \"second\" }) { clientMutationId } }",
         );
         let operation = document.operations.iter().next().unwrap();
@@ -2199,7 +2282,7 @@ mod tests {
         let create = parse_document(
             "mutation { createPullRequest(input: { repositoryId: \"WRONG\", \
              headRepositoryId: \"WRONG\", baseRefName: \"main\", \
-             headRefName: \"Ghead\", title: \"Title\", body: \"Body\", \
+             headRefName: \"Ghead\", title: \"Title\", body: \"Body\", draft: true, \
              clientMutationId: \"create\" }) { \
              pullRequest { number } } }",
         );
