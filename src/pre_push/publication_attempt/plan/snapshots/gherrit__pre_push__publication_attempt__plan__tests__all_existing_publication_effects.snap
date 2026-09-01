@@ -17,15 +17,9 @@ expression: driver.attempts
         - "000000000000000000000000000000000000000a:refs/heads/gherrit-bases/Gexisting"
         - "0000000000000000000000000000000000000014:refs/tags/gherrit/Gexisting/v2"
 - Markers:
-    - options:
-        - "--porcelain"
-        - "--atomic"
-        - "--no-follow-tags"
-        - "--recurse-submodules=no"
-        - "--no-signed"
-        - "--force-with-lease=refs/tags/gherrit/Gexisting/pr:"
-      refspecs:
-        - "0000000000000000000000000000000000000065:refs/tags/gherrit/Gexisting/pr"
+    - id: Gexisting
+      v1: "0000000000000000000000000000000000000065"
+      number: 7
 - Projection:
     - Update:
         number: 7

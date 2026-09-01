@@ -9,6 +9,7 @@
 mod body;
 mod github;
 mod history;
+mod marker;
 mod plan;
 mod refs;
 mod remote;
@@ -217,7 +218,7 @@ impl ObservedLocalPublication {
         )?;
         let observation =
             CompletePublicationObservation { stack, public_branch, validated, github: observed };
-        plan::plan_publication(observation)?.execute().await?;
+        plan::plan_publication(observation)?.execute(repository).await?;
         Ok(count)
     }
 }
