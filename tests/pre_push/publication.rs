@@ -47,6 +47,18 @@ fn bare_ref_oid(ctx: &testutil::TestContext, repository: &Path, ref_name: &str) 
     }
 }
 
+fn remote_annotated_tag(ctx: &testutil::TestContext, ref_name: &str) -> String {
+    let bytes = ctx
+        .remote_git_cmd()
+        .args(["cat-file", "tag", ref_name])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(bytes).unwrap()
+}
+
 fn github_operation_count(
     ctx: &testutil::TestContext,
     operation: testutil::GraphQlOperation,
@@ -78,11 +90,11 @@ fn direct_pre_push_publishes_a_complete_stack() {
     testutil::assert_success_snapshot!(
         ctx,
         ctx.gherrit_cmd().args(["hook", "pre-push"]),
-        "full_stack_lifecycle_push"
+        "full_stack_initial_publication"
     );
 
     // Both the bare Git destination and the GitHub fake hold durable state.
-    testutil::assert_pr_snapshot!(ctx, "full_stack_lifecycle_state");
+    testutil::assert_pr_snapshot!(ctx, "full_stack_initial_state");
 
     let pushes = ctx.recorded_pushes();
     assert_eq!(pushes.len(), 2, "first publication requires a tuple and marker push");
@@ -148,6 +160,71 @@ fn lost_tuple_acknowledgement_recovers_from_durable_git_state() {
         ctx.recorded_pushes().len(),
         2,
         "retry acknowledges the existing tuple and only publishes its marker"
+    );
+}
+
+#[test]
+fn unmarked_paginated_rows_bind_the_lowest_contender_before_projection() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("unmarked-contenders");
+    let id = ctx.commit_with_gherrit_id("Select one provisional review");
+    ctx.inject_failure(testutil::FailureKind::GitPushOutput { preceding_pushes: 0, stdout: "" });
+
+    ctx.hook_cmd("pre-push").assert().failure();
+    ctx.assert_failure_consumed();
+    assert!(ctx.remote_ref_oid(&format!("refs/heads/{id}")).is_some());
+    assert!(ctx.remote_ref_oid(&format!("refs/tags/gherrit/{id}/pr")).is_none());
+
+    for (number, title) in [(12, "First page"), (9, "Lower contender on page two")] {
+        ctx.github().seed_pull_request(testutil::PullRequestSeed::new(
+            number,
+            title,
+            "",
+            id.clone(),
+            format!("gherrit-bases/{id}"),
+        ));
+    }
+    let requests_before = ctx.github().requests().len();
+    let pushes_before = ctx.recorded_pushes().len();
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    let pull_requests = ctx.github().pull_requests();
+    let canonical = pull_requests.iter().find(|pull_request| pull_request.number == 9).unwrap();
+    assert_eq!(canonical.state, testutil::PullRequestState::Open);
+    assert_eq!(canonical.base, "main");
+    assert_eq!(canonical.title, "Select one provisional review");
+    assert_eq!(
+        pull_requests.iter().find(|pull_request| pull_request.number == 12).unwrap().state,
+        testutil::PullRequestState::Closed
+    );
+    let marker_ref = format!("refs/tags/gherrit/{id}/pr");
+    assert!(
+        remote_annotated_tag(&ctx, &marker_ref).ends_with("gherrit-canonical-pr-v1 9\n"),
+        "the marker must bind the lowest contender seen only after pagination completed"
+    );
+    assert_eq!(ctx.recorded_pushes().len(), pushes_before + 1);
+    assert_eq!(
+        &ctx.github().requests()[requests_before..],
+        [
+            vec![testutil::GraphQlOperation::pull_request_query([id.clone()], true)],
+            vec![testutil::GraphQlOperation::pull_request_query(
+                [
+                    testutil::PullRequestConnectionQuery::after(
+                        id.clone(),
+                        format!("cursor:{id}:1"),
+                    )
+                ],
+                false,
+            )],
+            vec![testutil::GraphQlOperation::ClosePr, testutil::GraphQlOperation::UpdatePr],
+        ],
+        "no marker or projection decision may precede complete OPEN pagination"
     );
 }
 
@@ -316,7 +393,7 @@ fn lost_update_acknowledgement_recovers_without_replaying_the_mutation() {
 }
 
 #[test]
-fn duplicate_repair_recovers_after_losing_the_mixed_projection_response() {
+fn marker_identity_survives_a_lower_number_duplicate_and_lost_projection_response() {
     let ctx = testutil::test_context!()
         .with_remote()
         .with_initial_commit()
@@ -324,12 +401,25 @@ fn duplicate_repair_recovers_after_losing_the_mixed_projection_response() {
         .with_git_interceptor()
         .build();
     ctx.checkout_managed_private("duplicate-repair");
+    ctx.github().seed_pull_request(testutil::PullRequestSeed::new(
+        11,
+        "Unrelated review",
+        "",
+        "Gunrelated",
+        "main",
+    ));
     let id = ctx.commit_with_gherrit_id("Initial canonical pull request");
     ctx.hook_cmd("pre-push").assert().success();
-    let canonical = ctx.github().pull_requests().pop().unwrap();
-    ctx.github().seed_pull_request(testutil::PullRequestSeed::new(
-        12,
-        "Delayed duplicate",
+    let canonical = ctx
+        .github()
+        .pull_requests()
+        .into_iter()
+        .find(|pull_request| pull_request.head == id)
+        .unwrap();
+    assert_eq!(canonical.number, 12);
+    ctx.github().seed_earlier_pull_request(testutil::PullRequestSeed::new(
+        9,
+        "Lower-number duplicate",
         "",
         id.clone(),
         format!("gherrit-bases/{id}"),
@@ -345,11 +435,18 @@ fn duplicate_repair_recovers_after_losing_the_mixed_projection_response() {
     ctx.assert_failure_consumed();
 
     let repaired = ctx.github().pull_requests();
-    assert_eq!(repaired[0].number, canonical.number);
-    assert_eq!(repaired[0].state, testutil::PullRequestState::Open);
-    assert_eq!(repaired[0].title, "Repair duplicate pull requests");
-    assert_eq!(repaired[1].number, 12);
-    assert_eq!(repaired[1].state, testutil::PullRequestState::Closed);
+    let canonical = repaired.iter().find(|pull_request| pull_request.number == 12).unwrap();
+    assert_eq!(canonical.state, testutil::PullRequestState::Open);
+    assert_eq!(canonical.title, "Repair duplicate pull requests");
+    assert_eq!(
+        repaired.iter().find(|pull_request| pull_request.number == 9).unwrap().state,
+        testutil::PullRequestState::Closed
+    );
+    let marker_ref = format!("refs/tags/gherrit/{id}/pr");
+    assert!(
+        remote_annotated_tag(&ctx, &marker_ref).ends_with("gherrit-canonical-pr-v1 12\n"),
+        "the immutable marker must retain PR #12 despite visible PR #9"
+    );
     assert_eq!(
         &ctx.github().requests()[requests_before_repair..],
         [
@@ -376,19 +473,8 @@ fn duplicate_repair_recovers_after_losing_the_mixed_projection_response() {
     assert_eq!(ctx.recorded_pushes().len(), pushes_before_retry);
     assert_eq!(
         &ctx.github().requests()[requests_before_retry..],
-        &[
-            vec![testutil::GraphQlOperation::pull_request_query([id.clone()], true)],
-            vec![testutil::GraphQlOperation::pull_request_query(
-                [
-                    testutil::PullRequestConnectionQuery::after(
-                        id.clone(),
-                        format!("cursor:{id}:1"),
-                    )
-                ],
-                false,
-            )],
-        ],
-        "fresh observation must exhaust durable history without replaying the repair"
+        &[vec![testutil::GraphQlOperation::pull_request_query([id.clone()], true)]],
+        "fresh OPEN-only observation must not replay the repair or page through closed rows"
     );
 }
 
@@ -417,7 +503,7 @@ fn mixed_established_and_new_stack_publishes_only_the_new_change() {
             [established.clone(), new.clone()],
             true,
         )]],
-        "one all-lifecycle query must observe both established and absent heads"
+        "one OPEN-only query must observe both established and absent heads"
     );
     assert!(second_attempt_requests[1..].iter().flatten().all(|operation| !matches!(
         operation,

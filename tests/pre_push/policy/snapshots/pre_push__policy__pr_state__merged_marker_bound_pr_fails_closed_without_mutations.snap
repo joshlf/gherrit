@@ -10,4 +10,4 @@ STDOUT:
 STDERR:
 [gherrit] Branch feature-non-open is MANAGED. Publishing stack...
 [gherrit] [WARN] Using custom GitHub API URL: [MOCK_SERVER_URL]
-[gherrit] [ERROR] Cannot push GHerrit change '[GHERRIT_ID_1]' because PR #1 is merged. Change the commit's gherrit-pr-id to start a new review.
+[gherrit] [ERROR] GHerrit change '[GHERRIT_ID_1]' marker selects OPEN pull request #1 which GitHub did not return
