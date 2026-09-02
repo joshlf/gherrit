@@ -469,7 +469,8 @@ mod tests {
         super::{
             MAX_MUTATION_REQUEST_BYTES, PullRequestIdentity,
             mutation::{
-                PreparedCreates, PreparedPullRequestProjection, TestClose, TestCreate, TestUpdate,
+                DraftPullRequest, PreparedCreates, PreparedDraftConversions,
+                PreparedPullRequestProjection, TestClose, TestCreate, TestUpdate,
             },
             observation::LocalPullRequestObservation,
             pull_request::PullRequestIdentityRegistry,
@@ -797,7 +798,7 @@ mod tests {
             .enumerate()
             .map(|(index, (id, _))| {
                 format!(
-                    "op{index}: createPullRequest(input: {{ repositoryId: \"REPOSITORY_NODE\", headRepositoryId: \"REPOSITORY_NODE\", baseRefName: \"gherrit-bases/{id}\", headRefName: \"{id}\", title: \"title {id}\", body: \"body {id}\", clientMutationId: \"gherrit:create:{id}\" }}) {{ clientMutationId, pullRequest {{ number, id, state, headRefName, headRefOid, headRepository {{ id }}, baseRefName, baseRefOid, baseRepository {{ id }} }} }}"
+                    "op{index}: createPullRequest(input: {{ repositoryId: \"REPOSITORY_NODE\", headRepositoryId: \"REPOSITORY_NODE\", baseRefName: \"gherrit-bases/{id}\", headRefName: \"{id}\", title: \"title {id}\", body: \"body {id}\", draft: true, clientMutationId: \"gherrit:create:{id}\" }}) {{ clientMutationId, pullRequest {{ number, id, state, isDraft, headRefName, headRefOid, headRepository {{ id }}, baseRefName, baseRefOid, baseRepository {{ id }} }} }}"
                 )
             })
             .collect::<Vec<_>>()
@@ -818,12 +819,60 @@ mod tests {
                             "number": number,
                             "id": node_id,
                             "state": "OPEN",
+                            "isDraft": true,
                             "headRefName": id,
                             "headRefOid": oid(*head).to_string(),
                             "headRepository": { "id": "REPOSITORY_NODE" },
                             "baseRefName": format!("gherrit-bases/{id}"),
                             "baseRefOid": oid(1).to_string(),
                             "baseRepository": { "id": "REPOSITORY_NODE" },
+                        },
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        json!({ "data": data })
+    }
+
+    fn test_draft(number: u32) -> DraftPullRequest {
+        DraftPullRequest::from_ready_default(
+            id(&format!("G{number}")),
+            PullRequestIdentity::new(u64::from(number), format!("PR{number}")).unwrap(),
+            oid(u64::from(number) + 100),
+            DefaultBranch::new("main".to_owned(), oid(1)).unwrap(),
+        )
+    }
+
+    fn draft_request(numbers: RangeInclusive<u32>) -> Value {
+        let fields = numbers
+            .enumerate()
+            .map(|(index, number)| {
+                format!(
+                    "op{index}: convertPullRequestToDraft(input: {{ pullRequestId: \"PR{number}\", clientMutationId: \"gherrit:draft:PR{number}\" }}) {{ clientMutationId, pullRequest {{ number, id, state, isDraft, headRefName, headRefOid, baseRefName, baseRefOid }} }}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        json!({ "query": format!("mutation {{ {fields} }}") })
+    }
+
+    fn draft_response(numbers: RangeInclusive<u32>) -> Value {
+        let data = numbers
+            .enumerate()
+            .map(|(index, number)| {
+                (
+                    format!("op{index}"),
+                    json!({
+                        "clientMutationId": format!("gherrit:draft:PR{number}"),
+                        "pullRequest": {
+                            "number": number,
+                            "id": format!("PR{number}"),
+                            "state": "OPEN",
+                            "isDraft": true,
+                            "headRefName": format!("G{number}"),
+                            "headRefOid": oid(u64::from(number) + 100).to_string(),
+                            "baseRefName": "main",
+                            "baseRefOid": oid(1).to_string(),
                         },
                     }),
                 )
@@ -1422,6 +1471,29 @@ mod tests {
         let requests = finish_peer(server).await;
 
         assert_eq!(requests.len(), 1);
+        assert!(error.to_string().contains("acknowledgement is indeterminate"));
+    }
+
+    #[tokio::test]
+    async fn a_middle_draft_batch_failure_stops_all_later_batches_without_replay() {
+        let first_request = draft_request(1..=64);
+        let second_request = draft_request(65..=128);
+        let first_response = draft_response(1..=64);
+        let (api_url, server) = scripted_peer(vec![
+            exchange(first_request, Reply::Json(first_response)),
+            exchange(second_request, Reply::Disconnect),
+        ])
+        .await;
+        let conversions =
+            PreparedDraftConversions::prepare((1..=129).map(test_draft).collect::<Vec<_>>())
+                .unwrap();
+        let error = test_github(&api_url, test_timeouts())
+            .convert_pull_requests_to_draft(conversions)
+            .await
+            .unwrap_err();
+        let requests = finish_peer(server).await;
+
+        assert_eq!(requests.len(), 2);
         assert!(error.to_string().contains("acknowledgement is indeterminate"));
     }
 
