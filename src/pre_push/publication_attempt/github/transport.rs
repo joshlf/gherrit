@@ -210,7 +210,7 @@ impl Github {
         Ok(Self { http: builder.build()?, target, timeouts })
     }
 
-    /// Observes every lifecycle state for each change in the sealed stack.
+    /// Exhausts the OPEN pull request connection for each sealed local change.
     pub(in crate::pre_push::publication_attempt) async fn observe_local_pull_requests(
         self,
         local: &LocalStack,
@@ -468,7 +468,9 @@ mod tests {
     use super::{
         super::{
             MAX_MUTATION_REQUEST_BYTES, PullRequestIdentity,
-            mutation::{PreparedCreates, PreparedUpdates, TestCreate, TestUpdate},
+            mutation::{
+                PreparedCreates, PreparedPullRequestProjection, TestClose, TestCreate, TestUpdate,
+            },
             observation::LocalPullRequestObservation,
             pull_request::PullRequestIdentityRegistry,
         },
@@ -861,6 +863,27 @@ mod tests {
             })
             .collect::<serde_json::Map<_, _>>();
         json!({ "data": data })
+    }
+
+    fn mixed_projection_request() -> Value {
+        json!({
+            "query": "mutation { op0: closePullRequest(input: { pullRequestId: \"PR2\", clientMutationId: \"gherrit:close:PR2\" }) { clientMutationId, pullRequest { number, id, state } } op1: updatePullRequest(input: { pullRequestId: \"PR1\", title: \"title 1\", clientMutationId: \"gherrit:update:PR1\" }) { clientMutationId, pullRequest { number, id, state } } }"
+        })
+    }
+
+    fn mixed_projection_response() -> Value {
+        json!({
+            "data": {
+                "op0": {
+                    "clientMutationId": "gherrit:close:PR2",
+                    "pullRequest": { "number": 2, "id": "PR2", "state": "CLOSED" },
+                },
+                "op1": {
+                    "clientMutationId": "gherrit:update:PR1",
+                    "pullRequest": { "number": 1, "id": "PR1", "state": "OPEN" },
+                },
+            },
+        })
     }
 
     #[test]
@@ -1364,6 +1387,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_closes_and_canonical_updates_share_one_request() {
+        let (api_url, server) = scripted_peer(vec![exchange(
+            mixed_projection_request(),
+            Reply::Json(mixed_projection_response()),
+        )])
+        .await;
+        let projection = PreparedPullRequestProjection::for_projection_test(
+            vec![TestClose { identity: PullRequestIdentity::new(2, "PR2".to_owned()).unwrap() }],
+            vec![test_update(1)],
+        )
+        .unwrap();
+        test_github(&api_url, test_timeouts()).project_pull_requests(projection).await.unwrap();
+        let requests = finish_peer(server).await;
+
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_close_receipt_makes_the_mixed_projection_indeterminate() {
+        let mut response = mixed_projection_response();
+        response["data"]["op0"]["pullRequest"]["state"] = json!("OPEN");
+        let (api_url, server) =
+            scripted_peer(vec![exchange(mixed_projection_request(), Reply::Json(response))]).await;
+        let projection = PreparedPullRequestProjection::for_projection_test(
+            vec![TestClose { identity: PullRequestIdentity::new(2, "PR2".to_owned()).unwrap() }],
+            vec![test_update(1)],
+        )
+        .unwrap();
+        let error = test_github(&api_url, test_timeouts())
+            .project_pull_requests(projection)
+            .await
+            .unwrap_err();
+        let requests = finish_peer(server).await;
+
+        assert_eq!(requests.len(), 1);
+        assert!(error.to_string().contains("acknowledgement is indeterminate"));
+    }
+
+    #[tokio::test]
     async fn every_unusable_mutation_response_is_indeterminate_and_stops_the_stage() {
         let mut invalid_receipt = update_response(1..=64);
         invalid_receipt["data"]["op0"]["pullRequest"]["id"] = json!("OTHER");
@@ -1378,10 +1440,13 @@ mod tests {
         for reply in replies {
             let (api_url, server) =
                 scripted_peer(vec![exchange(update_request(1..=64), reply)]).await;
-            let updates =
-                PreparedUpdates::for_test((1..=65).map(test_update).collect::<Vec<_>>()).unwrap();
+            let projection = PreparedPullRequestProjection::for_projection_test(
+                Vec::new(),
+                (1..=65).map(test_update).collect::<Vec<_>>(),
+            )
+            .unwrap();
             let error = test_github(&api_url, test_timeouts())
-                .update_pull_requests(updates)
+                .project_pull_requests(projection)
                 .await
                 .unwrap_err();
             let requests = finish_peer(server).await;
@@ -1399,9 +1464,13 @@ mod tests {
             response["data"]["op0"]["pullRequest"]["state"] = json!(state);
             let (api_url, server) =
                 scripted_peer(vec![exchange(request, Reply::Json(response))]).await;
-            let updates = PreparedUpdates::for_test(vec![test_update(1)]).unwrap();
+            let projection = PreparedPullRequestProjection::for_projection_test(
+                Vec::new(),
+                vec![test_update(1)],
+            )
+            .unwrap();
             let error = test_github(&api_url, test_timeouts())
-                .update_pull_requests(updates)
+                .project_pull_requests(projection)
                 .await
                 .unwrap_err();
             let requests = finish_peer(server).await;
@@ -1416,9 +1485,13 @@ mod tests {
     async fn a_disconnect_after_mutation_send_is_indeterminate_and_never_replayed() {
         let request = update_request(1..=1);
         let (api_url, server) = scripted_peer(vec![exchange(request, Reply::Disconnect)]).await;
-        let updates = PreparedUpdates::for_test(vec![test_update(1)]).unwrap();
-        let error =
-            test_github(&api_url, test_timeouts()).update_pull_requests(updates).await.unwrap_err();
+        let projection =
+            PreparedPullRequestProjection::for_projection_test(Vec::new(), vec![test_update(1)])
+                .unwrap();
+        let error = test_github(&api_url, test_timeouts())
+            .project_pull_requests(projection)
+            .await
+            .unwrap_err();
         let requests = finish_peer(server).await;
 
         assert_eq!(requests.len(), 1);
@@ -1430,11 +1503,13 @@ mod tests {
         let request = update_request(1..=1);
         let (api_url, server) =
             scripted_peer(vec![exchange(request, Reply::Hang(Duration::from_millis(250)))]).await;
-        let updates = PreparedUpdates::for_test(vec![test_update(1)]).unwrap();
+        let projection =
+            PreparedPullRequestProjection::for_projection_test(Vec::new(), vec![test_update(1)])
+                .unwrap();
         let mut timeouts = test_timeouts();
         timeouts.attempt = Duration::from_millis(50);
         let error =
-            test_github(&api_url, timeouts).update_pull_requests(updates).await.unwrap_err();
+            test_github(&api_url, timeouts).project_pull_requests(projection).await.unwrap_err();
         let requests = finish_peer(server).await;
 
         assert_eq!(requests.len(), 1);
@@ -1453,9 +1528,12 @@ mod tests {
             exchange(second_request, Reply::Disconnect),
         ])
         .await;
-        let updates = PreparedUpdates::for_test(updates).unwrap();
-        let error =
-            test_github(&api_url, test_timeouts()).update_pull_requests(updates).await.unwrap_err();
+        let projection =
+            PreparedPullRequestProjection::for_projection_test(Vec::new(), updates).unwrap();
+        let error = test_github(&api_url, test_timeouts())
+            .project_pull_requests(projection)
+            .await
+            .unwrap_err();
         let requests = finish_peer(server).await;
 
         assert_eq!(requests.len(), 2);
@@ -1468,9 +1546,13 @@ mod tests {
             let request = update_request(1..=1);
             let (api_url, server) =
                 scripted_peer(vec![exchange(request, Reply::Status(status))]).await;
-            let updates = PreparedUpdates::for_test(vec![test_update(1)]).unwrap();
+            let projection = PreparedPullRequestProjection::for_projection_test(
+                Vec::new(),
+                vec![test_update(1)],
+            )
+            .unwrap();
             let error = test_github(&api_url, test_timeouts())
-                .update_pull_requests(updates)
+                .project_pull_requests(projection)
                 .await
                 .unwrap_err();
             let requests = finish_peer(server).await;
@@ -1486,9 +1568,13 @@ mod tests {
                 Reply::Redirect { status, location: "/graphql".to_owned() },
             )])
             .await;
-            let updates = PreparedUpdates::for_test(vec![test_update(1)]).unwrap();
+            let projection = PreparedPullRequestProjection::for_projection_test(
+                Vec::new(),
+                vec![test_update(1)],
+            )
+            .unwrap();
             let error = test_github(&api_url, test_timeouts())
-                .update_pull_requests(updates)
+                .project_pull_requests(projection)
                 .await
                 .unwrap_err();
             let requests = finish_peer(server).await;

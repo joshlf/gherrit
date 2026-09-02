@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    CreatePreparation, PullRequestIdentity, Repository, RepositoryNodeId,
+    CreatePreparation, PullRequestIdentity, PullRequestNumber, Repository, RepositoryNodeId,
     pull_request::PullRequestIdentityRegistry,
 };
 use crate::pre_push::{
@@ -79,14 +79,12 @@ impl ObservedBase {
     }
 }
 
-/// Same-repository OPEN evidence for one exact local change.
+/// The complete history and policy evidence for one same-repository OPEN row.
 ///
-/// The requested connection already proves the head branch name, so storing it
-/// again would make disagreement representable. Construction remains private
-/// to this observation boundary.
+/// The requested connection and enclosing collection retain the exact head
+/// branch name. Storing it on each row would make disagreement representable.
 #[derive(Debug)]
-pub(in crate::pre_push::publication_attempt) struct ManagedOpenPullRequest {
-    id: GherritPrId,
+pub(in crate::pre_push::publication_attempt) struct ManagedOpenPullRequestCandidate {
     identity: PullRequestIdentity,
     head_oid: ObjectId,
     base: ObservedBase,
@@ -96,23 +94,25 @@ pub(in crate::pre_push::publication_attempt) struct ManagedOpenPullRequest {
     has_landing_automation: bool,
 }
 
-impl ManagedOpenPullRequest {
-    #[allow(clippy::too_many_arguments)]
+impl ManagedOpenPullRequestCandidate {
     fn from_observation(
         default_branch: &str,
-        id: GherritPrId,
-        identity: PullRequestIdentity,
-        title: String,
-        body: String,
-        base_name: String,
-        base_oid: ObjectId,
-        head_oid: ObjectId,
-        is_draft: bool,
-        has_landing_automation: bool,
+        id: &GherritPrId,
+        observation: OpenPullRequest,
     ) -> Result<Self> {
+        let OpenPullRequest {
+            identity,
+            title,
+            body,
+            base_name,
+            base_oid,
+            head_oid,
+            is_draft,
+            has_landing_automation,
+        } = observation;
         let kind = if base_name == default_branch {
             BaseKind::Default
-        } else if base_name == owned_base_name(&id) {
+        } else if base_name == owned_base_name(id) {
             BaseKind::Owned
         } else {
             let id = diagnostic_detail(id.as_str());
@@ -123,7 +123,6 @@ impl ManagedOpenPullRequest {
             );
         };
         Ok(Self {
-            id,
             identity,
             head_oid,
             base: ObservedBase { kind, oid: base_oid },
@@ -132,10 +131,6 @@ impl ManagedOpenPullRequest {
             is_draft,
             has_landing_automation,
         })
-    }
-
-    pub(in crate::pre_push::publication_attempt) fn id(&self) -> &GherritPrId {
-        &self.id
     }
 
     pub(in crate::pre_push::publication_attempt) fn identity(&self) -> &PullRequestIdentity {
@@ -165,6 +160,87 @@ impl ManagedOpenPullRequest {
     pub(in crate::pre_push::publication_attempt) fn has_landing_automation(&self) -> bool {
         self.has_landing_automation
     }
+}
+
+/// Every same-repository OPEN row for one exact local change.
+///
+/// Number order makes the evidence deterministic but grants no authority.
+/// Only a later join with the independently observed Git marker can select a
+/// canonical row. The nonempty shape avoids an optional collection whose
+/// empty case would duplicate [`AbsentPullRequest`].
+#[derive(Debug)]
+pub(in crate::pre_push::publication_attempt) struct ManagedOpenPullRequests {
+    id: GherritPrId,
+    first: ManagedOpenPullRequestCandidate,
+    later: Box<[ManagedOpenPullRequestCandidate]>,
+}
+
+impl ManagedOpenPullRequests {
+    fn from_observations(
+        default_branch: &str,
+        id: GherritPrId,
+        mut observations: Vec<OpenPullRequest>,
+    ) -> Result<Self> {
+        observations.sort_unstable_by_key(|open| open.identity.number().get());
+        let mut candidates = observations.into_iter().map(|open| {
+            ManagedOpenPullRequestCandidate::from_observation(default_branch, &id, open)
+        });
+        let first = candidates
+            .next()
+            .transpose()?
+            .ok_or_else(|| eyre!("An OPEN pull request collection cannot be empty"))?;
+        let later = candidates.collect::<Result<Box<[_]>>>()?;
+        Ok(Self { id, first, later })
+    }
+
+    pub(in crate::pre_push::publication_attempt) fn id(&self) -> &GherritPrId {
+        &self.id
+    }
+
+    fn into_candidates(self) -> impl Iterator<Item = ManagedOpenPullRequestCandidate> {
+        std::iter::once(self.first).chain(self.later)
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn candidates(
+        &self,
+    ) -> impl Iterator<Item = &ManagedOpenPullRequestCandidate> {
+        std::iter::once(&self.first).chain(self.later.iter())
+    }
+
+    /// Joins the complete OPEN collection to the independently observed Git
+    /// marker. Marker absence yields only a deterministic contender; marker
+    /// presence authenticates exactly the numbered row and fails closed when
+    /// that row is not visible.
+    pub(in crate::pre_push::publication_attempt) fn select(
+        self,
+        marker: Option<PullRequestNumber>,
+    ) -> Result<OpenPullRequestSelection> {
+        let id = self.id.clone();
+        let mut candidates = self.into_candidates().collect::<Vec<_>>();
+        let selected = match marker {
+            None => 0,
+            Some(number) => candidates
+                .iter()
+                .position(|candidate| candidate.identity().number() == number)
+                .ok_or_else(|| {
+                    eyre!(
+                        "GHerrit change '{}' marker selects OPEN pull request #{} which GitHub did not return",
+                        id.as_str(),
+                        number.get()
+                    )
+                })?,
+        };
+        let selected = SelectedOpenPullRequest {
+            id,
+            selected: candidates.remove(selected),
+            duplicates: candidates.into_boxed_slice(),
+        };
+        Ok(match marker {
+            Some(_) => OpenPullRequestSelection::Authenticated(selected),
+            None => OpenPullRequestSelection::Contender(selected),
+        })
+    }
 
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
@@ -180,14 +256,88 @@ impl ManagedOpenPullRequest {
     ) -> Self {
         Self {
             id,
-            identity,
-            head_oid,
-            base,
-            title: title.into(),
-            body: body.into(),
-            is_draft,
-            has_landing_automation,
+            first: ManagedOpenPullRequestCandidate {
+                identity,
+                head_oid,
+                base,
+                title: title.into(),
+                body: body.into(),
+                is_draft,
+                has_landing_automation,
+            },
+            later: Box::new([]),
         }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(in crate::pre_push::publication_attempt) fn with_candidates_for_plan_test(
+        mut self,
+        candidates: Vec<(PullRequestIdentity, ObjectId, ObservedBase, String, String, bool, bool)>,
+    ) -> Self {
+        let mut all = std::iter::once(self.first)
+            .chain(candidates.into_iter().map(
+                |(identity, head_oid, base, title, body, is_draft, has_landing_automation)| {
+                    ManagedOpenPullRequestCandidate {
+                        identity,
+                        head_oid,
+                        base,
+                        title: title.into(),
+                        body: body.into(),
+                        is_draft,
+                        has_landing_automation,
+                    }
+                },
+            ))
+            .collect::<Vec<_>>();
+        all.sort_unstable_by_key(|candidate| candidate.identity().number().get());
+        let mut numbers = HashSet::with_capacity(all.len());
+        let mut node_ids = HashSet::with_capacity(all.len());
+        assert!(
+            all.iter().all(|candidate| {
+                numbers.insert(candidate.identity().number())
+                    && node_ids.insert(candidate.identity().node_id())
+            }),
+            "plan-test OPEN identities must be unique and coupled"
+        );
+        let mut all = all.into_iter();
+        self.first = all.next().expect("the original OPEN row is retained");
+        self.later = all.collect();
+        self
+    }
+}
+
+/// Whether the selected OPEN row already has Git-authenticated authority or
+/// is merely the deterministic input to a proposed marker lease.
+#[derive(Debug)]
+pub(in crate::pre_push::publication_attempt) enum OpenPullRequestSelection {
+    Authenticated(SelectedOpenPullRequest),
+    Contender(SelectedOpenPullRequest),
+}
+
+/// One selected OPEN row and every other visible row for the same change.
+#[derive(Debug)]
+pub(in crate::pre_push::publication_attempt) struct SelectedOpenPullRequest {
+    id: GherritPrId,
+    selected: ManagedOpenPullRequestCandidate,
+    duplicates: Box<[ManagedOpenPullRequestCandidate]>,
+}
+
+impl SelectedOpenPullRequest {
+    pub(in crate::pre_push::publication_attempt) fn id(&self) -> &GherritPrId {
+        &self.id
+    }
+
+    pub(in crate::pre_push::publication_attempt) fn selected(
+        &self,
+    ) -> &ManagedOpenPullRequestCandidate {
+        &self.selected
+    }
+
+    pub(in crate::pre_push::publication_attempt) fn duplicate_candidates(
+        &self,
+    ) -> impl Iterator<Item = &ManagedOpenPullRequestCandidate> {
+        self.duplicates.iter()
     }
 }
 
@@ -220,7 +370,7 @@ impl AbsentPullRequest {
 /// Correlated state for one local change, in exact local stack order.
 #[derive(Debug)]
 pub(in crate::pre_push::publication_attempt) enum LocalPullRequestObservation {
-    Open(ManagedOpenPullRequest),
+    Open(ManagedOpenPullRequests),
     Absent(AbsentPullRequest),
 }
 
@@ -296,7 +446,9 @@ impl CompleteLocalPullRequests {
         let mut identities = PullRequestIdentityRegistry::default();
         for observation in &local {
             if let LocalPullRequestObservation::Open(pull_request) = observation {
-                identities.insert_observation(pull_request.identity())?;
+                for candidate in pull_request.candidates() {
+                    identities.insert_observation(candidate.identity())?;
+                }
             }
         }
         for identity in additional_identities {
@@ -774,7 +926,7 @@ impl Progress {
 struct ConnectionObservation {
     progress: Progress,
     baseline_row_available: bool,
-    open: Option<OpenPullRequest>,
+    opens: Vec<OpenPullRequest>,
 }
 
 /// One local change and the only observation state which can belong to it.
@@ -789,7 +941,7 @@ struct ConnectionSlot {
 
 impl Default for ConnectionObservation {
     fn default() -> Self {
-        Self { progress: Progress::Initial, baseline_row_available: true, open: None }
+        Self { progress: Progress::Initial, baseline_row_available: true, opens: Vec::new() }
     }
 }
 
@@ -997,13 +1149,7 @@ impl LocalPullRequestAccumulator {
                 DecodedPullRequest::CrossRepository => {}
                 DecodedPullRequest::Open(open) => {
                     self.identities.insert_observation(&open.identity)?;
-                    if connection.open.is_some() {
-                        bail!(
-                            "GitHub has more than one same-repository OPEN pull request for '{}'",
-                            diagnostic_detail(id.as_str())
-                        );
-                    }
-                    connection.open = Some(open);
+                    connection.opens.push(open);
                 }
             }
         }
@@ -1071,19 +1217,12 @@ impl LocalPullRequestAccumulator {
         let mut local = Vec::with_capacity(self.connections.len());
 
         for ConnectionSlot { id, observation: connection } in self.connections.into_vec() {
-            if let Some(open) = connection.open {
+            if !connection.opens.is_empty() {
                 local.push(LocalPullRequestObservation::Open(
-                    ManagedOpenPullRequest::from_observation(
+                    ManagedOpenPullRequests::from_observations(
                         default_branch,
                         id,
-                        open.identity,
-                        open.title,
-                        open.body,
-                        open.base_name,
-                        open.base_oid,
-                        open.head_oid,
-                        open.is_draft,
-                        open.has_landing_automation,
+                        connection.opens,
                     )?,
                 ));
             } else {
@@ -1518,18 +1657,29 @@ mod tests {
     }
 
     #[test]
-    fn a_second_same_repository_open_rejects_across_pages() {
-        let first = decoded_page("G", None, Some(node(1, "ONE", "G", "OPEN")), Some("next"), true);
+    fn every_same_repository_open_is_retained_in_number_order() {
+        let first = decoded_page("G", None, Some(node(2, "TWO", "G", "OPEN")), Some("next"), true);
         let second =
-            decoded_page("G", Some("next"), Some(node(2, "TWO", "G", "OPEN")), None, false);
-        assert!(
-            accumulator([id("G")])
-                .unwrap()
-                .record_batch(first)
-                .unwrap()
-                .record_batch(second)
-                .is_err()
+            decoded_page("G", Some("next"), Some(node(1, "ONE", "G", "OPEN")), None, false);
+        let complete = accumulator([id("G")])
+            .unwrap()
+            .record_batch(first)
+            .unwrap()
+            .record_batch(second)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let LocalPullRequestObservation::Open(open) = &complete.local()[0] else {
+            panic!("G must be open");
+        };
+        assert_eq!(
+            open.candidates()
+                .map(|candidate| candidate.identity().number().get())
+                .collect::<Vec<_>>(),
+            [1, 2]
         );
+        assert_eq!(complete.identities.number_values(), HashSet::from([1, 2]));
+        assert_eq!(complete.identities.node_id_values(), HashSet::from(["ONE", "TWO"]));
     }
 
     #[test]
@@ -1716,8 +1866,12 @@ mod tests {
                     let LocalPullRequestObservation::Open(open) = &complete.local()[0] else {
                         panic!("G must be open");
                     };
-                    assert_eq!(open.is_draft(), is_draft);
-                    assert_eq!(open.has_landing_automation(), has_auto_merge_request || in_queue);
+                    let candidate = open.candidates().next().unwrap();
+                    assert_eq!(candidate.is_draft(), is_draft);
+                    assert_eq!(
+                        candidate.has_landing_automation(),
+                        has_auto_merge_request || in_queue
+                    );
                 }
             }
         }
