@@ -495,6 +495,7 @@ pub enum FailureKind {
     CreatePrMalformedJson(MalformedJson),
     CreatePrHttp(RetryableHttpStatus),
     CreatePrRedirect(RedirectStatus),
+    DraftPrApplyThenDisconnect,
     ClosePr,
     ClosePrApplyThenDisconnect,
     UpdatePr,
