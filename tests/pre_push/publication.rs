@@ -199,6 +199,42 @@ fn lost_initial_push_receipt_recovers_from_the_durable_tuple() {
 }
 
 #[test]
+fn lost_public_branch_push_receipt_recovers_without_replaying_the_push() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_public("lost-public-receipt");
+    let desired = ctx.head_oid();
+    ctx.inject_failure(testutil::FailureKind::LosePublicationPushReceipt(
+        testutil::PublicationPushStage::Initial,
+    ));
+
+    ctx.hook_cmd("pre-push").assert().failure();
+
+    ctx.assert_failure_consumed();
+    assert_eq!(
+        ctx.remote_ref_oid("refs/heads/lost-public-receipt").as_deref(),
+        Some(desired.as_str()),
+        "the public branch must be durable before its acknowledgement is lost"
+    );
+    assert_eq!(ctx.recorded_pushes().len(), 1);
+
+    ctx.hook_cmd("pre-push").assert().success();
+
+    assert_eq!(
+        ctx.recorded_pushes().len(),
+        1,
+        "recovery must observe the desired public target without replaying its push"
+    );
+    assert_eq!(
+        ctx.remote_ref_oid("refs/heads/lost-public-receipt").as_deref(),
+        Some(desired.as_str())
+    );
+}
+
+#[test]
 fn lost_marker_push_receipt_recovers_by_projecting_the_durable_identity() {
     let ctx = testutil::test_context!()
         .with_remote()
@@ -340,6 +376,86 @@ fn lost_update_acknowledgement_recovers_without_replaying_the_mutation() {
     assert_eq!(ctx.recorded_pushes().len(), pushes_before + 1);
     assert_eq!(ctx.github().pull_requests(), projected);
     assert_remote_pr_marker(&ctx, &id, &v1, projected[0].number);
+}
+
+#[test]
+fn lost_draft_acknowledgement_recovers_without_replaying_the_mutation() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("lost-draft-ack");
+    let departing_id = ctx.commit_with_gherrit_id("Original root");
+    let departing_v1 = ctx.head_oid();
+    ctx.hook_cmd("pre-push").assert().success();
+
+    let departing_pr = ctx.github().pull_requests().pop().unwrap();
+    ctx.github().set_pull_request_draft(departing_pr.number, false);
+    ctx.run_git(&["checkout", "-b", "replacement-root", "main"]);
+    let replacement_id = ctx.commit_with_gherrit_id("Replacement root");
+    let replacement_v1 = ctx.head_oid();
+    ctx.run_git(&["checkout", "lost-draft-ack"]);
+    ctx.run_git(&["rebase", "--onto", &replacement_v1, "main"]);
+    let departing_v2 = ctx.head_oid();
+
+    let requests_before = ctx.github().requests().len();
+    let pushes_before = ctx.recorded_pushes().len();
+    ctx.inject_failure(testutil::FailureKind::DraftPrApplyThenDisconnect);
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("acknowledgement is indeterminate"));
+
+    ctx.assert_failure_consumed();
+    assert!(
+        ctx.github()
+            .pull_requests()
+            .iter()
+            .find(|pull_request| pull_request.number == departing_pr.number)
+            .unwrap()
+            .is_draft,
+        "the conversion must apply before its acknowledgement is lost"
+    );
+    assert_eq!(
+        &ctx.github().requests()[requests_before..],
+        [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::DraftPr],]
+    );
+    assert_eq!(
+        ctx.recorded_pushes().len(),
+        pushes_before,
+        "an indeterminate draft barrier must stop before Git publication"
+    );
+
+    let retry_requests_before = ctx.github().requests().len();
+    ctx.hook_cmd("pre-push").assert().success();
+
+    assert!(
+        ctx.github().requests()[retry_requests_before..]
+            .iter()
+            .flatten()
+            .all(|operation| *operation != testutil::GraphQlOperation::DraftPr),
+        "recovery must observe the durable draft state without replaying conversion"
+    );
+    assert_eq!(ctx.recorded_pushes().len(), pushes_before + 2);
+    assert_eq!(
+        ctx.remote_ref_oid(&format!("refs/heads/{departing_id}")).as_deref(),
+        Some(departing_v2.as_str())
+    );
+    let pull_requests = ctx.github().pull_requests();
+    let departing = pull_requests
+        .iter()
+        .find(|pull_request| pull_request.number == departing_pr.number)
+        .unwrap();
+    let replacement =
+        pull_requests.iter().find(|pull_request| pull_request.head == replacement_id).unwrap();
+    assert!(departing.is_draft);
+    assert_eq!(departing.base, format!("gherrit-bases/{departing_id}"));
+    assert!(replacement.is_draft);
+    assert_eq!(replacement.base, "main");
+    assert_remote_pr_marker(&ctx, &departing_id, &departing_v1, departing.number);
+    assert_remote_pr_marker(&ctx, &replacement_id, &replacement_v1, replacement.number);
 }
 
 #[test]

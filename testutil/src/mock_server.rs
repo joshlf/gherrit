@@ -169,6 +169,10 @@ fn check_and_apply_graphql_failure(
             !operations.is_empty()
                 && operations.iter().all(|operation| *operation == GraphQlOperation::CreatePr)
         }
+        DraftPrApplyThenDisconnect => {
+            !operations.is_empty()
+                && operations.iter().all(|operation| *operation == GraphQlOperation::DraftPr)
+        }
         ClosePr | ClosePrApplyThenDisconnect => operations.contains(&GraphQlOperation::ClosePr),
         UpdatePr
         | UpdatePrApplyThenDisconnect
@@ -869,6 +873,7 @@ async fn graphql(
         if matches!(
             failure,
             FailureKind::CreatePrApplyThenDisconnect
+                | FailureKind::DraftPrApplyThenDisconnect
                 | FailureKind::ClosePrApplyThenDisconnect
                 | FailureKind::UpdatePrApplyThenDisconnect
         ) {
@@ -998,6 +1003,7 @@ fn graphql_failure_response(failure: FailureKind) -> Response {
         GraphQl | CreatePr | ClosePr | UpdatePr => StatusCode::OK,
         QueryTransport => unreachable!("handled above"),
         CreatePrApplyThenDisconnect
+        | DraftPrApplyThenDisconnect
         | ClosePrApplyThenDisconnect
         | UpdatePrApplyThenDisconnect
         | UpdatePrConcurrentClose => {
