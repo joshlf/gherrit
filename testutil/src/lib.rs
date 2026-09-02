@@ -206,9 +206,21 @@ impl TestEnvironment {
         fs::create_dir_all(&temporary_directory).unwrap();
 
         let git_config = home.join("gitconfig");
+        // Put the fixture identity in the per-context global config so every
+        // repository and clone created by the test is deterministic.
         fs::write(
             &git_config,
-            "[color]\n\tui = false\n[commit]\n\tgpgSign = false\n[tag]\n\tgpgSign = false\n",
+            concat!(
+                "[color]\n",
+                "\tui = false\n",
+                "[commit]\n",
+                "\tgpgSign = false\n",
+                "[tag]\n",
+                "\tgpgSign = false\n",
+                "[user]\n",
+                "\temail = test@example.com\n",
+                "\tname = Test User\n",
+            ),
         )
         .unwrap();
 
@@ -1297,9 +1309,6 @@ fn init_git_repo(
     let run = |args| run_git_cmd(environment, system_git, path, args);
     run(&["init"]);
     run(&["config", "core.hooksPath", ".git/hooks"]);
-    // Must config user identity for commits to work
-    run(&["config", "user.email", "test@example.com"]);
-    run(&["config", "user.name", "Test User"]);
     // Pin both the actual branch and the configuration consulted by default-
     // branch discovery. Ambient Git defaults must not choose fixture topology.
     run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
@@ -1558,6 +1567,42 @@ mod tests {
         assert!(!output.contains("SHOULD_BE_CLEARED="));
         assert!(output.lines().any(|line| line == "RUST_LOG=info"));
         assert!(output.lines().any(|line| line.starts_with("HOME=")));
+    }
+
+    #[test]
+    fn test_environment_provides_a_deterministic_git_identity() {
+        let root = TempDir::new().unwrap();
+        let environment = TestEnvironment::new(root.path(), SYSTEM_GIT.as_path());
+        let repository = root.path().join("secondary");
+        fs::create_dir(&repository).unwrap();
+        environment
+            .command(SYSTEM_GIT.as_path())
+            .current_dir(&repository)
+            .args(["init", "--quiet"])
+            .assert()
+            .success();
+        environment
+            .command(SYSTEM_GIT.as_path())
+            .current_dir(&repository)
+            .args(["commit", "--allow-empty", "--message", "Test identity"])
+            .env("GIT_AUTHOR_DATE", "@946684800 +0000")
+            .env("GIT_COMMITTER_DATE", "@946684800 +0000")
+            .assert()
+            .success();
+
+        let output = environment
+            .command(SYSTEM_GIT.as_path())
+            .current_dir(&repository)
+            .args(["show", "--no-patch", "--format=%an%n%ae%n%cn%n%ce", "HEAD"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Test User\ntest@example.com\nTest User\ntest@example.com\n"
+        );
     }
 
     #[test]
