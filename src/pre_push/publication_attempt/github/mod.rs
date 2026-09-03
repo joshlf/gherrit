@@ -23,12 +23,13 @@ mod pull_request;
 mod transport;
 
 pub(super) use mutation::{
-    ClosePullRequest, CompleteCreateReceipts, CreatePullRequest, PreflightedDuplicateCloses,
-    PreparedCreates, PreparedPullRequestProjection, UpdatePullRequest,
+    ClosePullRequest, CompleteCreateReceipts, CreatePullRequest, DraftPullRequest,
+    PreflightedDuplicateCloses, PreparedCreates, PreparedDraftConversions,
+    PreparedPullRequestProjection, UpdatePullRequest,
 };
 #[cfg(test)]
 pub(in crate::pre_push::publication_attempt) use mutation::{
-    TestCreate, TestPullRequestProjection, TestUpdate,
+    TestCreate, TestDraft, TestPullRequestProjection, TestUpdate,
 };
 pub(super) use observation::{
     AbsentPullRequest, BaseKind, CompleteLocalPullRequests, LocalPullRequestObservation,

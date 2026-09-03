@@ -22,9 +22,10 @@ use super::{
     body::StackBodyRecipes,
     github::{
         AbsentPullRequest, BaseKind, CompleteCreateReceipts, CompleteLocalPullRequests,
-        LocalPullRequestObservation, ManagedOpenPullRequests, ObservedBase, PreparedCreates,
-        PreparedPullRequestProjection, PullRequestIdentity, PullRequestNumber, TestCreate,
-        TestPullRequestProjection, TestUpdate,
+        DraftPullRequest, LocalPullRequestObservation, ManagedOpenPullRequests, ObservedBase,
+        PreparedCreates, PreparedDraftConversions, PreparedPullRequestProjection,
+        PullRequestIdentity, PullRequestNumber, TestCreate, TestDraft, TestPullRequestProjection,
+        TestUpdate,
     },
     history::ValidatedChangeHistory,
     marker::{MarkerTemplate, PullRequestMarker},
@@ -438,7 +439,7 @@ impl DurableWorld {
                 title: title.to_owned(),
                 body: body.to_owned(),
                 base: BaseKind::Owned,
-                is_draft: false,
+                is_draft: true,
             }),
         });
         self.assert_well_formed();
@@ -471,6 +472,20 @@ impl DurableWorld {
             .expect("a setup marker names a durable row");
         selected.open_fields_mut().expect("the setup marker selects an OPEN row").base = base;
         change.marker = Some(marker_identity(v1, identity.number()));
+        self.assert_well_formed();
+    }
+
+    fn mark_ready_on_default_for_setup(&mut self, id: &GherritPrId, v1: ObjectId) {
+        self.mark_for_setup(id, v1, BaseKind::Default);
+        let marker = self.published(id).unwrap().marker.unwrap();
+        let row = self
+            .published_mut(id)
+            .unwrap()
+            .pull_requests
+            .iter_mut()
+            .find(|row| row.identity.number() == marker.number())
+            .expect("a setup marker selects its durable row");
+        row.open_fields_mut().unwrap().is_draft = false;
         self.assert_well_formed();
     }
 
@@ -510,7 +525,7 @@ impl DurableWorld {
             title: title.to_owned(),
             body: body.to_owned(),
             base,
-            is_draft: false,
+            is_draft: true,
         });
         self.assert_well_formed();
     }
@@ -921,6 +936,13 @@ struct UpdateEffect {
     operation: TestUpdate,
 }
 
+/// One draft-conversion request after resolving its node ID in durable state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DraftEffect {
+    resolved_id: Option<GherritPrId>,
+    operation: TestDraft,
+}
+
 /// One literal operation in a mixed final-projection request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProjectionEffect {
@@ -930,6 +952,7 @@ enum ProjectionEffect {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct AttemptTrace {
+    draft_conversions: EffectBatches<DraftEffect>,
     initial_refs: EffectBatches<InitialRefEffect>,
     creates: EffectBatches<TestCreate>,
     markers: EffectBatches<MarkerEffect>,
@@ -938,7 +961,8 @@ struct AttemptTrace {
 
 impl AttemptTrace {
     fn is_empty(&self) -> bool {
-        self.initial_refs.is_empty()
+        self.draft_conversions.is_empty()
+            && self.initial_refs.is_empty()
             && self.creates.is_empty()
             && self.markers.is_empty()
             && self.projections.is_empty()
@@ -970,6 +994,7 @@ enum GitStop {
 
 #[derive(Clone, Debug)]
 enum Interruption {
+    Draft { batch: usize, applied_aliases: Box<[usize]> },
     InitialRefs { batch: usize, stop: GitStop },
     Create { batch: usize, applied_aliases: Box<[usize]> },
     Marker { batch: usize, stop: GitStop },
@@ -984,6 +1009,7 @@ struct AttemptReport {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EffectStage {
+    Draft,
     InitialRefs,
     Create,
     Marker,
@@ -993,11 +1019,12 @@ enum EffectStage {
 /// A point where another complete publisher may run while the primary keeps
 /// its already-planned, attempt-local authority.
 ///
-/// Only the first three stages release later authority. A between-batches
-/// point is reached after the named batch is acknowledged and only when a
-/// later serialized batch remains.
+/// Draft conversion, initial refs, creates, and markers release later
+/// authority. A between-batches point is reached after the named batch is
+/// acknowledged and only when a later serialized batch remains.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompetitionBoundary {
+    AfterDraftConversions,
     AfterInitialRefs,
     AfterCreates,
     AfterMarkers,
@@ -1071,6 +1098,9 @@ impl<'world> WorldDriver<'world> {
 
     fn take_interruption(&mut self, stage: EffectStage, batch: usize) -> Option<Interruption> {
         let matches = match self.interruption.as_ref() {
+            Some(Interruption::Draft { batch: stopped, .. }) => {
+                stage == EffectStage::Draft && *stopped == batch
+            }
             Some(Interruption::InitialRefs { batch: stopped, .. }) => {
                 stage == EffectStage::InitialRefs && *stopped == batch
             }
@@ -1098,17 +1128,59 @@ impl<'world> WorldDriver<'world> {
         bail!("injected or observed external interruption")
     }
 
+    fn assert_target_draft_safety(&self, target: ExternalTarget) {
+        if let ExternalTarget::Change(id) = target {
+            assert!(
+                self.world.local_open_rows_are_draft_safe(&id),
+                "each reached local effect prefix must retain draft safety"
+            );
+        }
+    }
+
+    fn apply_effect(&mut self, effect: ExternalEffect) -> EffectOutcome {
+        let target = effect.target();
+        let outcome = self.world.apply_effect(&effect);
+        self.assert_target_draft_safety(target);
+        outcome
+    }
+
+    fn assert_git_batch_draft_safety<T: Clone>(
+        &self,
+        effects: &[T],
+        wrap: impl Fn(T) -> ExternalEffect,
+    ) {
+        for effect in effects.iter().cloned().map(wrap) {
+            self.assert_target_draft_safety(effect.target());
+        }
+    }
+
+    fn apply_git_batch<T: Clone>(
+        &mut self,
+        effects: &[T],
+        wrap: impl Fn(T) -> ExternalEffect + Copy,
+    ) -> EffectOutcome {
+        let outcome = apply_atomic_git_batch(self.world, effects, wrap);
+        self.assert_git_batch_draft_safety(effects, wrap);
+        outcome
+    }
+
     fn stop_git_batch<T: Clone>(
         &mut self,
         stop: GitStop,
         effects: &[T],
-        wrap: impl Fn(T) -> ExternalEffect,
+        wrap: impl Fn(T) -> ExternalEffect + Copy,
     ) -> Result<()> {
         match stop {
-            GitStop::Rejected => self.stop(StopReason::Rejected),
-            GitStop::Indeterminate { applied: false } => self.stop(StopReason::Indeterminate),
+            GitStop::Rejected => {
+                self.assert_git_batch_draft_safety(effects, wrap);
+                self.stop(StopReason::Rejected)
+            }
+            GitStop::Indeterminate { applied: false } => {
+                self.assert_git_batch_draft_safety(effects, wrap);
+                self.stop(StopReason::Indeterminate)
+            }
             GitStop::Indeterminate { applied: true } => {
-                let outcome = apply_atomic_git_batch(self.world, effects, wrap);
+                let outcome = self.apply_git_batch(effects, wrap);
                 assert_eq!(
                     outcome,
                     EffectOutcome::Acknowledged,
@@ -1197,6 +1269,56 @@ fn validated_aliases(aliases: &[usize], batch_len: usize) -> HashSet<usize> {
 }
 
 impl EffectDriver for WorldDriver<'_> {
+    async fn convert_pull_requests_to_draft(
+        &mut self,
+        conversions: PreparedDraftConversions,
+    ) -> Result<()> {
+        let batch_count = conversions.batches_for_test().len();
+        for (index, batch) in conversions.batches_for_test().enumerate() {
+            assert!(
+                batch.iter().all(|operation| self.world.marker_authorizes_draft(operation)),
+                "a planned draft conversion requires exact immutable-marker authority"
+            );
+            let batch = batch
+                .iter()
+                .cloned()
+                .map(|operation| self.world.resolve_draft(operation))
+                .collect::<Box<[_]>>();
+            self.trace.draft_conversions.push(batch.clone());
+            let interruption = self.take_interruption(EffectStage::Draft, index);
+            let selected = match &interruption {
+                Some(Interruption::Draft { applied_aliases, .. }) => {
+                    Some(validated_aliases(applied_aliases, batch.len()))
+                }
+                _ => None,
+            };
+            let mut exact = true;
+            for (alias, operation) in batch.iter().enumerate() {
+                if selected.as_ref().is_some_and(|selected| !selected.contains(&alias)) {
+                    continue;
+                }
+                exact &= self.apply_effect(ExternalEffect::Draft(operation.clone()))
+                    == EffectOutcome::Acknowledged;
+            }
+            for operation in &batch {
+                self.assert_target_draft_safety(ExternalEffect::Draft(operation.clone()).target());
+            }
+            if interruption.is_some() || !exact {
+                // Mutation aliases are independent, but an incomplete or
+                // mismatched response cannot release the Git continuation.
+                return self.stop(StopReason::Indeterminate);
+            }
+            if index + 1 < batch_count {
+                self.run_competition_at(CompetitionBoundary::BetweenBatches {
+                    stage: EffectStage::Draft,
+                    completed_batch: index,
+                })
+                .await?;
+            }
+        }
+        self.run_competition_at(CompetitionBoundary::AfterDraftConversions).await
+    }
+
     async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()> {
         let batch_count = pushes.batches().len();
         for (index, batch) in pushes.batches().enumerate() {
@@ -1231,7 +1353,7 @@ impl EffectDriver for WorldDriver<'_> {
             {
                 return self.stop_git_batch(stop, &effects, ExternalEffect::InitialRef);
             }
-            let outcome = apply_atomic_git_batch(self.world, &effects, ExternalEffect::InitialRef);
+            let outcome = self.apply_git_batch(&effects, ExternalEffect::InitialRef);
             if outcome != EffectOutcome::Acknowledged {
                 return self.stop(outcome.stop_reason());
             }
@@ -1268,11 +1390,14 @@ impl EffectDriver for WorldDriver<'_> {
                 if selected.as_ref().is_some_and(|selected| !selected.contains(&alias)) {
                     continue;
                 }
-                let outcome = self.world.apply_effect(&ExternalEffect::Create(create.clone()));
+                let outcome = self.apply_effect(ExternalEffect::Create(create.clone()));
                 exact &= outcome == EffectOutcome::Acknowledged;
                 if outcome == EffectOutcome::Acknowledged {
                     receipts.push((create.id.clone(), self.world.latest_identity(&create.id)));
                 }
+            }
+            for create in &batch {
+                self.assert_target_draft_safety(ExternalTarget::Change(create.id.clone()));
             }
             if interruption.is_some() || !exact {
                 // A GraphQL response with any missing, duplicate, or mismatched
@@ -1334,7 +1459,7 @@ impl EffectDriver for WorldDriver<'_> {
             {
                 return self.stop_git_batch(stop, &effects, ExternalEffect::Marker);
             }
-            let outcome = apply_atomic_git_batch(self.world, &effects, ExternalEffect::Marker);
+            let outcome = self.apply_git_batch(&effects, ExternalEffect::Marker);
             if outcome != EffectOutcome::Acknowledged {
                 return self.stop(outcome.stop_reason());
             }
@@ -1391,8 +1516,13 @@ impl EffectDriver for WorldDriver<'_> {
                 if selected.as_ref().is_some_and(|selected| !selected.contains(&alias)) {
                     continue;
                 }
-                exact &= self.world.apply_effect(&ExternalEffect::Projection(operation.clone()))
+                exact &= self.apply_effect(ExternalEffect::Projection(operation.clone()))
                     == EffectOutcome::Acknowledged;
+            }
+            for operation in &batch {
+                self.assert_target_draft_safety(
+                    ExternalEffect::Projection(operation.clone()).target(),
+                );
             }
             if interruption.is_some() || !exact {
                 return self.stop(StopReason::Indeterminate);
@@ -1432,6 +1562,7 @@ impl EffectOutcome {
 
 #[derive(Clone, Debug)]
 enum ExternalEffect {
+    Draft(DraftEffect),
     InitialRef(InitialRefEffect),
     Create(TestCreate),
     Marker(MarkerEffect),
@@ -1448,6 +1579,9 @@ enum ExternalTarget {
 impl ExternalEffect {
     fn target(&self) -> ExternalTarget {
         match self {
+            Self::Draft(effect) => {
+                effect.resolved_id.clone().map_or(ExternalTarget::Unknown, ExternalTarget::Change)
+            }
             Self::InitialRef(InitialRefEffect::Tuple(effect)) => {
                 ExternalTarget::Change(effect.id.clone())
             }
@@ -1465,6 +1599,20 @@ impl ExternalEffect {
 }
 
 impl DurableWorld {
+    fn marker_authorizes_draft(&self, operation: &TestDraft) -> bool {
+        self.published(&operation.id).is_some_and(|change| {
+            change.marker.is_some_and(|marker| marker.number() == operation.identity.number())
+                && change.pull_requests.iter().any(|row| row.identity == operation.identity)
+        })
+    }
+
+    fn local_open_rows_are_draft_safe(&self, id: &GherritPrId) -> bool {
+        self.open_pull_requests(id).all(|row| {
+            let fields = row.open_fields().expect("the iterator retains only OPEN rows");
+            fields.base != BaseKind::Owned || fields.is_draft
+        })
+    }
+
     fn resolve_identity(&self, identity: &PullRequestIdentity) -> Option<GherritPrId> {
         let requested_node = identity.node_id_for_test();
         self.changes.iter().find_map(|(id, change)| {
@@ -1491,6 +1639,10 @@ impl DurableWorld {
         }
     }
 
+    fn resolve_draft(&self, operation: TestDraft) -> DraftEffect {
+        DraftEffect { resolved_id: self.resolve_identity(&operation.identity), operation }
+    }
+
     fn resolve_close(&self, identity: PullRequestIdentity) -> ProjectionEffect {
         ProjectionEffect::Close { resolved_id: self.resolve_identity(&identity), identity }
     }
@@ -1499,6 +1651,7 @@ impl DurableWorld {
         let before = self.clone();
         let target = effect.target();
         let outcome = match effect {
+            ExternalEffect::Draft(effect) => self.apply_draft(effect),
             ExternalEffect::InitialRef(effect) => self.apply_initial_ref(effect),
             ExternalEffect::Create(effect) => self.apply_create(effect),
             ExternalEffect::Marker(effect) => self.apply_marker(effect),
@@ -1609,7 +1762,7 @@ impl DurableWorld {
                 title: effect.title.clone(),
                 body: effect.body.clone(),
                 base: BaseKind::Owned,
-                is_draft: false,
+                is_draft: true,
             }),
         });
         if effect.head_oid == current.head && effect.base_oid == current.first_parent {
@@ -1617,6 +1770,39 @@ impl DurableWorld {
         } else {
             EffectOutcome::Indeterminate
         }
+    }
+
+    fn apply_draft(&mut self, effect: &DraftEffect) -> EffectOutcome {
+        let Some(resolved_id) = effect.resolved_id.as_ref() else {
+            return EffectOutcome::Indeterminate;
+        };
+        let change = self
+            .changes
+            .get_mut(resolved_id)
+            .expect("a resolved draft conversion belongs to a published change");
+        let current = change.history.last();
+        let pull_request = change
+            .pull_requests
+            .iter_mut()
+            .find(|row| {
+                row.identity.node_id_for_test() == effect.operation.identity.node_id_for_test()
+            })
+            .expect("a resolved draft conversion belongs to a durable pull request");
+        let exact_identity = pull_request.identity == effect.operation.identity;
+        let Some(fields) = pull_request.open_fields_mut() else {
+            return EffectOutcome::Indeterminate;
+        };
+        // The mutation may return the already-draft row. It grants authority
+        // only when the same exact receipt would also acknowledge a fresh
+        // ready-to-draft transition.
+        fields.is_draft = true;
+        let exact = resolved_id == &effect.operation.id
+            && exact_identity
+            && current.head == effect.operation.head_oid
+            && fields.base == BaseKind::Default
+            && effect.operation.default_branch.name() == DEFAULT_BRANCH
+            && effect.operation.default_branch.tip() == self.default_tip;
+        if exact { EffectOutcome::Acknowledged } else { EffectOutcome::Indeterminate }
     }
 
     fn apply_marker(&mut self, effect: &MarkerEffect) -> EffectOutcome {
@@ -1772,8 +1958,8 @@ impl DurableWorld {
             }
             assert!(
                 new.pull_requests.starts_with(&old.pull_requests)
-                    || matches!(effect, ExternalEffect::Projection(_)),
-                "only projection may mutate an existing pull request row"
+                    || matches!(effect, ExternalEffect::Draft(_) | ExternalEffect::Projection(_)),
+                "only a pull request mutation may change an existing row"
             );
             assert_eq!(
                 new.pull_requests.len(),
@@ -2224,6 +2410,7 @@ fn assert_interrupted_create_state(
             assert_eq!(open.len(), 1, "a selected create alias establishes one OPEN row");
             let fields = open[0].open_fields().unwrap();
             assert_eq!(fields.title, create.title);
+            assert!(fields.is_draft, "every created pull request must be durably draft");
             assert!(
                 fields.body == create.body,
                 "durable create body for {} differs from its applied create ({} != {} bytes)",
@@ -2604,6 +2791,228 @@ fn public_create_lease_rejects_a_d_f_conflict_without_mutation() {
     assert_eq!(world, before);
 }
 
+fn exact_draft_operation(world: &DurableWorld, id: &GherritPrId) -> TestDraft {
+    TestDraft {
+        id: id.clone(),
+        identity: world.identity(id),
+        head_oid: world.published(id).unwrap().history.last().head,
+        default_branch: DefaultBranch::new(DEFAULT_BRANCH.to_owned(), world.default_tip).unwrap(),
+    }
+}
+
+fn draft_routing_world() -> (DurableWorld, GherritPrId, GherritPrId) {
+    let default = oid(1);
+    let target_intent = root_intent(
+        default,
+        "Gdraftroute",
+        LiteralRevision { head: oid(2), first_parent: default },
+    );
+    let sibling_intent = root_intent(
+        default,
+        "Gdraftsibling",
+        LiteralRevision { head: oid(3), first_parent: default },
+    );
+    let mut world = DurableWorld::for_intents(default, &[&target_intent, &sibling_intent]);
+    for intent in [&target_intent, &sibling_intent] {
+        world.publish_for_setup(&intent.first.id, intent.first.desired);
+        world.open_for_setup(&intent.first.id, &intent.first.title, "old body");
+        world.mark_ready_on_default_for_setup(&intent.first.id, intent.first.desired.head);
+    }
+    (world, target_intent.first.id, sibling_intent.first.id)
+}
+
+#[test]
+fn draft_authority_and_safety_predicates_are_locally_scoped() {
+    let (mut world, target_id, sibling_id) = draft_routing_world();
+    let exact = exact_draft_operation(&world, &target_id);
+    assert!(world.marker_authorizes_draft(&exact));
+    assert!(world.local_open_rows_are_draft_safe(&target_id));
+
+    world.published_mut(&target_id).unwrap().marker = None;
+    assert!(!world.marker_authorizes_draft(&exact));
+    let v1 = world.published(&target_id).unwrap().history.first.head;
+    world.published_mut(&target_id).unwrap().marker =
+        Some(marker_identity(v1, exact.identity.number()));
+
+    world.open_for_setup(&target_id, "duplicate", "duplicate body");
+    let duplicate = TestDraft { identity: world.latest_identity(&target_id), ..exact.clone() };
+    assert!(!world.marker_authorizes_draft(&duplicate));
+
+    let sibling = world.identity(&sibling_id);
+    world
+        .published_mut(&sibling_id)
+        .unwrap()
+        .pull_requests
+        .iter_mut()
+        .find(|row| row.identity == sibling)
+        .unwrap()
+        .open_fields_mut()
+        .unwrap()
+        .base = BaseKind::Owned;
+    assert!(world.local_open_rows_are_draft_safe(&target_id));
+    assert!(!world.local_open_rows_are_draft_safe(&sibling_id));
+}
+
+fn prepared_draft_conversion(operation: &TestDraft) -> PreparedDraftConversions {
+    PreparedDraftConversions::prepare(vec![DraftPullRequest::from_ready_default(
+        operation.id.clone(),
+        operation.identity.clone(),
+        operation.head_oid,
+        operation.default_branch.clone(),
+    )])
+    .unwrap()
+}
+
+#[tokio::test]
+#[should_panic(expected = "a planned draft conversion requires exact immutable-marker authority")]
+async fn semantic_driver_rejects_a_fabricated_unmarked_draft_conversion() {
+    let (mut world, target_id, _) = draft_routing_world();
+    let operation = exact_draft_operation(&world, &target_id);
+    world.published_mut(&target_id).unwrap().marker = None;
+    let conversions = prepared_draft_conversion(&operation);
+    let mut driver = WorldDriver::new(&mut world, None);
+    driver.convert_pull_requests_to_draft(conversions).await.unwrap();
+}
+
+#[tokio::test]
+#[should_panic(expected = "each reached local effect prefix must retain draft safety")]
+async fn semantic_driver_checks_draft_safety_at_an_interrupted_owned_prefix() {
+    let (mut world, target_id, _) = draft_routing_world();
+    let operation = exact_draft_operation(&world, &target_id);
+    let target_identity = operation.identity.clone();
+    world
+        .published_mut(&target_id)
+        .unwrap()
+        .pull_requests
+        .iter_mut()
+        .find(|row| row.identity == target_identity)
+        .unwrap()
+        .open_fields_mut()
+        .unwrap()
+        .base = BaseKind::Owned;
+    let conversions = prepared_draft_conversion(&operation);
+    let interruption = Interruption::Draft { batch: 0, applied_aliases: Box::new([]) };
+    let mut driver = WorldDriver::new(&mut world, Some(interruption));
+    driver.convert_pull_requests_to_draft(conversions).await.unwrap();
+}
+
+fn assert_indeterminate_draft_converts_real_target(
+    world: &mut DurableWorld,
+    target_id: &GherritPrId,
+    sibling_id: &GherritPrId,
+    operation: TestDraft,
+) {
+    let sibling = world.published(sibling_id).unwrap().clone();
+    let effect = world.resolve_draft(operation);
+    assert_eq!(effect.resolved_id.as_ref(), Some(target_id));
+    assert_eq!(world.apply_effect(&ExternalEffect::Draft(effect)), EffectOutcome::Indeterminate);
+    assert!(
+        world.selected_open_pull_request(target_id).unwrap().open_fields().unwrap().is_draft,
+        "the service mutates the node target before the receipt mismatch is known"
+    );
+    assert_eq!(world.published(sibling_id), Some(&sibling));
+}
+
+#[test]
+fn drafts_route_by_node_id_and_validate_complete_receipt_evidence_after_mutation() {
+    let (initial, target_id, sibling_id) = draft_routing_world();
+    let exact = exact_draft_operation(&initial, &target_id);
+
+    let mut unknown_world = initial.clone();
+    let unknown = TestDraft {
+        identity: PullRequestIdentity::for_plan_test(999, "UNKNOWN_NODE"),
+        ..exact.clone()
+    };
+    let unknown = unknown_world.resolve_draft(unknown);
+    assert_eq!(unknown.resolved_id, None);
+    let before_unknown = unknown_world.clone();
+    assert_eq!(
+        unknown_world.apply_effect(&ExternalEffect::Draft(unknown)),
+        EffectOutcome::Indeterminate
+    );
+    assert_eq!(unknown_world, before_unknown, "an unknown node ID cannot select a durable row");
+
+    let mut wrong_number_world = initial.clone();
+    let wrong_number = TestDraft {
+        identity: PullRequestIdentity::for_plan_test(
+            exact.identity.number().get() + 1,
+            exact.identity.node_id_for_test(),
+        ),
+        ..exact.clone()
+    };
+    assert_indeterminate_draft_converts_real_target(
+        &mut wrong_number_world,
+        &target_id,
+        &sibling_id,
+        wrong_number,
+    );
+
+    let mut wrong_change_world = initial.clone();
+    assert_indeterminate_draft_converts_real_target(
+        &mut wrong_change_world,
+        &target_id,
+        &sibling_id,
+        TestDraft { id: sibling_id.clone(), ..exact.clone() },
+    );
+
+    let mut wrong_head_world = initial.clone();
+    assert_indeterminate_draft_converts_real_target(
+        &mut wrong_head_world,
+        &target_id,
+        &sibling_id,
+        TestDraft { head_oid: oid(99), ..exact.clone() },
+    );
+
+    let mut wrong_base_world = initial.clone();
+    let target_identity = wrong_base_world.identity(&target_id);
+    wrong_base_world
+        .published_mut(&target_id)
+        .unwrap()
+        .pull_requests
+        .iter_mut()
+        .find(|row| row.identity == target_identity)
+        .unwrap()
+        .open_fields_mut()
+        .unwrap()
+        .base = BaseKind::Owned;
+    assert_indeterminate_draft_converts_real_target(
+        &mut wrong_base_world,
+        &target_id,
+        &sibling_id,
+        exact.clone(),
+    );
+
+    for default_branch in [
+        DefaultBranch::new("trunk".to_owned(), initial.default_tip).unwrap(),
+        DefaultBranch::new(DEFAULT_BRANCH.to_owned(), oid(99)).unwrap(),
+    ] {
+        let mut wrong_default_world = initial.clone();
+        assert_indeterminate_draft_converts_real_target(
+            &mut wrong_default_world,
+            &target_id,
+            &sibling_id,
+            TestDraft { default_branch, ..exact.clone() },
+        );
+    }
+
+    for merged in [false, true] {
+        let mut terminal_world = initial.clone();
+        if merged {
+            terminal_world.merge_for_setup(&exact.identity);
+        } else {
+            terminal_world.close_for_setup(&exact.identity);
+        }
+        let before = terminal_world.clone();
+        let terminal = terminal_world.resolve_draft(exact.clone());
+        assert_eq!(terminal.resolved_id.as_ref(), Some(&target_id));
+        assert_eq!(
+            terminal_world.apply_effect(&ExternalEffect::Draft(terminal)),
+            EffectOutcome::Indeterminate
+        );
+        assert_eq!(terminal_world, before, "a terminal target and every sibling stay unchanged");
+    }
+}
+
 #[test]
 fn updates_route_by_node_id_and_validate_the_complete_receipt_after_mutation() {
     let default = oid(1);
@@ -2791,6 +3200,136 @@ async fn every_small_attempt_prefix_restarts_from_literal_durable_state() {
 
     let done = completed.run_attempt(&intent, &QueryVisibility::default(), None).await.unwrap();
     assert!(done.trace.is_empty());
+}
+
+#[tokio::test]
+async fn multibatch_draft_interruption_replans_only_remaining_conversions_before_git() {
+    let intent = many_bounded_ids_intent(66, 16);
+    let mut initial = DurableWorld::for_intents(oid(1), &[&intent]);
+    for local in intent.iter() {
+        initial.publish_for_setup(&local.id, local.desired);
+        initial.open_for_setup(&local.id, &local.title, "stale body");
+        initial.mark_ready_on_default_for_setup(&local.id, local.desired.head);
+    }
+    let mut completed = initial.clone();
+    let complete = completed.run_attempt(&intent, &QueryVisibility::default(), None).await.unwrap();
+    assert_eq!(complete.outcome, AttemptOutcome::Acknowledged);
+    assert_eq!(
+        complete.trace.draft_conversions.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+        [64, 1]
+    );
+
+    let interruptions = [
+        (0, Vec::new()),
+        (0, vec![0, 17, 63]),
+        (0, (0..64).collect()),
+        (1, Vec::new()),
+        (1, vec![0]),
+    ];
+    for (batch, applied_aliases) in interruptions {
+        let mut world = initial.clone();
+
+        let stopped = world
+            .run_attempt(
+                &intent,
+                &QueryVisibility::default(),
+                Some(Interruption::Draft {
+                    batch,
+                    applied_aliases: applied_aliases.clone().into_boxed_slice(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped.outcome, AttemptOutcome::Stopped(StopReason::Indeterminate));
+        assert_eq!(stopped.trace.draft_conversions, complete.trace.draft_conversions[..=batch]);
+        assert!(stopped.trace.initial_refs.is_empty());
+        assert!(stopped.trace.creates.is_empty());
+        assert!(stopped.trace.markers.is_empty());
+        assert!(stopped.trace.projections.is_empty());
+
+        let label = format!("draft batch {batch} retry after {applied_aliases:?}");
+        let retry = run_acknowledged_retry(&mut world, &intent, &label).await;
+        assert_eq!(
+            flatten(&retry.trace.draft_conversions),
+            unapplied_request_suffix(&complete.trace.draft_conversions, batch, &applied_aliases),
+            "{label}: retry must convert exactly the aliases not known durable"
+        );
+        assert!(retry.trace.initial_refs.is_empty());
+        assert_eq!(flatten(&retry.trace.projections).len(), 66);
+        assert_quiescent(&mut world, &intent, &label).await;
+    }
+}
+
+fn ready_departing_child_world(intent: &LocalIntent) -> DurableWorld {
+    let mut world = DurableWorld::for_intents(oid(10), &[intent]);
+    let root = &intent.first;
+    world.publish_for_setup(&root.id, root.desired);
+    world.open_for_setup(&root.id, &root.title, "root body");
+    world.mark_for_setup(&root.id, root.desired.head, BaseKind::Default);
+
+    let child = &intent.later[0];
+    let old_child = LiteralRevision { head: oid(30), first_parent: root.desired.head };
+    world.publish_for_setup(&child.id, old_child);
+    world.open_for_setup(&child.id, &child.title, "child body");
+    world.mark_ready_on_default_for_setup(&child.id, old_child.head);
+
+    world
+}
+
+#[tokio::test]
+async fn stale_identical_draft_conversion_with_lost_receipt_stops_before_git() {
+    let intent = two_change_intent();
+    for applied_aliases in [Vec::new(), vec![0]] {
+        let mut world = ready_departing_child_world(&intent);
+        let primary = world.plan(&intent, &QueryVisibility::default()).unwrap();
+        let stale = world.plan(&intent, &QueryVisibility::default()).unwrap();
+        let (winner, loser) = execute_with_competition(
+            &mut world,
+            primary,
+            stale,
+            CompetitionBoundary::AfterDraftConversions,
+            Some(Interruption::Draft {
+                batch: 0,
+                applied_aliases: applied_aliases.into_boxed_slice(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(winner.outcome, AttemptOutcome::Acknowledged);
+        assert_eq!(loser.outcome, AttemptOutcome::Stopped(StopReason::Indeterminate));
+        assert_eq!(flatten(&winner.trace.draft_conversions).len(), 1);
+        assert_eq!(flatten(&winner.trace.initial_refs).len(), 1);
+        assert_eq!(flatten(&loser.trace.draft_conversions).len(), 1);
+        assert!(loser.trace.initial_refs.is_empty());
+        assert!(loser.trace.creates.is_empty());
+        assert!(loser.trace.markers.is_empty());
+        assert!(loser.trace.projections.is_empty());
+        assert_quiescent(&mut world, &intent, "stale lost draft receipt").await;
+    }
+}
+
+#[tokio::test]
+async fn exact_already_draft_receipt_releases_stale_publisher_to_cas_convergence() {
+    let intent = two_change_intent();
+    let mut world = ready_departing_child_world(&intent);
+    let primary = world.plan(&intent, &QueryVisibility::default()).unwrap();
+    let stale = world.plan(&intent, &QueryVisibility::default()).unwrap();
+    let (primary, stale) = execute_with_competition(
+        &mut world,
+        primary,
+        stale,
+        CompetitionBoundary::AfterDraftConversions,
+        None,
+    )
+    .await
+    .unwrap();
+    for report in [&primary, &stale] {
+        assert_eq!(report.outcome, AttemptOutcome::Acknowledged);
+        assert_eq!(flatten(&report.trace.draft_conversions).len(), 1);
+        assert_eq!(flatten(&report.trace.initial_refs).len(), 1);
+        assert_eq!(flatten(&report.trace.projections).len(), 2);
+    }
+    assert_quiescent(&mut world, &intent, "exact stale draft conversion").await;
 }
 
 #[tokio::test]

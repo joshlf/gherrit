@@ -21,10 +21,11 @@ use super::{
     body::{GeneratedBody, StackBodyRecipes},
     github::{
         AbsentPullRequest, BaseKind, ClosePullRequest, CompleteCreateReceipts,
-        CompleteLocalPullRequests, CreatePreparation, CreatePullRequest, Github,
+        CompleteLocalPullRequests, CreatePreparation, CreatePullRequest, DraftPullRequest, Github,
         LocalPullRequestObservation, ManagedOpenPullRequestCandidate, OpenPullRequestSelection,
-        PreflightedDuplicateCloses, PreparedCreates, PreparedPullRequestProjection,
-        PullRequestIdentity, PullRequestNumber, SelectedOpenPullRequest, UpdatePullRequest,
+        PreflightedDuplicateCloses, PreparedCreates, PreparedDraftConversions,
+        PreparedPullRequestProjection, PullRequestIdentity, PullRequestNumber,
+        SelectedOpenPullRequest, UpdatePullRequest,
     },
     history::{Revision, ValidatedChangeHistory},
     marker::MarkerTemplate,
@@ -142,12 +143,17 @@ impl PublicationPlan {
     }
 }
 
-/// Performs the four externally durable effect kinds for one bound attempt.
+/// Performs the externally durable effect kinds for one bound attempt.
 ///
 /// The staged plan, rather than the driver, owns their order and every
 /// continuation. Each operation consumes an already-preflighted value and
 /// returns only the acknowledgement needed to release the next stage.
 pub(super) trait EffectDriver {
+    async fn convert_pull_requests_to_draft(
+        &mut self,
+        conversions: PreparedDraftConversions,
+    ) -> Result<()>;
+
     async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()>;
 
     async fn create_pull_requests(
@@ -172,6 +178,13 @@ struct RemoteEffectDriver<'attempt> {
 }
 
 impl EffectDriver for RemoteEffectDriver<'_> {
+    async fn convert_pull_requests_to_draft(
+        &mut self,
+        conversions: PreparedDraftConversions,
+    ) -> Result<()> {
+        self.github.convert_pull_requests_to_draft(conversions).await
+    }
+
     async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()> {
         pushes.execute(self.destination).await
     }
@@ -211,8 +224,7 @@ impl EffectDriver for RemoteEffectDriver<'_> {
 /// Test-only pure planning inspects this type; production wraps it in the
 /// consuming [`PublicationPlan`] above.
 pub(super) struct PlannedPublication {
-    initial_ref_pushes: PreparedPushes,
-    after_initial_refs: AfterInitialRefs,
+    draft_safety: DraftSafetyStage,
 }
 
 impl PlannedPublication {
@@ -221,7 +233,9 @@ impl PlannedPublication {
     /// Any error ends the attempt immediately. No later effect is exposed to
     /// the driver, and no effect is retried or reobserved here.
     pub(super) async fn execute_with(self, driver: &mut impl EffectDriver) -> Result<()> {
-        let Self { initial_ref_pushes, after_initial_refs } = self;
+        let Self { draft_safety } = self;
+        let InitialRefsStage { initial_ref_pushes, after_initial_refs } =
+            draft_safety.complete_with(driver).await?;
         driver.publish_initial_refs(initial_ref_pushes).await?;
         let marker_stage = match after_initial_refs {
             AfterInitialRefs::Ready(stage) => *stage,
@@ -230,6 +244,34 @@ impl PlannedPublication {
         driver.publish_markers(marker_stage.markers).await?;
         driver.project_pull_requests(marker_stage.projection).await
     }
+}
+
+/// The first effect boundary admits exactly the two protocol states.
+///
+/// `Convert` always owns a nonempty preflighted batch. Its continuation is
+/// private until the complete batch is exactly acknowledged, so no Git effect
+/// can be reached through an unconverted ready row.
+enum DraftSafetyStage {
+    Ready(InitialRefsStage),
+    Convert { conversions: PreparedDraftConversions, next: InitialRefsStage },
+}
+
+impl DraftSafetyStage {
+    async fn complete_with(self, driver: &mut impl EffectDriver) -> Result<InitialRefsStage> {
+        match self {
+            Self::Ready(next) => Ok(next),
+            Self::Convert { conversions, next } => {
+                driver.convert_pull_requests_to_draft(conversions).await?;
+                Ok(next)
+            }
+        }
+    }
+}
+
+/// Initial Git publication and the continuation it can release.
+struct InitialRefsStage {
+    initial_ref_pushes: PreparedPushes,
+    after_initial_refs: AfterInitialRefs,
 }
 
 enum AfterInitialRefs {
@@ -394,10 +436,37 @@ impl ExistingReality {
 struct ValidatedOpenPullRequest {
     id: GherritPrId,
     identity: PullRequestIdentity,
-    base: BaseKind,
+    base_safety: CanonicalBaseSafety,
     title: Box<str>,
     body: Box<str>,
     duplicates: Box<[PullRequestIdentity]>,
+}
+
+/// The only canonical base/draft states that may survive validation.
+///
+/// Draft state is consumed here rather than retained as a flag. A ready
+/// owned-base row has no variant, and the only ready default-base row that
+/// needs an owned base carries its exact conversion capability.
+#[derive(Debug)]
+enum CanonicalBaseSafety {
+    AlreadySafe(BaseKind),
+    DraftBeforeOwned(DraftPullRequest),
+}
+
+impl CanonicalBaseSafety {
+    fn observed_base(&self) -> BaseKind {
+        match self {
+            Self::AlreadySafe(base) => *base,
+            Self::DraftBeforeOwned(_) => BaseKind::Default,
+        }
+    }
+
+    fn draft_conversion(&self) -> Option<&DraftPullRequest> {
+        match self {
+            Self::AlreadySafe(_) => None,
+            Self::DraftBeforeOwned(conversion) => Some(conversion),
+        }
+    }
 }
 
 impl ValidatedOpenPullRequest {
@@ -410,7 +479,7 @@ impl ValidatedOpenPullRequest {
     }
 
     fn base(&self) -> BaseKind {
-        self.base
+        self.base_safety.observed_base()
     }
 
     fn title(&self) -> &str {
@@ -423,6 +492,10 @@ impl ValidatedOpenPullRequest {
 
     fn duplicate_identities(&self) -> impl Iterator<Item = &PullRequestIdentity> {
         self.duplicates.iter()
+    }
+
+    fn draft_conversion(&self) -> Option<&DraftPullRequest> {
+        self.base_safety.draft_conversion()
     }
 }
 
@@ -522,6 +595,12 @@ fn plan_bound_effects(
         .iter()
         .map(|history| publication_revision(history.proposed()))
         .collect::<Result<Box<[_]>>>()?;
+    let realities = build_realities(
+        histories.iter().zip(desired_revisions.iter().copied()),
+        pull_requests.into_vec(),
+        &default_branch,
+    )?;
+    let draft_conversions = draft_conversions(&realities);
     let tuple_transitions = histories
         .iter()
         .zip(&desired_revisions)
@@ -532,17 +611,13 @@ fn plan_bound_effects(
         public_branch.as_ref().and_then(PlannedPublicBranch::transition),
         &tuple_transitions,
     )?;
-    let realities = build_realities(
-        histories.iter().zip(desired_revisions),
-        pull_requests.into_vec(),
-        &default_branch,
-    )?;
     let body_branch = public_branch.as_ref().map(|branch| branch.branch().clone());
     let recipes = StackBodyRecipes::new(destination, body_branch, stack, histories.into_vec())?;
     let after_initial_refs =
         prepare_projection(realities, recipes, create_preparation, default_branch)?;
 
-    Ok(PlannedPublication { initial_ref_pushes, after_initial_refs })
+    let next = InitialRefsStage { initial_ref_pushes, after_initial_refs };
+    Ok(PlannedPublication { draft_safety: prepare_draft_safety(draft_conversions, next)? })
 }
 
 #[cfg(test)]
@@ -621,12 +696,15 @@ fn validate_selected_open(
     Ok(())
 }
 
-fn validated_open(pull_request: SelectedOpenPullRequest) -> ValidatedOpenPullRequest {
+fn validated_open(
+    pull_request: SelectedOpenPullRequest,
+    base_safety: CanonicalBaseSafety,
+) -> ValidatedOpenPullRequest {
     let selected = pull_request.selected();
     ValidatedOpenPullRequest {
         id: pull_request.id().clone(),
         identity: selected.identity().clone(),
-        base: selected.base().kind(),
+        base_safety,
         title: selected.title().into(),
         body: selected.body().into(),
         duplicates: pull_request
@@ -655,12 +733,31 @@ fn validate_open_selection(
                     history.id().as_str()
                 );
             }
-            Ok(ExistingReality::Authenticated(validated_open(pull_request)))
+            let base_safety = if selected.is_draft() {
+                CanonicalBaseSafety::AlreadySafe(selected.base().kind())
+            } else if selected.base().kind() == BaseKind::Owned {
+                bail!(
+                    "OPEN pull request #{} for '{}' is ready on an owned base",
+                    selected.identity().number().get(),
+                    history.id().as_str()
+                );
+            } else if desired_base == BaseKind::Owned {
+                CanonicalBaseSafety::DraftBeforeOwned(DraftPullRequest::from_ready_default(
+                    history.id().clone(),
+                    selected.identity().clone(),
+                    selected.head_oid(),
+                    default_branch.clone(),
+                ))
+            } else {
+                CanonicalBaseSafety::AlreadySafe(BaseKind::Default)
+            };
+            Ok(ExistingReality::Authenticated(validated_open(pull_request, base_safety)))
         }
         OpenPullRequestSelection::Contender(pull_request) => {
             validate_selected_open(history, &pull_request, default_branch)?;
             validate_unmarked_or_duplicate(history.id(), pull_request.selected())?;
-            let pull_request = validated_open(pull_request);
+            let pull_request =
+                validated_open(pull_request, CanonicalBaseSafety::AlreadySafe(BaseKind::Owned));
             let marker =
                 MarkerOrigin::from_history(history).bind(pull_request.identity().number())?;
             Ok(ExistingReality::Contender { pull_request, marker })
@@ -710,6 +807,12 @@ fn validate_unmarked_or_duplicate(
             id.as_str()
         );
     }
+    if !candidate.is_draft() {
+        bail!(
+            "Unmarked or duplicate OPEN pull request #{number} for '{}' must already be a draft",
+            id.as_str()
+        );
+    }
     if candidate.has_landing_automation() {
         bail!(
             "Unmarked or duplicate OPEN pull request #{number} for '{}' cannot use landing automation",
@@ -717,6 +820,40 @@ fn validate_unmarked_or_duplicate(
         );
     }
     Ok(())
+}
+
+/// Seals the leading safety boundary around every required conversion.
+fn prepare_draft_safety(
+    conversions: Vec<DraftPullRequest>,
+    next: InitialRefsStage,
+) -> Result<DraftSafetyStage> {
+    if conversions.is_empty() {
+        Ok(DraftSafetyStage::Ready(next))
+    } else {
+        Ok(DraftSafetyStage::Convert {
+            conversions: PreparedDraftConversions::prepare(conversions)?,
+            next,
+        })
+    }
+}
+
+fn draft_conversions(realities: &ProjectionRealities) -> Vec<DraftPullRequest> {
+    let mut conversions = Vec::new();
+    let mut retain = |entry: &ExistingReality| {
+        conversions.extend(entry.pull_request().draft_conversion().cloned());
+    };
+    match realities {
+        ProjectionRealities::AllExisting(entries) => entries.iter().for_each(&mut retain),
+        ProjectionRealities::NeedsCreate(entries) => {
+            entries.before.iter().for_each(&mut retain);
+            for reality in &entries.after {
+                if let ProjectionReality::Existing(entry) = reality {
+                    retain(entry);
+                }
+            }
+        }
+    }
+    conversions
 }
 
 fn tuple_transition(
