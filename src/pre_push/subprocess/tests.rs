@@ -36,13 +36,15 @@ const REEXEC_READY: &str = "GHERRIT_SUBPROCESS_TEST_READY";
 #[cfg(unix)]
 const REEXEC_TARGET_PROCESS_GROUP: &str = "GHERRIT_SUBPROCESS_TEST_TARGET_PROCESS_GROUP";
 const REEXEC_TEST: &str = "pre_push::subprocess::tests::reexec_helper";
+const REEXEC_STDOUT_FRAME: &[u8] = b"\0GHERRIT-REEXEC-STDOUT\0";
 
 fn reexec(mode: &str) -> Command {
     let mut command = Command::new(env::current_exe().unwrap());
-    // Re-exec fixtures are a final, test-only adapter boundary. They need
-    // only their explicit mode and per-fixture bootstrap values; ambient
-    // credentials, proxy settings, Git configuration, and a stale test
-    // mode must never cross this boundary.
+    // Re-exec fixtures are raw only because they are inputs to the production
+    // subprocess adapter under test. That adapter owns their process group,
+    // deadline, and cleanup. They need only their explicit mode and
+    // per-fixture bootstrap values; ambient credentials, proxy settings, Git
+    // configuration, and a stale test mode must never cross this boundary.
     clear_environment(&mut command);
     command.args(["--exact", REEXEC_TEST, "--nocapture"]).env(REEXEC_MODE, mode);
     command
@@ -61,6 +63,8 @@ fn clear_environment(command: &mut Command) {
 
 #[cfg(unix)]
 fn shell(script: &str) -> Command {
+    // Like `reexec`, this builder is executed only by the bounded production
+    // subprocess adapter under test.
     let mut command = Command::new("/bin/sh");
     clear_environment(&mut command);
     command.arg("-c").arg(script);
@@ -72,9 +76,11 @@ fn reexec_helper() {
     let Ok(mode) = env::var(REEXEC_MODE) else {
         return;
     };
+    // Any raw descendants in these fixture modes remain in the process group
+    // owned by the bounded production adapter that launched this helper.
     match mode.as_str() {
         "binary-stdout" => {
-            std::io::stdout().write_all(&[1, 128, 255]).unwrap();
+            write_framed_stdout_and_exit(&[1, 128, 255]);
         }
         "nonzero" => process::exit(23),
         "large-both" => {
@@ -92,9 +98,6 @@ fn reexec_helper() {
         }
         "stderr-only" => {
             std::io::stderr().write_all(&vec![b'e'; reexec_bytes()]).unwrap();
-        }
-        "stdout-sized" => {
-            std::io::stdout().write_all(&vec![b'o'; reexec_bytes()]).unwrap();
         }
         "stdout-overflow" => {
             std::io::stdout().write_all(&vec![b'o'; reexec_bytes()]).unwrap();
@@ -119,7 +122,7 @@ fn reexec_helper() {
         "copy-stdin" => {
             let mut input = Vec::new();
             std::io::stdin().read_to_end(&mut input).unwrap();
-            std::io::stdout().write_all(&input).unwrap();
+            write_framed_stdout_and_exit(&input);
         }
         "read-only-stdin" => {
             let mut input = borrowed_standard_input();
@@ -127,7 +130,7 @@ fn reexec_helper() {
             input.rewind().unwrap();
             let mut bytes = Vec::new();
             input.read_to_end(&mut bytes).unwrap();
-            std::io::stdout().write_all(&bytes).unwrap();
+            write_framed_stdout_and_exit(&bytes);
         }
         "clean-environment" => {
             for (name, _) in env::vars_os() {
@@ -349,13 +352,6 @@ fn terminal_supervisor(case: &str) {
     assert_terminal_restored();
 }
 
-fn copy_stdin_output(bytes: &[u8]) -> process::Output {
-    let mut input = tempfile::tempfile().unwrap();
-    input.write_all(bytes).unwrap();
-    input.rewind().unwrap();
-    reexec("copy-stdin").stdin(Stdio::from(input)).output().unwrap()
-}
-
 fn borrowed_standard_input() -> std::mem::ManuallyDrop<fs::File> {
     #[cfg(unix)]
     {
@@ -381,6 +377,24 @@ fn borrowed_standard_input() -> std::mem::ManuallyDrop<fs::File> {
         // taking responsibility for closing the borrowed standard handle.
         std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_handle(handle as RawHandle) })
     }
+}
+
+fn write_framed_stdout_and_exit(payload: &[u8]) -> ! {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(REEXEC_STDOUT_FRAME).unwrap();
+    stdout.write_all(payload).unwrap();
+    stdout.flush().unwrap();
+    process::exit(0)
+}
+
+fn framed_fixture_stdout(stdout: &[u8]) -> &[u8] {
+    let frames = stdout
+        .windows(REEXEC_STDOUT_FRAME.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == REEXEC_STDOUT_FRAME).then_some(offset))
+        .collect::<Vec<_>>();
+    assert_eq!(frames.len(), 1, "fixture stdout must contain one frame");
+    &stdout[frames[0] + REEXEC_STDOUT_FRAME.len()..]
 }
 
 fn wait_for_marker_blocking(path: &Path) {
@@ -450,6 +464,8 @@ fn close_standard_handle(kind: windows_sys::Win32::System::Console::STD_HANDLE) 
 
 #[tokio::test(flavor = "current_thread")]
 async fn runs_a_platform_native_process() {
+    // The raw builder is the input to the bounded production adapter under
+    // test; it is not executed directly here.
     let mut command = Command::new(env::current_exe().unwrap());
     clear_environment(&mut command);
     command.arg("--help");
@@ -462,12 +478,10 @@ async fn runs_a_platform_native_process() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn preserves_binary_stdout_exactly() {
-    let expected = reexec("binary-stdout").output().unwrap();
     let output = output(reexec("binary-stdout"), TEST_TIMEOUT).await.unwrap();
 
-    assert_eq!(output.status(), &expected.status);
-    assert_eq!(output.stdout(), expected.stdout);
-    assert!(output.stdout().ends_with(&[1, 128, 255]));
+    assert!(output.status().success());
+    assert_eq!(framed_fixture_stdout(output.stdout()), [1, 128, 255]);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -544,13 +558,11 @@ async fn regular_file_stdin_is_rewound_and_can_exceed_pipe_capacity() {
     let mut input = RegularFileStdinBuilder::new().unwrap();
     input.write_all(&bytes).unwrap();
     let input = input.finish().unwrap();
-    let expected = copy_stdin_output(&bytes);
-
     let output =
         output_with_regular_file_stdin(reexec("copy-stdin"), input, TEST_TIMEOUT).await.unwrap();
 
     assert!(output.status().success());
-    assert_eq!(output.stdout(), expected.stdout);
+    assert_eq!(framed_fixture_stdout(output.stdout()), bytes);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -565,7 +577,7 @@ async fn regular_file_stdin_accepts_the_exact_limit() {
             .unwrap();
 
     assert!(output.status().success());
-    assert_eq!(output.stdout(), copy_stdin_output(bytes).stdout);
+    assert_eq!(framed_fixture_stdout(output.stdout()), bytes);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -581,7 +593,7 @@ async fn regular_file_stdin_rejects_overflow_without_writing_it() {
         output_with_regular_file_stdin(reexec("copy-stdin"), input.finish().unwrap(), TEST_TIMEOUT)
             .await
             .unwrap();
-    assert_eq!(output.stdout(), copy_stdin_output(bytes).stdout);
+    assert_eq!(framed_fixture_stdout(output.stdout()), bytes);
 }
 
 #[test]
@@ -627,7 +639,7 @@ async fn child_cannot_write_to_regular_file_stdin() {
     .unwrap();
 
     assert!(output.status().success());
-    assert_eq!(output.stdout(), copy_stdin_output(bytes).stdout);
+    assert_eq!(framed_fixture_stdout(output.stdout()), bytes);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -675,6 +687,11 @@ fn future_cancellation_restores_the_controlling_terminal() {
 
 #[cfg(unix)]
 fn run_terminal_session(mode: &str, reply: bool, ready: &[u8]) {
+    // This PTY supervisor cannot use `TestCommand` because it must establish
+    // a new session and controlling terminal between fork and exec. Its
+    // environment is cleared by `reexec`, transcript reads have fixed
+    // deadlines, and `KillOnDrop` reaps the supervisor on every unwind. The
+    // supervisor's own descendants use the bounded production adapter.
     let (master, slave) = open_pseudoterminal();
     let mut command = reexec(mode);
     command
@@ -1403,26 +1420,28 @@ async fn stderr_reader_failure_in_the_second_poll_slot_discards_partial_output()
 
 #[tokio::test(flavor = "current_thread")]
 async fn stdout_at_the_exact_limit_succeeds() {
-    let bytes = 64 * 1024;
-    let mut expected_command = reexec("stdout-sized");
-    expected_command.env(REEXEC_BYTES, bytes.to_string());
-    let expected = expected_command.output().unwrap();
-    let limit = expected.stdout.len();
-    let mut command = reexec("stdout-sized");
-    command.env(REEXEC_BYTES, bytes.to_string());
+    let context = testutil::TestContextBuilder::new("unused").build();
+    let global = context.dir.path().join("empty-global.config");
+    fs::write(&global, "").unwrap();
+    let expected = b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\n";
+    let mut command = Command::new(&context.system_git);
+    clear_environment(&mut command);
+    command
+        .current_dir(context.dir.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", global)
+        .args(["hash-object", "--stdin"]);
 
-    let output = output_with_stdout_limit(command, TEST_TIMEOUT, limit).await.unwrap();
+    let output = output_with_stdout_limit(command, TEST_TIMEOUT, expected.len()).await.unwrap();
 
     assert!(output.status().success());
-    assert_eq!(output.stdout(), expected.stdout);
+    assert_eq!(output.stdout(), expected);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn stdout_overflow_stops_execution_and_enters_cleanup_immediately() {
     let bytes = 64 * 1024;
-    let mut exact_command = reexec("stdout-sized");
-    exact_command.env(REEXEC_BYTES, bytes.to_string());
-    let limit = exact_command.output().unwrap().stdout.len();
+    let limit = 32;
     let mut command = reexec("stdout-overflow");
     command.env(REEXEC_BYTES, (bytes + 1).to_string());
     let started = Instant::now();
@@ -1527,6 +1546,8 @@ fn remote_git_execution_timeout_is_two_minutes() {
 #[tokio::test(flavor = "current_thread")]
 async fn errors_do_not_reveal_command_contents() {
     let secret = "secret-destination-that-must-not-appear";
+    // The deliberately missing program is passed to the bounded production
+    // adapter so this test can inspect its redacted start error.
     let mut command = Command::new(format!("/definitely/missing/{secret}"));
     clear_environment(&mut command);
 
