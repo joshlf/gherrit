@@ -2,15 +2,19 @@ use gix::ObjectId;
 
 use super::{
     super::{
-        github::{AbsentPullRequest, ObservedBase},
+        github::{AbsentPullRequest, ObservedBase, ObservedGithub},
         history::ValidatedChangeHistory,
+        refs::TestPushEffect,
     },
     *,
 };
-use crate::pre_push::{
-    batching::MAX_MUTATION_REQUEST_BYTES,
-    destination::RepositoryCoordinates,
-    local::{GherritPrId, LocalStack},
+use crate::{
+    manage::PublicBranchName,
+    pre_push::{
+        batching::MAX_MUTATION_REQUEST_BYTES,
+        destination::{ObservedPublicBranch, RepositoryCoordinates},
+        local::{GherritPrId, LocalStack},
+    },
 };
 
 const DEFAULT_NAME: &str = "main";
@@ -44,6 +48,39 @@ fn validated_history(
 ) -> ValidatedChangeHistory {
     let marker = pull_request_number.map(PullRequestNumber::for_test);
     ValidatedChangeHistory::for_plan_test(id, published, proposal, marker)
+}
+
+#[test]
+fn public_branch_cannot_conflict_with_the_default_branch_ref_path() {
+    for (public, default) in [
+        ("release-v1", "release-v1"),
+        ("release-v1/work", "release-v1"),
+        ("release-v1", "release-v1/stable"),
+    ] {
+        let name = PublicBranchName::new(public.to_owned()).unwrap();
+        assert!(PublicBranch::new(name, &default_branch(default, oid(10))).is_err());
+    }
+
+    let name = PublicBranchName::new("release-v1/work".to_owned()).unwrap();
+    assert!(PublicBranch::new(name, &default_branch("release-v2", oid(10))).is_ok());
+}
+
+#[test]
+fn public_branch_plan_retains_exactly_the_observed_transition_state() {
+    let desired = oid(20);
+    for (remote, needs_transition) in [
+        (RemoteBranchState::Absent, true),
+        (RemoteBranchState::At(desired), false),
+        (RemoteBranchState::At(oid(19)), true),
+    ] {
+        let default = default_branch(DEFAULT_NAME, oid(10));
+        let name = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+        let observed = ObservedPublicBranch::for_test(name, remote);
+        let observed = ObservedPublicProjection::new(observed, &default).unwrap();
+        let planned = plan_public_branch(Some(observed), desired).unwrap().unwrap();
+        assert_eq!(planned.branch().as_str(), "release-candidate");
+        assert_eq!(planned.transition().is_some(), needs_transition);
+    }
 }
 
 #[derive(Clone)]
@@ -199,12 +236,30 @@ fn plan(specs: &[EntrySpec]) -> Result<PlannedPublication> {
     plan_with_public_branch(specs, None)
 }
 
+fn plan_private_effects(
+    destination: PushDestination,
+    stack: LocalStack,
+    histories: Box<[ValidatedChangeHistory]>,
+    pull_requests: CompleteLocalPullRequests,
+) -> Result<PlannedPublication> {
+    plan_effects(
+        ObservedLocalPublication::for_plan_test(destination, stack, None),
+        histories,
+        pull_requests,
+    )
+}
+
 fn plan_with_public_branch(
     specs: &[EntrySpec],
     public_branch: Option<String>,
 ) -> Result<PlannedPublication> {
     let Inputs { destination, stack, histories, pull_requests } = inputs(specs);
-    plan_effects(&destination, public_branch, stack, histories, pull_requests)
+    let observed = public_branch
+        .map(PublicBranchName::new)
+        .transpose()?
+        .map(|name| ObservedPublicBranch::for_test(name, RemoteBranchState::Absent));
+    let local = ObservedLocalPublication::for_plan_test(destination, stack, observed);
+    plan_effects(local, histories, pull_requests)
 }
 
 fn observed_for_plan(
@@ -216,9 +271,11 @@ fn observed_for_plan(
 }
 
 fn tuple_count(pushes: &PreparedPushes) -> usize {
-    let refs = pushes.batches().map(|batch| batch.refspecs().len()).sum::<usize>();
-    assert_eq!(refs % 3, 0);
-    refs / 3
+    pushes
+        .batches()
+        .flat_map(|batch| batch.semantic_effects_for_test())
+        .filter(|effect| matches!(effect, TestPushEffect::Tuple { .. }))
+        .count()
 }
 
 fn marker_facts(stage: &MarkerStage) -> Vec<(String, ObjectId, u32)> {
@@ -362,8 +419,71 @@ fn planner_rejects_an_empty_stack_before_deriving_any_stage() {
     )
     .unwrap();
 
-    let error = plan_effects(&destination, None, stack, Box::new([]), pull_requests).err().unwrap();
+    let local = ObservedLocalPublication::for_plan_test(destination, stack, None);
+    let error = plan_effects(local, Box::new([]), pull_requests).err().unwrap();
     assert!(error.to_string().contains("requires a nonempty local stack"));
+}
+
+fn empty_publication_plan(public_state: Option<RemoteBranchState>) -> Result<EmptyPublicationPlan> {
+    let destination = PushDestination::for_test();
+    let default = default_branch(DEFAULT_NAME, oid(10));
+    let stack = LocalStack::for_plan_test(
+        default,
+        Vec::<(GherritPrId, ObjectId, ObjectId, String, String)>::new(),
+    );
+    let public_branch = public_state.map(|state| {
+        let name = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+        ObservedPublicBranch::for_test(name, state)
+    });
+    plan_empty_publication(ObservedLocalPublication::for_plan_test(
+        destination,
+        stack,
+        public_branch,
+    ))
+}
+
+#[test]
+fn empty_private_and_already_current_publication_have_no_git_effects() {
+    for public_state in [None, Some(RemoteBranchState::At(oid(10)))] {
+        let plan = empty_publication_plan(public_state).unwrap();
+        assert_eq!(plan.pushes.batches().len(), 0);
+    }
+}
+
+#[test]
+fn empty_publication_creates_or_advances_its_public_branch_to_the_default_tip() {
+    for (state, expected) in
+        [(RemoteBranchState::Absent, None), (RemoteBranchState::At(oid(9)), Some(oid(9)))]
+    {
+        let plan = empty_publication_plan(Some(state)).unwrap();
+        let effects = plan
+            .pushes
+            .batches()
+            .flat_map(|batch| batch.semantic_effects_for_test())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            effects,
+            [TestPushEffect::PublicBranch {
+                branch: "release-candidate".to_owned(),
+                expected,
+                desired: oid(10),
+            }]
+        );
+    }
+}
+
+#[test]
+fn empty_publication_planning_rejects_a_nonempty_stack() {
+    let Inputs { destination, stack, .. } = inputs(&[EntrySpec {
+        id: "Gone",
+        history: HistorySpec::absent(),
+        pull_request: PullRequestSpec::Absent,
+    }]);
+    let local = ObservedLocalPublication::for_plan_test(destination, stack, None);
+
+    let error = plan_empty_publication(local).err().unwrap();
+    assert!(error.to_string().contains("received a nonempty local stack"));
 }
 
 #[tokio::test]
@@ -376,9 +496,9 @@ async fn publication_plan_retains_its_matching_client_and_exact_git_target() {
     let Inputs { destination, stack, histories, pull_requests } = inputs(&[spec]);
     let observed = observed_for_plan(&destination, pull_requests);
     let expected_target = destination.publication_target();
-    let validated = ValidatedPublication::for_plan_test(histories, destination);
-
-    let plan = plan_publication(validated, observed, None, stack).unwrap();
+    let local = ObservedLocalPublication::for_plan_test(destination, stack, None);
+    let observed = CompletePublicationObservation::for_plan_test(local, histories, observed);
+    let plan = plan_publication(observed).unwrap();
     assert!(plan.github.publication_target() == &expected_target);
     assert!(plan.destination.publication_target() == expected_target);
 }
@@ -394,9 +514,9 @@ async fn one_attempt_rejects_a_client_for_another_literal_git_destination() {
     let repository = crate::util::Repo::open(".").unwrap();
     let other = PushDestination::for_test_url_in(&repository, "git@github.com:owner/repo.git");
     let observed = observed_for_plan(&other, pull_requests);
-    let validated = ValidatedPublication::for_plan_test(histories, destination);
-
-    let error = plan_publication(validated, observed, None, stack)
+    let local = ObservedLocalPublication::for_plan_test(destination, stack, None);
+    let observed = CompletePublicationObservation::for_plan_test(local, histories, observed);
+    let error = plan_publication(observed)
         .err()
         .expect("different literal destinations must not share one attempt");
     assert!(error.to_string().contains("different repository or push destination"));
@@ -415,9 +535,9 @@ async fn one_attempt_rejects_a_client_for_another_local_repository() {
     let repository = crate::util::Repo::open(directory.path().to_str().unwrap()).unwrap();
     let other = PushDestination::for_test_in(&repository);
     let observed = observed_for_plan(&other, pull_requests);
-    let validated = ValidatedPublication::for_plan_test(histories, destination);
-
-    let error = plan_publication(validated, observed, None, stack)
+    let local = ObservedLocalPublication::for_plan_test(destination, stack, None);
+    let observed = CompletePublicationObservation::for_plan_test(local, histories, observed);
+    let error = plan_publication(observed)
         .err()
         .expect("different local repositories must not share one attempt");
     assert!(error.to_string().contains("different repository or push destination"));
@@ -499,13 +619,13 @@ fn all_counts_and_ordered_joins_are_checked_before_planning() {
         };
         drop(preparation);
         let error =
-            plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
+            plan_private_effects(destination, stack, histories, pull_requests).err().unwrap();
         assert!(error.to_string().contains("different change counts"), "case={change}");
     }
 
     let Inputs { destination, stack, mut histories, pull_requests } = inputs(&specs);
     histories.swap(0, 1);
-    let error = plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
+    let error = plan_private_effects(destination, stack, histories, pull_requests).err().unwrap();
     assert!(error.to_string().contains("Git history at stack position 0"));
 
     let Inputs { destination, stack, histories, pull_requests } = inputs(&specs);
@@ -521,7 +641,7 @@ fn all_counts_and_ordered_joins_are_checked_before_planning() {
         &[],
     )
     .unwrap();
-    let error = plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
+    let error = plan_private_effects(destination, stack, histories, pull_requests).err().unwrap();
     assert!(error.to_string().contains("GitHub evidence at stack position 0"));
 }
 
@@ -541,7 +661,7 @@ fn repository_default_and_proposal_facts_must_match() {
             oid(10),
         );
         let error =
-            plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
+            plan_private_effects(destination, stack, histories, pull_requests).err().unwrap();
         assert!(error.to_string().contains("different push repository"));
     }
 
@@ -549,20 +669,20 @@ fn repository_default_and_proposal_facts_must_match() {
         let Inputs { destination, stack, histories, pull_requests } =
             inputs_with_repository(std::slice::from_ref(&spec), "owner", "repo", name, tip);
         let error =
-            plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
+            plan_private_effects(destination, stack, histories, pull_requests).err().unwrap();
         assert!(error.to_string().contains("disagree"));
     }
 
     let Inputs { destination, stack, mut histories, pull_requests } =
         inputs(std::slice::from_ref(&spec));
     histories[0] = validated_history(id("Gone"), &[], (oid(99), oid(10)), None);
-    let error = plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
+    let error = plan_private_effects(destination, stack, histories, pull_requests).err().unwrap();
     assert!(error.to_string().contains("local proposal and first parent"));
 
     let Inputs { destination, stack, mut histories, pull_requests } =
         inputs(std::slice::from_ref(&spec));
     histories[0] = validated_history(id("Gone"), &[], (oid(20), oid(99)), None);
-    let error = plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
+    let error = plan_private_effects(destination, stack, histories, pull_requests).err().unwrap();
     assert!(error.to_string().contains("local proposal and first parent"));
 }
 
@@ -754,8 +874,16 @@ fn mixed_specs() -> [EntrySpec; 4] {
 #[test]
 fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
     let plan =
-        plan_with_public_branch(&mixed_specs(), Some("release/candidate".to_owned())).unwrap();
+        plan_with_public_branch(&mixed_specs(), Some("release-candidate".to_owned())).unwrap();
     assert_eq!(tuple_count(&plan.initial_ref_pushes), 1);
+    assert_eq!(
+        plan.initial_ref_pushes
+            .batches()
+            .flat_map(|batch| batch.semantic_effects_for_test())
+            .filter(|effect| matches!(effect, TestPushEffect::PublicBranch { .. }))
+            .count(),
+        1
+    );
     let stage = creates(plan);
     let create_operations = stage.creates.operations_for_test();
     assert_eq!(create_operations.len(), 2);
@@ -771,7 +899,9 @@ fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
     for (operation, expected_id) in create_operations.iter().zip(["Gtwo", "Gfour"]) {
         assert_eq!(operation.title, desired_title(expected_id));
         assert!(operation.body.contains(&desired_body(expected_id)));
-        assert!(operation.body.contains("[release\\/candidate](../tree/release/candidate)"));
+        assert!(
+            operation.body.contains("[release\\-candidate](/owner/repo/tree/release-candidate)")
+        );
         assert!(operation.body.contains(&format!("refs/heads/{expected_id}")));
     }
 
@@ -802,7 +932,7 @@ fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
     for (update, expected_id) in updates.iter().zip(["Gone", "Gtwo", "Gthree", "Gfour"]) {
         let body = update.body.as_deref().unwrap();
         assert!(body.contains(&desired_body(expected_id)));
-        assert!(body.contains("[release\\/candidate](../tree/release/candidate)"));
+        assert!(body.contains("[release\\-candidate](/owner/repo/tree/release-candidate)"));
         assert!(body.contains(&format!("refs/heads/{expected_id}")));
         for other_id in ["Gone", "Gtwo", "Gthree", "Gfour"] {
             assert_eq!(body.contains(&desired_body(other_id)), other_id == expected_id);
@@ -922,7 +1052,7 @@ fn graphql_stages_are_preflighted_before_a_tuple_plan_can_escape() {
         &oversized_repository,
     )
     .unwrap();
-    let error = plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
+    let error = plan_private_effects(destination, stack, histories, pull_requests).err().unwrap();
     assert!(error.to_string().contains("GraphQL create mutation at item 0"));
 
     let oversized_node = "N".repeat(MAX_MUTATION_REQUEST_BYTES);
@@ -1203,11 +1333,14 @@ impl EffectDriver for ScriptedEffectDriver {
 }
 
 fn fresh_execution_plan() -> PlannedPublication {
-    plan(&[EntrySpec {
-        id: "Gfresh",
-        history: HistorySpec::absent(),
-        pull_request: PullRequestSpec::Absent,
-    }])
+    plan_with_public_branch(
+        &[EntrySpec {
+            id: "Gfresh",
+            history: HistorySpec::absent(),
+            pull_request: PullRequestSpec::Absent,
+        }],
+        Some("release-candidate".to_owned()),
+    )
     .unwrap()
 }
 

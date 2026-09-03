@@ -12,10 +12,12 @@ expression: acknowledged.attempts
         - "--force-with-lease=refs/heads/Gfresh:"
         - "--force-with-lease=refs/heads/gherrit-bases/Gfresh:"
         - "--force-with-lease=refs/tags/gherrit/Gfresh/v1:"
+        - "--force-with-lease=refs/heads/release-candidate:"
       refspecs:
         - "0000000000000000000000000000000000000014:refs/heads/Gfresh"
         - "000000000000000000000000000000000000000a:refs/heads/gherrit-bases/Gfresh"
         - "0000000000000000000000000000000000000014:refs/tags/gherrit/Gfresh/v1"
+        - "0000000000000000000000000000000000000014:refs/heads/release-candidate"
 - Creates:
     - id: Gfresh
       title: Title for Gfresh
@@ -27,6 +29,8 @@ expression: acknowledged.attempts
         - Second paragraph for Gfresh.
         - ""
         - "---"
+        - ""
+        - "This PR is on branch [release\\-candidate](/owner/repo/tree/release-candidate)."
         - ""
         - ""
         - "<details>"
@@ -75,6 +79,8 @@ expression: acknowledged.attempts
         - Second paragraph for Gfresh.
         - ""
         - "---"
+        - ""
+        - "This PR is on branch [release\\-candidate](/owner/repo/tree/release-candidate)."
         - ""
         - "- 👉 #100"
         - ""
