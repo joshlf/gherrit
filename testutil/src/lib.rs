@@ -1016,7 +1016,10 @@ impl Drop for TestContext {
 impl TestContext {
     fn configure_test_env(&self, cmd: &mut TestCommand) {
         self.test_environment.apply_to_command(cmd);
+        self.configure_test_capabilities(cmd);
+    }
 
+    fn configure_test_capabilities(&self, cmd: &mut TestCommand) {
         // Give each command a deterministic, unique timestamp. In particular,
         // this ensures an otherwise-empty amend creates a distinct Git object.
         let timestamp = self.next_git_timestamp.fetch_add(1, Ordering::Relaxed);
@@ -1062,6 +1065,21 @@ impl TestContext {
     #[must_use = "command builders do nothing until executed"]
     pub fn reexec_test_cmd(&self) -> TestCommand {
         self.test_environment.command(&env::current_exe().expect("current test executable"))
+    }
+
+    /// Executes a production-built command through the bounded, hermetic test
+    /// harness while preserving its explicit environment overrides.
+    #[must_use = "command builders do nothing until executed"]
+    pub fn bounded_cmd(&self, command: Command) -> TestCommand {
+        let mut cmd = TestCommand::from_command(command);
+        // `Command` records only explicit overrides. Capture them before
+        // replacing ambient inheritance, then restore them after fixture
+        // capabilities so production `env` and `env_remove` choices win.
+        let overrides = cmd.environment_overrides();
+        self.test_environment.apply_to_command(&mut cmd);
+        self.configure_test_capabilities(&mut cmd);
+        cmd.apply_environment_overrides(overrides);
+        cmd
     }
 
     #[must_use = "command builders do nothing until executed"]
@@ -1721,19 +1739,63 @@ fn init_git_repo(
 }
 
 static SYSTEM_GIT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
-    let output = if cfg!(windows) {
-        Command::new("where").arg("git").output()
-    } else {
-        Command::new("which").arg("git").output()
-    };
-    let output = output.expect("Failed to find system git");
-    if !output.status.success() {
-        panic!("Failed to find git using 'which/where': {:?}", output);
-    }
-    let stdout = String::from_utf8(output.stdout).expect("Invalid utf8 from which git");
-    let path = stdout.lines().next().expect("No git path found").trim();
-    PathBuf::from(path)
+    let path = env::var_os("PATH").expect("PATH is required to find system Git");
+    find_system_git(&path, env::var_os("PATHEXT").as_deref())
+        .expect("Failed to find an executable system Git on PATH")
 });
+
+fn find_system_git(
+    path: &std::ffi::OsStr,
+    path_extensions: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let names = system_git_names(path_extensions);
+    env::split_paths(path).find_map(|directory| {
+        names.iter().find_map(|name| {
+            let candidate = directory.join(name);
+            if is_executable_file(&candidate) {
+                fs::canonicalize(candidate).ok()
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn system_git_names(_path_extensions: Option<&std::ffi::OsStr>) -> Vec<OsString> {
+    #[cfg(not(windows))]
+    {
+        vec![OsString::from("git")]
+    }
+    #[cfg(windows)]
+    {
+        let extensions =
+            _path_extensions.and_then(std::ffi::OsStr::to_str).unwrap_or(".COM;.EXE;.BAT;.CMD");
+        let mut names = vec![OsString::from("git.exe")];
+        for extension in extensions.split(';').filter(|extension| !extension.is_empty()) {
+            names.push(format!("git{extension}").into());
+        }
+        names
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2012,6 +2074,54 @@ mod tests {
         assert!(!output.contains("SHOULD_BE_CLEARED="));
         assert!(output.lines().any(|line| line == "RUST_LOG=info"));
         assert!(output.lines().any(|line| line.starts_with("HOME=")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_command_preserves_overrides_after_context_capabilities() {
+        let context = TestContextBuilder::new("unused").build();
+        let mut raw = Command::new("/usr/bin/env");
+        raw.env("EXPLICIT_FIXTURE_VALUE", "present")
+            .env("GIT_AUTHOR_DATE", "explicit-author-date")
+            .env_remove("GIT_COMMITTER_DATE")
+            .env_remove("RUST_LOG");
+        let mut command = context.bounded_cmd(raw);
+
+        let output =
+            String::from_utf8(command.assert().success().get_output().stdout.clone()).unwrap();
+        assert!(output.lines().any(|line| line == "EXPLICIT_FIXTURE_VALUE=present"));
+        assert!(output.lines().any(|line| line == "GIT_AUTHOR_DATE=explicit-author-date"));
+        assert!(!output.lines().any(|line| line.starts_with("GIT_COMMITTER_DATE=")));
+        assert!(!output.lines().any(|line| line.starts_with("RUST_LOG=")));
+        assert!(output.lines().any(|line| line.starts_with("HOME=")));
+    }
+
+    #[test]
+    fn system_git_resolution_uses_path_order_and_executable_files() {
+        let root = TempDir::new().unwrap();
+        let skipped = root.path().join("skipped");
+        let selected = root.path().join("selected");
+        fs::create_dir(&skipped).unwrap();
+        fs::create_dir(&selected).unwrap();
+        #[cfg(windows)]
+        let name = "git.EXE";
+        #[cfg(not(windows))]
+        let name = "git";
+        let executable = selected.join(name);
+        fs::write(&executable, b"fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let non_executable = skipped.join(name);
+            fs::write(&non_executable, b"fixture").unwrap();
+        }
+        let path = env::join_paths([&skipped, &selected]).unwrap();
+
+        let resolved = find_system_git(&path, Some(std::ffi::OsStr::new(".EXE"))).unwrap();
+
+        assert_eq!(resolved, fs::canonicalize(executable).unwrap());
     }
 
     #[test]

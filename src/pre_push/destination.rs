@@ -1760,6 +1760,9 @@ mod tests {
     }
 
     fn observation_fixture(mode: &str) -> Command {
+        // This raw command is the input to `observe_initial_command`, whose
+        // production subprocess adapter supplies the deadline and owns the
+        // fixture process group through cleanup.
         let mut command = Command::new(env::current_exe().unwrap());
         command.env_clear();
         #[cfg(windows)]
@@ -1775,14 +1778,13 @@ mod tests {
     fn transport_fixture(context: &testutil::TestContext, mode: &str) -> process::Output {
         let global = context.dir.path().join("empty-global.config");
         fs::write(&global, "").unwrap();
-        Command::new(env::current_exe().unwrap())
+        context
+            .reexec_test_cmd()
             .args(["--exact", TRANSPORT_FIXTURE_TEST, "--nocapture"])
             .current_dir(&context.repo_path)
             .env(TRANSPORT_FIXTURE_MODE, mode)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", global)
-            .env_remove(GIT_CONFIG_PARAMETERS_ENV)
-            .env_remove("GIT_CONFIG_COUNT")
             .output()
             .unwrap()
     }
@@ -1921,28 +1923,12 @@ mod tests {
             .map(|(_, value)| value)
     }
 
-    fn successful_git(current_dir: &Path, arguments: &[&str]) {
-        let mut command = Command::new("git");
-        for variable in [
-            "GIT_DIR",
-            "GIT_COMMON_DIR",
-            "GIT_WORK_TREE",
-            "GIT_IMPLICIT_WORK_TREE",
-            "GIT_NAMESPACE",
-            "GIT_CEILING_DIRECTORIES",
-            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-        ] {
-            command.env_remove(variable);
-        }
-        let output = command.current_dir(current_dir).args(arguments).output().unwrap();
-        assert!(
-            output.status.success(),
-            "git {arguments:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn successful_git(context: &testutil::TestContext, current_dir: &Path, arguments: &[&str]) {
+        context.git_cmd().current_dir(current_dir).args(arguments).assert().success();
     }
 
     fn assert_repository_binding(
+        context: &testutil::TestContext,
         repository: &util::Repo,
         expected_current: &Path,
         expected_work_tree: Option<&Path>,
@@ -1990,7 +1976,7 @@ mod tests {
         if expected_work_tree.is_some() {
             command.arg("--show-toplevel");
         }
-        let output = command.output().unwrap();
+        let output = context.bounded_cmd(command).output().unwrap();
         assert!(
             output.status.success(),
             "bound git rev-parse failed: {}",
@@ -2016,10 +2002,12 @@ mod tests {
 
     #[test]
     fn repository_binding_models_normal_linked_and_bare_repositories() {
+        let context = testutil::TestContextBuilder::new("unused").build();
         let root = tempfile::tempdir().unwrap();
         let ordinary = root.path().join("ordinary");
-        successful_git(root.path(), &["init", ordinary.to_str().unwrap()]);
+        successful_git(&context, root.path(), &["init", ordinary.to_str().unwrap()]);
         successful_git(
+            &context,
             &ordinary,
             &[
                 "-c",
@@ -2037,6 +2025,7 @@ mod tests {
 
         let linked = root.path().join("linked");
         successful_git(
+            &context,
             &ordinary,
             &["worktree", "add", "--detach", linked.to_str().unwrap(), "HEAD"],
         );
@@ -2047,13 +2036,19 @@ mod tests {
         gix::init_bare(&hostile).unwrap();
 
         let ordinary_repository = util::Repo::open(ordinary.to_str().unwrap()).unwrap();
-        assert_repository_binding(&ordinary_repository, &ordinary, Some(&ordinary), &hostile);
+        assert_repository_binding(
+            &context,
+            &ordinary_repository,
+            &ordinary,
+            Some(&ordinary),
+            &hostile,
+        );
 
         let linked_repository = util::Repo::open(linked.to_str().unwrap()).unwrap();
-        assert_repository_binding(&linked_repository, &linked, Some(&linked), &hostile);
+        assert_repository_binding(&context, &linked_repository, &linked, Some(&linked), &hostile);
 
         let bare_repository = util::Repo::open(bare.to_str().unwrap()).unwrap();
-        assert_repository_binding(&bare_repository, &bare, None, &hostile);
+        assert_repository_binding(&context, &bare_repository, &bare, None, &hostile);
     }
 
     #[test]
@@ -2217,7 +2212,7 @@ mod tests {
             .env("GIT_CONFIG_NOSYSTEM", "0")
             .env("GIT_CONFIG_SYSTEM", &system)
             .env("GIT_CONFIG_GLOBAL", &global);
-        let output = command.output().unwrap();
+        let output = context.bounded_cmd(command).output().unwrap();
 
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_trace2_unchanged(&traces);
@@ -2389,6 +2384,7 @@ mod tests {
 
     #[test]
     fn exact_redirect_parameter_preserves_command_scope_and_wins() {
+        let context = testutil::TestContextBuilder::new("unused").build();
         let literal = "https://redirect.invalid/private/repo.git";
         let key = format!("http.{literal}.followRedirects");
         let inherited = format!(
@@ -2405,7 +2401,7 @@ mod tests {
         assert!(parameters.to_str().unwrap().starts_with(&inherited));
 
         let command = |arguments: &[&str]| {
-            let mut command = Command::new("git");
+            let mut command = context.git_cmd();
             command
                 .args(arguments)
                 .env(GIT_CONFIG_PARAMETERS_ENV, &parameters)
@@ -2565,6 +2561,9 @@ mod tests {
             .env("GIT_CONFIG_VALUE_0", format!("+{SOURCE}:{SENTINEL}"));
         let mut input = subprocess::RegularFileStdinBuilder::new().unwrap();
         input.write_all(format!("{SOURCE}\n").as_bytes()).unwrap();
+        // The prepared production command is executed by the same bounded
+        // subprocess adapter used in production, including its deadline and
+        // process-boundary cleanup.
         let output = subprocess::output_with_regular_file_stdin(
             command,
             input.finish().unwrap(),
