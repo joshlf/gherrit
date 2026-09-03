@@ -1,21 +1,15 @@
 ---
 source: tests/pre_push/publication.rs
-assertion_line: 461
 expression: requests
 ---
 [
     [
         Query,
-        Query,
-        Query,
-        Query,
     ],
     [
         Query,
-        Query,
     ],
     [
-        Query,
         Query,
     ],
     [

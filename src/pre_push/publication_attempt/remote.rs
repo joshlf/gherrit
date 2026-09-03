@@ -302,6 +302,55 @@ pub(super) async fn observe_and_validate_histories(
         .await
 }
 
+/// Completes exact named-default observation before an empty public stack is
+/// planned.
+///
+/// Nonempty publication obtains this evidence in its first exact-local query.
+/// Empty private and already-current public stacks require no plan which can
+/// write, so their initial observation is already complete.
+pub(super) async fn require_exact_default(
+    expected: &DefaultBranch,
+    repository: &util::Repo,
+    destination: &PushDestination,
+) -> Result<()> {
+    if !destination.belongs_to(repository)? {
+        bail!(
+            "Exact default-branch observation received a destination from a different repository"
+        );
+    }
+    let output = destination
+        .observe_refs_from(repository, [expected.full_ref_name()])
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "Failed to observe the exact default branch for GHerrit remote '{}'",
+                destination.configured_remote()
+            )
+        })?;
+    if !output.status().success() {
+        return Err(remote_command_failure(
+            format!(
+                "Exact default-branch observation failed for GHerrit remote '{}'",
+                destination.configured_remote()
+            ),
+            &output,
+            destination,
+        ));
+    }
+    parse_exact_default_branch(output.stdout(), expected).wrap_err_with(|| {
+        format!(
+            "GHerrit remote '{}' did not provide the exact default branch",
+            destination.configured_remote()
+        )
+    })
+}
+
+fn parse_exact_default_branch(output: &[u8], expected: &DefaultBranch) -> Result<()> {
+    let changes = parse_query(output, std::iter::empty(), Some(expected))?;
+    debug_assert!(changes.is_empty());
+    Ok(())
+}
+
 async fn acquire(
     repository: &util::Repo,
     destination: &PushDestination,
@@ -1573,6 +1622,33 @@ mod tests {
     ) -> Result<RawExactLocalObservation> {
         let default = default_branch();
         QueryPlan::new(default, ids)?.decode(outputs)
+    }
+
+    #[test]
+    fn exact_default_observation_requires_one_matching_named_ref() {
+        let default = default_branch();
+        assert!(
+            parse_exact_default_branch(
+                format!("{DEFAULT}\trefs/heads/main\n").as_bytes(),
+                &default,
+            )
+            .is_ok()
+        );
+
+        for (case, output, expected) in [
+            ("missing", String::new(), "omitted the default branch"),
+            ("moved", format!("{HEAD}\trefs/heads/main\n"), "default branch moved"),
+            (
+                "duplicate",
+                format!("{DEFAULT}\trefs/heads/main\n{DEFAULT}\trefs/heads/main\n"),
+                "same remote ref record more than once",
+            ),
+        ] {
+            let error = parse_exact_default_branch(output.as_bytes(), &default)
+                .expect_err(case)
+                .to_string();
+            assert!(error.contains(expected), "case={case}, error={error}");
+        }
     }
 
     fn full_output() -> String {

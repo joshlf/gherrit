@@ -12,11 +12,13 @@ use std::borrow::Cow;
 use color_eyre::eyre::{Result, bail};
 
 #[cfg(test)]
+use super::ObservedLocalPublication;
+#[cfg(test)]
 use super::github::{ManagedOpenPullRequests, TestPullRequestProjection, TestUpdate};
 #[cfg(test)]
 use super::refs::prepare_tuple_pushes;
 use super::{
-    CompletePublicationObservation, ObservedLocalPublication, ObservedPublicProjection,
+    CompleteEmptyPublicationObservation, CompletePublicationObservation, ObservedPublicProjection,
     PublicBranch,
     body::{GeneratedBody, StackBodyRecipes},
     github::{
@@ -71,12 +73,13 @@ fn plan_public_branch(
 ) -> Result<Option<PlannedPublicBranch>> {
     observed
         .map(|observed| {
+            let requires_transition = observed.requires_transition_to(desired);
             let (branch, remote) = observed.into_parts();
             match remote {
-                RemoteBranchState::Absent => PublicBranchTransition::create(branch, desired),
-                RemoteBranchState::At(current) if current == desired => {
+                RemoteBranchState::At(_) if !requires_transition => {
                     return Ok(PlannedPublicBranch::AlreadyDesired(branch));
                 }
+                RemoteBranchState::Absent => PublicBranchTransition::create(branch, desired),
                 RemoteBranchState::At(current) => {
                     PublicBranchTransition::advance(branch, current, desired)
                 }
@@ -86,34 +89,45 @@ fn plan_public_branch(
         .transpose()
 }
 
-/// One executable public projection for an otherwise empty local stack.
-pub(super) struct EmptyPublicationPlan {
-    destination: PushDestination,
-    pushes: PreparedPushes,
+/// The only two possible plans for an empty local stack.
+///
+/// Each plan is created and consumed once, so retaining its prepared push
+/// inline is simpler and avoids an otherwise unnecessary allocation.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum EmptyPublicationPlan {
+    Noop,
+    PublicTransition { destination: PushDestination, pushes: PreparedPushes },
 }
 
 impl EmptyPublicationPlan {
     pub(super) async fn execute(self) -> Result<()> {
-        let Self { destination, pushes } = self;
+        let Self::PublicTransition { destination, pushes } = self else {
+            return Ok(());
+        };
         pushes.execute(&destination).await
+    }
+
+    #[cfg(test)]
+    fn pushes(&self) -> Option<&PreparedPushes> {
+        match self {
+            Self::Noop => None,
+            Self::PublicTransition { pushes, .. } => Some(pushes),
+        }
     }
 }
 
 /// Consumes the sealed local publication and prepares its only possible work.
 pub(super) fn plan_empty_publication(
-    local: ObservedLocalPublication,
+    observation: CompleteEmptyPublicationObservation,
 ) -> Result<EmptyPublicationPlan> {
+    let local = observation.into_local();
     let (destination, stack, observed_public_branch) = local.into_parts();
-    if !stack.is_empty() {
-        bail!("empty publication planning received a nonempty local stack");
-    }
     let public_branch = plan_public_branch(observed_public_branch, stack.tip())?;
-    let pushes = prepare_initial_pushes(
-        &destination,
-        public_branch.as_ref().and_then(PlannedPublicBranch::transition),
-        &[],
-    )?;
-    Ok(EmptyPublicationPlan { destination, pushes })
+    let Some(transition) = public_branch.as_ref().and_then(PlannedPublicBranch::transition) else {
+        return Ok(EmptyPublicationPlan::Noop);
+    };
+    let pushes = prepare_initial_pushes(&destination, Some(transition), &[])?;
+    Ok(EmptyPublicationPlan::PublicTransition { destination, pushes })
 }
 
 /// One complete executable publication plan.

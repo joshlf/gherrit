@@ -516,18 +516,15 @@ fn empty_publication_plan(public_state: Option<RemoteBranchState>) -> Result<Emp
         let name = PublicBranchName::new("release-candidate".to_owned()).unwrap();
         ObservedPublicBranch::for_test(name, state)
     });
-    plan_empty_publication(ObservedLocalPublication::for_plan_test(
-        destination,
-        stack,
-        public_branch,
-    ))
+    let local = ObservedLocalPublication::for_plan_test(destination, stack, public_branch);
+    plan_empty_publication(CompleteEmptyPublicationObservation::for_plan_test(local))
 }
 
 #[test]
 fn empty_private_and_already_current_publication_have_no_git_effects() {
     for public_state in [None, Some(RemoteBranchState::At(oid(10)))] {
         let plan = empty_publication_plan(public_state).unwrap();
-        assert_eq!(plan.pushes.batches().len(), 0);
+        assert!(matches!(plan, EmptyPublicationPlan::Noop));
     }
 }
 
@@ -538,7 +535,8 @@ fn empty_publication_creates_or_advances_its_public_branch_to_the_default_tip() 
     {
         let plan = empty_publication_plan(Some(state)).unwrap();
         let effects = plan
-            .pushes
+            .pushes()
+            .expect("a divergent public branch requires one transition")
             .batches()
             .flat_map(|batch| batch.semantic_effects_for_test())
             .cloned()
@@ -552,19 +550,6 @@ fn empty_publication_creates_or_advances_its_public_branch_to_the_default_tip() 
             }]
         );
     }
-}
-
-#[test]
-fn empty_publication_planning_rejects_a_nonempty_stack() {
-    let Inputs { destination, stack, .. } = inputs(&[EntrySpec {
-        id: "Gone",
-        history: HistorySpec::absent(),
-        pull_request: PullRequestSpec::Absent,
-    }]);
-    let local = ObservedLocalPublication::for_plan_test(destination, stack, None);
-
-    let error = plan_empty_publication(local).err().unwrap();
-    assert!(error.to_string().contains("received a nonempty local stack"));
 }
 
 #[tokio::test]
