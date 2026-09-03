@@ -147,8 +147,8 @@ fn test_manage_drift_detection() {
     // Assert Success
     ctx.assert_config("branch.drift-feature.gherritManaged", Some(testutil::MANAGED_PUBLIC));
 
-    // Check pushRemote is now origin
-    ctx.assert_config("branch.drift-feature.pushRemote", Some("origin"));
+    // The enclosing push remains a local no-op in both visibility modes.
+    ctx.assert_config("branch.drift-feature.pushRemote", Some("."));
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn test_manage_toggle_visibility() {
         ctx.gherrit_cmd().args(["manage", "--public"]),
         "manage_toggle_switch_public"
     );
-    ctx.assert_config("branch.visibility-feature.pushRemote", Some("origin"));
+    ctx.assert_config("branch.visibility-feature.pushRemote", Some("."));
 
     // 3. Private again
     testutil::assert_success_snapshot!(
@@ -251,6 +251,199 @@ fn private_management_does_not_read_invalid_remote_configuration() {
 }
 
 #[test]
+fn exact_legacy_public_configuration_migrates_once() {
+    let ctx = testutil::test_context!().build();
+    let branch = "legacy-public";
+    let merge = format!("refs/heads/{branch}");
+    ctx.checkout_new(branch);
+    ctx.set_config("gherrit.remote", Some("publication"));
+    configure_branch(
+        &ctx,
+        branch,
+        Some(testutil::MANAGED_PUBLIC),
+        Some("publication"),
+        Some("."),
+        Some(&merge),
+    );
+
+    ctx.manage_cmd().assert().success();
+    assert_branch_config(
+        &ctx,
+        branch,
+        Some(testutil::MANAGED_PUBLIC),
+        Some("."),
+        Some("."),
+        Some(&merge),
+    );
+
+    // The migrated form is the ordinary current form, so repeating the command
+    // neither needs the legacy remote nor changes any configuration.
+    ctx.set_config("gherrit.remote", Some("different-publication"));
+    ctx.run_git(&["config", "--add", "gherrit.remote", "duplicate-publication"]);
+    ctx.manage_cmd().assert().success();
+    assert_branch_config(
+        &ctx,
+        branch,
+        Some(testutil::MANAGED_PUBLIC),
+        Some("."),
+        Some("."),
+        Some(&merge),
+    );
+}
+
+#[test]
+fn incompatible_legacy_public_name_has_an_explicit_private_upgrade_path() {
+    let ctx = testutil::test_context!().build();
+    let branch = "feature";
+    let merge = format!("refs/heads/{branch}");
+    ctx.checkout_new(branch);
+    ctx.set_config("gherrit.remote", Some("publication"));
+    configure_branch(
+        &ctx,
+        branch,
+        Some(testutil::MANAGED_PUBLIC),
+        Some("publication"),
+        Some("."),
+        Some(&merge),
+    );
+
+    ctx.manage_cmd()
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("run `gherrit manage --private`"));
+    assert_branch_config(
+        &ctx,
+        branch,
+        Some(testutil::MANAGED_PUBLIC),
+        Some("publication"),
+        Some("."),
+        Some(&merge),
+    );
+
+    ctx.manage_cmd().arg("--private").assert().success();
+    assert_branch_config(
+        &ctx,
+        branch,
+        Some(testutil::MANAGED_PRIVATE),
+        Some("."),
+        Some("."),
+        Some(&merge),
+    );
+}
+
+#[test]
+fn static_legacy_public_near_misses_do_not_read_the_legacy_remote() {
+    let cases = [
+        ("missing-push-remote", None, Some("."), None),
+        ("upstream-remote", Some("publication"), Some("publication"), None),
+        ("merge-target", Some("publication"), Some("."), Some("refs/heads/other-branch")),
+    ];
+
+    cases.into_iter().for_each(|(name, push_remote, remote, merge_override)| {
+        let ctx = testutil::test_context!().build();
+        let branch = format!("legacy-{name}");
+        let merge = format!("refs/heads/{branch}");
+        ctx.checkout_new(&branch);
+        // An empty remote is invalid. These static near misses must remain
+        // ordinary drift instead of trying to decode unrelated legacy state.
+        ctx.set_config("gherrit.remote", Some(""));
+        configure_branch(
+            &ctx,
+            &branch,
+            Some(testutil::MANAGED_PUBLIC),
+            push_remote,
+            remote,
+            merge_override.or(Some(merge.as_str())),
+        );
+
+        ctx.manage_cmd().assert().success();
+        assert_branch_config(
+            &ctx,
+            &branch,
+            Some(testutil::MANAGED_PUBLIC),
+            push_remote,
+            remote,
+            merge_override.or(Some(merge.as_str())),
+        );
+
+        ctx.manage_cmd().arg("--force").assert().success();
+        assert_branch_config(
+            &ctx,
+            &branch,
+            Some(testutil::MANAGED_PUBLIC),
+            Some("."),
+            Some("."),
+            Some(&merge),
+        );
+    });
+}
+
+#[test]
+fn unreadable_legacy_remote_makes_an_exact_candidate_drift() {
+    ["empty", "duplicate"].into_iter().for_each(|case| {
+        let ctx = testutil::test_context!().build();
+        let branch = format!("legacy-{case}-remote");
+        let merge = format!("refs/heads/{branch}");
+        ctx.checkout_new(&branch);
+        configure_branch(
+            &ctx,
+            &branch,
+            Some(testutil::MANAGED_PUBLIC),
+            Some("publication"),
+            Some("."),
+            Some(&merge),
+        );
+        match case {
+            "empty" => ctx.set_config("gherrit.remote", Some("")),
+            "duplicate" => {
+                ctx.set_config("gherrit.remote", Some("publication"));
+                ctx.run_git(&["config", "--add", "gherrit.remote", "other-publication"]);
+            }
+            _ => unreachable!(),
+        }
+
+        ctx.manage_cmd().assert().success();
+        assert_branch_config(
+            &ctx,
+            &branch,
+            Some(testutil::MANAGED_PUBLIC),
+            Some("publication"),
+            Some("."),
+            Some(&merge),
+        );
+    });
+}
+
+#[test]
+fn forced_public_drift_repair_does_not_require_a_parseable_legacy_remote() {
+    let ctx = testutil::test_context!().build();
+    let branch = "forced-public-drift";
+    let merge = format!("refs/heads/{branch}");
+    ctx.checkout_new(branch);
+    configure_branch(
+        &ctx,
+        branch,
+        Some(testutil::MANAGED_PUBLIC),
+        Some("manually-drifted"),
+        Some("."),
+        Some(&merge),
+    );
+    ctx.set_config("gherrit.remote", Some("first"));
+    ctx.run_git(&["config", "--add", "gherrit.remote", "second"]);
+
+    ctx.manage_cmd().args(["--private", "--force"]).assert().success();
+
+    assert_branch_config(
+        &ctx,
+        branch,
+        Some(testutil::MANAGED_PRIVATE),
+        Some("."),
+        Some("."),
+        Some(&merge),
+    );
+}
+
+#[test]
 fn current_private_cleanup_does_not_read_invalid_remote_configuration() {
     ["empty", "repeated"].into_iter().for_each(|case| {
         let ctx = testutil::test_context!().build();
@@ -307,6 +500,71 @@ fn current_private_cleanup_does_not_read_non_utf8_remote_configuration() {
 }
 
 #[test]
+fn legacy_public_shape_is_not_adopted_for_other_ownership_states() {
+    let cases = [
+        ("manual", None),
+        ("unmanaged", Some("false")),
+        ("private", Some(testutil::MANAGED_PRIVATE)),
+    ];
+
+    cases.into_iter().for_each(|(name, state)| {
+        let ctx = testutil::test_context!().build();
+        let branch = format!("legacy-shaped-{name}");
+        let merge = format!("refs/heads/{branch}");
+        ctx.checkout_new(&branch);
+        ctx.set_config("gherrit.remote", Some("publication"));
+        configure_branch(&ctx, &branch, state, Some("publication"), Some("."), Some(&merge));
+
+        ctx.manage_cmd().arg("--public").assert().success();
+        assert_branch_config(&ctx, &branch, state, Some("publication"), Some("."), Some(&merge));
+    });
+}
+
+#[test]
+fn legacy_public_configuration_is_owned_during_visibility_and_cleanup_transitions() {
+    let private = testutil::test_context!().build();
+    let private_branch = "legacy-to-private";
+    let private_merge = format!("refs/heads/{private_branch}");
+    private.checkout_new(private_branch);
+    private.set_config("gherrit.remote", Some("publication"));
+    configure_branch(
+        &private,
+        private_branch,
+        Some(testutil::MANAGED_PUBLIC),
+        Some("publication"),
+        Some("."),
+        Some(&private_merge),
+    );
+
+    private.manage_cmd().arg("--private").assert().success();
+    assert_branch_config(
+        &private,
+        private_branch,
+        Some(testutil::MANAGED_PRIVATE),
+        Some("."),
+        Some("."),
+        Some(&private_merge),
+    );
+
+    let unmanaged = testutil::test_context!().build();
+    let unmanaged_branch = "legacy-to-unmanaged";
+    let unmanaged_merge = format!("refs/heads/{unmanaged_branch}");
+    unmanaged.checkout_new(unmanaged_branch);
+    unmanaged.set_config("gherrit.remote", Some("publication"));
+    configure_branch(
+        &unmanaged,
+        unmanaged_branch,
+        Some(testutil::MANAGED_PUBLIC),
+        Some("publication"),
+        Some("."),
+        Some(&unmanaged_merge),
+    );
+
+    unmanaged.unmanage_cmd().assert().success();
+    assert_branch_config(&unmanaged, unmanaged_branch, Some("false"), None, None, None);
+}
+
+#[test]
 fn test_manage_mutually_exclusive_flags() {
     let ctx = testutil::test_context!().build();
     ctx.checkout_new("conflict-feature");
@@ -347,6 +605,21 @@ fn forced_public_cleanup_does_not_require_a_parseable_remote() {
 }
 
 #[test]
+fn public_management_requires_a_ref_namespace_disjoint_from_change_ids() {
+    for branch in ["feature", "feature/one", "Gchange", "Gchange/child", "gherrit-bases/Gchange"] {
+        let ctx = testutil::test_context!().build();
+        ctx.checkout_new(branch);
+
+        ctx.gherrit_cmd().args(["manage", "--public"]).assert().failure();
+
+        ctx.assert_config(&format!("branch.{branch}.gherritManaged"), None);
+        ctx.assert_config(&format!("branch.{branch}.pushRemote"), None);
+        ctx.assert_config(&format!("branch.{branch}.remote"), None);
+        ctx.assert_config(&format!("branch.{branch}.merge"), None);
+    }
+}
+
+#[test]
 fn test_manage_invalid_config() {
     let ctx = testutil::test_context!().build();
     ctx.checkout_new("invalid-config-feature");
@@ -356,4 +629,189 @@ fn test_manage_invalid_config() {
 
     // Attempt to manage; should fail
     testutil::assert_failure_snapshot!(ctx, ctx.manage_cmd(), "manage_invalid_config");
+}
+
+#[test]
+fn management_state_requires_one_exact_local_value() {
+    let cases: &[(&str, &[&str])] = &[
+        ("leading-whitespace", &[" managedPrivate"]),
+        ("trailing-whitespace", &["false "]),
+        ("repeated", &["managedPrivate", "managedPrivate"]),
+        ("differing-repeated", &["managedPrivate", "false"]),
+    ];
+
+    for &(name, values) in cases {
+        let ctx = testutil::test_context!().build();
+        let branch = format!("state-{name}");
+        let key = format!("branch.{branch}.gherritManaged");
+        ctx.checkout_new(&branch);
+        ctx.set_config(&key, None);
+        for value in values {
+            ctx.git_cmd().args(["config", "--local", "--add", &key, value]).assert().success();
+        }
+
+        ctx.manage_cmd().assert().failure();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn management_state_rejects_non_utf8_without_echoing_it() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let ctx = testutil::test_context!().build();
+    let branch = "state-non-utf8";
+    let key = format!("branch.{branch}.gherritManaged");
+    ctx.checkout_new(branch);
+    ctx.git_cmd()
+        .args(["config", "--local", "--add", &key])
+        .arg(std::ffi::OsStr::from_bytes(b"managedPrivate\xff"))
+        .assert()
+        .success();
+
+    ctx.manage_cmd()
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Invalid gherritManaged value"));
+}
+
+#[test]
+fn branch_ownership_requires_one_exact_value_and_force_repairs_it() {
+    let cases = [
+        ("pushRemote", ".", " . "),
+        ("remote", ".", ". "),
+        ("merge", "refs/heads/exact-config", " refs/heads/exact-config"),
+    ];
+
+    for (suffix, expected, drifted) in cases {
+        let ctx = testutil::test_context!().build();
+        let branch = "exact-config";
+        let key = format!("branch.{branch}.{suffix}");
+        ctx.checkout_new(branch);
+        ctx.manage_cmd().arg("--private").assert().success();
+
+        ctx.git_cmd()
+            .args(["config", "--local", "--replace-all", &key, drifted])
+            .assert()
+            .success();
+        ctx.manage_cmd().arg("--private").assert().success();
+        ctx.git_cmd()
+            .args(["config", "--local", "--get", &key])
+            .assert()
+            .stdout(format!("{drifted}\n"));
+
+        ctx.git_cmd().args(["config", "--local", "--add", &key, expected]).assert().success();
+        ctx.manage_cmd().args(["--private", "--force"]).assert().success();
+        ctx.git_cmd()
+            .args(["config", "--local", "--get-all", &key])
+            .assert()
+            .success()
+            .stdout(format!("{expected}\n"));
+
+        ctx.git_cmd().args(["config", "--local", "--add", &key, expected]).assert().success();
+        ctx.manage_cmd().arg("--private").assert().success();
+        ctx.git_cmd()
+            .args(["config", "--local", "--get-all", &key])
+            .assert()
+            .success()
+            .stdout(format!("{expected}\n{expected}\n"));
+        ctx.manage_cmd().args(["--private", "--force"]).assert().success();
+        ctx.git_cmd()
+            .args(["config", "--local", "--get-all", &key])
+            .assert()
+            .success()
+            .stdout(format!("{expected}\n"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn force_repairs_a_non_utf8_owned_branch_value() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let ctx = testutil::test_context!().build();
+    let branch = "non-utf8-owned-config";
+    let key = format!("branch.{branch}.pushRemote");
+    ctx.checkout_new(branch);
+    ctx.manage_cmd().arg("--private").assert().success();
+    ctx.set_config(&key, None);
+    ctx.git_cmd()
+        .args(["config", "--local", "--add", &key])
+        .arg(std::ffi::OsStr::from_bytes(b"\xff"))
+        .assert()
+        .success();
+
+    ctx.manage_cmd().args(["--private", "--force"]).assert().success();
+    ctx.git_cmd().args(["config", "--local", "--get-all", &key]).assert().success().stdout(".\n");
+}
+
+#[test]
+fn forced_cleanup_unsets_every_owned_branch_occurrence() {
+    let ctx = testutil::test_context!().build();
+    let branch = "repeated-cleanup";
+    ctx.checkout_new(branch);
+    ctx.manage_cmd().arg("--private").assert().success();
+    for suffix in ["pushRemote", "remote", "merge"] {
+        ctx.git_cmd()
+            .args(["config", "--local", "--add", &format!("branch.{branch}.{suffix}"), "duplicate"])
+            .assert()
+            .success();
+    }
+
+    ctx.unmanage_cmd().arg("--force").assert().success();
+    assert_branch_config(&ctx, branch, Some("false"), None, None, None);
+}
+
+#[test]
+fn management_ownership_ignores_global_and_included_branch_values() {
+    let ctx = testutil::test_context!().build();
+    let branch = "local-ownership";
+    let state_key = format!("branch.{branch}.gherritManaged");
+    let push_key = format!("branch.{branch}.pushRemote");
+    ctx.checkout_new(branch);
+    ctx.git_cmd().args(["config", "--global", &state_key, "false"]).assert().success();
+    ctx.git_cmd().args(["config", "--global", &push_key, "global-drift"]).assert().success();
+
+    let included = ctx.dir.path().join("included-config");
+    std::fs::write(&included, format!("[branch \"{branch}\"]\n\tpushRemote = included-drift\n"))
+        .unwrap();
+    ctx.git_cmd().args(["config", "--local", "include.path"]).arg(&included).assert().success();
+
+    ctx.manage_cmd().arg("--private").assert().success();
+    ctx.git_cmd()
+        .args(["config", "--local", "--get-all", &state_key])
+        .assert()
+        .success()
+        .stdout(format!("{}\n", testutil::MANAGED_PRIVATE));
+    ctx.git_cmd()
+        .args(["config", "--local", "--get-all", &push_key])
+        .assert()
+        .success()
+        .stdout(".\n");
+}
+
+#[test]
+fn command_scope_operational_config_does_not_become_owned_branch_state() {
+    let ctx = testutil::test_context!().build();
+    let branch = "command-scope-config";
+    let state_key = format!("branch.{branch}.gherritManaged");
+    ctx.checkout_new(branch);
+
+    ctx.manage_cmd()
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", &state_key)
+        .env("GIT_CONFIG_VALUE_0", "false")
+        // Operational command-scope settings must still reach the Git child
+        // which performs the explicitly local query.
+        .env("GIT_CONFIG_KEY_1", "safe.directory")
+        .env("GIT_CONFIG_VALUE_1", &ctx.repo_path)
+        .arg("--private")
+        .assert()
+        .success();
+
+    ctx.git_cmd()
+        .args(["config", "--local", "--get-all", &state_key])
+        .assert()
+        .success()
+        .stdout(format!("{}\n", testutil::MANAGED_PRIVATE));
 }
