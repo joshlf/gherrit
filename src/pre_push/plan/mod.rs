@@ -7,31 +7,80 @@
 //! durable-effect barrier without the exact acknowledgement required by the
 //! preceding stage.
 
+#![cfg_attr(
+    test,
+    allow(dead_code, reason = "the production executor remains dormant until activation")
+)]
+
 use std::borrow::Cow;
 
 use color_eyre::eyre::{Result, bail};
 
-#[cfg(test)]
-use super::github::CompleteCreateReceipts;
 use super::{
     body::{GeneratedBody, StackBodyRecipes},
     destination::{DefaultBranch, PushDestination},
     github::{
-        BaseKind, CompleteLocalPullRequests, CreatePreparation, CreatePullRequest,
-        LocalPullRequestObservation, ManagedOpenPullRequest, PreparedCreates, PreparedUpdates,
-        PullRequestIdentity, PullRequestNumber, UpdatePullRequest,
+        BaseKind, CompleteCreateReceipts, CompleteLocalPullRequests, CreatePreparation,
+        CreatePullRequest, Github, LocalPullRequestObservation, ManagedOpenPullRequest,
+        PreparedCreates, PreparedUpdates, PullRequestIdentity, PullRequestNumber,
+        UpdatePullRequest,
     },
     history::ValidatedChangeHistory,
     local::{GherritPrId, LocalChange, LocalStack},
     marker::MarkerTemplate,
-    publication::{PreparedPushes, PublicationRevision, TupleTransition, prepare_tuple_pushes},
+    publication::{
+        MarkerTransition, PreparedPushes, PublicationRevision, TupleTransition,
+        prepare_marker_pushes, prepare_tuple_pushes,
+    },
+    remote::ValidatedPublication,
 };
+use crate::util;
 
-/// One complete staged publication plan.
+/// One complete executable publication plan.
 ///
-/// No production accessor exposes either field. Publication execution consumes
-/// this value as one workflow and crosses its internal barriers in order.
+/// Planning consumes the validated Git provenance, destination, and GitHub
+/// client. The plan retains its stages privately, and execution consumes this
+/// value as one workflow.
 pub(super) struct PublicationPlan {
+    destination: PushDestination,
+    github: Github,
+    effects: PlannedPublication,
+}
+
+impl PublicationPlan {
+    /// Executes the one fixed publication sequence without reobservation or
+    /// retry. Every later effect remains inaccessible until its preceding
+    /// durable acknowledgement has completed.
+    pub(super) async fn execute(self, repository: &util::Repo) -> Result<()> {
+        let Self { destination, github, effects } = self;
+        let PlannedPublication { tuple_pushes, after_tuples } = effects;
+        tuple_pushes.execute(&destination).await?;
+        let marker_stage = match after_tuples {
+            AfterTuples::Ready(stage) => *stage,
+            AfterTuples::Creates(stage) => stage.complete_from_github(&github).await?,
+        };
+        let markers = marker_stage
+            .markers
+            .into_vec()
+            .into_iter()
+            .map(MarkerTemplate::prepare)
+            .collect::<Result<Vec<_>>>()?;
+        let transitions = markers.iter().map(MarkerTransition::from_prepared).collect::<Vec<_>>();
+        let marker_pushes = prepare_marker_pushes(&destination, &transitions)?;
+        for marker in markers {
+            marker.materialize(repository)?;
+        }
+        marker_pushes.execute(&destination).await?;
+        github.update_pull_requests(marker_stage.updates).await
+    }
+}
+
+/// One complete staged publication plan before it receives execution
+/// provenance and clients.
+///
+/// Test-only pure planning inspects this type; production wraps it in the
+/// consuming [`PublicationPlan`] above.
+struct PlannedPublication {
     tuple_pushes: PreparedPushes,
     after_tuples: AfterTuples,
 }
@@ -39,7 +88,7 @@ pub(super) struct PublicationPlan {
 enum AfterTuples {
     /// Every pull request identity was present in the observation, so exact
     /// final updates could be rendered and preflighted during planning.
-    Ready(MarkerStage),
+    Ready(Box<MarkerStage>),
     /// At least one identity can exist only after an exact create receipt.
     Creates(Box<CreateStage>),
 }
@@ -57,6 +106,12 @@ struct CreateStage {
 }
 
 impl CreateStage {
+    async fn complete_from_github(self, github: &Github) -> Result<MarkerStage> {
+        let Self { creates, seed } = self;
+        let receipts = github.create_pull_requests(creates).await?;
+        seed.complete(receipts)
+    }
+
     /// Injects synthetic receipts without executing GitHub.
     ///
     /// Production execution must instead consume `self.creates` and pass its
@@ -78,7 +133,6 @@ struct ProjectionSeed {
 }
 
 impl ProjectionSeed {
-    #[cfg(test)]
     fn complete(self, receipts: CompleteCreateReceipts) -> Result<MarkerStage> {
         let Self { entries, recipes, default_branch } = self;
         let BoundProjection { entries, markers } =
@@ -222,12 +276,27 @@ impl BoundProjectionEntry {
 
 /// Consumes complete exact-local evidence into one immutable publication.
 pub(super) fn plan_publication(
+    validated: ValidatedPublication,
+    github: Github,
+    public_branch: Option<String>,
+    stack: LocalStack,
+    pull_requests: CompleteLocalPullRequests,
+) -> Result<PublicationPlan> {
+    let (histories, destination) = validated.into_parts();
+    if github.publication_target() != &destination.publication_target() {
+        bail!("GitHub publication client belongs to a different repository or push destination");
+    }
+    let effects = plan_effects(&destination, public_branch, stack, histories, pull_requests)?;
+    Ok(PublicationPlan { destination, github, effects })
+}
+
+fn plan_effects(
     destination: &PushDestination,
     public_branch: Option<String>,
     stack: LocalStack,
     histories: Box<[ValidatedChangeHistory]>,
     pull_requests: CompleteLocalPullRequests,
-) -> Result<PublicationPlan> {
+) -> Result<PlannedPublication> {
     if stack.is_empty() {
         bail!("publication planning requires a nonempty local stack");
     }
@@ -247,13 +316,13 @@ pub(super) fn plan_publication(
         .zip(&desired_revisions)
         .filter_map(|(history, desired)| tuple_transition(history, *desired))
         .collect::<Result<Vec<_>>>()?;
-    let tuple_pushes = prepare_tuple_pushes(&tuple_transitions)?;
+    let tuple_pushes = prepare_tuple_pushes(destination, &tuple_transitions)?;
     let realities =
         build_realities(histories.iter().zip(desired_revisions), pull_requests.into_vec())?;
     let recipes = StackBodyRecipes::new(destination, public_branch, stack, histories.into_vec())?;
     let after_tuples = prepare_projection(realities, recipes, create_preparation, default_branch)?;
 
-    Ok(PublicationPlan { tuple_pushes, after_tuples })
+    Ok(PlannedPublication { tuple_pushes, after_tuples })
 }
 
 /// Checks every count and positional join before any truncating iterator can
@@ -297,6 +366,9 @@ fn validate_proposal_join(change: &LocalChange, history: &ValidatedChangeHistory
             change.id().as_str()
         );
     }
+    // The head object also seals the subject and body retained by
+    // `LocalChange`: those bytes are part of the same immutable commit. A
+    // separate stack-instance token would not prove any additional fact.
     Ok(())
 }
 
@@ -439,7 +511,7 @@ fn prepare_projection(
                 .collect::<Box<[_]>>();
             let updates = prepare_final_updates(entries, &recipes, default_branch.name())?;
             drop(create_preparation);
-            Ok(AfterTuples::Ready(MarkerStage { markers: markers.into(), updates }))
+            Ok(AfterTuples::Ready(Box::new(MarkerStage { markers: markers.into(), updates })))
         }
         ProjectionRealities::NeedsCreate(realities) => {
             prepare_create_stage(realities, recipes, create_preparation, default_branch)

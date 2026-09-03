@@ -603,7 +603,7 @@ impl fmt::Write for BoundedWriter {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, fmt::Write as _, path::Path};
+    use std::{cell::Cell, fmt::Write as _};
 
     use gix::ObjectId;
 
@@ -1047,9 +1047,10 @@ mod tests {
         // The configured remote is still named `origin`, but the independently
         // resolved push destination identifies this repository. A different
         // fetch URL on `origin` must not affect text published to GitHub.
-        let destination = PushDestination::for_test_url(
+        let repository = crate::util::Repo::open(".").unwrap();
+        let destination = PushDestination::for_test_url_in(
+            &repository,
             "git@github.com:push-owner/push-repository.git",
-            Path::new("."),
         );
         let context = BodyLinkContext::from_destination(&destination, None).unwrap();
         let fixture = stack_fixture(&[("Gsplit", "Split remote", "Use the push repository.")]);
