@@ -1,6 +1,5 @@
 ---
 source: tests/pre_push/failures/mod.rs
-assertion_line: 488
 expression: content
 ---
 EXIT_CODE: 1
@@ -9,5 +8,5 @@ STDOUT:
 (empty)
 
 STDERR:
-[gherrit] Branch feature-fail is MANAGED. Syncing stack...
+[gherrit] Branch feature-fail is MANAGED. Publishing stack...
 [gherrit] [ERROR] The local push destination for GHerrit remote 'broken-remote' cannot be resolved
