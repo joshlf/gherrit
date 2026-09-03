@@ -87,6 +87,156 @@ fn github_operation_count(
     ctx.github().requests().into_iter().flatten().filter(|observed| *observed == operation).count()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ConvergedAttemptEvidence {
+    exit_code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    graphql_documents: Vec<String>,
+    graphql_operations: Vec<Vec<testutil::GraphQlOperation>>,
+    git_operations: Vec<testutil::GitOperation>,
+    pushes: Vec<testutil::PushRecord>,
+    pull_requests: Vec<testutil::PullRequestSnapshot>,
+    remote_refs: Vec<(String, Option<String>)>,
+}
+
+fn run_converged_attempt(ctx: &testutil::TestContext, id: &str) -> ConvergedAttemptEvidence {
+    let document_offset = ctx.github().request_documents().len();
+    let request_offset = ctx.github().requests().len();
+    let operation_offset = ctx.recorded_git_operations().len();
+    let push_offset = ctx.recorded_pushes().len();
+
+    let output = ctx.hook_cmd("pre-push").output().expect("publication attempt must finish");
+    assert!(
+        output.status.success(),
+        "publication attempt failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let relevant_refs = [
+        format!("refs/heads/{id}"),
+        format!("refs/heads/gherrit-bases/{id}"),
+        format!("refs/tags/gherrit/{id}/v1"),
+        format!("refs/tags/gherrit/{id}/pr"),
+    ];
+    ConvergedAttemptEvidence {
+        exit_code: output.status.code(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+        graphql_documents: ctx.github().request_documents()[document_offset..].to_vec(),
+        graphql_operations: ctx.github().requests()[request_offset..].to_vec(),
+        git_operations: ctx.recorded_git_operations()[operation_offset..].to_vec(),
+        pushes: ctx.recorded_pushes()[push_offset..].to_vec(),
+        pull_requests: ctx
+            .github()
+            .pull_requests()
+            .into_iter()
+            .filter(|pull_request| pull_request.head == id)
+            .collect(),
+        remote_refs: relevant_refs
+            .into_iter()
+            .map(|reference| {
+                let oid = ctx.remote_ref_oid(&reference);
+                (reference, oid)
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn exact_git_and_local_github_observations_start_concurrently() {
+    const ID: &str = "Gconcurrentobservation";
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_observation_overlap(ID, "main")
+        .build();
+    ctx.checkout_managed_private("concurrent-observation");
+    ctx.commit_with_explicit_gherrit_id("Observe both bounded authorities", ID);
+
+    // Each fake transport waits in the same two-party rendezvous before
+    // entering mutable fake state. Awaiting either observation before
+    // starting the other turns this success into a bounded process failure.
+    let output = ctx.hook_cmd("pre-push").output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "publication failed after observation rendezvous:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ctx.observation_overlap().assert_consumed();
+    let requests = ctx.github().requests();
+    assert_eq!(requests.first(), Some(&vec![testutil::GraphQlOperation::Query]));
+    assert_eq!(
+        requests
+            .iter()
+            .flatten()
+            .filter(|operation| **operation == testutil::GraphQlOperation::Query)
+            .count(),
+        1,
+        "the publication attempt must make one bounded GitHub observation"
+    );
+    assert_eq!(
+        ctx.recorded_git_operations()
+            .into_iter()
+            .filter(|operation| *operation == testutil::GitOperation::LsRemote)
+            .count(),
+        2,
+        "one initial and one exact Git observation must complete"
+    );
+}
+
+#[test]
+fn unrequested_open_pull_requests_do_not_expand_publication_work() {
+    const ID: &str = "Gboundedpopulation";
+    const UNREQUESTED_PULL_REQUESTS: usize = 512;
+
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("bounded-population");
+    ctx.commit_with_explicit_gherrit_id("Keep observation bounded", ID);
+    ctx.hook_cmd("pre-push").assert().success();
+
+    let established = ctx
+        .github()
+        .pull_requests()
+        .into_iter()
+        .find(|pull_request| pull_request.head == ID)
+        .expect("setup publication must establish the marker-bound pull request");
+    assert_remote_pr_marker(&ctx, ID, &ctx.head_oid(), established.number);
+
+    let baseline = run_converged_attempt(&ctx, ID);
+    assert_eq!(baseline.graphql_documents.len(), 1, "one physical GitHub request");
+    assert_eq!(
+        baseline.graphql_operations,
+        [vec![testutil::GraphQlOperation::Query]],
+        "a marker-bound current change needs observation but no mutation"
+    );
+    assert!(baseline.pushes.is_empty(), "a converged attempt must not push");
+
+    for index in 0..UNREQUESTED_PULL_REQUESTS {
+        ctx.github().seed_pull_request(testutil::PullRequestSeed::new(
+            10_000 + index,
+            format!("Unrequested pull request {index}"),
+            "Unrelated body",
+            format!("Gunrequested{index:04}"),
+            "main",
+        ));
+    }
+
+    let populated = run_converged_attempt(&ctx, ID);
+    assert_eq!(
+        populated, baseline,
+        "unrequested OPEN heads must not alter documents, physical operations, pushes, output, or relevant pull request and ref state"
+    );
+}
+
 #[test]
 fn direct_pre_push_publishes_a_complete_stack() {
     let ctx = testutil::test_context!()
