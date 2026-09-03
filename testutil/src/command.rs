@@ -1,5 +1,5 @@
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     io::{self, Read},
     path::Path,
     process::{Command, ExitStatus, Output, Stdio},
@@ -23,6 +23,30 @@ pub struct TestCommand {
 impl TestCommand {
     pub(crate) fn new(program: impl AsRef<OsStr>) -> Self {
         Self { command: Command::new(program), timeout: DEFAULT_TIMEOUT }
+    }
+
+    pub(crate) fn from_command(command: Command) -> Self {
+        Self { command, timeout: DEFAULT_TIMEOUT }
+    }
+
+    pub(crate) fn environment_overrides(&self) -> Vec<(OsString, Option<OsString>)> {
+        self.command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+            .collect()
+    }
+
+    pub(crate) fn apply_environment_overrides(
+        &mut self,
+        overrides: Vec<(OsString, Option<OsString>)>,
+    ) {
+        for (name, value) in overrides {
+            if let Some(value) = value {
+                self.command.env(name, value);
+            } else {
+                self.command.env_remove(name);
+            }
+        }
     }
 
     pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
@@ -195,6 +219,9 @@ mod tests {
     fn terminates_descendants_on_timeout() {
         match env::var(DESCENDANT_TEST_MODE).as_deref() {
             Ok("parent") => {
+                // This raw descendant is the behavior under test. The outer
+                // `TestCommand` below owns the parent and leaf as one process
+                // group and applies the 100 ms deadline to that boundary.
                 let mut leaf = Command::new(env::current_exe().unwrap())
                     .args([
                         "--exact",
