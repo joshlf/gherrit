@@ -20,8 +20,8 @@ use axum::{
 use tokio::net::TcpListener;
 
 use crate::{
-    git_interceptor, FailureKind, GraphQlOperation, MalformedJson, PublicationOverlapSchedule,
-    PullRequestState, RedirectStatus, RetryableHttpStatus, TestEnvironment,
+    git_interceptor, FailureKind, GraphQlOperation, MalformedJson, MockSchedules, PullRequestState,
+    RedirectStatus, RetryableHttpStatus, TestEnvironment,
 };
 
 const LOCAL_PULL_REQUEST_PAGE_SIZE: usize = 1;
@@ -39,13 +39,19 @@ pub struct MockState {
     pub prs: Vec<PrEntry>,
     pub(super) cross_repository_prs: HashSet<usize>,
     pub(super) git: git_interceptor::State,
-    pub graphql_requests: Vec<Vec<GraphQlOperation>>,
+    pub(super) graphql_requests: Vec<GraphQlRequestRecord>,
     pub graphql_redirect_trap_requests: usize,
     pub max_graphql_query_operations_per_request: Option<usize>,
     pub repo_owner: String,
     pub repo_name: String,
     pub github_default_branch: Option<(String, String)>,
     pub faults: VecDeque<FailureKind>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct GraphQlRequestRecord {
+    pub(super) operations: Vec<GraphQlOperation>,
+    pub(super) document: String,
 }
 
 impl MockState {
@@ -110,7 +116,7 @@ struct AppState {
     remote_path: PathBuf,
     system_git: PathBuf,
     test_environment: TestEnvironment,
-    publication_overlap: Option<Arc<PublicationOverlapSchedule>>,
+    schedules: MockSchedules,
 }
 
 /// Runs a mock GitHub API server until `shutdown_rx` is signaled.
@@ -119,7 +125,7 @@ pub(super) async fn run_mock_server(
     remote_path: PathBuf,
     system_git: PathBuf,
     test_environment: TestEnvironment,
-    publication_overlap: Option<Arc<PublicationOverlapSchedule>>,
+    schedules: MockSchedules,
     ready_tx: Sender<String>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
@@ -132,10 +138,9 @@ pub(super) async fn run_mock_server(
         remote_path.clone(),
         system_git.clone(),
         test_environment.clone(),
-        publication_overlap.clone(),
+        schedules.clone(),
     );
-    let app_state =
-        AppState { state, remote_path, system_git, test_environment, publication_overlap };
+    let app_state = AppState { state, remote_path, system_git, test_environment, schedules };
 
     let app = Router::new()
         .route("/graphql", post(graphql))
@@ -804,7 +809,10 @@ fn validate_supported_document(
     Ok(())
 }
 
-fn local_pull_request_connection_count(document: &ExecutableDocument) -> usize {
+fn local_pull_request_heads(
+    document: &ExecutableDocument,
+    variables: &GraphQlVariables,
+) -> Result<Vec<String>, String> {
     document
         .operations
         .iter()
@@ -814,10 +822,14 @@ fn local_pull_request_connection_count(document: &ExecutableDocument) -> usize {
             (field.name == "repository").then_some(&field.selection_set.selections)
         })
         .flatten()
-        .filter(|selection| {
-            matches!(selection, executable::Selection::Field(field) if field.name == "pullRequests")
+        .filter_map(|selection| {
+            let executable::Selection::Field(field) = selection else { return None };
+            (field.name == "pullRequests").then_some(field)
         })
-        .count()
+        .map(|field| {
+            resolve_string_argument(field, "headRefName", "repository.pullRequests", variables)
+        })
+        .collect()
 }
 
 async fn graphql(
@@ -845,10 +857,29 @@ async fn graphql(
     }
 
     let operations = graphql_operations(&document);
+    let local_heads = local_pull_request_heads(&document, &variables)
+        .expect("validated pull request queries have string head arguments");
+    let overlap_observation =
+        app_state.schedules.observation_overlap.as_deref().filter(|overlap| {
+            operations.as_slice() == [GraphQlOperation::Query]
+                && local_heads.as_slice() == [overlap.expected_id()]
+        });
+    if let Some(overlap) = overlap_observation {
+        // The exact request has been parsed and validated, but has not entered
+        // mutable fake state. Its Git peer can therefore rendezvous here
+        // without either transport serializing the other through a lock.
+        if !overlap.local_github_arrived().await {
+            return graphql_http_error("Observation overlap schedule was cancelled");
+        }
+    }
     let overlap_create = operations.as_slice() == [GraphQlOperation::CreatePr]
-        && app_state.publication_overlap.as_ref().is_some_and(|overlap| overlap.claim_create());
+        && app_state
+            .schedules
+            .publication_overlap
+            .as_ref()
+            .is_some_and(|overlap| overlap.claim_create());
     if overlap_create {
-        let overlap = app_state.publication_overlap.as_ref().unwrap();
+        let overlap = app_state.schedules.publication_overlap.as_ref().unwrap();
         // This rendezvous is intentionally after protocol validation but
         // before request logging or state mutation. Both publishers therefore
         // prove they observed the same empty OPEN set.
@@ -858,11 +889,14 @@ async fn graphql(
     }
     let response = {
         let mut mock_state = app_state.state.write().unwrap();
-        mock_state.graphql_requests.push(operations.clone());
+        mock_state.graphql_requests.push(GraphQlRequestRecord {
+            operations: operations.clone(),
+            document: query.to_owned(),
+        });
         if operations.iter().all(|operation| *operation == GraphQlOperation::Query)
             && mock_state
                 .max_graphql_query_operations_per_request
-                .is_some_and(|limit| local_pull_request_connection_count(&document) > limit)
+                .is_some_and(|limit| local_heads.len() > limit)
         {
             return graphql_response(
                 StatusCode::OK,
@@ -981,7 +1015,7 @@ async fn graphql(
             .unwrap_or_else(|| graphql_response(StatusCode::OK, response_json))
     };
     if overlap_create {
-        let overlap = app_state.publication_overlap.as_ref().unwrap();
+        let overlap = app_state.schedules.publication_overlap.as_ref().unwrap();
         // The created draft is durable and the state guard is gone before
         // either response can release a publisher toward marker publication.
         if !overlap.after_create_application().await {
