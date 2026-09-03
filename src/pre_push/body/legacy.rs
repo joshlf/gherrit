@@ -5,8 +5,8 @@ use super::MAX_BODY_SIZE_BYTES;
 /// Renderer for the legacy publication orchestration.
 ///
 /// That orchestration cannot supply validated literal first-parent history,
-/// so it retains its original inputs instead of constructing
-/// [`super::StackBodyRecipes`].
+/// so it retains its original inputs instead of using the exact publisher's
+/// bounded renderer.
 pub(in crate::pre_push) struct PrBody<'a> {
     pub commit_body: &'a str,
     pub repo_url: &'a str,
