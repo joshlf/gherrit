@@ -1,6 +1,6 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::{fs, path::PathBuf};
+use std::{fs, io::Write as _, path::PathBuf};
 
 use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
@@ -17,59 +17,108 @@ const SHIM_TEMPLATE: &str = r#"#!/bin/sh
 gherrit hook {} "$@"
 "#;
 
-pub fn install(repo: &Repo, force: bool, allow_global: bool) -> Result<()> {
-    let hooks_dir = resolve_hooks_dir(repo, allow_global)?;
+struct HookReplacement {
+    name: &'static str,
+    path: PathBuf,
+    content: String,
+}
 
-    fs::create_dir_all(&hooks_dir)
-        .wrap_err_with(|| format!("Failed to create hooks directory: {:?}", hooks_dir))?;
+/// A complete executable sibling; failure or drop leaves the old hook intact.
+struct PreparedHook {
+    destination: PathBuf,
+    temporary: tempfile::NamedTempFile,
+}
 
-    // Phase 1: Validation
-    let mut conflicts = Vec::new();
-    for hook in REQUIRED_HOOKS {
-        let hook_path = hooks_dir.join(hook);
-        if hook_path.exists() {
-            let content = fs::read_to_string(&hook_path)
-                .wrap_err_with(|| format!("Failed to read hook file: {:?}", hook_path))?;
-            if !content.contains(PROLOGUE) {
-                conflicts.push(hook_path);
-            }
-        }
-    }
-
-    if !conflicts.is_empty() && !force {
-        let mut msg = String::from("Refusing to overwrite unmanaged hooks:\n");
-        for path in conflicts {
-            msg.push_str(&format!("  - {}\n", path.display()));
-        }
-        msg.push_str("\nUse --force to overwrite them.");
-        bail!(msg);
-    }
-
-    // Phase 2: Execution
-    for hook in REQUIRED_HOOKS {
-        let hook_path = hooks_dir.join(hook);
-        let content = SHIM_TEMPLATE.replace("{}", hook);
-
-        fs::write(&hook_path, &content)
-            .wrap_err_with(|| format!("Failed to write hook file: {:?}", hook_path))?;
-
+impl HookReplacement {
+    fn prepare(self) -> Result<PreparedHook> {
+        let parent = self.path.parent().expect("hook destination has a parent");
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".gherrit-hook-")
+            .tempfile_in(parent)
+            // tempfile includes a random path in its creation error. Keep
+            // diagnostics stable and identify the intended destination below.
+            .map_err(|error| eyre::eyre!("Cannot prepare hook replacement: {}", error.kind()))
+            .wrap_err_with(|| format!("Failed to write hook file: {:?}", self.path))?;
+        temporary.write_all(self.content.as_bytes())?;
         #[cfg(unix)]
-        {
-            let mut perms = fs::metadata(&hook_path)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&hook_path, perms)?;
-        }
+        temporary.as_file().set_permissions(fs::Permissions::from_mode(0o755))?;
+        temporary.as_file().sync_all()?;
+        Ok(PreparedHook { destination: self.path, temporary })
+    }
+}
 
-        log::info!("Installed {}", hook.green());
+impl PreparedHook {
+    fn replace(self) -> Result<()> {
+        self.temporary
+            .persist(&self.destination)
+            .map_err(|error| error.error)
+            .wrap_err_with(|| format!("Failed to replace hook file: {:?}", self.destination))?;
+        Ok(())
+    }
+}
+
+struct InstallPlan {
+    directory: PathBuf,
+    hooks: Vec<HookReplacement>,
+}
+
+fn is_managed_hook(content: &[u8]) -> bool {
+    content.windows(PROLOGUE.len()).any(|window| window == PROLOGUE.as_bytes())
+}
+
+impl InstallPlan {
+    /// Inspect every destination before creating directories or writing hooks.
+    /// This retains sentinel ownership; it does not lock out concurrent writers.
+    fn inspect(directory: PathBuf, force: bool) -> Result<Self> {
+        let mut conflicts = Vec::new();
+        let mut hooks = Vec::new();
+        for &name in REQUIRED_HOOKS {
+            let path = directory.join(name);
+            if path.try_exists()? {
+                let content = fs::read(&path)
+                    .wrap_err_with(|| format!("Failed to read hook file: {path:?}"))?;
+                if !is_managed_hook(&content) {
+                    conflicts.push(path.clone());
+                }
+            }
+            hooks.push(HookReplacement { name, path, content: SHIM_TEMPLATE.replace("{}", name) });
+        }
+        if !conflicts.is_empty() && !force {
+            let mut message = String::from("Refusing to overwrite unmanaged hooks:\n");
+            for path in conflicts {
+                message.push_str(&format!("  - {}\n", path.display()));
+            }
+            message.push_str("\nUse --force to overwrite them.");
+            bail!(message);
+        }
+        Ok(Self { directory, hooks })
     }
 
-    Ok(())
+    fn apply(self) -> Result<()> {
+        self.apply_using(|hook| hook.prepare()?.replace())
+    }
+
+    fn apply_using(self, mut replace: impl FnMut(HookReplacement) -> Result<()>) -> Result<()> {
+        fs::create_dir_all(&self.directory)
+            .wrap_err_with(|| format!("Failed to create hooks directory: {:?}", self.directory))?;
+        for hook in self.hooks {
+            let name = hook.name;
+            replace(hook)?;
+            log::info!("Installed {}", name.green());
+        }
+        Ok(())
+    }
+}
+
+pub fn install(repo: &Repo, force: bool, allow_global: bool) -> Result<()> {
+    InstallPlan::inspect(resolve_hooks_dir(repo, allow_global)?, force)?.apply()
 }
 
 fn resolve_hooks_dir(repo: &Repo, allow_global: bool) -> Result<PathBuf> {
     if let Some(path_buf) = repo.config_path("core.hooksPath")? {
         // Security check: ensure the hooks directory is within the repository.
-        let root = repo.workdir().unwrap_or(repo.path());
+        let layout = repo.layout();
+        let root = layout.workdir.unwrap_or(layout.worktree_git_dir);
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
         // Best effort canonicalization
@@ -91,6 +140,86 @@ fn resolve_hooks_dir(repo: &Repo, allow_global: bool) -> Result<PathBuf> {
         return Ok(abs_hooks);
     }
 
-    // Default: .git/hooks
-    Ok(repo.path().join("hooks"))
+    // Default hooks belong to the common repository, including linked worktrees.
+    Ok(repo.layout().common_git_dir.join("hooks"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_interrupted_replacement_preserves_complete_hook_files() {
+        for existing in [false, true] {
+            for fail_at in 0..REQUIRED_HOOKS.len() {
+                for fail_after_prepare in [false, true] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let old = b"# gherrit-installer: managed\noriginal hook";
+                    if existing {
+                        for name in REQUIRED_HOOKS {
+                            fs::write(directory.path().join(name), old).unwrap();
+                        }
+                    }
+                    let plan = InstallPlan::inspect(directory.path().to_owned(), false).unwrap();
+                    // This executor test owns payload delivery; integration
+                    // tests independently own complete shim encoding and mode.
+                    let expected: Vec<_> =
+                        plan.hooks.iter().map(|hook| hook.content.clone()).collect();
+                    let mut index = 0;
+                    let result = plan.apply_using(|hook| {
+                        let current = index;
+                        index += 1;
+                        if current == fail_at && !fail_after_prepare {
+                            bail!("before preparation");
+                        }
+                        let prepared = hook.prepare()?;
+                        if current == fail_at {
+                            bail!("before replacement");
+                        }
+                        prepared.replace()
+                    });
+                    assert!(result.is_err());
+                    for (index, name) in REQUIRED_HOOKS.iter().enumerate() {
+                        let path = directory.path().join(name);
+                        if index < fail_at {
+                            assert_eq!(fs::read(path).unwrap(), expected[index].as_bytes());
+                        } else if existing {
+                            assert_eq!(fs::read(path).unwrap(), old);
+                        } else {
+                            assert!(!path.exists());
+                        }
+                    }
+                    assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+                        !entry.unwrap().file_name().to_string_lossy().starts_with(".gherrit-hook-")
+                    }));
+                    InstallPlan::inspect(directory.path().to_owned(), false)
+                        .unwrap()
+                        .apply()
+                        .unwrap();
+                    for (index, name) in REQUIRED_HOOKS.iter().enumerate() {
+                        assert_eq!(
+                            fs::read(directory.path().join(name)).unwrap(),
+                            expected[index].as_bytes()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn replacement_replaces_symlink_entry_without_writing_its_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("outside-target");
+        let original = b"# gherrit-installer: managed\nexternal original";
+        fs::write(&target, original).unwrap();
+        let hooks = directory.path().join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        let link = hooks.join("pre-push");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        InstallPlan::inspect(hooks, false).unwrap().apply().unwrap();
+        assert_eq!(fs::read(target).unwrap(), original);
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_file());
+    }
 }

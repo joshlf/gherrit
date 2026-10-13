@@ -1,3 +1,5 @@
+mod layout;
+
 use std::{ffi::OsStr, process::Command};
 
 use eyre::{OptionExt, Result, WrapErr, bail, eyre};

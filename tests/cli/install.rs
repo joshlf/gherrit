@@ -158,8 +158,84 @@ fn test_install_read_only_fs() {
         "install_read_only_fs"
     );
 
+    for hook in ["pre-push", "commit-msg", "post-checkout"] {
+        assert!(!hooks_dir.join(hook).exists(), "failed preparation created {hook}");
+    }
+
     // Cleanup: Restore permissions so TempDir cleanup doesn't panic
     let mut perms = std::fs::metadata(&hooks_dir).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&hooks_dir, perms).unwrap();
+}
+
+#[test]
+fn test_install_linked_worktree_uses_git_hooks_path() {
+    let ctx = testutil::test_context!().with_initial_commit().build();
+    // The shared fixture sets an explicit .git/hooks path for ordinary repos.
+    ctx.run_git(&["config", "--unset", "core.hooksPath"]);
+    let linked = ctx.repo_path.parent().unwrap().join("linked");
+    ctx.git_cmd().args(["worktree", "add", "-b", "linked"]).arg(&linked).assert().success();
+    let output = ctx
+        .git_cmd()
+        .current_dir(&linked)
+        .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let effective = std::path::PathBuf::from(std::str::from_utf8(&output).unwrap().trim_end());
+    ctx.gherrit_cmd().current_dir(&linked).arg("install").assert().success();
+    assert_installed_hooks(&effective);
+    assert_eq!(effective, ctx.repo_path.join(".git/hooks").canonicalize().unwrap());
+    assert!(!ctx.repo_path.join(".git/worktrees/linked/hooks").exists());
+
+    ctx.run_git(&["config", "core.hooksPath", ".githooks"]);
+    ctx.gherrit_cmd().current_dir(&linked).arg("install").assert().success();
+    assert_installed_hooks(&linked.join(".githooks"));
+    assert!(!ctx.repo_path.join(".githooks").exists());
+}
+
+#[test]
+fn test_install_bare_repository() {
+    let ctx = testutil::test_context!().with_initial_commit().build();
+    let bare = ctx.repo_path.parent().unwrap().join("bare");
+    ctx.git_cmd().args(["clone", "--bare"]).arg(&ctx.repo_path).arg(&bare).assert().success();
+    ctx.gherrit_cmd().current_dir(&bare).arg("install").assert().success();
+    assert_installed_hooks(&bare.join("hooks"));
+    ctx.git_cmd()
+        .current_dir(&bare)
+        .args(["config", "core.hooksPath", "custom-hooks"])
+        .assert()
+        .success();
+    ctx.gherrit_cmd().current_dir(&bare).arg("install").assert().success();
+    assert_installed_hooks(&bare.join("custom-hooks"));
+}
+
+#[test]
+fn test_install_binary_hooks_and_complete_conflict_inspection() {
+    let ctx = testutil::test_context!().build();
+    let hooks = ctx.repo_path.join(".git/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let managed = b"# gherrit-installer: managed\noriginal managed bytes";
+    let binary = b"\xff\x00unmanaged executable";
+    std::fs::write(hooks.join("pre-push"), managed).unwrap();
+    // A conflict at the last destination must prevent every replacement.
+    std::fs::write(hooks.join("post-checkout"), binary).unwrap();
+    ctx.gherrit_cmd()
+        .arg("install")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Refusing to overwrite unmanaged hooks"))
+        .stderr(predicates::str::contains("Use --force"));
+    assert_eq!(std::fs::read(hooks.join("pre-push")).unwrap(), managed);
+    assert_eq!(std::fs::read(hooks.join("post-checkout")).unwrap(), binary);
+    assert!(!hooks.join("commit-msg").exists());
+
+    ctx.gherrit_cmd().args(["install", "--force"]).assert().success();
+    assert_installed_hooks(&hooks);
+    let binary_managed = b"\xff# gherrit-installer: managed\x00";
+    std::fs::write(hooks.join("pre-push"), binary_managed).unwrap();
+    ctx.gherrit_cmd().arg("install").assert().success();
+    assert_installed_hooks(&hooks);
 }
