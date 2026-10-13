@@ -127,6 +127,11 @@ impl MarkerTemplate {
             })?;
         Ok(PreparedMarker { id: self.id, tag, bytes: bytes.into_boxed_slice() })
     }
+
+    #[cfg(test)]
+    pub(super) fn test_parts(&self) -> (&GherritPrId, ObjectId, PullRequestNumber) {
+        (&self.id, self.v1, self.marker.number())
+    }
 }
 
 impl PreparedMarker {
