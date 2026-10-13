@@ -115,6 +115,36 @@ struct OpenSpec {
     body: Option<String>,
     is_draft: bool,
     landing_automation: bool,
+    additional: Vec<AdditionalOpenSpec>,
+}
+
+#[derive(Clone)]
+struct AdditionalOpenSpec {
+    number: u32,
+    node: String,
+    head: ObjectId,
+    base_kind: BaseKind,
+    base: ObjectId,
+    title: String,
+    body: String,
+    is_draft: bool,
+    landing_automation: bool,
+}
+
+impl AdditionalOpenSpec {
+    fn new(number: u32, head: ObjectId, base_kind: BaseKind, base: ObjectId) -> Self {
+        Self {
+            number,
+            node: format!("PR_{number}"),
+            head,
+            base_kind,
+            base,
+            title: format!("observed title {number}"),
+            body: format!("observed body {number}"),
+            is_draft: true,
+            landing_automation: false,
+        }
+    }
 }
 
 impl OpenSpec {
@@ -129,6 +159,7 @@ impl OpenSpec {
             body: None,
             is_draft: true,
             landing_automation: false,
+            additional: Vec::new(),
         }
     }
 }
@@ -195,7 +226,7 @@ fn inputs_with_repository(
             PullRequestSpec::Open(open) => {
                 let title = open.title.clone().unwrap_or_else(|| desired_title(spec.id));
                 let body = open.body.clone().unwrap_or_else(|| desired_body(spec.id));
-                LocalPullRequestObservation::Open(ManagedOpenPullRequest::for_plan_test(
+                let open = ManagedOpenPullRequests::for_plan_test(
                     id(spec.id),
                     identity(open.number, &open.node),
                     open.head,
@@ -204,7 +235,24 @@ fn inputs_with_repository(
                     &body,
                     open.is_draft,
                     open.landing_automation,
-                ))
+                )
+                .with_candidates_for_plan_test(
+                    open.additional
+                        .iter()
+                        .map(|candidate| {
+                            (
+                                identity(candidate.number, &candidate.node),
+                                candidate.head,
+                                ObservedBase::for_plan_test(candidate.base_kind, candidate.base),
+                                candidate.title.clone(),
+                                candidate.body.clone(),
+                                candidate.is_draft,
+                                candidate.landing_automation,
+                            )
+                        })
+                        .collect(),
+                );
+                LocalPullRequestObservation::Open(open)
             }
         })
         .collect();
@@ -288,6 +336,20 @@ fn marker_facts(stage: &MarkerStage) -> Vec<(String, ObjectId, u32)> {
         .collect()
 }
 
+fn update_operations(stage: &MarkerStage) -> Vec<&TestUpdate> {
+    stage
+        .projection
+        .operations_for_test()
+        .iter()
+        .map(|operation| match operation {
+            TestPullRequestProjection::Update(update) => update,
+            TestPullRequestProjection::Close(_) => {
+                panic!("this assertion expects no duplicate-close projection")
+            }
+        })
+        .collect()
+}
+
 fn tuple_for_test(history: &ValidatedChangeHistory) -> Option<Result<TupleTransition>> {
     tuple_transition(history, publication_revision(history.proposed()).unwrap())
 }
@@ -332,16 +394,21 @@ fn current_open(
 }
 
 fn single_desired_body() -> String {
+    single_desired_body_for("Gone", 7)
+}
+
+fn single_desired_body_for(change_id: &str, number: u32) -> String {
     let destination = PushDestination::for_test();
     let default = default_branch(DEFAULT_NAME, oid(10));
     let stack = LocalStack::for_plan_test(
         default,
-        [(id("Gone"), oid(20), oid(10), desired_title("Gone"), desired_body("Gone"))],
+        [(id(change_id), oid(20), oid(10), desired_title(change_id), desired_body(change_id))],
     );
-    let history = validated_history(id("Gone"), &[(oid(20), oid(10))], (oid(20), oid(10)), Some(7));
+    let history =
+        validated_history(id(change_id), &[(oid(20), oid(10))], (oid(20), oid(10)), Some(number));
     StackBodyRecipes::new(&destination, None, stack, vec![history])
         .unwrap()
-        .final_bodies(&[(id("Gone"), super::super::github::PullRequestNumber::for_test(7))])
+        .final_bodies(&[(id(change_id), super::super::github::PullRequestNumber::for_test(number))])
         .unwrap()
         .into_vec()
         .pop()
@@ -692,8 +759,8 @@ fn open_for_validation(
     base: ObjectId,
     is_draft: bool,
     landing_automation: bool,
-) -> ManagedOpenPullRequest {
-    ManagedOpenPullRequest::for_plan_test(
+) -> ManagedOpenPullRequests {
+    ManagedOpenPullRequests::for_plan_test(
         history.id().clone(),
         identity(7, "PR_7"),
         head,
@@ -703,6 +770,23 @@ fn open_for_validation(
         is_draft,
         landing_automation,
     )
+}
+
+fn validate_open_for_test(
+    history: &ValidatedChangeHistory,
+    pull_request: ManagedOpenPullRequests,
+    desired_base: BaseKind,
+    default: &DefaultBranch,
+) -> Result<ValidatedOpenPullRequest> {
+    match validate_open_selection(
+        history,
+        pull_request.select(history.pull_request_marker().map(|marker| marker.number()))?,
+        desired_base,
+        default,
+    )? {
+        ExistingReality::Authenticated(pull_request)
+        | ExistingReality::Contender { pull_request, .. } => Ok(pull_request),
+    }
 }
 
 #[test]
@@ -717,23 +801,23 @@ fn every_published_owned_head_and_base_pair_is_independently_valid() {
         for base in bases {
             let pull_request =
                 open_for_validation(&history, head, BaseKind::Owned, base, true, false);
-            validate_open(&history, &pull_request, BaseKind::Owned, &default).unwrap();
+            validate_open_for_test(&history, pull_request, BaseKind::Owned, &default).unwrap();
         }
     }
 
     let proposal = open_for_validation(&history, oid(20), BaseKind::Owned, bases[0], true, false);
-    assert!(validate_open(&history, &proposal, BaseKind::Owned, &default).is_err());
+    assert!(validate_open_for_test(&history, proposal, BaseKind::Owned, &default).is_err());
 
     let wrong_owned =
         open_for_validation(&history, heads[0], BaseKind::Owned, oid(999), true, false);
-    assert!(validate_open(&history, &wrong_owned, BaseKind::Owned, &default).is_err());
+    assert!(validate_open_for_test(&history, wrong_owned, BaseKind::Owned, &default).is_err());
 
     let exact_default =
         open_for_validation(&history, heads[0], BaseKind::Default, default.tip(), true, false);
-    validate_open(&history, &exact_default, BaseKind::Default, &default).unwrap();
+    validate_open_for_test(&history, exact_default, BaseKind::Default, &default).unwrap();
     let wrong_default =
         open_for_validation(&history, heads[0], BaseKind::Default, oid(999), true, false);
-    assert!(validate_open(&history, &wrong_default, BaseKind::Default, &default).is_err());
+    assert!(validate_open_for_test(&history, wrong_default, BaseKind::Default, &default).is_err());
 }
 
 #[test]
@@ -758,7 +842,7 @@ fn marker_base_and_landing_automation_rules_form_the_exact_truth_table() {
                         landing_automation,
                     );
                     let accepted =
-                        validate_open(&history, &pull_request, desired, &default).is_ok();
+                        validate_open_for_test(&history, pull_request, desired, &default).is_ok();
                     let expected = (marker || observed == BaseKind::Owned)
                         && (!landing_automation
                             || (observed == BaseKind::Default && desired == BaseKind::Default));
@@ -778,9 +862,9 @@ fn marker_identity_must_match_the_exact_open_pull_request() {
         validated_history(id("Gidentity"), &[(oid(20), oid(10))], (oid(20), oid(10)), Some(8));
     let pull_request =
         open_for_validation(&history, oid(20), BaseKind::Default, oid(10), true, false);
-    let error = validate_open(
+    let error = validate_open_for_test(
         &history,
-        &pull_request,
+        pull_request,
         BaseKind::Default,
         &default_branch(DEFAULT_NAME, oid(10)),
     )
@@ -788,8 +872,186 @@ fn marker_identity_must_match_the_exact_open_pull_request() {
 
     assert_eq!(
         error.to_string(),
-        "Pull-request marker for 'Gidentity' names #8, but exact GitHub evidence names #7"
+        "GHerrit change 'Gidentity' marker selects OPEN pull request #8 which GitHub did not return"
     );
+}
+
+#[test]
+fn marker_selects_the_exact_row_and_closes_lower_duplicates() {
+    let mut open = OpenSpec::new(10, oid(20), BaseKind::Owned, oid(10));
+    let mut canonical = AdditionalOpenSpec::new(20, oid(20), BaseKind::Default, oid(10));
+    canonical.title = desired_title("Gselected");
+    canonical.body = single_desired_body_for("Gselected", 20);
+    open.additional.push(canonical);
+    let stage = ready(
+        plan(&[EntrySpec {
+            id: "Gselected",
+            history: HistorySpec::current(oid(20), oid(10), Some(20)),
+            pull_request: PullRequestSpec::Open(open),
+        }])
+        .unwrap(),
+    );
+
+    assert!(stage.markers.is_empty());
+    assert!(matches!(
+        stage.projection.operations_for_test(),
+        [TestPullRequestProjection::Close(close)]
+            if close.identity.number().get() == 10
+    ));
+}
+
+#[test]
+fn marker_selected_fields_drive_the_update_and_closes_stay_first() {
+    let mut open = OpenSpec::new(20, oid(20), BaseKind::Owned, oid(10));
+    let mut canonical = AdditionalOpenSpec::new(10, oid(20), BaseKind::Owned, oid(10));
+    canonical.title = "stale selected title".to_owned();
+    canonical.body = "stale selected body".to_owned();
+    open.additional.push(canonical);
+    let stage = ready(
+        plan(&[EntrySpec {
+            id: "Gselected",
+            history: HistorySpec::current(oid(20), oid(10), Some(10)),
+            pull_request: PullRequestSpec::Open(open),
+        }])
+        .unwrap(),
+    );
+
+    assert!(matches!(
+        stage.projection.operations_for_test(),
+        [
+            TestPullRequestProjection::Close(close),
+            TestPullRequestProjection::Update(update),
+        ] if close.identity.number().get() == 20
+            && update.identity.number().get() == 10
+            && update.title.as_deref() == Some(desired_title("Gselected").as_str())
+            && update.body.as_deref() == Some(single_desired_body_for("Gselected", 10).as_str())
+            && update.base_branch.as_deref() == Some(DEFAULT_NAME)
+    ));
+}
+
+#[test]
+fn an_unmarked_lowest_row_is_only_the_marker_contender() {
+    let mut open = OpenSpec::new(20, oid(20), BaseKind::Owned, oid(10));
+    open.additional.push(AdditionalOpenSpec::new(10, oid(20), BaseKind::Owned, oid(10)));
+    let stage = ready(
+        plan(&[EntrySpec {
+            id: "Gcontender",
+            history: HistorySpec::current(oid(20), oid(10), None),
+            pull_request: PullRequestSpec::Open(open),
+        }])
+        .unwrap(),
+    );
+
+    assert_eq!(marker_facts(&stage), [("Gcontender".to_owned(), oid(20), 10)]);
+    assert!(matches!(
+        stage.projection.operations_for_test(),
+        [
+            TestPullRequestProjection::Close(close),
+            TestPullRequestProjection::Update(update),
+        ] if close.identity.number().get() == 20
+            && update.identity.number().get() == 10
+    ));
+}
+
+#[test]
+fn every_duplicate_must_satisfy_noncanonical_history_and_policy() {
+    let invalid = [
+        AdditionalOpenSpec::new(10, oid(999), BaseKind::Owned, oid(10)),
+        AdditionalOpenSpec::new(10, oid(20), BaseKind::Owned, oid(999)),
+        AdditionalOpenSpec::new(10, oid(20), BaseKind::Default, oid(10)),
+        {
+            let mut duplicate = AdditionalOpenSpec::new(10, oid(20), BaseKind::Owned, oid(10));
+            duplicate.landing_automation = true;
+            duplicate
+        },
+    ];
+    for duplicate in invalid {
+        let mut open = OpenSpec::new(20, oid(20), BaseKind::Default, oid(10));
+        open.additional.push(duplicate);
+        assert!(
+            plan(&[EntrySpec {
+                id: "Ginvalid",
+                history: HistorySpec::current(oid(20), oid(10), Some(20)),
+                pull_request: PullRequestSpec::Open(open),
+            }])
+            .is_err()
+        );
+    }
+
+    let mut open = OpenSpec::new(30, oid(20), BaseKind::Default, oid(10));
+    open.additional.push(AdditionalOpenSpec::new(10, oid(20), BaseKind::Owned, oid(10)));
+    open.additional.push(AdditionalOpenSpec::new(20, oid(20), BaseKind::Default, oid(10)));
+    let error = plan(&[EntrySpec {
+        id: "Ginvalid",
+        history: HistorySpec::current(oid(20), oid(10), Some(30)),
+        pull_request: PullRequestSpec::Open(open),
+    }])
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("#20"));
+}
+
+#[test]
+fn known_duplicate_closes_survive_create_receipt_binding() {
+    let mut existing = OpenSpec::new(20, oid(20), BaseKind::Default, oid(10));
+    existing.additional.push(AdditionalOpenSpec::new(10, oid(20), BaseKind::Owned, oid(10)));
+    let stage = creates(
+        plan(&[
+            EntrySpec {
+                id: "Gexisting",
+                history: HistorySpec::current(oid(20), oid(10), Some(20)),
+                pull_request: PullRequestSpec::Open(existing),
+            },
+            EntrySpec {
+                id: "Gmissing",
+                history: HistorySpec::absent(),
+                pull_request: PullRequestSpec::Absent,
+            },
+        ])
+        .unwrap(),
+    );
+    let stage = stage.complete_for_test(receipts(&[("Gmissing", 30, "PR_30")])).unwrap();
+    let operations = stage.projection.operations_for_test();
+    assert!(matches!(
+        operations.first(),
+        Some(TestPullRequestProjection::Close(close))
+            if close.identity.number().get() == 10
+    ));
+    assert!(operations.iter().any(|operation| matches!(
+        operation,
+        TestPullRequestProjection::Update(update) if update.identity.number().get() == 30
+    )));
+}
+
+#[test]
+fn known_duplicate_closes_are_preflighted_before_a_create_stage_escapes() {
+    let mut existing = OpenSpec::new(20, oid(20), BaseKind::Default, oid(10));
+    existing.additional.push(AdditionalOpenSpec {
+        number: 10,
+        node: "N".repeat(MAX_MUTATION_REQUEST_BYTES),
+        head: oid(20),
+        base_kind: BaseKind::Owned,
+        base: oid(10),
+        title: "duplicate".to_owned(),
+        body: "duplicate".to_owned(),
+        is_draft: true,
+        landing_automation: false,
+    });
+    let error = plan(&[
+        EntrySpec {
+            id: "Gexisting",
+            history: HistorySpec::current(oid(20), oid(10), Some(20)),
+            pull_request: PullRequestSpec::Open(existing),
+        },
+        EntrySpec {
+            id: "Gmissing",
+            history: HistorySpec::absent(),
+            pull_request: PullRequestSpec::Absent,
+        },
+    ])
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("pull request projection"));
 }
 
 #[test]
@@ -915,12 +1177,12 @@ fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
             ("Gfour".to_owned(), oid(23), 44),
         ]
     );
-    let updates = final_stage.updates.operations_for_test();
+    let updates = update_operations(&final_stage);
     assert_eq!(
         updates.iter().map(|update| update.identity.number().get()).collect::<Vec<_>>(),
         [11, 22, 33, 44]
     );
-    for update in updates {
+    for update in &updates {
         let body = update.body.as_deref().expect("every stale or created body is updated");
         for number in [11, 22, 33, 44] {
             assert!(body.contains(&format!("#{number}")));
@@ -962,7 +1224,7 @@ fn root_and_nonroot_creates_share_the_owned_key_but_only_root_moves_final_base()
 
     let final_stage =
         stage.complete_for_test(receipts(&[("Groot", 1, "PR_1"), ("Gtip", 2, "PR_2")])).unwrap();
-    let updates = final_stage.updates.operations_for_test();
+    let updates = update_operations(&final_stage);
     assert_eq!(updates.len(), 2);
     assert_eq!(updates[0].base_branch.as_deref(), Some(DEFAULT_NAME));
     assert_eq!(updates[1].base_branch, None);
@@ -977,9 +1239,8 @@ fn a_marked_pull_request_moved_below_the_root_returns_to_its_owned_base() {
     ];
 
     let stage = ready(plan(&specs).unwrap());
-    let moved = stage
-        .updates
-        .operations_for_test()
+    let updates = update_operations(&stage);
+    let moved = updates
         .iter()
         .find(|update| update.identity.number().get() == 2)
         .expect("the moved pull request requires a projection update");
@@ -1068,6 +1329,7 @@ fn graphql_stages_are_preflighted_before_a_tuple_plan_can_escape() {
             body: None,
             is_draft: true,
             landing_automation: false,
+            additional: Vec::new(),
         }),
     };
     let error = plan(&[spec]).err().unwrap();
@@ -1093,6 +1355,7 @@ fn existing_projection_emits_exact_desired_values_for_differing_fields() {
             body: Some(if body_differs { "stale body".to_owned() } else { desired_body.clone() }),
             is_draft: true,
             landing_automation: false,
+            additional: Vec::new(),
         };
         let spec = EntrySpec {
             id: "Gone",
@@ -1100,7 +1363,7 @@ fn existing_projection_emits_exact_desired_values_for_differing_fields() {
             pull_request: PullRequestSpec::Open(open),
         };
         let stage = ready(plan(&[spec]).unwrap());
-        let updates = stage.updates.operations_for_test();
+        let updates = update_operations(&stage);
         assert_eq!(updates.len(), usize::from(mask != 0), "mask={mask:03b}");
         if let Some(update) = updates.first() {
             assert_eq!(
@@ -1146,10 +1409,11 @@ fn body_comparison_normalizes_only_crlf_pairs() {
             body: Some(desired.replace('\n', "\r\n")),
             is_draft: true,
             landing_automation: false,
+            additional: Vec::new(),
         }),
     };
     let stage = ready(plan(&[spec]).unwrap());
-    assert!(stage.updates.operations_for_test().is_empty());
+    assert!(stage.projection.operations_for_test().is_empty());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1157,7 +1421,7 @@ enum EffectBoundary {
     InitialRefs,
     Creates,
     Markers,
-    Updates,
+    Projection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -1183,12 +1447,18 @@ struct MarkerAttempt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-struct UpdateAttempt {
-    number: u32,
-    node_id: String,
-    title: Option<String>,
-    body: Option<Box<[String]>>,
-    base_branch: Option<String>,
+enum ProjectionAttempt {
+    Close {
+        number: u32,
+        node_id: String,
+    },
+    Update {
+        number: u32,
+        node_id: String,
+        title: Option<String>,
+        body: Option<Box<[String]>>,
+        base_branch: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -1196,7 +1466,7 @@ enum DurableEffectAttempt {
     InitialRefs(Box<[GitBatchAttempt]>),
     Creates(Box<[CreateAttempt]>),
     Markers(Box<[MarkerAttempt]>),
-    Updates(Box<[UpdateAttempt]>),
+    Projection(Box<[ProjectionAttempt]>),
 }
 
 impl DurableEffectAttempt {
@@ -1205,7 +1475,7 @@ impl DurableEffectAttempt {
             Self::InitialRefs(_) => EffectBoundary::InitialRefs,
             Self::Creates(_) => EffectBoundary::Creates,
             Self::Markers(_) => EffectBoundary::Markers,
-            Self::Updates(_) => EffectBoundary::Updates,
+            Self::Projection(_) => EffectBoundary::Projection,
         }
     }
 }
@@ -1311,22 +1581,31 @@ impl EffectDriver for ScriptedEffectDriver {
         }
     }
 
-    async fn update_pull_requests(&mut self, updates: PreparedUpdates) -> Result<()> {
-        let attempts = updates
+    async fn project_pull_requests(
+        &mut self,
+        projection: PreparedPullRequestProjection,
+    ) -> Result<()> {
+        let attempts = projection
             .operations_for_test()
             .iter()
-            .map(|update| UpdateAttempt {
-                number: update.identity.number().get(),
-                node_id: update.identity.node_id_for_test().to_owned(),
-                title: update.title.clone(),
-                body: update.body.as_deref().map(Self::body_lines),
-                base_branch: update.base_branch.clone(),
+            .map(|operation| match operation {
+                TestPullRequestProjection::Close(close) => ProjectionAttempt::Close {
+                    number: close.identity.number().get(),
+                    node_id: close.identity.node_id_for_test().to_owned(),
+                },
+                TestPullRequestProjection::Update(update) => ProjectionAttempt::Update {
+                    number: update.identity.number().get(),
+                    node_id: update.identity.node_id_for_test().to_owned(),
+                    title: update.title.clone(),
+                    body: update.body.as_deref().map(Self::body_lines),
+                    base_branch: update.base_branch.clone(),
+                },
             })
             .collect::<Box<[_]>>();
         if attempts.is_empty() {
             Ok(())
         } else {
-            self.record(DurableEffectAttempt::Updates(attempts))
+            self.record(DurableEffectAttempt::Projection(attempts))
         }
     }
 }
@@ -1352,6 +1631,17 @@ fn all_existing_execution_plan() -> PlannedPublication {
     .unwrap()
 }
 
+fn unmarked_multi_open_execution_plan() -> PlannedPublication {
+    let mut open = OpenSpec::new(20, oid(20), BaseKind::Owned, oid(10));
+    open.additional.push(AdditionalOpenSpec::new(10, oid(20), BaseKind::Owned, oid(10)));
+    plan(&[EntrySpec {
+        id: "Gduplicates",
+        history: HistorySpec::current(oid(20), oid(10), None),
+        pull_request: PullRequestSpec::Open(open),
+    }])
+    .unwrap()
+}
+
 async fn execute_scripted(
     plan: PlannedPublication,
     failure: Option<EffectBoundary>,
@@ -1372,7 +1662,7 @@ async fn durable_effect_barriers_release_only_the_next_reachable_stage() {
             EffectBoundary::InitialRefs,
             EffectBoundary::Creates,
             EffectBoundary::Markers,
-            EffectBoundary::Updates,
+            EffectBoundary::Projection,
         ]
     );
     insta::assert_yaml_snapshot!("acknowledged_publication_effects", acknowledged.attempts);
@@ -1381,7 +1671,7 @@ async fn durable_effect_barriers_release_only_the_next_reachable_stage() {
         EffectBoundary::InitialRefs,
         EffectBoundary::Creates,
         EffectBoundary::Markers,
-        EffectBoundary::Updates,
+        EffectBoundary::Projection,
     ] {
         let (result, interrupted) = execute_scripted(fresh_execution_plan(), Some(boundary)).await;
         let error = result.expect_err("the configured durable effect must interrupt the attempt");
@@ -1404,9 +1694,37 @@ async fn all_existing_publication_skips_create_without_reordering_effects() {
     driver.assert_consumed();
     assert_eq!(
         driver.attempts.iter().map(DurableEffectAttempt::boundary).collect::<Vec<_>>(),
-        [EffectBoundary::InitialRefs, EffectBoundary::Markers, EffectBoundary::Updates]
+        [EffectBoundary::InitialRefs, EffectBoundary::Markers, EffectBoundary::Projection]
     );
     insta::assert_yaml_snapshot!("all_existing_publication_effects", driver.attempts);
+}
+
+#[tokio::test]
+async fn marker_acknowledgement_releases_duplicate_repair_projection() {
+    let (result, interrupted) =
+        execute_scripted(unmarked_multi_open_execution_plan(), Some(EffectBoundary::Markers)).await;
+    assert!(result.is_err());
+    interrupted.assert_consumed();
+    assert!(matches!(interrupted.attempts.as_slice(), [DurableEffectAttempt::Markers(_)]));
+
+    let (result, acknowledged) = execute_scripted(unmarked_multi_open_execution_plan(), None).await;
+    result.unwrap();
+    acknowledged.assert_consumed();
+    assert!(matches!(
+        acknowledged.attempts.as_slice(),
+        [
+            DurableEffectAttempt::Markers(markers),
+            DurableEffectAttempt::Projection(projection),
+        ] if matches!(markers.as_ref(), [MarkerAttempt { number: 10, .. }])
+            && matches!(
+                projection.as_ref(),
+                [
+                    ProjectionAttempt::Close { number: 20, .. },
+                    ProjectionAttempt::Update { number: 10, .. },
+                ]
+            )
+    ));
+    insta::assert_yaml_snapshot!("duplicate_repair_after_marker", acknowledged.attempts);
 }
 
 #[tokio::test]
@@ -1424,6 +1742,7 @@ async fn empty_effect_stages_cross_without_attempting_a_durable_write() {
             body: Some(single_desired_body()),
             is_draft: true,
             landing_automation: false,
+            additional: Vec::new(),
         }),
     }])
     .unwrap();
