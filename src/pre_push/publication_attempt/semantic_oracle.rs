@@ -22,8 +22,9 @@ use super::{
     body::StackBodyRecipes,
     github::{
         AbsentPullRequest, BaseKind, CompleteCreateReceipts, CompleteLocalPullRequests,
-        LocalPullRequestObservation, ManagedOpenPullRequest, ObservedBase, PreparedCreates,
-        PreparedUpdates, PullRequestIdentity, PullRequestNumber, TestCreate, TestUpdate,
+        LocalPullRequestObservation, ManagedOpenPullRequests, ObservedBase, PreparedCreates,
+        PreparedPullRequestProjection, PullRequestIdentity, PullRequestNumber, TestCreate,
+        TestPullRequestProjection, TestUpdate,
     },
     history::ValidatedChangeHistory,
     marker::{MarkerTemplate, PullRequestMarker},
@@ -530,7 +531,7 @@ impl DurableWorld {
             Some(OpenVisibility::Stale(fields)) => fields.clone(),
             None => self.current_open_fields(id),
         };
-        LocalPullRequestObservation::Open(ManagedOpenPullRequest::for_plan_test(
+        LocalPullRequestObservation::Open(ManagedOpenPullRequests::for_plan_test(
             id.clone(),
             pull_request.pull_request().identity.clone(),
             fields.head_oid,
@@ -1118,13 +1119,22 @@ impl EffectDriver for WorldDriver<'_> {
         self.run_competition_at(CompetitionBoundary::AfterMarkers).await
     }
 
-    async fn update_pull_requests(&mut self, updates: PreparedUpdates) -> Result<()> {
-        let batch_count = updates.batches_for_test().len();
-        for (index, batch) in updates.batches_for_test().enumerate() {
+    async fn project_pull_requests(
+        &mut self,
+        projection: PreparedPullRequestProjection,
+    ) -> Result<()> {
+        let batch_count = projection.batches_for_test().len();
+        for (index, batch) in projection.batches_for_test().enumerate() {
             let batch = batch
                 .iter()
-                .cloned()
-                .map(|operation| self.world.resolve_update(operation))
+                .map(|operation| match operation {
+                    TestPullRequestProjection::Update(operation) => {
+                        self.world.resolve_update(operation.clone())
+                    }
+                    TestPullRequestProjection::Close(_) => {
+                        panic!("duplicate recovery schedules are introduced by the next test layer")
+                    }
+                })
                 .collect::<Box<[_]>>();
             self.trace.updates.push(batch.clone());
             let interruption = self.take_interruption(EffectStage::Update, index);
