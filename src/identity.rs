@@ -147,3 +147,30 @@ pub(crate) fn gherrit_id_trailers(message: &[u8]) -> Vec<GherritIdTrailer> {
 
     identities
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_codec_identity_bytes_preserve_ranges_and_literal_alphabet() {
+        let seed = b"Subject\n\ngherrit-pr-id: Gone\nReviewed-by: Person\n";
+        for byte in 0..=u8::MAX {
+            let expected = matches!(byte, b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z');
+            assert_eq!(GherritPrId::from_ref_component(&[byte]).is_ok(), expected);
+            for position in 0..=seed.len() {
+                let mut input = seed.to_vec();
+                input.insert(position, byte);
+                for occurrence in gherrit_id_trailers(&input) {
+                    if let GherritIdTrailer::Exact { line, .. } = occurrence {
+                        let source =
+                            input.get(line.clone()).expect("source range must remain in bounds");
+                        assert!(source[..13].eq_ignore_ascii_case(b"gherrit-pr-id"));
+                        assert_eq!(&source[13..15], b": ");
+                        assert!(line.start == 0 || input[line.start - 1] == b'\n');
+                    }
+                }
+            }
+        }
+    }
+}

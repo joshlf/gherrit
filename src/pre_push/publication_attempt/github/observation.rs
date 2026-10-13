@@ -1242,6 +1242,29 @@ impl LocalPullRequestAccumulator {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn generated_codec_opaque_cursor_chains_require_exact_progress_and_no_repetition() {
+        let id = id("Gone");
+        let cursors = ["plain", "quote\"", "line\nfeed", "雪", "\0"];
+        for first in cursors {
+            for second in cursors {
+                let progress = Progress::Initial.advance(&id, Some(first.to_owned())).unwrap();
+                assert!(progress.expects(Some(first)));
+                assert!(!progress.expects(None));
+                let next = progress.advance(&id, Some(second.to_owned()));
+                assert_eq!(next.is_ok(), first != second);
+                if let Ok(next) = next {
+                    assert!(next.expects(Some(second)));
+                    assert!(next.advance(&id, Some(first.to_owned())).is_err());
+                }
+            }
+            let exhausted = Progress::Initial.advance(&id, None).unwrap();
+            assert!(!exhausted.expects(Some(first)));
+            assert!(exhausted.advance(&id, Some(first.to_owned())).is_err());
+        }
+    }
+
     use super::*;
 
     const DEFAULT_OID: &str = "1111111111111111111111111111111111111111";

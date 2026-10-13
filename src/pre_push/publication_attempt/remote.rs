@@ -1010,6 +1010,28 @@ fn parse_version(suffix: &[u8]) -> Result<Version> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn generated_codec_ref_advertisements_preserve_exact_record_fields() {
+        let seed = b"2222222222222222222222222222222222222222\trefs/heads/Gone\n";
+        assert_eq!(records(seed).count(), 1);
+        for byte in 0..=u8::MAX {
+            for position in 0..=seed.len() {
+                let mut input = seed.to_vec();
+                input.insert(position, byte);
+                for record in records(&input).flatten() {
+                    assert!(!record.object_id.is_null());
+                    assert!(input.windows(record.name.len()).any(|window| window == record.name));
+                }
+            }
+            let mut version = b"v1".to_vec();
+            version.push(byte);
+            assert_eq!(parse_version(&version).is_ok(), byte.is_ascii_digit());
+        }
+        assert!(parse_version(b"v18446744073709551615").is_ok());
+        assert!(parse_version(b"v18446744073709551616").is_err());
+    }
+
     use std::{
         env, fs,
         path::{Path, PathBuf},
