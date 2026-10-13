@@ -20,7 +20,7 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::{ObjectId, bstr::ByteSlice as _};
 
 use super::{INTERNAL_PRE_PUSH_GIT_DIR_ENV, INTERNAL_PRE_PUSH_REMOTE_ENV, subprocess};
-use crate::util;
+use crate::{manage::PublicBranchName, util};
 
 const DESTINATION_ENV: &str = "GHERRIT_PRIVATE_PUSH_DESTINATION";
 const PROXY_ENV: &str = "GHERRIT_PRIVATE_REMOTE_PROXY";
@@ -191,6 +191,64 @@ pub(super) struct PushDestination {
     resolved: ResolvedDestination,
     internal_remote: String,
     transport: RemoteTransportSettings,
+}
+
+/// Exact state of the requested public branch projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RemoteBranchState {
+    Absent,
+    At(ObjectId),
+}
+
+/// The requested public branch and the exact state observed for that same
+/// branch.
+///
+/// Keeping the request identity with its evidence prevents a planner from
+/// accidentally pairing one branch name with another branch's remote state.
+#[derive(Debug)]
+pub(super) struct ObservedPublicBranch {
+    name: PublicBranchName,
+    state: RemoteBranchState,
+}
+
+impl ObservedPublicBranch {
+    pub(super) fn into_parts(self) -> (PublicBranchName, RemoteBranchState) {
+        (self.name, self.state)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(name: PublicBranchName, state: RemoteBranchState) -> Self {
+        Self { name, state }
+    }
+}
+
+/// The complete initial observation together with the exact destination
+/// capability which produced it.
+pub(super) struct InitialRemoteObservation {
+    destination: PushDestination,
+    refs: ParsedInitialRemoteObservation,
+}
+
+#[derive(Debug)]
+struct ParsedInitialRemoteObservation {
+    default_branch: DefaultBranch,
+    public_branch: Option<ObservedPublicBranch>,
+}
+
+impl InitialRemoteObservation {
+    pub(super) fn into_parts(
+        self,
+    ) -> (PushDestination, DefaultBranch, Option<ObservedPublicBranch>) {
+        let ParsedInitialRemoteObservation { default_branch, public_branch } = self.refs;
+        (self.destination, default_branch, public_branch)
+    }
+}
+
+impl ParsedInitialRemoteObservation {
+    #[cfg(test)]
+    fn into_parts(self) -> (DefaultBranch, Option<ObservedPublicBranch>) {
+        (self.default_branch, self.public_branch)
+    }
 }
 
 /// The one acquisition behavior selected from exact graph-load evidence.
@@ -468,9 +526,9 @@ impl PushDestination {
 
     /// Observes destination refs through the sole bounded execution path.
     ///
-    /// Keeping the raw `ls-remote` command private prevents an observation
-    /// caller from bypassing the execution deadline, output limit, descendant
-    /// cleanup, or asynchronous process supervision.
+    /// This compatibility entry point remains for the active legacy runtime.
+    /// The exact-local workflow uses [`Self::observe_refs_from`] so its
+    /// repository binding remains explicit while that workflow is dormant.
     pub(super) async fn observe_refs(
         &self,
         options: impl IntoIterator<Item = String>,
@@ -485,11 +543,11 @@ impl PushDestination {
 
     /// Observes refs from the exact repository bound to an acquisition plan.
     ///
-    /// The repository supplies only the command's working directory. The
-    /// destination and every transport setting still come from this validated
-    /// value, and execution uses the same finite supervisor as every other
-    /// remote ref observation.
-    #[allow(dead_code)]
+    /// Keeping the raw `ls-remote` command private prevents callers from
+    /// bypassing the execution deadline, output limit, descendant cleanup, or
+    /// asynchronous process supervision. The repository supplies only the
+    /// command's working directory; the destination and every transport
+    /// setting still come from this validated value.
     pub(super) async fn observe_refs_from(
         &self,
         repository: &util::Repo,
@@ -509,7 +567,6 @@ impl PushDestination {
     /// wants. An empty bundle URI prevents a configured secondary object
     /// source and its creation-token state from participating in this one
     /// fetch.
-    #[allow(dead_code)]
     pub(super) fn exact_object_fetch(&self, mode: ExactObjectFetchMode) -> Command {
         let fixed = [
             "--quiet",
@@ -627,8 +684,30 @@ impl PushDestination {
         )
     }
 
-    /// Observes the symbolic default branch and its exact tip from this
-    /// destination. No local remote-tracking ref participates in the result.
+    /// Observes the symbolic default branch and optional exact public branch
+    /// through the shared bounded subprocess adapter. Public mode adds one ref
+    /// pattern without another network request. No local remote-tracking ref
+    /// participates in the result.
+    pub(super) async fn observe_initial(
+        self,
+        public_branch: Option<PublicBranchName>,
+    ) -> Result<InitialRemoteObservation> {
+        let command = self.initial_observation_command(public_branch.as_ref());
+        let refs = observe_initial_command(
+            command,
+            self.configured_remote(),
+            public_branch,
+            subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
+            subprocess::REMOTE_GIT_STDOUT_LIMIT,
+        )
+        .await?;
+        Ok(InitialRemoteObservation { destination: self, refs })
+    }
+
+    /// Observes only the symbolic default for the active legacy runtime.
+    ///
+    /// Keep this path independent from the dormant exact-local observation so
+    /// the preparatory public-branch model does not change active behavior.
     pub(super) async fn observe_default_branch(&self) -> Result<DefaultBranch> {
         observe_default_branch_command(
             self.ls_remote(["--symref".to_string()], ["HEAD".to_string()]),
@@ -637,6 +716,14 @@ impl PushDestination {
             subprocess::REMOTE_GIT_STDOUT_LIMIT,
         )
         .await
+    }
+
+    fn initial_observation_command(&self, public_branch: Option<&PublicBranchName>) -> Command {
+        self.ls_remote(
+            ["--symref".to_string()],
+            std::iter::once("HEAD".to_string())
+                .chain(public_branch.map(|branch| format!("refs/heads/{}", branch.as_str()))),
+        )
     }
 
     /// Returns bounded, redacted, terminal-safe context from a normally
@@ -778,17 +865,42 @@ async fn observe_default_branch_command(
     timeout: Duration,
     stdout_limit: usize,
 ) -> Result<DefaultBranch> {
+    let output = run_initial_observation(command, configured_remote, timeout, stdout_limit).await?;
+    parse_default_branch(output.stdout()).wrap_err_with(|| {
+        format!(
+            "GHerrit remote '{configured_remote}' did not report one valid symbolic default branch"
+        )
+    })
+}
+
+async fn observe_initial_command(
+    command: Command,
+    configured_remote: &str,
+    public_branch: Option<PublicBranchName>,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<ParsedInitialRemoteObservation> {
+    let output = run_initial_observation(command, configured_remote, timeout, stdout_limit).await?;
+    parse_initial_remote_observation(output.stdout(), public_branch).wrap_err_with(|| {
+        format!(
+            "GHerrit remote '{configured_remote}' did not report one valid initial ref observation"
+        )
+    })
+}
+
+async fn run_initial_observation(
+    command: Command,
+    configured_remote: &str,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<subprocess::CommandOutput> {
     let output = subprocess::output_with_stdout_limit(command, timeout, stdout_limit)
         .await
         .wrap_err_with(|| format!("Failed to observe GHerrit remote '{configured_remote}'"))?;
     if !output.status().success() {
         bail!("`git ls-remote --symref` failed for GHerrit remote '{configured_remote}'");
     }
-    parse_default_branch(output.stdout()).wrap_err_with(|| {
-        format!(
-            "GHerrit remote '{configured_remote}' did not report one valid symbolic default branch"
-        )
-    })
+    Ok(output)
 }
 
 fn local_destination_path(destination: &str) -> Option<PathBuf> {
@@ -1543,8 +1655,21 @@ fn valid_repository_component(component: &str) -> bool {
 }
 
 fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
+    let ParsedInitialRemoteObservation { default_branch, public_branch } =
+        parse_initial_remote_observation(output, None)?;
+    debug_assert!(public_branch.is_none());
+    Ok(default_branch)
+}
+
+fn parse_initial_remote_observation(
+    output: &[u8],
+    requested_public_branch: Option<PublicBranchName>,
+) -> Result<ParsedInitialRemoteObservation> {
     let mut symbolic_head = None;
     let mut direct_head = None;
+    let requested_public_ref =
+        requested_public_branch.as_ref().map(|branch| format!("refs/heads/{}", branch.as_str()));
+    let mut direct_public_branch = None;
 
     for record in git_output_records(output) {
         let mut fields = record.split(|byte| *byte == b'\t');
@@ -1558,6 +1683,9 @@ fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
             if name == b"HEAD" && symbolic_head.replace(target).is_some() {
                 bail!("duplicate symbolic HEAD");
             }
+            if requested_public_ref.as_deref().is_some_and(|expected| name == expected.as_bytes()) {
+                bail!("requested public branch is symbolic");
+            }
         } else {
             validate_direct_advertised_ref_name(name)?;
             let object_id =
@@ -1567,6 +1695,11 @@ fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
             }
             if name == b"HEAD" && direct_head.replace(object_id).is_some() {
                 bail!("duplicate direct HEAD");
+            }
+            if requested_public_ref.as_deref().is_some_and(|expected| name == expected.as_bytes())
+                && direct_public_branch.replace(object_id).is_some()
+            {
+                bail!("duplicate requested public branch");
             }
         }
     }
@@ -1581,7 +1714,18 @@ fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
         .strip_prefix(b"refs/heads/")
         .ok_or_else(|| eyre!("symbolic HEAD does not target a local branch"))?;
     let branch = str::from_utf8(branch).wrap_err("default branch name is not UTF-8")?.to_owned();
-    DefaultBranch::new(branch, direct_head)
+    let default_branch = DefaultBranch::new(branch, direct_head)?;
+    // Git output alone cannot distinguish these two states from a hidden or
+    // dangling symbolic ref on an arbitrary server. Production reaches this
+    // decoder only after selecting GitHub.com, whose ref contract makes
+    // absent-or-direct exhaustive. Custom test destinations promise the same
+    // fixture property. An explicitly advertised symbolic ref was rejected
+    // above as a defensive check.
+    let public_branch = requested_public_branch.map(|name| ObservedPublicBranch {
+        name,
+        state: direct_public_branch.map_or(RemoteBranchState::Absent, RemoteBranchState::At),
+    });
+    Ok(ParsedInitialRemoteObservation { default_branch, public_branch })
 }
 
 fn validate_advertised_ref_name(name: &[u8]) -> Result<()> {
