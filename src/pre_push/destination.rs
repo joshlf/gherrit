@@ -1720,4 +1720,5 @@ pub(super) fn git_output_records(output: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 #[cfg(test)]
+#[path = "destination/tests.rs"]
 mod tests;
