@@ -845,6 +845,31 @@ fn parse_push_receipt_lines<'line>(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn generated_codec_porcelain_receipts_do_not_gain_authority_from_suffix_noise() {
+        let source = object_id(2);
+        let expected = expected_receipts(&[(
+            "refs/heads/Gone",
+            source,
+            ExpectedRefTransition::CreateOrAlreadyDesired,
+        )]);
+        let seed = b"To private\n*\t0202020202020202020202020202020202020202:refs/heads/Gone\t[new branch]\nDone\n";
+        assert!(receipts_acknowledge(&expected, seed));
+        for byte in 0..=u8::MAX {
+            let mut trailing = seed.to_vec();
+            trailing.push(byte);
+            assert!(!receipts_acknowledge(&expected, &trailing));
+            for position in 0..=seed.len() {
+                let mut input = seed.to_vec();
+                input.insert(position, byte);
+                if let Some(receipts) = parse_push_receipts(&expected, &input) {
+                    assert_eq!(receipts.len(), 1);
+                }
+            }
+        }
+    }
+
     use std::env;
 
     use super::*;

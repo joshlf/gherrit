@@ -141,6 +141,31 @@ impl<'de> Deserialize<'de> for UniqueJson {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn generated_codec_json_requires_unique_decoded_keys_and_complete_input() {
+        for input in
+            [br#"{"a":1,"\u0061":2}"#.as_slice(), "{\"👍\":1,\"\\ud83d\\udc4d\":2}".as_bytes()]
+        {
+            assert!(UniqueJson::decode(input).is_err());
+        }
+        let seed = br#"{"a":[1,true,null]}"#;
+        assert!(UniqueJson::decode(seed).is_ok());
+        for byte in 0..=u8::MAX {
+            let mut trailing = seed.to_vec();
+            trailing.push(byte);
+            assert_eq!(
+                UniqueJson::decode(&trailing).is_ok(),
+                matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+            );
+            for position in 0..=seed.len() {
+                let mut input = seed.to_vec();
+                input.insert(position, byte);
+                let _ = UniqueJson::decode(&input);
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
