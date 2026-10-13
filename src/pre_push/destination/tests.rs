@@ -151,9 +151,10 @@ fn effective_remote_transport_settings_follow_git_value_semantics() {
 #[tokio::test(flavor = "current_thread")]
 async fn initial_observation_hang_is_bounded_off_the_async_runtime() {
     let started = Instant::now();
-    let observation = observe_default_branch_command(
+    let observation = observe_initial_command(
         observation_fixture("hang"),
         "origin",
+        None,
         Duration::from_millis(50),
         1024,
     );
@@ -172,9 +173,10 @@ async fn initial_observation_hang_is_bounded_off_the_async_runtime() {
 #[tokio::test(flavor = "current_thread")]
 async fn initial_observation_excess_output_enters_bounded_cleanup() {
     let started = Instant::now();
-    let error = observe_default_branch_command(
+    let error = observe_initial_command(
         observation_fixture("overflow"),
         "origin",
+        None,
         Duration::from_secs(2),
         32,
     )
@@ -705,6 +707,19 @@ fn exact_redirect_parameter_preserves_non_utf8_command_scope_bytes() {
     assert_eq!(&bytes[..inherited.len()], inherited.as_bytes());
     assert_eq!(bytes[inherited.len()], b' ');
     assert!(bytes.ends_with(b"='false'"));
+}
+
+#[test]
+fn initial_observation_adds_only_the_checked_public_branch() {
+    let destination = destination();
+    let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+    let command = destination.initial_observation_command(Some(&branch));
+    let arguments = arguments(&command);
+
+    assert_eq!(
+        &arguments[arguments.len() - 2..],
+        [OsStr::new("HEAD"), OsStr::new("refs/heads/release-candidate")]
+    );
 }
 
 #[test]
@@ -1430,6 +1445,111 @@ fn parses_exact_symbolic_default_branch_observation() {
             .unwrap(),
         DefaultBranch::new("master".to_string(), ObjectId::from_hex(oid.as_bytes()).unwrap())
             .unwrap()
+    );
+}
+
+#[test]
+fn initial_observation_reports_exact_public_branch_presence_or_absence() {
+    let head = "1111111111111111111111111111111111111111";
+    let public = "2222222222222222222222222222222222222222";
+    let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+
+    for (extra, expected) in [
+        (String::new(), RemoteBranchState::Absent),
+        (
+            format!("{public}\trefs/heads/release-candidate\n"),
+            RemoteBranchState::At(ObjectId::from_hex(public.as_bytes()).unwrap()),
+        ),
+    ] {
+        let output = format!("ref: refs/heads/main\tHEAD\n{head}\tHEAD\n{extra}");
+        let observation =
+            parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).unwrap();
+        let (default, observed) = observation.into_parts();
+        assert_eq!(default.name(), "main");
+        let (observed_name, observed_state) = observed.unwrap().into_parts();
+        assert_eq!(observed_name, branch);
+        assert_eq!(observed_state, expected);
+    }
+}
+
+#[test]
+fn initial_observation_preserves_valid_unicode_c1_public_branch_data() {
+    let head = "1111111111111111111111111111111111111111";
+    let public = "2222222222222222222222222222222222222222";
+    let branch = PublicBranchName::new("release-/\u{85}candidate".to_owned()).unwrap();
+    let output = format!(
+        "ref: refs/heads/main\tHEAD\n{head}\tHEAD\n{public}\trefs/heads/{}\n",
+        branch.as_str()
+    );
+
+    let observation =
+        parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).unwrap();
+    let (_, observed) = observation.into_parts();
+    let (observed_name, observed_state) = observed.unwrap().into_parts();
+
+    assert_eq!(observed_name, branch);
+    assert_eq!(
+        observed_state,
+        RemoteBranchState::At(ObjectId::from_hex(public.as_bytes()).unwrap())
+    );
+}
+
+#[test]
+fn initial_observation_rejects_ambiguous_public_branch_records() {
+    let oid = "1111111111111111111111111111111111111111";
+    let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+    for extra in [
+        format!("{oid}\trefs/heads/release-candidate\n{oid}\trefs/heads/release-candidate\n"),
+        "ref: refs/heads/other\trefs/heads/release-candidate\n".to_owned(),
+    ] {
+        let output = format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n{extra}");
+        assert!(
+            parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).is_err(),
+            "extra={extra:?}"
+        );
+    }
+}
+
+#[test]
+fn initial_observation_rejects_malformed_public_branch_records() {
+    let oid = "1111111111111111111111111111111111111111";
+    let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+    for extra in [
+        "not-an-object-id\trefs/heads/release-candidate\n".to_owned(),
+        "0000000000000000000000000000000000000000\trefs/heads/release-candidate\n".to_owned(),
+        format!("{oid}\trefs/heads/invalid..branch\n"),
+    ] {
+        let output = format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n{extra}");
+        assert!(
+            parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).is_err(),
+            "extra={extra:?}"
+        );
+    }
+}
+
+#[test]
+fn initial_observation_ignores_valid_unrequested_records_in_any_order() {
+    let head = "1111111111111111111111111111111111111111";
+    let public = "2222222222222222222222222222222222222222";
+    let unrelated = "3333333333333333333333333333333333333333";
+    let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+    let output = format!(
+        "{unrelated}\trefs/heads/candidate\n\
+         {public}\trefs/heads/release-candidate\n\
+         {head}\tHEAD\n\
+         ref: refs/heads/other\trefs/remotes/upstream/HEAD\n\
+         ref: refs/heads/main\tHEAD\n"
+    );
+
+    let observation =
+        parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).unwrap();
+    let (default, observed) = observation.into_parts();
+    assert_eq!(default.name(), "main");
+    let (observed_name, observed_state) = observed.unwrap().into_parts();
+    assert_eq!(observed_name, branch);
+    assert_eq!(
+        observed_state,
+        RemoteBranchState::At(ObjectId::from_hex(public.as_bytes()).unwrap())
     );
 }
 
