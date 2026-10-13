@@ -69,12 +69,19 @@ It achieves this by:
     - `pre_push/publication_attempt/refs.rs`: Atomic change tuples, public-ref
       transitions, batching, exact push receipts, and marker publication.
     - `pre_push/subprocess/`: The single bounded subprocess implementation
-      shared by destination observation, remote acquisition, and publication.
+      shared by local/auth commands, destination observation, remote acquisition,
+      and publication; see `agent_docs/subprocesses.md`.
     - `pre_push/destination.rs` and `pre_push/local.rs`: Destination binding
       and local stack derivation.
     - `manage.rs`: Handles branch management state and loopback configuration
       through `git config`, plus public branch name validation.
-    - `commit_msg.rs`: Ensures commits have `gherrit-pr-id` trailers.
+    - `identity.rs`: Shared raw identity syntax and source ranges.
+    - `commit_msg.rs`: Preserves Git cancellation and edits identity trailers.
+    - `util/`: Named layout, repository, config, command, and auth boundaries.
+    - `inspect.rs`, `hosted.rs`, `pre_push/inspection.rs`: Read-only local and
+      factual hosted inspection, separate from publication admission.
+    - `hosted_contracts.rs`: Explicit disposable provider probes; never run
+      merely because an environment variable or test feature is present.
 - `hooks/`: Git hooks (`pre-push`, `commit-msg`, `post-checkout`) that shell out
   to the `gherrit` binary.
 
@@ -95,3 +102,8 @@ that your change is valid and follows the style guidelines.
   changes
 - [agent_docs/style.md](./agent_docs/style.md) for style and formatting
   guidelines for files and commit messages
+
+The [architecture and test map](design/architecture.md) locates invariant owners.
+[Issue/PR provenance](agent_docs/issue-provenance.md) preserves the surveyed
+historical counterexamples and distinguishes the survey baseline from these
+cleanups. Read both before rebuilding an older pipeline proposal.
