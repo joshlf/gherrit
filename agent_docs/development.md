@@ -9,8 +9,8 @@ change. They match the checks run in CI, including the required test-build
 configuration.
 
 Use [testing.md](./testing.md) when choosing a test layer or extending the test
-infrastructure. It defines the product-risk model and the target architecture
-for the ongoing migration away from broad system fixtures.
+infrastructure. It defines the product-risk model and the implemented
+architecture for pure, adapter-contract, semantic-recovery, and system tests.
 
 - `cargo build`: Builds the project.
 
