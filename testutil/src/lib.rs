@@ -773,12 +773,6 @@ impl TestContext {
             .args(["push", "--quiet", "--no-verify", "origin", "refs/heads/main:refs/heads/main"])
             .assert()
             .success();
-        self.test_environment
-            .command(&self.system_git)
-            .current_dir(&self.remote_path)
-            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
-            .assert()
-            .success();
     }
 
     pub fn checkout_new(&self, branch_name: &str) {
@@ -1249,6 +1243,7 @@ fn install_gherrit_binary(path: &Path, gherrit_bin: &Path) {
 fn init_git_bare_repo(environment: &TestEnvironment, system_git: &Path, path: &Path) {
     fs::create_dir(path).unwrap();
     run_git_cmd(environment, system_git, path, &["init", "--bare"]);
+    run_git_cmd(environment, system_git, path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 }
 
 fn init_git_repo(
@@ -1263,8 +1258,10 @@ fn init_git_repo(
     // Must config user identity for commits to work
     run(&["config", "user.email", "test@example.com"]);
     run(&["config", "user.name", "Test User"]);
-    // Ensure default branch is main
+    // Pin both the actual branch and the configuration consulted by default-
+    // branch discovery. Ambient Git defaults must not choose fixture topology.
     run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+    run(&["config", "init.defaultBranch", "main"]);
     // Explicitly unmanage main to satisfy strict config checks
     run(&["config", "branch.main.gherritManaged", "false"]);
     if let Some(remote_path) = remote_path {
