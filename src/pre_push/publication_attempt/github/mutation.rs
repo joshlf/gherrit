@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::{
-    super::{body::GeneratedBody, refs::PublicationRevision},
+    super::{body::GeneratedBody, failure::contextualize, refs::PublicationRevision},
     MAX_MUTATION_ALIASES, MAX_MUTATION_REQUEST_BYTES, RepositoryNodeId,
     pull_request::{PullRequestIdentity, PullRequestIdentityRegistry},
     transport::{Github, indeterminate_mutation},
@@ -401,12 +401,25 @@ impl PreparedCreates {
                 batch.expected.len(),
                 batch.serialized_bytes
             );
+            let targets = batch
+                .expected
+                .iter()
+                .map(|expected| format!("change {}", expected.id.as_str()))
+                .collect::<Vec<_>>();
             let (request, decoder) = batch.into_request();
-            let response = github.send_mutation_once(request).await?;
-            let receipts =
-                decoder.decode(&repository_id, response).map_err(indeterminate_mutation)?;
+            let response = github
+                .send_mutation_once(request)
+                .await
+                .map_err(|error| contextualize(error, "create PRs", &targets))?;
+            let receipts = decoder
+                .decode(&repository_id, response)
+                .map_err(indeterminate_mutation)
+                .map_err(|error| contextualize(error, "create PRs", &targets))?;
             for (id, identity) in receipts.into_vec() {
-                identities.insert_create_receipt(&identity).map_err(indeterminate_mutation)?;
+                identities
+                    .insert_create_receipt(&identity)
+                    .map_err(indeterminate_mutation)
+                    .map_err(|error| contextualize(error, "create PRs", &targets))?;
                 values.push((id, identity));
             }
         }
@@ -1088,9 +1101,27 @@ impl PreparedPullRequestProjection {
                 batch.expected.len(),
                 batch.serialized_bytes
             );
+            let targets = batch
+                .expected
+                .iter()
+                .map(|expected| {
+                    let identity = match expected {
+                        ExpectedMutationReceipt::Close(value) => &value.identity,
+                        ExpectedMutationReceipt::Update(value) => &value.identity,
+                        ExpectedMutationReceipt::Draft(value) => &value.identity,
+                    };
+                    format!("PR #{}", identity.number().get())
+                })
+                .collect::<Vec<_>>();
             let (request, decoder) = batch.into_request();
-            let response = github.send_mutation_once(request).await?;
-            decoder.decode(response).map_err(indeterminate_mutation)?;
+            let response = github
+                .send_mutation_once(request)
+                .await
+                .map_err(|error| contextualize(error, "project and close PRs", &targets))?;
+            decoder
+                .decode(response)
+                .map_err(indeterminate_mutation)
+                .map_err(|error| contextualize(error, "project and close PRs", &targets))?;
         }
         Ok(())
     }
@@ -1141,9 +1172,27 @@ impl PreparedDraftConversions {
                 batch.expected.len(),
                 batch.serialized_bytes
             );
+            let targets = batch
+                .expected
+                .iter()
+                .map(|expected| {
+                    let identity = match expected {
+                        ExpectedMutationReceipt::Close(value) => &value.identity,
+                        ExpectedMutationReceipt::Update(value) => &value.identity,
+                        ExpectedMutationReceipt::Draft(value) => &value.identity,
+                    };
+                    format!("PR #{}", identity.number().get())
+                })
+                .collect::<Vec<_>>();
             let (request, decoder) = batch.into_request();
-            let response = github.send_mutation_once(request).await?;
-            decoder.decode(response).map_err(indeterminate_mutation)?;
+            let response = github
+                .send_mutation_once(request)
+                .await
+                .map_err(|error| contextualize(error, "draft safety", &targets))?;
+            decoder
+                .decode(response)
+                .map_err(indeterminate_mutation)
+                .map_err(|error| contextualize(error, "draft safety", &targets))?;
         }
         Ok(())
     }
