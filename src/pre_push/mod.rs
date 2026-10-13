@@ -14,7 +14,7 @@ mod destination;
 mod json;
 mod local;
 mod publication_attempt;
-mod subprocess;
+pub(crate) mod subprocess;
 
 const INTERNAL_PRE_PUSH_GIT_DIR_ENV: &str = "GHERRIT_INTERNAL_PRE_PUSH_GIT_DIR";
 const INTERNAL_PRE_PUSH_REMOTE_ENV: &str = "GHERRIT_INTERNAL_PRE_PUSH_REMOTE";

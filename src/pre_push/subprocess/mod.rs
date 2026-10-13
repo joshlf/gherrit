@@ -113,14 +113,14 @@ enum CommandInput {
 /// [`finish`](Self::finish) consumes the builder, the exact file has been
 /// reopened read-only, its name has been removed, and its GHerrit-owned
 /// writable handle has been closed.
-pub(super) struct RegularFileStdinBuilder {
+pub(crate) struct RegularFileStdinBuilder {
     file: tempfile::NamedTempFile,
     written: u64,
     limit: u64,
 }
 
 impl RegularFileStdinBuilder {
-    pub(super) fn new() -> Result<Self, CommandError> {
+    pub(crate) fn new() -> Result<Self, CommandError> {
         Self::with_limit(REGULAR_FILE_STDIN_LIMIT)
     }
 
@@ -132,7 +132,7 @@ impl RegularFileStdinBuilder {
 
     /// Reopens the exact file read-only, removes its name, and closes
     /// GHerrit's writer.
-    pub(super) fn finish(self) -> Result<RegularFileStdin, CommandError> {
+    pub(crate) fn finish(self) -> Result<RegularFileStdin, CommandError> {
         let Self { mut file, written, limit } = self;
         file.flush().map_err(|error| io_error(IoStage::PrepareInput, &error))?;
         let metadata =
@@ -252,7 +252,7 @@ impl io::Write for RegularFileStdinBuilder {
 /// It proves that no GHerrit-owned writer or input producer can extend the
 /// command lifetime, and that the handle inherited as standard input is
 /// read-only.
-pub(super) struct RegularFileStdin {
+pub(crate) struct RegularFileStdin {
     file: File,
 }
 
@@ -663,7 +663,7 @@ impl fmt::Debug for CommandOutput {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum CommandError {
+pub(crate) enum CommandError {
     InvalidTimeout,
     TimedOut,
     StdinNotRegular,
@@ -675,7 +675,7 @@ pub(super) enum CommandError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum IoStage {
+pub(crate) enum IoStage {
     PrepareInput,
     Start,
     Monitor,
@@ -758,8 +758,41 @@ impl Drop for CancellationGuard {
     }
 }
 
+/// Local and credential commands share lifecycle ownership, not remote
+/// publication authority. This synchronous entry point accepts only finite
+/// prepared input and returns raw local bytes after complete normal capture.
+/// Remote callers must continue using the sealed destination-aware API.
+pub(crate) fn local_output(
+    command: &mut Command,
+    input: Option<RegularFileStdin>,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<std::process::Output, CommandError> {
+    let deadline_at = Instant::now().checked_add(timeout).ok_or(CommandError::InvalidTimeout)?;
+    let output = output_blocking_borrowed(
+        command,
+        input.map_or(CommandInput::Null, CommandInput::RegularFile),
+        Deadline::execution(deadline_at, DeadlineFault::None),
+        stdout_limit,
+        Faults::NONE,
+        &AtomicBool::new(false),
+    )?;
+    Ok(std::process::Output { status: output.status, stdout: output.stdout, stderr: output.stderr })
+}
+
 fn output_blocking(
     mut command: Command,
+    input: CommandInput,
+    deadline: Deadline,
+    stdout_limit: usize,
+    faults: Faults,
+    cancelled: &AtomicBool,
+) -> Result<CommandOutput, CommandError> {
+    output_blocking_borrowed(&mut command, input, deadline, stdout_limit, faults, cancelled)
+}
+
+fn output_blocking_borrowed(
+    command: &mut Command,
     input: CommandInput,
     deadline: Deadline,
     stdout_limit: usize,
@@ -779,9 +812,9 @@ fn output_blocking(
 
     command.stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
-    let started = spawn_owned(&mut command, deadline, cancelled);
+    let started = spawn_owned(command, deadline, cancelled);
     #[cfg(windows)]
-    let started = spawn_owned(&mut command, deadline, cancelled, &faults.platform);
+    let started = spawn_owned(command, deadline, cancelled, &faults.platform);
     let child = match started {
         Ok(child) => child,
         Err(StartError::BeforeSpawn(error)) => {
