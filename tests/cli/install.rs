@@ -163,3 +163,47 @@ fn test_install_read_only_fs() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&hooks_dir, perms).unwrap();
 }
+
+#[test]
+fn test_install_linked_worktree_uses_git_hooks_path() {
+    let ctx = testutil::test_context!().with_initial_commit().build();
+    // The shared fixture sets an explicit .git/hooks path for ordinary repos.
+    ctx.run_git(&["config", "--unset", "core.hooksPath"]);
+    let linked = ctx.repo_path.parent().unwrap().join("linked");
+    ctx.git_cmd().args(["worktree", "add", "-b", "linked"]).arg(&linked).assert().success();
+    let output = ctx
+        .git_cmd()
+        .current_dir(&linked)
+        .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let effective = std::path::PathBuf::from(std::str::from_utf8(&output).unwrap().trim_end());
+    ctx.gherrit_cmd().current_dir(&linked).arg("install").assert().success();
+    assert_installed_hooks(&effective);
+    assert_eq!(effective, ctx.repo_path.join(".git/hooks").canonicalize().unwrap());
+    assert!(!ctx.repo_path.join(".git/worktrees/linked/hooks").exists());
+
+    ctx.run_git(&["config", "core.hooksPath", ".githooks"]);
+    ctx.gherrit_cmd().current_dir(&linked).arg("install").assert().success();
+    assert_installed_hooks(&linked.join(".githooks"));
+    assert!(!ctx.repo_path.join(".githooks").exists());
+}
+
+#[test]
+fn test_install_bare_repository() {
+    let ctx = testutil::test_context!().with_initial_commit().build();
+    let bare = ctx.repo_path.parent().unwrap().join("bare");
+    ctx.git_cmd().args(["clone", "--bare"]).arg(&ctx.repo_path).arg(&bare).assert().success();
+    ctx.gherrit_cmd().current_dir(&bare).arg("install").assert().success();
+    assert_installed_hooks(&bare.join("hooks"));
+    ctx.git_cmd()
+        .current_dir(&bare)
+        .args(["config", "core.hooksPath", "custom-hooks"])
+        .assert()
+        .success();
+    ctx.gherrit_cmd().current_dir(&bare).arg("install").assert().success();
+    assert_installed_hooks(&bare.join("custom-hooks"));
+}

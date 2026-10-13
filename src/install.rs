@@ -92,6 +92,6 @@ fn resolve_hooks_dir(repo: &Repo, allow_global: bool) -> Result<PathBuf> {
         return Ok(abs_hooks);
     }
 
-    // Default: .git/hooks
-    Ok(repo.layout().worktree_git_dir.join("hooks"))
+    // Default hooks belong to the common repository, including linked worktrees.
+    Ok(repo.layout().common_git_dir.join("hooks"))
 }
