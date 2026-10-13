@@ -929,3 +929,14 @@ Its insertion remains Git's `interpret-trailers` operation. These acceptance
 policies are intentionally preserved by the extraction; normalization is not
 proof that the original raw message is publishable. Status should diagnose a
 malformed raw identity rather than silently inventing a replacement.
+
+## Semantic model source map
+
+The private test-only `semantic_oracle/` tree separates literal durable state
+and service transitions (`world`), captured query visibility (`visibility`),
+local intent construction (`fixtures`), exact typed traces and outcomes
+(`reports`), the production consuming executor adapter (`driver`), independent
+invariant checks (`assertions`), and restart/concurrency cases (`scenarios`).
+Moving a case does not change its snapshot identity or directory. This model
+still does not parse wire data or derive desired projections in the fake
+world. Native landing needs new literal transitions and assumptions.
