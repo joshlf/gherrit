@@ -9,17 +9,16 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::*;
-use crate::pre_push::{
-    destination::DefaultBranch,
-    github::{
+use super::{
+    super::{
         MAX_MUTATION_REQUEST_BYTES, PullRequestIdentity,
         mutation::{PreparedCreates, PreparedUpdates, TestCreate, TestUpdate},
         observation::LocalPullRequestObservation,
         pull_request::PullRequestIdentityRegistry,
     },
-    local::GherritPrId,
+    *,
 };
+use crate::pre_push::{destination::DefaultBranch, local::GherritPrId};
 
 const SERVER_STEP_TIMEOUT: Duration = Duration::from_secs(2);
 const EXTRA_REQUEST_WINDOW: Duration = Duration::from_millis(550);
@@ -281,13 +280,35 @@ fn test_timeouts() -> Timeouts {
 }
 
 fn test_github(api_url: &str, timeouts: Timeouts) -> Github {
+    let destination = PushDestination::for_test();
     Github::with_timeouts(
         "token".to_owned(),
         Some(api_url),
-        RepositoryCoordinates::for_test("owner", "repo"),
+        destination.publication_target(),
         timeouts,
     )
     .unwrap()
+}
+
+#[test]
+fn production_client_rejects_destinations_outside_supported_github_push_transports() {
+    let repository = crate::util::Repo::open(".").unwrap();
+    for destination in [
+        "http://github.com/owner/repo.git",
+        "git://github.com/owner/repo.git",
+        "https://evil.example/owner/repo.git",
+        "evil://github.com/owner/repo.git",
+        "HTTPS://github.com/owner/repo.git",
+    ] {
+        let other = PushDestination::for_test_url_in(&repository, destination);
+        let error = Github::new(&GithubEndpoint::Production, &other)
+            .err()
+            .expect("an unsupported GitHub transport must fail before client construction");
+        assert_eq!(
+            error.to_string(),
+            "Production publication requires an HTTPS or SSH destination on github.com"
+        );
+    }
 }
 
 fn test_update(number: u32) -> TestUpdate {
@@ -461,6 +482,7 @@ async fn facade_paginates_connections_independently() {
         .observe_local_pull_requests(&local(&["A", "B"]))
         .await
         .unwrap();
+    let (_, complete) = complete.into_parts();
     let requests = finish_peer(server).await;
 
     assert_eq!(requests.len(), 2);
@@ -501,6 +523,7 @@ async fn resource_rejection_splits_only_aliases_and_retains_repository_facts() {
         .observe_local_pull_requests(&local(&["A", "B", "C", "D"]))
         .await
         .unwrap();
+    let (_, complete) = complete.into_parts();
     let requests = finish_peer(server).await;
 
     assert_eq!(requests.len(), 3);
@@ -597,6 +620,7 @@ async fn resource_backoff_rebuilds_the_same_paginated_cursors() {
         .observe_local_pull_requests(&local(&["A", "B"]))
         .await
         .unwrap();
+    let (_, complete) = complete.into_parts();
     let requests = finish_peer(server).await;
 
     assert_eq!(requests.len(), 4);
