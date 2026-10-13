@@ -23,23 +23,26 @@ mod pull_request;
 mod transport;
 
 pub(super) use mutation::{
-    CompleteCreateReceipts, CreatePullRequest, PreparedCreates, PreparedUpdates, UpdatePullRequest,
+    ClosePullRequest, CompleteCreateReceipts, CreatePullRequest, PreflightedDuplicateCloses,
+    PreparedCreates, PreparedPullRequestProjection, UpdatePullRequest,
 };
 #[cfg(test)]
-pub(in crate::pre_push::publication_attempt) use mutation::{TestCreate, TestUpdate};
-#[cfg(test)]
-pub(super) use observation::ObservedBase;
+pub(in crate::pre_push::publication_attempt) use mutation::{
+    TestCreate, TestPullRequestProjection, TestUpdate,
+};
 pub(super) use observation::{
     AbsentPullRequest, BaseKind, CompleteLocalPullRequests, LocalPullRequestObservation,
-    ManagedOpenPullRequest,
+    ManagedOpenPullRequestCandidate, OpenPullRequestSelection, SelectedOpenPullRequest,
 };
+#[cfg(test)]
+pub(super) use observation::{ManagedOpenPullRequests, ObservedBase};
 pub(super) use pull_request::{PullRequestIdentity, PullRequestNumber};
 pub(super) use transport::Github;
 
 /// Complete GitHub evidence and the exact client which produced it.
 ///
 /// This pair has no independent production accessors. Planning consumes it
-/// and retains this same client for every create and update.
+/// and retains this same client for every create and final projection.
 pub(super) struct ObservedGithub {
     github: Github,
     pull_requests: CompleteLocalPullRequests,

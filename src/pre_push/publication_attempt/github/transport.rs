@@ -210,7 +210,7 @@ impl Github {
         Ok(Self { http: builder.build()?, target, timeouts })
     }
 
-    /// Observes every lifecycle state for each change in the sealed stack.
+    /// Exhausts the OPEN pull request connection for each sealed local change.
     pub(in crate::pre_push::publication_attempt) async fn observe_local_pull_requests(
         self,
         local: &LocalStack,

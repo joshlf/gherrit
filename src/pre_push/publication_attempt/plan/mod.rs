@@ -12,16 +12,19 @@ use std::borrow::Cow;
 use color_eyre::eyre::{Result, bail};
 
 #[cfg(test)]
+use super::github::{ManagedOpenPullRequests, TestPullRequestProjection, TestUpdate};
+#[cfg(test)]
 use super::refs::prepare_tuple_pushes;
 use super::{
     CompletePublicationObservation, ObservedLocalPublication, ObservedPublicProjection,
     PublicBranch,
     body::{GeneratedBody, StackBodyRecipes},
     github::{
-        AbsentPullRequest, BaseKind, CompleteCreateReceipts, CompleteLocalPullRequests,
-        CreatePreparation, CreatePullRequest, Github, LocalPullRequestObservation,
-        ManagedOpenPullRequest, PreparedCreates, PreparedUpdates, PullRequestIdentity,
-        PullRequestNumber, UpdatePullRequest,
+        AbsentPullRequest, BaseKind, ClosePullRequest, CompleteCreateReceipts,
+        CompleteLocalPullRequests, CreatePreparation, CreatePullRequest, Github,
+        LocalPullRequestObservation, ManagedOpenPullRequestCandidate, OpenPullRequestSelection,
+        PreflightedDuplicateCloses, PreparedCreates, PreparedPullRequestProjection,
+        PullRequestIdentity, PullRequestNumber, SelectedOpenPullRequest, UpdatePullRequest,
     },
     history::{Revision, ValidatedChangeHistory},
     marker::MarkerTemplate,
@@ -154,7 +157,10 @@ pub(super) trait EffectDriver {
 
     async fn publish_markers(&mut self, markers: Box<[MarkerTemplate]>) -> Result<()>;
 
-    async fn update_pull_requests(&mut self, updates: PreparedUpdates) -> Result<()>;
+    async fn project_pull_requests(
+        &mut self,
+        projection: PreparedPullRequestProjection,
+    ) -> Result<()>;
 }
 
 /// The sole production effect driver, bound to the destination and GitHub
@@ -191,8 +197,11 @@ impl EffectDriver for RemoteEffectDriver<'_> {
         pushes.execute(self.destination).await
     }
 
-    async fn update_pull_requests(&mut self, updates: PreparedUpdates) -> Result<()> {
-        self.github.update_pull_requests(updates).await
+    async fn project_pull_requests(
+        &mut self,
+        projection: PreparedPullRequestProjection,
+    ) -> Result<()> {
+        self.github.project_pull_requests(projection).await
     }
 }
 
@@ -219,7 +228,7 @@ impl PlannedPublication {
             AfterInitialRefs::Creates(stage) => stage.complete_with(driver).await?,
         };
         driver.publish_markers(marker_stage.markers).await?;
-        driver.update_pull_requests(marker_stage.updates).await
+        driver.project_pull_requests(marker_stage.projection).await
     }
 }
 
@@ -234,7 +243,7 @@ enum AfterInitialRefs {
 /// Marker work followed by an already-preflighted final projection.
 struct MarkerStage {
     markers: Box<[MarkerTemplate]>,
-    updates: PreparedUpdates,
+    projection: PreparedPullRequestProjection,
 }
 
 /// A necessarily nonempty create stage and its inseparable continuation.
@@ -267,19 +276,21 @@ impl CreateStage {
 struct ProjectionSeed {
     entries: Box<[PendingProjectionEntry]>,
     recipes: StackBodyRecipes,
+    closes: PreflightedDuplicateCloses,
     default_branch: DefaultBranch,
 }
 
 impl ProjectionSeed {
     fn complete(self, receipts: CompleteCreateReceipts) -> Result<MarkerStage> {
-        let Self { entries, recipes, default_branch } = self;
+        let Self { entries, recipes, closes, default_branch } = self;
         let BoundProjection { entries, markers } =
             bind_created_identities(entries, receipts.into_values())?;
 
         // Receipt-supplied node IDs can still fail exact mutation preflight.
         // Keep markers receipt-gated until the whole projection is prepared.
         let updates = prepare_final_updates(entries, &recipes, default_branch.name())?;
-        Ok(MarkerStage { markers, updates })
+        let projection = closes.prepare_projection(updates)?;
+        Ok(MarkerStage { markers, projection })
     }
 }
 
@@ -346,9 +357,73 @@ enum ProjectionReality {
     Missing(MissingReality),
 }
 
-struct ExistingReality {
-    pull_request: ManagedOpenPullRequest,
-    marker: Option<MarkerTemplate>,
+/// One validated OPEN projection with exactly the marker work implied by its
+/// authority state.
+///
+/// Keeping authenticated and contender rows as distinct variants prevents an
+/// authenticated row from carrying a redundant marker template and prevents
+/// an unauthenticated contender from reaching projection without one.
+enum ExistingReality {
+    Authenticated(ValidatedOpenPullRequest),
+    Contender { pull_request: ValidatedOpenPullRequest, marker: MarkerTemplate },
+}
+
+impl ExistingReality {
+    fn pull_request(&self) -> &ValidatedOpenPullRequest {
+        match self {
+            Self::Authenticated(pull_request) | Self::Contender { pull_request, .. } => {
+                pull_request
+            }
+        }
+    }
+
+    fn into_parts(self) -> (ValidatedOpenPullRequest, Option<MarkerTemplate>) {
+        match self {
+            Self::Authenticated(pull_request) => (pull_request, None),
+            Self::Contender { pull_request, marker } => (pull_request, Some(marker)),
+        }
+    }
+}
+
+/// The only OPEN pull request fields needed after history and policy
+/// validation.
+///
+/// Head and base object IDs and landing-automation flags are consumed during
+/// validation. They cannot accidentally influence effect planning afterward.
+#[derive(Debug)]
+struct ValidatedOpenPullRequest {
+    id: GherritPrId,
+    identity: PullRequestIdentity,
+    base: BaseKind,
+    title: Box<str>,
+    body: Box<str>,
+    duplicates: Box<[PullRequestIdentity]>,
+}
+
+impl ValidatedOpenPullRequest {
+    fn id(&self) -> &GherritPrId {
+        &self.id
+    }
+
+    fn identity(&self) -> &PullRequestIdentity {
+        &self.identity
+    }
+
+    fn base(&self) -> BaseKind {
+        self.base
+    }
+
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn body(&self) -> &str {
+        &self.body
+    }
+
+    fn duplicate_identities(&self) -> impl Iterator<Item = &PullRequestIdentity> {
+        self.duplicates.iter()
+    }
 }
 
 struct MissingReality {
@@ -392,7 +467,7 @@ struct BoundProjection {
 }
 
 enum BoundProjectionEntry {
-    Existing(ManagedOpenPullRequest),
+    Existing(ValidatedOpenPullRequest),
     Created { id: GherritPrId, identity: PullRequestIdentity },
 }
 
@@ -442,7 +517,6 @@ fn plan_bound_effects(
         pull_requests.into_planning_parts_for(destination)?;
     let default_branch = DefaultBranch::agree(stack.default_branch().clone(), github_default)?;
     validate_ordered_inputs(&stack, &histories, &pull_requests)?;
-    validate_reality_set(&histories, &pull_requests, &default_branch)?;
 
     let desired_revisions = histories
         .iter()
@@ -458,8 +532,11 @@ fn plan_bound_effects(
         public_branch.as_ref().and_then(PlannedPublicBranch::transition),
         &tuple_transitions,
     )?;
-    let realities =
-        build_realities(histories.iter().zip(desired_revisions), pull_requests.into_vec())?;
+    let realities = build_realities(
+        histories.iter().zip(desired_revisions),
+        pull_requests.into_vec(),
+        &default_branch,
+    )?;
     let body_branch = public_branch.as_ref().map(|branch| branch.branch().clone());
     let recipes = StackBodyRecipes::new(destination, body_branch, stack, histories.into_vec())?;
     let after_initial_refs =
@@ -526,75 +603,116 @@ fn validate_proposal_join(change: &LocalChange, history: &ValidatedChangeHistory
     Ok(())
 }
 
-fn validate_reality_set(
-    histories: &[ValidatedChangeHistory],
-    pull_requests: &[LocalPullRequestObservation],
-    default_branch: &DefaultBranch,
-) -> Result<()> {
-    histories.iter().zip(pull_requests).enumerate().try_for_each(
-        |(index, (history, pull_request))| match pull_request {
-            LocalPullRequestObservation::Open(pull_request) => {
-                validate_open(history, pull_request, desired_base(index), default_branch)
-            }
-            LocalPullRequestObservation::Absent(_) => {
-                if history.has_pull_request_marker() {
-                    bail!(
-                        "GHerrit change '{}' has a pull request marker but no OPEN pull request",
-                        history.id().as_str()
-                    );
-                }
-                Ok(())
-            }
-        },
-    )
-}
-
-fn validate_open(
+fn validate_selected_open(
     history: &ValidatedChangeHistory,
-    pull_request: &ManagedOpenPullRequest,
-    desired_base: BaseKind,
+    pull_request: &SelectedOpenPullRequest,
     default_branch: &DefaultBranch,
 ) -> Result<()> {
     let id = history.id();
     if history.published_len() == 0 {
         bail!("GHerrit change '{}' has an OPEN pull request but no published history", id.as_str());
     }
-    if !history.contains_published_head(pull_request.head_oid()) {
+    let selected = pull_request.selected();
+    validate_open_candidate(history, selected, default_branch)?;
+    for duplicate in pull_request.duplicate_candidates() {
+        validate_open_candidate(history, duplicate, default_branch)?;
+        validate_unmarked_or_duplicate(id, duplicate)?;
+    }
+    Ok(())
+}
+
+fn validated_open(pull_request: SelectedOpenPullRequest) -> ValidatedOpenPullRequest {
+    let selected = pull_request.selected();
+    ValidatedOpenPullRequest {
+        id: pull_request.id().clone(),
+        identity: selected.identity().clone(),
+        base: selected.base().kind(),
+        title: selected.title().into(),
+        body: selected.body().into(),
+        duplicates: pull_request
+            .duplicate_candidates()
+            .map(|candidate| candidate.identity().clone())
+            .collect(),
+    }
+}
+
+fn validate_open_selection(
+    history: &ValidatedChangeHistory,
+    selection: OpenPullRequestSelection,
+    desired_base: BaseKind,
+    default_branch: &DefaultBranch,
+) -> Result<ExistingReality> {
+    match selection {
+        OpenPullRequestSelection::Authenticated(pull_request) => {
+            validate_selected_open(history, &pull_request, default_branch)?;
+            let selected = pull_request.selected();
+            if selected.has_landing_automation()
+                && (selected.base().kind() == BaseKind::Owned || desired_base == BaseKind::Owned)
+            {
+                bail!(
+                    "OPEN pull request #{} for '{}' cannot use landing automation with an owned base",
+                    selected.identity().number().get(),
+                    history.id().as_str()
+                );
+            }
+            Ok(ExistingReality::Authenticated(validated_open(pull_request)))
+        }
+        OpenPullRequestSelection::Contender(pull_request) => {
+            validate_selected_open(history, &pull_request, default_branch)?;
+            validate_unmarked_or_duplicate(history.id(), pull_request.selected())?;
+            let pull_request = validated_open(pull_request);
+            let marker =
+                MarkerOrigin::from_history(history).bind(pull_request.identity().number())?;
+            Ok(ExistingReality::Contender { pull_request, marker })
+        }
+    }
+}
+
+fn validate_open_candidate(
+    history: &ValidatedChangeHistory,
+    candidate: &ManagedOpenPullRequestCandidate,
+    default_branch: &DefaultBranch,
+) -> Result<()> {
+    let id = history.id();
+    let number = candidate.identity().number().get();
+    if !history.contains_published_head(candidate.head_oid()) {
         bail!(
-            "OPEN pull request for '{}' has a head not present in published history",
+            "OPEN pull request #{number} for '{}' has a head not present in published history",
             id.as_str()
         );
     }
-    if let Some(marker) = history.pull_request_marker()
-        && marker.number() != pull_request.identity().number()
-    {
-        bail!(
-            "Pull-request marker for '{}' names #{}, but exact GitHub evidence names #{}",
-            id.as_str(),
-            marker.number().get(),
-            pull_request.identity().number().get()
-        );
-    }
-    if history.pull_request_marker().is_none() && pull_request.base().kind() != BaseKind::Owned {
-        bail!("Unmarked OPEN pull request for '{}' must still use its owned base", id.as_str());
-    }
-    match pull_request.base().kind() {
-        BaseKind::Default if pull_request.base().oid() != default_branch.tip() => {
-            bail!("OPEN pull request for '{}' has the wrong default-branch object ID", id.as_str());
-        }
-        BaseKind::Owned if !history.contains_published_first_parent(pull_request.base().oid()) => {
+    match candidate.base().kind() {
+        BaseKind::Default if candidate.base().oid() != default_branch.tip() => {
             bail!(
-                "OPEN pull request for '{}' has an owned-base object ID not present in published history",
+                "OPEN pull request #{number} for '{}' has the wrong default-branch object ID",
+                id.as_str()
+            );
+        }
+        BaseKind::Owned if !history.contains_published_first_parent(candidate.base().oid()) => {
+            bail!(
+                "OPEN pull request #{number} for '{}' has an owned-base object ID not present in published history",
                 id.as_str()
             );
         }
         BaseKind::Default | BaseKind::Owned => {}
     }
-    if pull_request.has_landing_automation()
-        && (pull_request.base().kind() == BaseKind::Owned || desired_base == BaseKind::Owned)
-    {
+    Ok(())
+}
+
+fn validate_unmarked_or_duplicate(
+    id: &GherritPrId,
+    candidate: &ManagedOpenPullRequestCandidate,
+) -> Result<()> {
+    let number = candidate.identity().number().get();
+    if candidate.base().kind() != BaseKind::Owned {
         bail!(
-            "OPEN pull request for '{}' cannot use landing automation with an owned base",
+            "Unmarked or duplicate OPEN pull request #{number} for '{}' must use its owned base",
+            id.as_str()
+        );
+    }
+    if candidate.has_landing_automation() {
+        bail!(
+            "Unmarked or duplicate OPEN pull request #{number} for '{}' cannot use landing automation",
             id.as_str()
         );
     }
@@ -621,21 +739,29 @@ fn publication_revision(revision: Revision) -> Result<PublicationRevision> {
 fn build_realities<'history>(
     histories: impl Iterator<Item = (&'history ValidatedChangeHistory, PublicationRevision)>,
     pull_requests: Vec<LocalPullRequestObservation>,
+    default_branch: &DefaultBranch,
 ) -> Result<ProjectionRealities> {
     let mut realities = ProjectionRealities::new();
-    for ((history, desired), pull_request) in histories.zip(pull_requests) {
+    for (index, ((history, desired), pull_request)) in histories.zip(pull_requests).enumerate() {
         let marker = history.pull_request_marker();
         match pull_request {
             LocalPullRequestObservation::Open(pull_request) => {
-                let marker = marker
-                    .is_none()
-                    .then(|| {
-                        MarkerOrigin::from_history(history).bind(pull_request.identity().number())
-                    })
-                    .transpose()?;
-                realities.push_existing(ExistingReality { pull_request, marker });
+                let selection = pull_request.select(marker.map(|marker| marker.number()))?;
+                let reality = validate_open_selection(
+                    history,
+                    selection,
+                    desired_base(index),
+                    default_branch,
+                )?;
+                realities.push_existing(reality);
             }
             LocalPullRequestObservation::Absent(absence) => {
+                if marker.is_some() {
+                    bail!(
+                        "GHerrit change '{}' has a pull request marker but no OPEN pull request",
+                        history.id().as_str()
+                    );
+                }
                 realities.push_missing(MissingReality {
                     revision: desired,
                     absence,
@@ -656,16 +782,28 @@ fn prepare_projection(
     match realities {
         ProjectionRealities::AllExisting(realities) => {
             let mut markers = Vec::new();
+            let mut closes = Vec::new();
             let entries = realities
                 .into_iter()
                 .map(|reality| {
-                    markers.extend(reality.marker);
-                    BoundProjectionEntry::Existing(reality.pull_request)
+                    let (pull_request, marker) = reality.into_parts();
+                    markers.extend(marker);
+                    closes.extend(
+                        pull_request
+                            .duplicate_identities()
+                            .cloned()
+                            .map(ClosePullRequest::duplicate),
+                    );
+                    BoundProjectionEntry::Existing(pull_request)
                 })
                 .collect::<Box<[_]>>();
             let updates = prepare_final_updates(entries, &recipes, default_branch.name())?;
+            let projection = PreparedPullRequestProjection::prepare(closes, updates)?;
             drop(create_preparation);
-            Ok(AfterInitialRefs::Ready(Box::new(MarkerStage { markers: markers.into(), updates })))
+            Ok(AfterInitialRefs::Ready(Box::new(MarkerStage {
+                markers: markers.into(),
+                projection,
+            })))
         }
         ProjectionRealities::NeedsCreate(realities) => {
             prepare_create_stage(realities, recipes, create_preparation, default_branch)
@@ -687,6 +825,7 @@ fn prepare_create_stage(
         bail!("projection evidence and body recipes have different change counts");
     }
 
+    let mut closes = Vec::new();
     let mut create_operations = Vec::new();
     let mut entries = Vec::with_capacity(realities.len());
     for (index, ((reality, rendered), (title_id, title))) in
@@ -699,6 +838,13 @@ fn prepare_create_stage(
 
         match reality {
             ProjectionReality::Existing(existing) => {
+                closes.extend(
+                    existing
+                        .pull_request()
+                        .duplicate_identities()
+                        .cloned()
+                        .map(ClosePullRequest::duplicate),
+                );
                 entries.push(PendingProjectionEntry::Existing(Box::new(existing)));
             }
             ProjectionReality::Missing(missing) => {
@@ -712,14 +858,16 @@ fn prepare_create_stage(
             }
         }
     }
+    let closes = PreflightedDuplicateCloses::prepare(closes)?;
     let creates = create_preparation.prepare(create_operations)?;
-    let seed = ProjectionSeed { entries: entries.into_boxed_slice(), recipes, default_branch };
+    let seed =
+        ProjectionSeed { entries: entries.into_boxed_slice(), recipes, closes, default_branch };
     Ok(CreateStage { creates, seed })
 }
 
 fn reality_id(reality: &ProjectionReality) -> &GherritPrId {
     match reality {
-        ProjectionReality::Existing(existing) => existing.pull_request.id(),
+        ProjectionReality::Existing(existing) => existing.pull_request().id(),
         ProjectionReality::Missing(missing) => missing.absence.id(),
     }
 }
@@ -740,7 +888,7 @@ fn bind_created_identities(
     let mut markers = Vec::new();
     let bound = entries.into_vec().into_iter().enumerate().map(|(index, entry)| match entry {
         PendingProjectionEntry::Existing(existing) => {
-            let ExistingReality { pull_request, marker } = *existing;
+            let (pull_request, marker) = existing.into_parts();
             markers.extend(marker);
             Ok(BoundProjectionEntry::Existing(pull_request))
         }
@@ -769,7 +917,7 @@ fn prepare_final_updates(
     entries: Box<[BoundProjectionEntry]>,
     recipes: &StackBodyRecipes,
     default_branch: &str,
-) -> Result<PreparedUpdates> {
+) -> Result<Vec<UpdatePullRequest>> {
     if entries.len() != recipes.titles().len() {
         bail!("final projection and body recipes have different change counts");
     }
@@ -794,7 +942,7 @@ fn prepare_final_updates(
             operations.push(operation);
         }
     }
-    PreparedUpdates::new(operations)
+    Ok(operations)
 }
 
 fn final_update(
@@ -809,7 +957,7 @@ fn final_update(
         BoundProjectionEntry::Existing(pull_request) => {
             let title = (pull_request.title() != title.as_str()).then(|| title.clone());
             let body = (!bodies_equal(pull_request.body(), body.as_str())).then_some(body);
-            let base = (pull_request.base().kind() != desired_kind)
+            let base = (pull_request.base() != desired_kind)
                 .then(|| desired_base_name(desired_kind, default_branch, pull_request.id()));
             if title.is_none() && body.is_none() && base.is_none() {
                 return Ok(None);
