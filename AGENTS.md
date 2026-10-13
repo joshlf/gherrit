@@ -50,6 +50,9 @@ It achieves this by:
 When developing code changes, you **MUST** read
 [agent_docs/development.md](./agent_docs/development.md).
 
+Before changing pre-push publication behavior, you **MUST** read
+[design/pre-push.md](./design/pre-push.md).
+
 ### Before submitting
 
 Once you have made a change, you **MUST** read the relevant documents to ensure
@@ -59,3 +62,5 @@ that your change is valid and follows the style guidelines.
   changes
 - [agent_docs/style.md](./agent_docs/style.md) for style and formatting
   guidelines for files and commit messages
+
+*Updated by an AI agent acting on joshlf's behalf.*
