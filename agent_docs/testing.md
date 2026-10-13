@@ -918,3 +918,14 @@ abort or acceptance decision. Consequently an explicitly verbatim comment-only
 message can be committed without an identity. Add a trailer explicitly when
 such a message is intended for publication. Existing identified messages and
 ordinary new messages retain their separate regression contracts.
+
+## Identity compatibility
+
+`src/identity.rs` owns values and raw source ranges. Publication still requires
+one final-paragraph raw occurrence with a case-insensitive key, exact `: `
+separator, and 1–128 ASCII alphanumeric value bytes. The hook still recognizes
+the lowercase key in Git-normalized trailer output, including an empty value.
+Its insertion remains Git's `interpret-trailers` operation. These acceptance
+policies are intentionally preserved by the extraction; normalization is not
+proof that the original raw message is publishable. Status should diagnose a
+malformed raw identity rather than silently inventing a replacement.

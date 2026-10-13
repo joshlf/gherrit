@@ -30,6 +30,7 @@ use owo_colors::OwoColorize;
 
 use crate::{
     cmd,
+    identity::has_normalized_id as has_gherrit_id,
     manage::State,
     util::{self, CommandExt as _},
 };
@@ -39,10 +40,6 @@ pub(crate) type IdEntropy = [u8; ID_ENTROPY_BYTES];
 
 fn is_temporary_squash(message: &str) -> bool {
     message.lines().next().is_some_and(|line| line.starts_with("squash! "))
-}
-
-fn has_gherrit_id(trailers: &str) -> bool {
-    trailers.lines().any(|line| line.starts_with("gherrit-pr-id: "))
 }
 
 /// The hook does not receive `--cleanup` or `--allow-empty-message` flags.
