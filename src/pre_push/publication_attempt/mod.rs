@@ -5,6 +5,7 @@
 //! its acknowledgement-gated effects.
 
 mod body;
+mod failure;
 mod github;
 mod history;
 mod marker;
