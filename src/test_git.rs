@@ -11,7 +11,7 @@ use std::{
     io::{self, Read as _, Write as _},
     net::TcpStream,
     path::Path,
-    process::{Command, ExitCode},
+    process::{Command, ExitCode, Stdio},
     time::Duration,
 };
 
@@ -32,6 +32,7 @@ struct GitResponse {
     exit_code: i32,
     passthrough: bool,
     report_exit_status: bool,
+    suppress_stdout: bool,
 }
 
 #[derive(Serialize)]
@@ -66,11 +67,13 @@ pub fn run() -> ExitCode {
         return exit_code(response.exit_code);
     }
 
-    let status = Command::new(env::var("SYSTEM_GIT_PATH").expect("missing system Git path"))
-        .args(&args[1..])
-        .status()
-        .expect("failed to run system Git");
-    let code = status.code().unwrap_or(1);
+    let system_git = env::var("SYSTEM_GIT_PATH").expect("missing system Git path");
+    let mut command = Command::new(system_git);
+    command.args(&args[1..]);
+    if response.suppress_stdout {
+        command.stdout(Stdio::null());
+    }
+    let code = command.status().expect("failed to run system Git").code().unwrap_or(1);
 
     if response.report_exit_status {
         let completion = GitCompletion { args: &args, exit_code: code };

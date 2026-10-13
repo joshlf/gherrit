@@ -813,6 +813,7 @@ impl ValidatedChangeHistory {
         self.0.published.as_ref().map(PublishedHistory::current)
     }
 
+    #[cfg(test)]
     pub(super) fn has_pull_request_marker(&self) -> bool {
         self.pull_request_marker().is_some()
     }
@@ -892,6 +893,7 @@ pub(super) struct MissingAdvertisedRoot<'root> {
 }
 
 impl<'root> MissingAdvertisedRoot<'root> {
+    #[cfg(test)]
     pub(super) fn root(&self) -> &'root ExternalGraphRoot {
         self.root
     }
