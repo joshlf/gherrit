@@ -18,12 +18,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    fs,
-    io::{Seek as _, Write as _},
-    path::Path,
-    process::Stdio,
-};
+use std::{fs, io::Write as _, path::Path};
 
 use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
@@ -67,11 +62,18 @@ fn may_cancel_commit(repo: &util::Repo, message: &str) -> Result<bool> {
         length += line.len();
     }
     // Prepared private file input avoids a pipe producer or shell quoting.
-    let mut input = tempfile::tempfile().wrap_err("Failed to prepare message cleanup")?;
+    let mut input = crate::pre_push::subprocess::RegularFileStdinBuilder::new()
+        .wrap_err("Failed to prepare message cleanup")?;
     input.write_all(&message.as_bytes()[..length])?;
-    input.rewind()?;
-    let output =
-        cmd!("git stripspace --strip-comments").stdin(Stdio::from(input)).checked_output()?;
+    let output = crate::pre_push::subprocess::local_output(
+        &mut cmd!("git stripspace --strip-comments"),
+        Some(input.finish()?),
+        std::time::Duration::from_secs(60),
+        4 * 1024 * 1024,
+    )?;
+    if !output.status.success() {
+        bail!("Git message cleanup failed");
+    }
     Ok(output.stdout.is_empty())
 }
 

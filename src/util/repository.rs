@@ -254,7 +254,7 @@ impl Repo {
         }
 
         let output =
-            command.output().wrap_err("Failed to inspect remote promisor configuration")?;
+            command.bounded_output().wrap_err("Failed to inspect remote promisor configuration")?;
         match output.status.code() {
             Some(0) => Ok(configured_by_extension | parse_remote_promisor_config(&output.stdout)?),
             Some(1) if output.stdout.is_empty() => Ok(configured_by_extension),
@@ -281,7 +281,7 @@ impl Repo {
         command.env_remove("GIT_CONFIG_COUNT");
 
         let output = command
-            .output()
+            .bounded_output()
             .wrap_err("Failed to inspect the repository partial-clone configuration")?;
         match output.status.code() {
             Some(0) if output.stderr.is_empty() => output
