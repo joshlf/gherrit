@@ -158,6 +158,10 @@ fn test_install_read_only_fs() {
         "install_read_only_fs"
     );
 
+    for hook in ["pre-push", "commit-msg", "post-checkout"] {
+        assert!(!hooks_dir.join(hook).exists(), "failed preparation created {hook}");
+    }
+
     // Cleanup: Restore permissions so TempDir cleanup doesn't panic
     let mut perms = std::fs::metadata(&hooks_dir).unwrap().permissions();
     perms.set_mode(0o755);
