@@ -3,3 +3,5 @@ mod install;
 mod manage;
 mod post_checkout;
 mod production;
+
+mod inspect;
