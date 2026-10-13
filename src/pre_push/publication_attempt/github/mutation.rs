@@ -19,6 +19,7 @@ use super::{
     transport::{Github, indeterminate_mutation},
 };
 use crate::pre_push::{
+    destination::DefaultBranch,
     json::UniqueJson,
     local::{GherritPrId, PullRequestTitle},
 };
@@ -37,6 +38,10 @@ fn update_client_mutation_id(identity: &PullRequestIdentity) -> String {
 
 fn close_client_mutation_id(identity: &PullRequestIdentity) -> String {
     format!("gherrit:close:{}", identity.node_id().as_str())
+}
+
+fn draft_client_mutation_id(identity: &PullRequestIdentity) -> String {
+    format!("gherrit:draft:{}", identity.node_id().as_str())
 }
 
 fn response_data(response: UniqueJson, expected_operations: usize) -> Result<Map<String, Value>> {
@@ -147,12 +152,12 @@ impl CreatePullRequest {
             ("headRefName", self.id.as_str()),
             ("title", self.title.as_str()),
             ("body", self.body.as_str()),
-            ("clientMutationId", client_mutation_id.as_str()),
         ]
         .map(|(name, value)| format!("{name}: {}", json!(value)))
         .join(", ");
         format!(
-            "createPullRequest(input: {{ {fields} }}) {{ clientMutationId, pullRequest {{ number, id, state, headRefName, headRefOid, headRepository {{ id }}, baseRefName, baseRefOid, baseRepository {{ id }} }} }}"
+            "createPullRequest(input: {{ {fields}, draft: true, clientMutationId: {} }}) {{ clientMutationId, pullRequest {{ number, id, state, isDraft, headRefName, headRefOid, headRepository {{ id }}, baseRefName, baseRefOid, baseRepository {{ id }} }} }}",
+            json!(client_mutation_id)
         )
     }
 
@@ -194,6 +199,7 @@ impl ExpectedCreateReceipt {
             number: u64,
             id: String,
             state: PullRequestState,
+            is_draft: bool,
             head_ref_name: String,
             head_ref_oid: String,
             head_repository: Option<CreatedRepository>,
@@ -221,6 +227,9 @@ impl ExpectedCreateReceipt {
         })?;
         if created.state != PullRequestState::Open {
             bail!("createPullRequest returned a pull request which is not OPEN");
+        }
+        if !created.is_draft {
+            bail!("createPullRequest returned a pull request which is not a draft");
         }
         if created.head_ref_name != self.id.as_str() {
             bail!("createPullRequest returned a different head branch");
@@ -656,13 +665,130 @@ impl ExpectedUpdateReceipt {
     }
 }
 
-trait ProjectionOperation {
-    fn identity(&self) -> &PullRequestIdentity;
-    fn document(&self) -> String;
-    fn expected_receipt(&self) -> ExpectedProjectionReceipt;
+/// An OPEN pull request that must become a draft before any owned Git ref can
+/// move. The operation retains the complete observed topology so its receipt
+/// proves that conversion did not act on a retargeted or advanced row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::pre_push::publication_attempt) struct DraftPullRequest {
+    id: GherritPrId,
+    identity: PullRequestIdentity,
+    head_oid: ObjectId,
+    default_branch: DefaultBranch,
 }
 
-impl ProjectionOperation for ClosePullRequest {
+impl DraftPullRequest {
+    pub(in crate::pre_push::publication_attempt) fn from_ready_default(
+        id: GherritPrId,
+        identity: PullRequestIdentity,
+        head_oid: ObjectId,
+        default_branch: DefaultBranch,
+    ) -> Self {
+        Self { id, identity, head_oid, default_branch }
+    }
+
+    fn document(&self) -> String {
+        let client_mutation_id = draft_client_mutation_id(&self.identity);
+        let fields = [
+            ("pullRequestId", self.identity.node_id().as_str()),
+            ("clientMutationId", client_mutation_id.as_str()),
+        ]
+        .map(|(name, value)| format!("{name}: {}", json!(value)))
+        .join(", ");
+        format!(
+            "convertPullRequestToDraft(input: {{ {fields} }}) {{ clientMutationId, pullRequest {{ number, id, state, isDraft, headRefName, headRefOid, baseRefName, baseRefOid }} }}"
+        )
+    }
+
+    #[cfg(test)]
+    fn test_view(&self) -> TestDraft {
+        TestDraft {
+            id: self.id.clone(),
+            identity: self.identity.clone(),
+            head_oid: self.head_oid,
+            default_branch: self.default_branch.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ExpectedDraftReceipt {
+    id: GherritPrId,
+    identity: PullRequestIdentity,
+    head_oid: ObjectId,
+    default_branch: DefaultBranch,
+}
+
+impl ExpectedDraftReceipt {
+    fn decode(&self, response: Value) -> Result<()> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Response {
+            client_mutation_id: String,
+            pull_request: Option<DraftedPullRequest>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct DraftedPullRequest {
+            number: u64,
+            id: String,
+            state: PullRequestState,
+            is_draft: bool,
+            head_ref_name: String,
+            head_ref_oid: String,
+            base_ref_name: String,
+            base_ref_oid: String,
+        }
+
+        if response.is_null() {
+            bail!("GraphQL draft conversion response operation is null");
+        }
+        let response: Response = serde_json::from_value(response)
+            .map_err(|_| eyre!("Failed to decode convertPullRequestToDraft response"))?;
+        if response.client_mutation_id != draft_client_mutation_id(&self.identity) {
+            bail!("convertPullRequestToDraft returned a different clientMutationId");
+        }
+        let drafted = response
+            .pull_request
+            .ok_or_else(|| eyre!("convertPullRequestToDraft returned a null pull request"))?;
+        if PullRequestIdentity::new(drafted.number, drafted.id)? != self.identity {
+            bail!("convertPullRequestToDraft returned a different pull request identity");
+        }
+        if drafted.state != PullRequestState::Open || !drafted.is_draft {
+            bail!("convertPullRequestToDraft did not return an OPEN draft pull request");
+        }
+        if drafted.head_ref_name != self.id.as_str() {
+            bail!("convertPullRequestToDraft returned a different head branch");
+        }
+        if drafted.base_ref_name != self.default_branch.name() {
+            bail!("convertPullRequestToDraft returned a different base branch");
+        }
+        let parse_oid = |kind: &str, oid: &str| {
+            let oid = ObjectId::from_hex(oid.as_bytes()).map_err(|_| {
+                eyre!("convertPullRequestToDraft returned an invalid {kind} object ID")
+            })?;
+            if oid.is_null() {
+                bail!("convertPullRequestToDraft returned a null {kind} object ID");
+            }
+            Ok(oid)
+        };
+        if parse_oid("head", &drafted.head_ref_oid)? != self.head_oid {
+            bail!("convertPullRequestToDraft returned a different head object ID");
+        }
+        if parse_oid("base", &drafted.base_ref_oid)? != self.default_branch.tip() {
+            bail!("convertPullRequestToDraft returned a different base object ID");
+        }
+        Ok(())
+    }
+}
+
+trait MutationOperation {
+    fn identity(&self) -> &PullRequestIdentity;
+    fn document(&self) -> String;
+    fn expected_receipt(&self) -> ExpectedMutationReceipt;
+}
+
+impl MutationOperation for ClosePullRequest {
     fn identity(&self) -> &PullRequestIdentity {
         &self.identity
     }
@@ -671,12 +797,12 @@ impl ProjectionOperation for ClosePullRequest {
         ClosePullRequest::document(self)
     }
 
-    fn expected_receipt(&self) -> ExpectedProjectionReceipt {
-        ExpectedProjectionReceipt::Close(ExpectedCloseReceipt { identity: self.identity.clone() })
+    fn expected_receipt(&self) -> ExpectedMutationReceipt {
+        ExpectedMutationReceipt::Close(ExpectedCloseReceipt { identity: self.identity.clone() })
     }
 }
 
-impl ProjectionOperation for UpdatePullRequest {
+impl MutationOperation for UpdatePullRequest {
     fn identity(&self) -> &PullRequestIdentity {
         &self.identity
     }
@@ -685,8 +811,27 @@ impl ProjectionOperation for UpdatePullRequest {
         UpdatePullRequest::document(self)
     }
 
-    fn expected_receipt(&self) -> ExpectedProjectionReceipt {
-        ExpectedProjectionReceipt::Update(ExpectedUpdateReceipt { identity: self.identity.clone() })
+    fn expected_receipt(&self) -> ExpectedMutationReceipt {
+        ExpectedMutationReceipt::Update(ExpectedUpdateReceipt { identity: self.identity.clone() })
+    }
+}
+
+impl MutationOperation for DraftPullRequest {
+    fn identity(&self) -> &PullRequestIdentity {
+        &self.identity
+    }
+
+    fn document(&self) -> String {
+        DraftPullRequest::document(self)
+    }
+
+    fn expected_receipt(&self) -> ExpectedMutationReceipt {
+        ExpectedMutationReceipt::Draft(ExpectedDraftReceipt {
+            id: self.id.clone(),
+            identity: self.identity.clone(),
+            head_oid: self.head_oid,
+            default_branch: self.default_branch.clone(),
+        })
     }
 }
 
@@ -695,7 +840,7 @@ enum PullRequestProjectionOperation {
     Update(UpdatePullRequest),
 }
 
-impl ProjectionOperation for PullRequestProjectionOperation {
+impl MutationOperation for PullRequestProjectionOperation {
     fn identity(&self) -> &PullRequestIdentity {
         match self {
             Self::Close(operation) => operation.identity(),
@@ -710,7 +855,7 @@ impl ProjectionOperation for PullRequestProjectionOperation {
         }
     }
 
-    fn expected_receipt(&self) -> ExpectedProjectionReceipt {
+    fn expected_receipt(&self) -> ExpectedMutationReceipt {
         match self {
             Self::Close(operation) => operation.expected_receipt(),
             Self::Update(operation) => operation.expected_receipt(),
@@ -728,37 +873,39 @@ impl PullRequestProjectionOperation {
     }
 }
 
-enum ExpectedProjectionReceipt {
+enum ExpectedMutationReceipt {
     Close(ExpectedCloseReceipt),
     Update(ExpectedUpdateReceipt),
+    Draft(ExpectedDraftReceipt),
 }
 
-impl ExpectedProjectionReceipt {
+impl ExpectedMutationReceipt {
     fn decode(&self, response: Value) -> Result<()> {
         match self {
             Self::Close(expected) => expected.decode(response),
             Self::Update(expected) => expected.decode(response),
+            Self::Draft(expected) => expected.decode(response),
         }
     }
 }
 
-struct PreparedProjectionBatch {
+struct PreparedMutationBatch {
     request: MutationRequest,
     serialized_bytes: usize,
-    expected: Box<[ExpectedProjectionReceipt]>,
+    expected: Box<[ExpectedMutationReceipt]>,
 }
 
-impl PreparedProjectionBatch {
-    fn into_request(self) -> (MutationRequest, ProjectionReceiptDecoder) {
-        (self.request, ProjectionReceiptDecoder { expected: self.expected })
+impl PreparedMutationBatch {
+    fn into_request(self) -> (MutationRequest, MutationReceiptDecoder) {
+        (self.request, MutationReceiptDecoder { expected: self.expected })
     }
 }
 
-struct ProjectionReceiptDecoder {
-    expected: Box<[ExpectedProjectionReceipt]>,
+struct MutationReceiptDecoder {
+    expected: Box<[ExpectedMutationReceipt]>,
 }
 
-impl ProjectionReceiptDecoder {
+impl MutationReceiptDecoder {
     fn decode(self, response: UniqueJson) -> Result<()> {
         let mut data = response_data(response, self.expected.len())?;
         for (index, expected) in self.expected.into_vec().into_iter().enumerate() {
@@ -772,7 +919,7 @@ impl ProjectionReceiptDecoder {
     }
 }
 
-fn projection_batch<T: ProjectionOperation>(operations: &[T]) -> Result<PreparedProjectionBatch> {
+fn mutation_batch<T: MutationOperation>(operations: &[T]) -> Result<PreparedMutationBatch> {
     let mut fields = String::new();
     let mut expected = Vec::with_capacity(operations.len());
     for (index, operation) in operations.iter().enumerate() {
@@ -784,33 +931,33 @@ fn projection_batch<T: ProjectionOperation>(operations: &[T]) -> Result<Prepared
         expected.push(operation.expected_receipt());
     }
     let (request, serialized_bytes) = serialized_request(fields)?;
-    Ok(PreparedProjectionBatch { request, serialized_bytes, expected: expected.into_boxed_slice() })
+    Ok(PreparedMutationBatch { request, serialized_bytes, expected: expected.into_boxed_slice() })
 }
 
 #[cfg(test)]
-fn update_batch(operations: &[UpdatePullRequest]) -> Result<PreparedProjectionBatch> {
-    projection_batch(operations)
+fn update_batch(operations: &[UpdatePullRequest]) -> Result<PreparedMutationBatch> {
+    mutation_batch(operations)
 }
 
-fn prepare_projection_batches<T: ProjectionOperation>(
+fn prepare_mutation_batches<T: MutationOperation>(
     operations: &[T],
-) -> Result<Box<[PreparedProjectionBatch]>> {
+) -> Result<Box<[PreparedMutationBatch]>> {
     let mut batches = Vec::new();
     let mut start = 0;
     while start < operations.len() {
         let max_end = operations.len().min(start + MAX_MUTATION_ALIASES);
         let mut accepted = None;
         for end in start + 1..=max_end {
-            let batch = projection_batch(&operations[start..end])?;
+            let batch = mutation_batch(&operations[start..end])?;
             if batch.serialized_bytes > MAX_MUTATION_REQUEST_BYTES {
                 break;
             }
             accepted = Some((end, batch));
         }
         let Some((end, batch)) = accepted else {
-            let bytes = projection_batch(&operations[start..start + 1])?.serialized_bytes;
+            let bytes = mutation_batch(&operations[start..start + 1])?.serialized_bytes;
             bail!(
-                "GraphQL pull request projection at item {start} serializes to {bytes} bytes, which exceeds the {MAX_MUTATION_REQUEST_BYTES}-byte request limit. No mutation was sent."
+                "GraphQL pull request mutation at item {start} serializes to {bytes} bytes, which exceeds the {MAX_MUTATION_REQUEST_BYTES}-byte request limit. No mutation was sent."
             );
         };
         batches.push(batch);
@@ -819,18 +966,18 @@ fn prepare_projection_batches<T: ProjectionOperation>(
     Ok(batches.into_boxed_slice())
 }
 
-fn validate_projection_identities<T: ProjectionOperation>(operations: &[T]) -> Result<()> {
+fn validate_mutation_identities<T: MutationOperation>(operations: &[T]) -> Result<()> {
     let mut numbers = HashSet::with_capacity(operations.len());
     let mut node_ids = HashSet::with_capacity(operations.len());
     for (index, operation) in operations.iter().enumerate() {
         if !numbers.insert(operation.identity().number()) {
             bail!(
-                "GraphQL pull request projection at item {index} repeats a pull request number. No mutation was sent."
+                "GraphQL pull request mutation at item {index} repeats a pull request number. No mutation was sent."
             );
         }
         if !node_ids.insert(operation.identity().node_id()) {
             bail!(
-                "GraphQL pull request projection at item {index} repeats a pull request node ID. No mutation was sent."
+                "GraphQL pull request mutation at item {index} repeats a pull request node ID. No mutation was sent."
             );
         }
     }
@@ -852,8 +999,8 @@ impl PreflightedDuplicateCloses {
         closes: Vec<ClosePullRequest>,
     ) -> Result<Self> {
         let closes = closes.into_boxed_slice();
-        validate_projection_identities(&closes)?;
-        drop(prepare_projection_batches(&closes)?);
+        validate_mutation_identities(&closes)?;
+        drop(prepare_mutation_batches(&closes)?);
         Ok(Self { closes })
     }
 
@@ -878,7 +1025,7 @@ impl PreflightedDuplicateCloses {
 /// document order, while each alias remains independently applicable. The
 /// empty value represents a converged projection without a parallel option.
 pub(in crate::pre_push::publication_attempt) struct PreparedPullRequestProjection {
-    batches: Box<[PreparedProjectionBatch]>,
+    batches: Box<[PreparedMutationBatch]>,
     #[cfg(test)]
     operations: Box<[TestPullRequestProjection]>,
 }
@@ -897,8 +1044,8 @@ impl PreparedPullRequestProjection {
     }
 
     fn prepare_operations(operations: Vec<PullRequestProjectionOperation>) -> Result<Self> {
-        validate_projection_identities(&operations)?;
-        let batches = prepare_projection_batches(&operations)?;
+        validate_mutation_identities(&operations)?;
+        let batches = prepare_mutation_batches(&operations)?;
         #[cfg(test)]
         let operations =
             operations.into_iter().map(PullRequestProjectionOperation::into_test).collect();
@@ -960,7 +1107,79 @@ impl PreparedPullRequestProjection {
     }
 }
 
+/// Every required OPEN-to-draft conversion, preflighted before the first Git
+/// write. This nonempty capability can only be consumed as one acknowledged
+/// barrier; a rejected or indeterminate alias stops the attempt before refs.
+pub(in crate::pre_push::publication_attempt) struct PreparedDraftConversions {
+    batches: Box<[PreparedMutationBatch]>,
+    #[cfg(test)]
+    operations: Box<[TestDraft]>,
+}
+
+impl PreparedDraftConversions {
+    pub(in crate::pre_push::publication_attempt) fn prepare(
+        operations: Vec<DraftPullRequest>,
+    ) -> Result<Self> {
+        if operations.is_empty() {
+            bail!("A draft-safety barrier requires at least one conversion");
+        }
+        validate_mutation_identities(&operations)?;
+        let batches = prepare_mutation_batches(&operations)?;
+        #[cfg(test)]
+        let operations = operations.iter().map(DraftPullRequest::test_view).collect();
+        Ok(Self {
+            batches,
+            #[cfg(test)]
+            operations,
+        })
+    }
+
+    async fn execute(self, github: &Github) -> Result<()> {
+        for batch in self.batches.into_vec() {
+            log::trace!(
+                "Sending GraphQL draft-safety batch ({} operations, {} bytes)",
+                batch.expected.len(),
+                batch.serialized_bytes
+            );
+            let (request, decoder) = batch.into_request();
+            let response = github.send_mutation_once(request).await?;
+            decoder.decode(response).map_err(indeterminate_mutation)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn operations_for_test(&self) -> &[TestDraft] {
+        &self.operations
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn batches_for_test(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &[TestDraft]> + '_ {
+        assert_eq!(
+            self.batches.iter().map(|batch| batch.expected.len()).sum::<usize>(),
+            self.operations.len(),
+            "semantic draft operations must cover the exact prepared batches"
+        );
+        let mut start = 0;
+        self.batches.iter().map(move |batch| {
+            let end = start + batch.expected.len();
+            let operations = &self.operations[start..end];
+            start = end;
+            operations
+        })
+    }
+}
+
 impl Github {
+    pub(in crate::pre_push::publication_attempt) async fn convert_pull_requests_to_draft(
+        &self,
+        conversions: PreparedDraftConversions,
+    ) -> Result<()> {
+        conversions.execute(self).await
+    }
+
     pub(in crate::pre_push::publication_attempt) async fn create_pull_requests(
         &self,
         creates: PreparedCreates,
@@ -984,6 +1203,15 @@ pub(in crate::pre_push::publication_attempt) struct TestCreate {
     pub(in crate::pre_push::publication_attempt) body: String,
     pub(in crate::pre_push::publication_attempt) head_oid: ObjectId,
     pub(in crate::pre_push::publication_attempt) base_oid: ObjectId,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::pre_push::publication_attempt) struct TestDraft {
+    pub(in crate::pre_push::publication_attempt) id: GherritPrId,
+    pub(in crate::pre_push::publication_attempt) identity: PullRequestIdentity,
+    pub(in crate::pre_push::publication_attempt) head_oid: ObjectId,
+    pub(in crate::pre_push::publication_attempt) default_branch: DefaultBranch,
 }
 
 #[cfg(test)]
@@ -1056,6 +1284,7 @@ mod tests {
                         "number": number,
                         "id": node_id,
                         "state": "OPEN",
+                        "isDraft": true,
                         "headRefName": expected.id.as_str(),
                         "headRefOid": expected.head_oid.to_string(),
                         "headRepository": { "id": "REPOSITORY" },
@@ -1091,7 +1320,7 @@ mod tests {
         operation.body = "line one\nline two".to_owned();
         let repository_id = RepositoryNodeId::new("REPOSITORY".to_owned()).unwrap();
         let document = operation.document(&repository_id);
-        insta::assert_snapshot!(document, @r###"createPullRequest(input: { repositoryId: "REPOSITORY", headRepositoryId: "REPOSITORY", baseRefName: "gherrit-bases/Gone", headRefName: "Gone", title: "quoted \" title", body: "line one\nline two", clientMutationId: "gherrit:create:Gone" }) { clientMutationId, pullRequest { number, id, state, headRefName, headRefOid, headRepository { id }, baseRefName, baseRefOid, baseRepository { id } } }"###);
+        insta::assert_snapshot!(document, @r###"createPullRequest(input: { repositoryId: "REPOSITORY", headRepositoryId: "REPOSITORY", baseRefName: "gherrit-bases/Gone", headRefName: "Gone", title: "quoted \" title", body: "line one\nline two", draft: true, clientMutationId: "gherrit:create:Gone" }) { clientMutationId, pullRequest { number, id, state, isDraft, headRefName, headRefOid, headRepository { id }, baseRefName, baseRefOid, baseRepository { id } } }"###);
     }
 
     #[test]
@@ -1113,6 +1342,8 @@ mod tests {
             ("/data/op0/pullRequest/number", json!(0)),
             ("/data/op0/pullRequest/id", json!("")),
             ("/data/op0/pullRequest/state", json!("CLOSED")),
+            ("/data/op0/pullRequest/isDraft", json!(false)),
+            ("/data/op0/pullRequest/isDraft", Value::Null),
             ("/data/op0/pullRequest/headRefName", json!("Other")),
             ("/data/op0/pullRequest/headRefOid", json!(BASE)),
             ("/data/op0/pullRequest/headRefOid", Value::Null),
@@ -1133,6 +1364,93 @@ mod tests {
             assert!(
                 decoder.decode(&repository_id, response).is_err(),
                 "accepted mutation at {pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn draft_conversion_receipt_proves_the_observed_open_topology() {
+        assert!(PreparedDraftConversions::prepare(Vec::new()).is_err());
+        let operation = DraftPullRequest::from_ready_default(
+            id("Gone"),
+            PullRequestIdentity::new(7, "PR_SEVEN".to_owned()).unwrap(),
+            oid(HEAD),
+            DefaultBranch::new("main".to_owned(), oid(BASE)).unwrap(),
+        );
+        insta::assert_snapshot!(operation.document(), @r###"convertPullRequestToDraft(input: { pullRequestId: "PR_SEVEN", clientMutationId: "gherrit:draft:PR_SEVEN" }) { clientMutationId, pullRequest { number, id, state, isDraft, headRefName, headRefOid, baseRefName, baseRefOid } }"###);
+
+        let batch = mutation_batch(std::slice::from_ref(&operation)).unwrap();
+        let (_, decoder) = batch.into_request();
+        let valid = json!({
+            "data": {
+                "op0": {
+                    "clientMutationId": "gherrit:draft:PR_SEVEN",
+                    "pullRequest": {
+                        "number": 7,
+                        "id": "PR_SEVEN",
+                        "state": "OPEN",
+                        "isDraft": true,
+                        "headRefName": "Gone",
+                        "headRefOid": HEAD,
+                        "baseRefName": "main",
+                        "baseRefOid": BASE,
+                    },
+                },
+            },
+        });
+        decoder.decode(UniqueJson::decode(&serde_json::to_vec(&valid).unwrap()).unwrap()).unwrap();
+
+        for (pointer, replacement) in [
+            ("/data/op0/clientMutationId", json!("wrong")),
+            ("/data/op0/clientMutationId", Value::Null),
+            ("/data/op0/pullRequest", Value::Null),
+            ("/data/op0/pullRequest/number", json!(8)),
+            ("/data/op0/pullRequest/number", json!(0)),
+            ("/data/op0/pullRequest/id", json!("PR_EIGHT")),
+            ("/data/op0/pullRequest/id", json!("")),
+            ("/data/op0/pullRequest/state", json!("CLOSED")),
+            ("/data/op0/pullRequest/state", json!("MERGED")),
+            ("/data/op0/pullRequest/isDraft", json!(false)),
+            ("/data/op0/pullRequest/isDraft", Value::Null),
+            ("/data/op0/pullRequest/headRefName", json!("Other")),
+            ("/data/op0/pullRequest/headRefName", Value::Null),
+            ("/data/op0/pullRequest/headRefOid", json!(BASE)),
+            ("/data/op0/pullRequest/headRefOid", json!("invalid")),
+            ("/data/op0/pullRequest/headRefOid", Value::Null),
+            ("/data/op0/pullRequest/baseRefName", json!("Other")),
+            ("/data/op0/pullRequest/baseRefName", Value::Null),
+            ("/data/op0/pullRequest/baseRefOid", json!(HEAD)),
+            ("/data/op0/pullRequest/baseRefOid", json!("invalid")),
+            ("/data/op0/pullRequest/baseRefOid", Value::Null),
+        ] {
+            let mut response = valid.clone();
+            *response.pointer_mut(pointer).unwrap() = replacement;
+            let (_, decoder) =
+                mutation_batch(std::slice::from_ref(&operation)).unwrap().into_request();
+            assert!(
+                decoder
+                    .decode(UniqueJson::decode(&serde_json::to_vec(&response).unwrap()).unwrap())
+                    .is_err(),
+                "accepted mutation at {pointer}"
+            );
+        }
+
+        for mutate in [
+            |value: &mut Value| value["errors"] = json!([{ "message": "partial" }]),
+            |value: &mut Value| value["data"]["extra"] = Value::Null,
+            |value: &mut Value| {
+                value["data"].as_object_mut().unwrap().remove("op0");
+            },
+            |value: &mut Value| value["data"]["op0"]["extra"] = Value::Null,
+        ] {
+            let mut response = valid.clone();
+            mutate(&mut response);
+            let (_, decoder) =
+                mutation_batch(std::slice::from_ref(&operation)).unwrap().into_request();
+            assert!(
+                decoder
+                    .decode(UniqueJson::decode(&serde_json::to_vec(&response).unwrap()).unwrap())
+                    .is_err()
             );
         }
     }
