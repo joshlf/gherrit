@@ -74,6 +74,12 @@ impl RepositoryCoordinates {
             .then_some(Self { owner, repository })
     }
 
+    #[cfg(test)]
+    pub(super) fn for_test(owner: &str, repository: &str) -> Self {
+        Self::new(owner.to_owned(), repository.to_owned())
+            .expect("test repository coordinates must be valid")
+    }
+
     pub(super) fn owner(&self) -> &str {
         &self.owner
     }
