@@ -1170,3 +1170,20 @@ async fn mutation_redirects_and_retryable_statuses_are_never_replayed() {
         assert!(error.to_string().contains("acknowledgement is indeterminate"));
     }
 }
+
+#[test]
+fn mutation_failure_classification_survives_context_and_source() {
+    for message in [
+        "lost acknowledgement",
+        "null data",
+        "missing alias",
+        "partial effect",
+        "malformed receipt",
+    ] {
+        let error = indeterminate_mutation(eyre!(message)).wrap_err("GitHub create stage");
+        let failure = error.downcast_ref::<EffectFailure>().unwrap();
+        assert_eq!(failure.operation, Operation::GraphqlMutation);
+        assert_eq!(failure.outcome, Outcome::Indeterminate);
+        assert!(format!("{error:?}").contains(message));
+    }
+}
