@@ -8,8 +8,8 @@ use axum::{extract::State as AxumState, http::StatusCode, routing::post, Json, R
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    mock_server::MockState, FailureKind, GitOperation, PublicationOverlapSchedule,
-    PublicationPushStage, TestEnvironment,
+    mock_server::MockState, FailureKind, GitOperation, MockSchedules, PublicationPushStage,
+    TestEnvironment,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -77,7 +77,7 @@ struct HandlerState {
     remote_path: PathBuf,
     system_git: PathBuf,
     test_environment: TestEnvironment,
-    publication_overlap: Option<Arc<PublicationOverlapSchedule>>,
+    schedules: MockSchedules,
 }
 
 #[derive(Deserialize)]
@@ -106,18 +106,12 @@ pub(super) fn routes(
     remote_path: PathBuf,
     system_git: PathBuf,
     test_environment: TestEnvironment,
-    publication_overlap: Option<Arc<PublicationOverlapSchedule>>,
+    schedules: MockSchedules,
 ) -> Router {
     Router::new()
         .route("/_internal/git", post(handle_git))
         .route("/_internal/git/complete", post(complete_git))
-        .with_state(HandlerState {
-            shared,
-            remote_path,
-            system_git,
-            test_environment,
-            publication_overlap,
-        })
+        .with_state(HandlerState { shared, remote_path, system_git, test_environment, schedules })
 }
 
 impl GitOperation {
@@ -195,6 +189,40 @@ fn subcommand(args: &[String]) -> Option<&str> {
     subcommand_index(args).map(|index| args[index].as_str())
 }
 
+fn is_bound_publication_remote(args: &[String], command_index: usize, remote: &str) -> bool {
+    let Some(suffix) = remote.strip_prefix("gherrit-publication") else { return false };
+    if !suffix.is_empty()
+        && !suffix.strip_prefix('-').is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return false;
+    }
+
+    let url = format!("--config-env=remote.{remote}.url=");
+    let pushurl = format!("--config-env=remote.{remote}.pushurl=");
+    args[..command_index].iter().any(|argument| argument.starts_with(&url))
+        && args[..command_index].iter().any(|argument| argument.starts_with(&pushurl))
+}
+
+/// Recognizes one exact, destination-bound local-ID observation request.
+fn is_exact_ref_observation(args: &[String], expected_patterns: &[String]) -> bool {
+    let Some(index) = subcommand_index(args).filter(|index| args[*index] == "ls-remote") else {
+        return false;
+    };
+    let tail = &args[index + 1..];
+    let Some(separator) = tail.iter().position(|argument| argument == "--") else {
+        return false;
+    };
+    let options = &tail[..separator];
+    if options != ["--quiet", "--heads", "--tags"] {
+        return false;
+    }
+    let Some(remote) = tail.get(separator + 1) else { return false };
+    let patterns = &tail[separator + 2..];
+    is_bound_publication_remote(args, index, remote) && patterns == expected_patterns
+}
+
 /// Recognizes the destination-bound push shape emitted by GHerrit.
 ///
 /// Faults scheduled at the publication boundary must not be consumed by a
@@ -204,20 +232,7 @@ fn publication_push_stage(args: &[String]) -> Option<PublicationPushStage> {
     let tail = &args[index + 1..];
     let separator = tail.iter().position(|argument| argument == "--")?;
     let remote = tail.get(separator + 1)?;
-    let suffix = remote.strip_prefix("gherrit-publication")?;
-    if !suffix.is_empty()
-        && !suffix.strip_prefix('-').is_some_and(|digits| {
-            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-        })
-    {
-        return None;
-    }
-
-    let url = format!("--config-env=remote.{remote}.url=");
-    let pushurl = format!("--config-env=remote.{remote}.pushurl=");
-    if !args[..index].iter().any(|argument| argument.starts_with(&url))
-        || !args[..index].iter().any(|argument| argument.starts_with(&pushurl))
-    {
+    if !is_bound_publication_remote(args, index, remote) {
         return None;
     }
 
@@ -254,11 +269,33 @@ async fn handle_git(
 ) -> Json<GitResponse> {
     let subcommand = subcommand(&request.args);
     let is_push = subcommand == Some("push");
+    let overlap_observation =
+        handler.schedules.observation_overlap.as_deref().filter(|overlap| {
+            is_exact_ref_observation(&request.args, overlap.expected_git_patterns())
+        });
+    if let Some(overlap) = overlap_observation {
+        // Do not start the passthrough child or acquire mock state until the
+        // exact local-ID GitHub request has independently reached its gate.
+        if !overlap.exact_git_arrived().await {
+            return Json(GitResponse {
+                stdout: String::new(),
+                stderr: "Observation overlap schedule was cancelled".to_string(),
+                exit_code: 1,
+                passthrough: false,
+                report_exit_status: false,
+                suppress_stdout: false,
+            });
+        }
+    }
     let publication_stage = publication_push_stage(&request.args);
     let overlap_marker = publication_stage == Some(PublicationPushStage::Marker)
-        && handler.publication_overlap.as_ref().is_some_and(|overlap| overlap.claim_marker());
+        && handler
+            .schedules
+            .publication_overlap
+            .as_ref()
+            .is_some_and(|overlap| overlap.claim_marker());
     if overlap_marker {
-        let overlap = handler.publication_overlap.as_ref().unwrap();
+        let overlap = handler.schedules.publication_overlap.as_ref().unwrap();
         // The passthrough Git child has not started yet. Releasing both
         // publishers from this external gate makes the absence-lease race the
         // only nondeterministic winner, without holding mock state.
@@ -373,7 +410,7 @@ mod tests {
             remote_path: temporary.path().to_path_buf(),
             test_environment: TestEnvironment::new(temporary.path(), &system_git),
             system_git,
-            publication_overlap: None,
+            schedules: MockSchedules::default(),
         }
     }
 
@@ -412,6 +449,48 @@ mod tests {
     #[test]
     fn does_not_find_push_in_opaque_arguments() {
         assert_eq!(subcommand(&args(&["git", "show", "push"])), Some("show"));
+    }
+
+    #[test]
+    fn recognizes_only_the_exact_publication_ref_observation() {
+        let expected = args(&[
+            "refs/heads/main",
+            "refs/heads/Gone",
+            "refs/heads/gherrit-bases/Gone",
+            "refs/tags/gherrit/Gone",
+            "refs/tags/gherrit/Gone/*",
+        ]);
+        let exact = args(&[
+            "git",
+            "--no-replace-objects",
+            "--config-env=remote.gherrit-publication.url=DESTINATION",
+            "--config-env=remote.gherrit-publication.pushurl=DESTINATION",
+            "-c",
+            "http.followRedirects=false",
+            "ls-remote",
+            "--quiet",
+            "--heads",
+            "--tags",
+            "--",
+            "gherrit-publication",
+            "refs/heads/main",
+            "refs/heads/Gone",
+            "refs/heads/gherrit-bases/Gone",
+            "refs/tags/gherrit/Gone",
+            "refs/tags/gherrit/Gone/*",
+        ]);
+        assert!(is_exact_ref_observation(&exact, &expected));
+
+        let mut missing_pattern = exact.clone();
+        missing_pattern.pop();
+        assert!(!is_exact_ref_observation(&missing_pattern, &expected));
+        let mut unbounded = exact.clone();
+        unbounded.truncate(unbounded.len() - 5);
+        assert!(!is_exact_ref_observation(&unbounded, &expected));
+        assert!(!is_exact_ref_observation(
+            &args(&["git", "ls-remote", "--get-url", "gherrit-publication",]),
+            &expected
+        ));
     }
 
     #[test]
