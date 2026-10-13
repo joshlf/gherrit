@@ -17,6 +17,11 @@ practices and integrates seamlessly with the existing codebase.
 - **Documentation:** **DO** ensure that changes do not cause documentation to
   become out of date (e.g., renaming files referenced here).
 
+- **Bash:** **DO** start every new or modified Bash script and every multiline
+  GitHub Actions Bash step with `set -eo pipefail`, unless the script documents
+  why different failure handling is required. Use the stricter
+  `set -euo pipefail` when unset variables should also be errors.
+
 ## Project Context
 
 ### Overview
