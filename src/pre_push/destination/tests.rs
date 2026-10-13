@@ -28,11 +28,7 @@ fn resolved_result(output: &[u8]) -> Result<ResolvedDestination> {
 }
 
 fn destination() -> PushDestination {
-    PushDestination {
-        resolved: resolved(b"https://github.com/owner/repo.git\n"),
-        internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
-        transport: RemoteTransportSettings::default(),
-    }
+    PushDestination::for_test()
 }
 
 fn git_dir_identity() -> util::GitDirIdentity {
@@ -242,28 +238,9 @@ fn transport_diagnostics_remove_future_families_and_disable_trace2_config_target
     }
 }
 
-#[test]
-fn configured_trace2_targets_do_not_observe_a_destination_command() {
-    let context =
-        testutil::TestContextBuilder::new("unused").with_remote().with_initial_commit().build();
-    let literal = String::from_utf8(
-        context
-            .git_cmd()
-            .args(["remote", "get-url", "origin"])
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone(),
-    )
-    .unwrap();
-    let literal = literal.trim();
-    let destination = PushDestination {
-        resolved: resolved(format!("{literal}\n").as_bytes()),
-        internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
-        transport: RemoteTransportSettings::default(),
-    };
-
+fn configured_trace2_targets(
+    context: &testutil::TestContext,
+) -> (PathBuf, PathBuf, [(PathBuf, Vec<u8>); 3]) {
     let system = context.dir.path().join("trace2-system.config");
     let global = context.dir.path().join("trace2-global.config");
     let traces = [
@@ -300,7 +277,46 @@ fn configured_trace2_targets_do_not_observe_a_destination_command() {
         .args(["rev-parse", "--git-dir"])
         .assert()
         .success();
-    traces.iter().for_each(|trace| fs::remove_file(trace).unwrap());
+    let traces = traces.map(|trace| {
+        let snapshot = fs::read(&trace).expect("the probe must activate every Trace2 target");
+        assert!(!snapshot.is_empty(), "the Trace2 probe must emit evidence");
+        (trace, snapshot)
+    });
+    (system, global, traces)
+}
+
+fn assert_trace2_unchanged(traces: &[(PathBuf, Vec<u8>); 3]) {
+    for (trace, snapshot) in traces {
+        assert_eq!(
+            fs::read(trace).unwrap(),
+            *snapshot,
+            "a destination-bearing Git command appended to {trace:?}"
+        );
+    }
+}
+
+#[test]
+fn configured_trace2_targets_do_not_observe_a_destination_command() {
+    let context =
+        testutil::TestContextBuilder::new("unused").with_remote().with_initial_commit().build();
+    let literal = String::from_utf8(
+        context
+            .git_cmd()
+            .args(["remote", "get-url", "origin"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let literal = literal.trim();
+    let destination = PushDestination {
+        resolved: resolved(format!("{literal}\n").as_bytes()),
+        internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
+        transport: RemoteTransportSettings::default(),
+    };
+    let (system, global, traces) = configured_trace2_targets(&context);
 
     let mut command = destination.ls_remote(["--symref".to_owned()], ["HEAD".to_owned()]);
     command
@@ -311,7 +327,7 @@ fn configured_trace2_targets_do_not_observe_a_destination_command() {
     let output = command.output().unwrap();
 
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert!(traces.iter().all(|trace| !trace.exists()));
+    assert_trace2_unchanged(&traces);
 }
 
 #[test]
@@ -340,6 +356,33 @@ fn every_destination_bearing_git_command_disables_redirects() {
         ]
         .map(OsStr::new)
     );
+
+    let exact_observation = destination.exact_ref_observation_command([
+        "refs/heads/main".to_owned(),
+        "refs/tags/gherrit/Gone".to_owned(),
+    ]);
+    assert_eq!(
+        arguments(&exact_observation),
+        [
+            "--no-replace-objects",
+            "--config-env=remote.gherrit-publication.url=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            "--config-env=remote.gherrit-publication.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            "-c",
+            "http.followRedirects=false",
+            "ls-remote",
+            "--quiet",
+            "--heads",
+            "--tags",
+            "--",
+            "gherrit-publication",
+            "refs/heads/main",
+            "refs/tags/gherrit/Gone",
+        ]
+        .map(OsStr::new)
+    );
+    assert!(arguments(&ls_remote).iter().all(
+        |argument| *argument != OsStr::new("--heads") && *argument != OsStr::new("--tags")
+    ));
 
     let git_dir = git_dir_identity();
     let push =
@@ -410,6 +453,7 @@ fn remote_transport_settings_are_private_command_scoped_state() {
 
     for command in [
         destination.ls_remote(std::iter::empty(), std::iter::empty()),
+        destination.exact_object_fetch(ExactObjectFetchMode::Negotiated),
         destination.push(&git_dir_identity(), std::iter::empty(), std::iter::empty()),
     ] {
         let arguments = arguments(&command);
@@ -511,6 +555,125 @@ fn exact_redirect_parameter_preserves_non_utf8_command_scope_bytes() {
     assert_eq!(&bytes[..inherited.len()], inherited.as_bytes());
     assert_eq!(bytes[inherited.len()], b' ');
     assert!(bytes.ends_with(b"='false'"));
+}
+
+#[test]
+fn exact_object_fetch_has_one_fixed_source_only_stdin_grammar() {
+    let destination = destination();
+    for (mode, mode_argument) in [
+        (ExactObjectFetchMode::Negotiated, None),
+        (ExactObjectFetchMode::Refetch, Some("--refetch")),
+    ] {
+        let command = destination.exact_object_fetch(mode);
+        let expected = [
+            "--no-replace-objects",
+            "--config-env=remote.gherrit-publication.url=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            "--config-env=remote.gherrit-publication.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            "-c",
+            "http.followRedirects=false",
+            "-c",
+            "fetch.bundleURI=",
+            "fetch",
+            "--quiet",
+            "--no-progress",
+            "--no-write-fetch-head",
+            "--no-tags",
+            "--no-prune",
+            "--no-prune-tags",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--no-write-commit-graph",
+            "--no-update-shallow",
+            "--no-filter",
+            "--refmap=",
+        ]
+        .into_iter()
+        .chain(mode_argument)
+        .chain(["--stdin", "--", "gherrit-publication"])
+        .map(OsStr::new)
+        .collect::<Vec<_>>();
+        assert_eq!(arguments(&command), expected);
+        assert_eq!(arguments(&command).last(), Some(&OsStr::new("gherrit-publication")));
+        assert!(arguments(&command).iter().all(|argument| {
+            let argument = argument.to_string_lossy();
+            !argument.contains("refs/") && !argument.contains("https://github.com")
+        }));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(name, _)| *name == OsStr::new(DESTINATION_ENV))
+                .and_then(|(_, value)| value),
+            Some(OsStr::new("https://github.com/owner/repo.git"))
+        );
+        for variable in ["GIT_TRACE", "GIT_CURL_VERBOSE"] {
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find(|(name, _)| *name == OsStr::new(variable))
+                    .and_then(|(_, value)| value),
+                None
+            );
+        }
+        for variable in ["GIT_TRACE2", "GIT_TRACE2_PERF", "GIT_TRACE2_EVENT"] {
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find(|(name, _)| *name == OsStr::new(variable))
+                    .and_then(|(_, value)| value),
+                Some(OsStr::new("0"))
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn exact_object_fetch_ignores_configured_refmaps() {
+    const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    const SOURCE: &str = "refs/tags/gherrit/Local/v1";
+    const SENTINEL: &str = "refs/gherrit-test/refmap-sentinel";
+
+    let context =
+        testutil::TestContextBuilder::new("unused").with_remote().with_initial_commit().build();
+    let remote = context.dir.path().join("owner/repo.git");
+    let destination = PushDestination::for_test_url(
+        remote.to_str().expect("test paths must be UTF-8"),
+        &context.repo_path,
+    );
+    let remote_only = context
+        .remote_git_cmd()
+        .args(["commit-tree", EMPTY_TREE, "-p", "refs/heads/main", "-m", "remote only"])
+        .output()
+        .unwrap();
+    assert!(remote_only.status.success(), "{remote_only:?}");
+    let remote_only = str::from_utf8(&remote_only.stdout).unwrap().trim();
+    context.remote_git_cmd().args(["update-ref", SOURCE, remote_only]).assert().success();
+    context.git_cmd().args(["cat-file", "-e", remote_only]).assert().failure();
+    context.git_cmd().args(["show-ref", "--verify", "--quiet", SENTINEL]).assert().failure();
+    let (system, global, traces) = configured_trace2_targets(&context);
+
+    let mut command = destination.exact_object_fetch(ExactObjectFetchMode::Negotiated);
+    command
+        .current_dir(&context.repo_path)
+        .env("GIT_CONFIG_NOSYSTEM", "0")
+        .env("GIT_CONFIG_SYSTEM", system)
+        .env("GIT_CONFIG_GLOBAL", global)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "remote.gherrit-publication.fetch")
+        .env("GIT_CONFIG_VALUE_0", format!("+{SOURCE}:{SENTINEL}"));
+    let mut input = subprocess::RegularFileStdinBuilder::new().unwrap();
+    input.write_all(format!("{SOURCE}\n").as_bytes()).unwrap();
+    let output = subprocess::output_with_regular_file_stdin(
+        command,
+        input.finish().unwrap(),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    assert!(output.status().success(), "{output:?}");
+    assert_trace2_unchanged(&traces);
+    context.git_cmd().args(["cat-file", "-e", remote_only]).assert().success();
+    context.git_cmd().args(["show-ref", "--verify", "--quiet", SENTINEL]).assert().failure();
 }
 
 #[test]

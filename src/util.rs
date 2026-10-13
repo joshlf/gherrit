@@ -311,7 +311,13 @@ impl Repo {
         })
     }
 
-    fn has_promisor_remote(&self) -> Result<bool> {
+    /// Returns whether repository configuration declares a promisor object
+    /// source, either through partial-clone configuration or a promisor remote.
+    ///
+    /// History validation and repository preflight use the same interpretation
+    /// when deciding whether missing ancestry may be repaired with an explicit
+    /// refetch.
+    pub(crate) fn has_promisor_remote(&self) -> Result<bool> {
         let configured_by_extension = self
             .partial_clone_remote_from_direct_common_config()?
             .is_some_and(|remote| promisor_loader_accepts_remote_name(&remote));
@@ -563,7 +569,7 @@ fn reject_nonempty_history_file(path: &Path, description: &str, reason: &str) ->
     }
 }
 
-fn parse_git_version(output: &[u8]) -> Result<(u64, u64)> {
+pub(crate) fn parse_git_version(output: &[u8]) -> Result<(u64, u64)> {
     let version = str::from_utf8(output)?
         .trim()
         .strip_prefix("git version ")

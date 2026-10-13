@@ -27,6 +27,7 @@ const PROXY_ENV: &str = "GHERRIT_PRIVATE_REMOTE_PROXY";
 const PROXY_AUTH_METHOD_ENV: &str = "GHERRIT_PRIVATE_REMOTE_PROXY_AUTH_METHOD";
 const GIT_CONFIG_PARAMETERS_ENV: &str = "GIT_CONFIG_PARAMETERS";
 const DISABLE_HTTP_REDIRECTS: &str = "http.followRedirects=false";
+const DISABLE_BUNDLE_URI: &str = "fetch.bundleURI=";
 const DISABLE_FOLLOW_TAGS: &str = "push.followTags=false";
 const DISABLE_SUBMODULE_PUSHES: &str = "push.recurseSubmodules=no";
 const CLEAR_PUSH_OPTIONS: &str = "push.pushOption=";
@@ -102,7 +103,37 @@ pub(super) struct PushDestination {
     transport: RemoteTransportSettings,
 }
 
+// Exact history acquisition is staged behind the exact-local test boundary
+// until the orchestration slice routes it from `pre_push::run`.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExactObjectFetchMode {
+    Negotiated,
+    Refetch,
+}
+
 impl PushDestination {
+    #[cfg(test)]
+    pub(super) fn for_test() -> Self {
+        Self::for_test_url("https://github.com/owner/repo.git", Path::new("."))
+    }
+
+    #[cfg(test)]
+    fn for_test_url(url: &str, current_dir: &Path) -> Self {
+        let configured_remote = util::RemoteName::from_config(b"origin").unwrap();
+        let resolved = ResolvedDestination::from_git_output(
+            configured_remote,
+            format!("{url}\n").as_bytes(),
+            current_dir,
+        )
+        .unwrap();
+        Self {
+            resolved,
+            internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
+            transport: RemoteTransportSettings::default(),
+        }
+    }
+
     /// Resolves the one exact destination Git would use for pushing.
     ///
     /// The configured remote is supplied by the caller so configuration is
@@ -310,6 +341,23 @@ impl PushDestination {
         self.remote_command("ls-remote", options, ref_patterns)
     }
 
+    /// Constructs the exact-local ref observation command.
+    ///
+    /// Git's positional patterns remain tail filters, so the decoder must
+    /// still accept only complete canonical names. The category options ask a
+    /// protocol-v2 server to advertise only branch and tag namespaces. They
+    /// are fixed here rather than supplied by the caller because all evidence
+    /// requested by the exact-local query plan is in one of those namespaces.
+    fn exact_ref_observation_command(
+        &self,
+        ref_patterns: impl IntoIterator<Item = String>,
+    ) -> Command {
+        self.ls_remote(
+            ["--quiet".to_owned(), "--heads".to_owned(), "--tags".to_owned()],
+            ref_patterns,
+        )
+    }
+
     /// Observes destination refs through the sole bounded execution path.
     ///
     /// Keeping the raw `ls-remote` command private prevents an observation
@@ -325,6 +373,62 @@ impl PushDestination {
             subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
         )
         .await
+    }
+
+    /// Observes refs from the exact repository bound to an acquisition plan.
+    ///
+    /// The repository supplies only the command's working directory. The
+    /// destination and every transport setting still come from this validated
+    /// value, and execution uses the same finite supervisor as every other
+    /// remote ref observation.
+    #[allow(dead_code)]
+    pub(super) async fn observe_refs_from(
+        &self,
+        repository: &util::Repo,
+        ref_patterns: impl IntoIterator<Item = String>,
+    ) -> std::result::Result<subprocess::CommandOutput, subprocess::CommandError> {
+        let mut command = self.exact_ref_observation_command(ref_patterns);
+        command.current_dir(repository.workdir().unwrap_or(repository.path()));
+        subprocess::output(command, subprocess::REMOTE_GIT_EXECUTION_TIMEOUT).await
+    }
+
+    /// Constructs the sole exact-object acquisition command.
+    ///
+    /// Source refs are accepted only through `fetch --stdin`, so no advertised
+    /// ref, object ID, or destination literal can enter the top-level Git
+    /// argument list. The empty refmap is load-bearing: without it, configured
+    /// fetch refspecs could update remote-tracking refs even for source-only
+    /// wants. An empty bundle URI prevents a configured secondary object
+    /// source and its creation-token state from participating in this one
+    /// fetch.
+    #[allow(dead_code)]
+    pub(super) fn exact_object_fetch(&self, mode: ExactObjectFetchMode) -> Command {
+        let fixed = [
+            "--quiet",
+            "--no-progress",
+            "--no-write-fetch-head",
+            "--no-tags",
+            "--no-prune",
+            "--no-prune-tags",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--no-write-commit-graph",
+            "--no-update-shallow",
+            "--no-filter",
+            "--refmap=",
+        ];
+        let mode = match mode {
+            ExactObjectFetchMode::Negotiated => None,
+            ExactObjectFetchMode::Refetch => Some("--refetch"),
+        };
+        let options = fixed.into_iter().chain(mode).chain(std::iter::once("--stdin"));
+        self.adapter_command(
+            ["-c", DISABLE_HTTP_REDIRECTS, "-c", DISABLE_BUNDLE_URI, "fetch"]
+                .into_iter()
+                .chain(options)
+                .chain(["--", self.internal_remote.as_str()])
+                .map(str::to_owned),
+        )
     }
 
     pub(super) fn push(
