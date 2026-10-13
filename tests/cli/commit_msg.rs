@@ -150,3 +150,19 @@ fn test_commit_msg_non_utf8_filename() {
     assert!(bytes.starts_with(b"subject\n"));
     assert!(bytes.windows(b"gherrit-pr-id: G".len()).any(|window| window == b"gherrit-pr-id: G"));
 }
+
+#[test]
+#[cfg(unix)]
+fn test_existing_identity_avoids_committer_lookup() {
+    let ctx = testutil::test_context!().with_git_interceptor().build();
+    ctx.gherrit_cmd().arg("manage").assert().success();
+    let path = ctx.repo_path.join("identified-message");
+    let message = "subject\n\ngherrit-pr-id: Legacy123\n";
+    std::fs::write(&path, message).unwrap();
+    ctx.expect_git_failure(testutil::GitOperation::Var);
+    ctx.gherrit_cmd().args(["hook", "commit-msg"]).arg(&path).assert().success();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), message);
+    // Consume the still-pending failure explicitly: the hook did not query it.
+    ctx.git_cmd().args(["var", "GIT_COMMITTER_IDENT"]).assert().failure();
+    ctx.assert_failure_consumed();
+}

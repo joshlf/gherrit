@@ -79,6 +79,14 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
         return Ok(());
     }
 
+    // Check if trailer exists
+    let output = cmd!("git interpret-trailers --parse").arg(msg_file).checked_output()?;
+    let trailers = String::from_utf8_lossy(&output.stdout);
+
+    if has_gherrit_id(&trailers) {
+        return Ok(());
+    }
+
     // Construct the stable GHerrit ID input:
     // "Ident\nRefHash\nMsgContent".
     let input_data = {
@@ -104,14 +112,6 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
     )
     .wrap_err("Failed to compute hash")?;
     let gherrit_id = derive_gherrit_id(acquire_entropy(), object_id.as_bytes());
-
-    // Check if trailer exists
-    let output = cmd!("git interpret-trailers --parse").arg(msg_file).checked_output()?;
-    let trailers = String::from_utf8_lossy(&output.stdout);
-
-    if has_gherrit_id(&trailers) {
-        return Ok(());
-    }
 
     // Insert trailer
     // --where start: puts it at the top of the trailer block
