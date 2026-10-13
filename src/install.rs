@@ -17,53 +17,69 @@ const SHIM_TEMPLATE: &str = r#"#!/bin/sh
 gherrit hook {} "$@"
 "#;
 
-pub fn install(repo: &Repo, force: bool, allow_global: bool) -> Result<()> {
-    let hooks_dir = resolve_hooks_dir(repo, allow_global)?;
+struct HookReplacement {
+    name: &'static str,
+    path: PathBuf,
+    content: String,
+}
 
-    fs::create_dir_all(&hooks_dir)
-        .wrap_err_with(|| format!("Failed to create hooks directory: {:?}", hooks_dir))?;
+struct InstallPlan {
+    directory: PathBuf,
+    hooks: Vec<HookReplacement>,
+}
 
-    // Phase 1: Validation
-    let mut conflicts = Vec::new();
-    for hook in REQUIRED_HOOKS {
-        let hook_path = hooks_dir.join(hook);
-        if hook_path.exists() {
-            let content = fs::read_to_string(&hook_path)
-                .wrap_err_with(|| format!("Failed to read hook file: {:?}", hook_path))?;
-            if !content.contains(PROLOGUE) {
-                conflicts.push(hook_path);
+fn is_managed_hook(content: &[u8]) -> bool {
+    content.windows(PROLOGUE.len()).any(|window| window == PROLOGUE.as_bytes())
+}
+
+impl InstallPlan {
+    /// Inspect every destination before creating directories or writing hooks.
+    /// This retains sentinel ownership; it does not lock out concurrent writers.
+    fn inspect(directory: PathBuf, force: bool) -> Result<Self> {
+        let mut conflicts = Vec::new();
+        let mut hooks = Vec::new();
+        for &name in REQUIRED_HOOKS {
+            let path = directory.join(name);
+            if path.try_exists()? {
+                let content = fs::read(&path)
+                    .wrap_err_with(|| format!("Failed to read hook file: {path:?}"))?;
+                if !is_managed_hook(&content) {
+                    conflicts.push(path.clone());
+                }
             }
+            hooks.push(HookReplacement { name, path, content: SHIM_TEMPLATE.replace("{}", name) });
         }
+        if !conflicts.is_empty() && !force {
+            let mut message = String::from("Refusing to overwrite unmanaged hooks:\n");
+            for path in conflicts {
+                message.push_str(&format!("  - {}\n", path.display()));
+            }
+            message.push_str("\nUse --force to overwrite them.");
+            bail!(message);
+        }
+        Ok(Self { directory, hooks })
     }
 
-    if !conflicts.is_empty() && !force {
-        let mut msg = String::from("Refusing to overwrite unmanaged hooks:\n");
-        for path in conflicts {
-            msg.push_str(&format!("  - {}\n", path.display()));
+    fn apply(self) -> Result<()> {
+        fs::create_dir_all(&self.directory)
+            .wrap_err_with(|| format!("Failed to create hooks directory: {:?}", self.directory))?;
+        for hook in self.hooks {
+            fs::write(&hook.path, &hook.content)
+                .wrap_err_with(|| format!("Failed to write hook file: {:?}", hook.path))?;
+            #[cfg(unix)]
+            {
+                let mut permissions = fs::metadata(&hook.path)?.permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&hook.path, permissions)?;
+            }
+            log::info!("Installed {}", hook.name.green());
         }
-        msg.push_str("\nUse --force to overwrite them.");
-        bail!(msg);
+        Ok(())
     }
+}
 
-    // Phase 2: Execution
-    for hook in REQUIRED_HOOKS {
-        let hook_path = hooks_dir.join(hook);
-        let content = SHIM_TEMPLATE.replace("{}", hook);
-
-        fs::write(&hook_path, &content)
-            .wrap_err_with(|| format!("Failed to write hook file: {:?}", hook_path))?;
-
-        #[cfg(unix)]
-        {
-            let mut perms = fs::metadata(&hook_path)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&hook_path, perms)?;
-        }
-
-        log::info!("Installed {}", hook.green());
-    }
-
-    Ok(())
+pub fn install(repo: &Repo, force: bool, allow_global: bool) -> Result<()> {
+    InstallPlan::inspect(resolve_hooks_dir(repo, allow_global)?, force)?.apply()
 }
 
 fn resolve_hooks_dir(repo: &Repo, allow_global: bool) -> Result<PathBuf> {

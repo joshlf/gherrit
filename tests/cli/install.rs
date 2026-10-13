@@ -207,3 +207,31 @@ fn test_install_bare_repository() {
     ctx.gherrit_cmd().current_dir(&bare).arg("install").assert().success();
     assert_installed_hooks(&bare.join("custom-hooks"));
 }
+
+#[test]
+fn test_install_binary_hooks_and_complete_conflict_inspection() {
+    let ctx = testutil::test_context!().build();
+    let hooks = ctx.repo_path.join(".git/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let managed = b"# gherrit-installer: managed\noriginal managed bytes";
+    let binary = b"\xff\x00unmanaged executable";
+    std::fs::write(hooks.join("pre-push"), managed).unwrap();
+    // A conflict at the last destination must prevent every replacement.
+    std::fs::write(hooks.join("post-checkout"), binary).unwrap();
+    ctx.gherrit_cmd()
+        .arg("install")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Refusing to overwrite unmanaged hooks"))
+        .stderr(predicates::str::contains("Use --force"));
+    assert_eq!(std::fs::read(hooks.join("pre-push")).unwrap(), managed);
+    assert_eq!(std::fs::read(hooks.join("post-checkout")).unwrap(), binary);
+    assert!(!hooks.join("commit-msg").exists());
+
+    ctx.gherrit_cmd().args(["install", "--force"]).assert().success();
+    assert_installed_hooks(&hooks);
+    let binary_managed = b"\xff# gherrit-installer: managed\x00";
+    std::fs::write(hooks.join("pre-push"), binary_managed).unwrap();
+    ctx.gherrit_cmd().arg("install").assert().success();
+    assert_installed_hooks(&hooks);
+}
