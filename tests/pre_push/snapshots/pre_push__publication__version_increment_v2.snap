@@ -1,0 +1,13 @@
+---
+source: tests/pre_push/publication.rs
+expression: content
+---
+EXIT_CODE: 0
+
+STDOUT:
+(empty)
+
+STDERR:
+[gherrit] Branch feat-versioning is MANAGED. Publishing stack...
+[gherrit] [WARN] Using custom GitHub API URL: [MOCK_SERVER_URL]
+[gherrit] Successfully published 1 commit.
