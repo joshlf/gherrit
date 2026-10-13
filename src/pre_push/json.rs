@@ -1,8 +1,8 @@
 //! JSON decoding which retains duplicate object members as errors.
 //!
 //! `serde_json::Value` normally keeps only the final value for a duplicate
-//! object key. GraphQL aliases and receipt fields carry authority, so mutation
-//! responses cross this boundary before they can become ordinary values.
+//! object key. GraphQL aliases and receipt fields carry authority, so every
+//! response crosses this boundary before it can become an ordinary value.
 
 use std::fmt;
 
@@ -15,11 +15,15 @@ use serde_json::{Map, Number, Value};
 pub(super) struct UniqueJson(Value);
 
 impl UniqueJson {
-    pub(super) fn decode(bytes: &[u8]) -> serde_json::Result<Self> {
-        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    pub(super) fn decode(response: &[u8]) -> serde_json::Result<Self> {
+        let mut deserializer = serde_json::Deserializer::from_slice(response);
         let value = Self::deserialize(&mut deserializer)?;
         deserializer.end()?;
         Ok(value)
+    }
+
+    pub(super) fn as_value(&self) -> &Value {
+        &self.0
     }
 
     pub(super) fn into_value(self) -> Value {
