@@ -325,6 +325,21 @@ fn tuple_count(pushes: &PreparedPushes) -> usize {
         .count()
 }
 
+fn initial_refs(plan: &PlannedPublication) -> &PreparedPushes {
+    let stage = match &plan.draft_safety {
+        DraftSafetyStage::Ready(stage) => stage,
+        DraftSafetyStage::Convert { next, .. } => next,
+    };
+    &stage.initial_ref_pushes
+}
+
+fn into_initial_refs(plan: PlannedPublication) -> InitialRefsStage {
+    match plan.draft_safety {
+        DraftSafetyStage::Ready(stage) => stage,
+        DraftSafetyStage::Convert { .. } => panic!("expected no draft conversion"),
+    }
+}
+
 fn marker_facts(stage: &MarkerStage) -> Vec<(String, ObjectId, u32)> {
     stage
         .markers
@@ -355,14 +370,14 @@ fn tuple_for_test(history: &ValidatedChangeHistory) -> Option<Result<TupleTransi
 }
 
 fn ready(plan: PlannedPublication) -> MarkerStage {
-    match plan.after_initial_refs {
+    match into_initial_refs(plan).after_initial_refs {
         AfterInitialRefs::Ready(stage) => *stage,
         AfterInitialRefs::Creates(_) => panic!("expected an all-existing projection"),
     }
 }
 
 fn creates(plan: PlannedPublication) -> CreateStage {
-    match plan.after_initial_refs {
+    match into_initial_refs(plan).after_initial_refs {
         AfterInitialRefs::Creates(stage) => *stage,
         AfterInitialRefs::Ready(_) => panic!("expected a create-dependent projection"),
     }
@@ -426,7 +441,7 @@ fn planner_accepts_exactly_the_four_supported_local_realities() {
         pull_request: PullRequestSpec::Absent,
     }])
     .unwrap();
-    assert_eq!(tuple_count(&fresh.initial_ref_pushes), 1);
+    assert_eq!(tuple_count(initial_refs(&fresh)), 1);
     let fresh = creates(fresh);
     assert_eq!(fresh.creates.operations_for_test()[0].id, id("Gfresh"));
 
@@ -436,7 +451,7 @@ fn planner_accepts_exactly_the_four_supported_local_realities() {
         pull_request: PullRequestSpec::Absent,
     }])
     .unwrap();
-    assert_eq!(tuple_count(&recovery.initial_ref_pushes), 0);
+    assert_eq!(tuple_count(initial_refs(&recovery)), 0);
     assert_eq!(creates(recovery).creates.operations_for_test().len(), 1);
 
     let unmarked =
@@ -821,7 +836,7 @@ fn every_published_owned_head_and_base_pair_is_independently_valid() {
 }
 
 #[test]
-fn marker_base_and_landing_automation_rules_form_the_exact_truth_table() {
+fn canonical_draft_base_root_and_landing_rules_form_the_exact_truth_table() {
     let default = default_branch(DEFAULT_NAME, oid(10));
     for marker in [false, true] {
         let history = validated_history(
@@ -832,24 +847,41 @@ fn marker_base_and_landing_automation_rules_form_the_exact_truth_table() {
         );
         for observed in [BaseKind::Default, BaseKind::Owned] {
             for desired in [BaseKind::Default, BaseKind::Owned] {
-                for landing_automation in [false, true] {
-                    let pull_request = open_for_validation(
-                        &history,
-                        oid(20),
-                        observed,
-                        oid(10),
-                        true,
-                        landing_automation,
-                    );
-                    let accepted =
-                        validate_open_for_test(&history, pull_request, desired, &default).is_ok();
-                    let expected = (marker || observed == BaseKind::Owned)
-                        && (!landing_automation
-                            || (observed == BaseKind::Default && desired == BaseKind::Default));
-                    assert_eq!(
-                        accepted, expected,
-                        "marker={marker}, observed={observed:?}, desired={desired:?}, automation={landing_automation}"
-                    );
+                for is_draft in [false, true] {
+                    for landing_automation in [false, true] {
+                        let pull_request = open_for_validation(
+                            &history,
+                            oid(20),
+                            observed,
+                            oid(10),
+                            is_draft,
+                            landing_automation,
+                        );
+                        let result =
+                            validate_open_for_test(&history, pull_request, desired, &default);
+                        let safe_role = if marker {
+                            is_draft || observed == BaseKind::Default
+                        } else {
+                            observed == BaseKind::Owned && is_draft
+                        };
+                        let safe_landing = !landing_automation
+                            || (marker
+                                && observed == BaseKind::Default
+                                && desired == BaseKind::Default);
+                        let expected = safe_role && safe_landing;
+                        assert_eq!(
+                            result.is_ok(),
+                            expected,
+                            "marker={marker}, draft={is_draft}, observed={observed:?}, desired={desired:?}, automation={landing_automation}"
+                        );
+                        if let Ok(validated) = result {
+                            let expected_conversion = marker
+                                && !is_draft
+                                && observed == BaseKind::Default
+                                && desired == BaseKind::Owned;
+                            assert_eq!(validated.draft_conversion().is_some(), expected_conversion);
+                        }
+                    }
                 }
             }
         }
@@ -961,6 +993,11 @@ fn every_duplicate_must_satisfy_noncanonical_history_and_policy() {
         AdditionalOpenSpec::new(10, oid(20), BaseKind::Default, oid(10)),
         {
             let mut duplicate = AdditionalOpenSpec::new(10, oid(20), BaseKind::Owned, oid(10));
+            duplicate.is_draft = false;
+            duplicate
+        },
+        {
+            let mut duplicate = AdditionalOpenSpec::new(10, oid(20), BaseKind::Owned, oid(10));
             duplicate.landing_automation = true;
             duplicate
         },
@@ -989,6 +1026,40 @@ fn every_duplicate_must_satisfy_noncanonical_history_and_policy() {
     .err()
     .unwrap();
     assert!(error.to_string().contains("#20"));
+}
+
+#[test]
+fn duplicate_draft_base_and_landing_rules_form_the_exact_truth_table() {
+    for canonical_is_marked in [false, true] {
+        for base_kind in [BaseKind::Default, BaseKind::Owned] {
+            for is_draft in [false, true] {
+                for landing_automation in [false, true] {
+                    let (selected_number, duplicate_number, marker) =
+                        if canonical_is_marked { (20, 10, Some(20)) } else { (10, 20, None) };
+                    let selected_base =
+                        if canonical_is_marked { BaseKind::Default } else { BaseKind::Owned };
+                    let mut open = OpenSpec::new(selected_number, oid(20), selected_base, oid(10));
+                    let mut duplicate =
+                        AdditionalOpenSpec::new(duplicate_number, oid(20), base_kind, oid(10));
+                    duplicate.is_draft = is_draft;
+                    duplicate.landing_automation = landing_automation;
+                    open.additional.push(duplicate);
+
+                    let result = plan(&[EntrySpec {
+                        id: "Gduplicatetruth",
+                        history: HistorySpec::current(oid(20), oid(10), marker),
+                        pull_request: PullRequestSpec::Open(open),
+                    }]);
+                    let expected = base_kind == BaseKind::Owned && is_draft && !landing_automation;
+                    assert_eq!(
+                        result.is_ok(),
+                        expected,
+                        "canonical_is_marked={canonical_is_marked}, duplicate_base={base_kind:?}, duplicate_draft={is_draft}, duplicate_automation={landing_automation}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -1051,7 +1122,7 @@ fn known_duplicate_closes_are_preflighted_before_a_create_stage_escapes() {
     ])
     .err()
     .unwrap();
-    assert!(error.to_string().contains("pull request projection"));
+    assert!(error.to_string().contains("pull request mutation"));
 }
 
 #[test]
@@ -1099,7 +1170,7 @@ fn every_new_marker_targets_v1_and_names_the_canonical_identity() {
         pull_request: PullRequestSpec::Open(OpenSpec::new(7, oid(101), BaseKind::Owned, oid(10))),
     };
     let existing = plan(&[existing]).unwrap();
-    assert_eq!(tuple_count(&existing.initial_ref_pushes), 1);
+    assert_eq!(tuple_count(initial_refs(&existing)), 1);
     assert_eq!(marker_facts(&ready(existing)), [("Gexisting".to_owned(), oid(101), 7)]);
 
     let absent = EntrySpec {
@@ -1108,7 +1179,7 @@ fn every_new_marker_targets_v1_and_names_the_canonical_identity() {
         pull_request: PullRequestSpec::Absent,
     };
     let absent = plan(&[absent]).unwrap();
-    assert_eq!(tuple_count(&absent.initial_ref_pushes), 1);
+    assert_eq!(tuple_count(initial_refs(&absent)), 1);
     let absent = creates(absent);
     assert_eq!(absent.creates.operations_for_test()[0].head_oid, oid(20));
     let absent = absent.complete_for_test(receipts(&[("Gabsent", 8, "PR_8")])).unwrap();
@@ -1136,9 +1207,9 @@ fn mixed_specs() -> [EntrySpec; 4] {
 fn mixed_projection_has_one_create_order_and_one_final_identity_order() {
     let plan =
         plan_with_public_branch(&mixed_specs(), Some("release-candidate".to_owned())).unwrap();
-    assert_eq!(tuple_count(&plan.initial_ref_pushes), 1);
+    assert_eq!(tuple_count(initial_refs(&plan)), 1);
     assert_eq!(
-        plan.initial_ref_pushes
+        initial_refs(&plan)
             .batches()
             .flat_map(|batch| batch.semantic_effects_for_test())
             .filter(|effect| matches!(effect, TestPushEffect::PublicBranch { .. }))
@@ -1418,6 +1489,7 @@ fn body_comparison_normalizes_only_crlf_pairs() {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EffectBoundary {
+    DraftConversions,
     InitialRefs,
     Creates,
     Markers,
@@ -1436,6 +1508,16 @@ struct CreateAttempt {
     title: String,
     body: Box<[String]>,
     head: String,
+    base: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+struct DraftAttempt {
+    id: String,
+    number: u32,
+    node_id: String,
+    head: String,
+    base_branch: String,
     base: String,
 }
 
@@ -1463,6 +1545,7 @@ enum ProjectionAttempt {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 enum DurableEffectAttempt {
+    DraftConversions(Box<[DraftAttempt]>),
     InitialRefs(Box<[GitBatchAttempt]>),
     Creates(Box<[CreateAttempt]>),
     Markers(Box<[MarkerAttempt]>),
@@ -1472,6 +1555,7 @@ enum DurableEffectAttempt {
 impl DurableEffectAttempt {
     fn boundary(&self) -> EffectBoundary {
         match self {
+            Self::DraftConversions(_) => EffectBoundary::DraftConversions,
             Self::InitialRefs(_) => EffectBoundary::InitialRefs,
             Self::Creates(_) => EffectBoundary::Creates,
             Self::Markers(_) => EffectBoundary::Markers,
@@ -1525,6 +1609,25 @@ impl ScriptedEffectDriver {
 }
 
 impl EffectDriver for ScriptedEffectDriver {
+    async fn convert_pull_requests_to_draft(
+        &mut self,
+        conversions: PreparedDraftConversions,
+    ) -> Result<()> {
+        let attempts = conversions
+            .operations_for_test()
+            .iter()
+            .map(|operation| DraftAttempt {
+                id: operation.id.as_str().to_owned(),
+                number: operation.identity.number().get(),
+                node_id: operation.identity.node_id_for_test().to_owned(),
+                head: operation.head_oid.to_string(),
+                base_branch: operation.default_branch.name().to_owned(),
+                base: operation.default_branch.tip().to_string(),
+            })
+            .collect();
+        self.record(DurableEffectAttempt::DraftConversions(attempts))
+    }
+
     async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()> {
         let attempts = Self::push_attempts(&pushes);
         if attempts.is_empty() {
@@ -1642,6 +1745,21 @@ fn unmarked_multi_open_execution_plan() -> PlannedPublication {
     .unwrap()
 }
 
+fn ready_departing_root_execution_plan() -> PlannedPublication {
+    let root = current_open("Groot", oid(20), oid(10), true, 7, BaseKind::Default, oid(10));
+    let mut child = OpenSpec::new(8, oid(101), BaseKind::Default, oid(10));
+    child.is_draft = false;
+    plan(&[
+        root,
+        EntrySpec {
+            id: "Gchild",
+            history: HistorySpec::current(oid(101), oid(20), Some(8)),
+            pull_request: PullRequestSpec::Open(child),
+        },
+    ])
+    .unwrap()
+}
+
 async fn execute_scripted(
     plan: PlannedPublication,
     failure: Option<EffectBoundary>,
@@ -1685,6 +1803,46 @@ async fn durable_effect_barriers_release_only_the_next_reachable_stage() {
         assert_eq!(interrupted.attempts, acknowledged.attempts[..prefix_len]);
         assert!(error.to_string().contains(&format!("{boundary:?}")));
     }
+}
+
+#[tokio::test]
+async fn draft_conversion_acknowledgement_is_required_before_every_git_effect() {
+    let (result, acknowledged) =
+        execute_scripted(ready_departing_root_execution_plan(), None).await;
+    result.unwrap();
+    acknowledged.assert_consumed();
+    assert_eq!(
+        acknowledged.attempts.iter().map(DurableEffectAttempt::boundary).collect::<Vec<_>>(),
+        [EffectBoundary::DraftConversions, EffectBoundary::InitialRefs, EffectBoundary::Projection,]
+    );
+    assert!(matches!(
+        acknowledged.attempts.first(),
+        Some(DurableEffectAttempt::DraftConversions(conversions))
+            if matches!(
+                conversions.as_ref(),
+                [DraftAttempt {
+                    id,
+                    number: 8,
+                    node_id,
+                    head,
+                    base_branch,
+                    base,
+                }] if id == "Gchild"
+                    && node_id == "PR_8"
+                    && head == &oid(101).to_string()
+                    && base_branch == DEFAULT_NAME
+                    && base == &oid(10).to_string()
+            )
+    ));
+
+    let (result, interrupted) = execute_scripted(
+        ready_departing_root_execution_plan(),
+        Some(EffectBoundary::DraftConversions),
+    )
+    .await;
+    assert!(result.is_err());
+    interrupted.assert_consumed();
+    assert!(matches!(interrupted.attempts.as_slice(), [DurableEffectAttempt::DraftConversions(_)]));
 }
 
 #[tokio::test]
