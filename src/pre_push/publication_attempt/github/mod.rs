@@ -1,45 +1,69 @@
-#![cfg_attr(test, allow(dead_code, reason = "later commits activate the complete adapter"))]
-
 //! GitHub boundary for exact-local observation and publication.
 //!
-//! The active publisher still uses [`super::legacy_github`]. This complete
-//! boundary is production-compiled now and becomes reachable only when the
-//! planner and publication state machine switch together.
+//! Observation consumes the client which performs it. The resulting value
+//! keeps that client inseparable from its evidence until the publication plan
+//! retains the same client for every later mutation.
 
 use color_eyre::eyre::{Result, bail};
 
-use super::destination::{DefaultBranch, RepositoryCoordinates};
+use crate::pre_push::destination::{DefaultBranch, RepositoryCoordinates};
 
 /// Maximum number of mutation fields sent in one GraphQL request.
-pub(super) const MAX_MUTATION_ALIASES: usize = 64;
+pub(in crate::pre_push::publication_attempt) const MAX_MUTATION_ALIASES: usize = 64;
 
 // A 131,072-byte pull-request body made entirely from U+0001 expands to
 // 917,504 bytes after GraphQL-string escaping and then outer-JSON escaping.
 // One MiB accommodates that worst case plus the mutation's other supported
 // fields while retaining a deterministic preflight request limit.
-pub(super) const MAX_MUTATION_REQUEST_BYTES: usize = 1024 * 1024;
+pub(in crate::pre_push::publication_attempt) const MAX_MUTATION_REQUEST_BYTES: usize = 1024 * 1024;
 
 mod mutation;
 mod observation;
 mod pull_request;
 mod transport;
 
-#[cfg(test)]
-pub(in crate::pre_push) use mutation::CompleteCreateReceipts;
-pub(in crate::pre_push) use mutation::{
-    CreatePullRequest, PreparedCreates, PreparedUpdates, UpdatePullRequest,
+pub(super) use mutation::{
+    CompleteCreateReceipts, CreatePullRequest, PreparedCreates, PreparedUpdates, UpdatePullRequest,
 };
 #[cfg(test)]
-pub(in crate::pre_push) use observation::ObservedBase;
-pub(in crate::pre_push) use observation::{
+pub(super) use observation::ObservedBase;
+pub(super) use observation::{
     AbsentPullRequest, BaseKind, CompleteLocalPullRequests, LocalPullRequestObservation,
     ManagedOpenPullRequest,
 };
-pub(in crate::pre_push) use pull_request::PullRequestIdentity;
-#[allow(unused_imports, reason = "the exact planner activates in a later commit")]
-pub(in crate::pre_push) use pull_request::PullRequestNumber;
-#[allow(unused_imports, reason = "the exact adapter activates in a later atomic switch")]
-pub(in crate::pre_push) use transport::Github;
+pub(super) use pull_request::{PullRequestIdentity, PullRequestNumber};
+pub(super) use transport::Github;
+
+/// Complete GitHub evidence and the exact client which produced it.
+///
+/// This pair has no independent production accessors. Planning consumes it
+/// and retains this same client for every create and update.
+pub(super) struct ObservedGithub {
+    github: Github,
+    pull_requests: CompleteLocalPullRequests,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for ObservedGithub {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ObservedGithub(..)")
+    }
+}
+
+impl ObservedGithub {
+    fn new(github: Github, pull_requests: CompleteLocalPullRequests) -> Self {
+        Self { github, pull_requests }
+    }
+
+    pub(super) fn into_parts(self) -> (Github, CompleteLocalPullRequests) {
+        (self.github, self.pull_requests)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_plan_test(github: Github, pull_requests: CompleteLocalPullRequests) -> Self {
+        Self::new(github, pull_requests)
+    }
+}
 
 /// One-use authority to preflight creates against the repository and identity
 /// namespaces retained by an exact-local observation.
@@ -47,7 +71,7 @@ pub(in crate::pre_push) use transport::Github;
 /// Keeping these values together prevents a planner from replacing the
 /// observed repository node or starting create-receipt collision checks from
 /// an unrelated empty registry.
-pub(in crate::pre_push) struct CreatePreparation {
+pub(super) struct CreatePreparation {
     repository_id: RepositoryNodeId,
     identities: pull_request::PullRequestIdentityRegistry,
 }
@@ -60,10 +84,7 @@ impl CreatePreparation {
         Self { repository_id, identities }
     }
 
-    pub(in crate::pre_push) fn prepare(
-        self,
-        operations: Vec<CreatePullRequest>,
-    ) -> Result<PreparedCreates> {
+    pub(super) fn prepare(self, operations: Vec<CreatePullRequest>) -> Result<PreparedCreates> {
         PreparedCreates::new(self.repository_id, operations, self.identities)
     }
 }
