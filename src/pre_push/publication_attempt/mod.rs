@@ -18,6 +18,8 @@ mod marker;
 mod plan;
 mod refs;
 mod remote;
+#[cfg(test)]
+mod semantic_oracle;
 mod version;
 
 use color_eyre::eyre::{Context as _, Result, bail};
