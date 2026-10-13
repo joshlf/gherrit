@@ -77,3 +77,137 @@ impl Repo {
         }
     }
 }
+
+/// Complete direct-local values for the four keys owned by branch management.
+/// Empty vectors mean absence only after the one exact-key query completes.
+pub(crate) struct BranchConfigValues {
+    pub(crate) push_remote: Vec<Vec<u8>>,
+    pub(crate) remote: Vec<Vec<u8>>,
+    pub(crate) merge: Vec<Vec<u8>>,
+    pub(crate) management: Vec<Vec<u8>>,
+}
+
+fn escape_config_subsection(value: &str) -> String {
+    let mut escaped = String::new();
+    for character in value.chars() {
+        if matches!(
+            character,
+            '\\' | '.' | '^' | '$' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+fn decode_branch_config(branch: &str, output: &[u8]) -> Result<BranchConfigValues> {
+    let mut result = BranchConfigValues {
+        push_remote: Vec::new(),
+        remote: Vec::new(),
+        merge: Vec::new(),
+        management: Vec::new(),
+    };
+    if output.is_empty() {
+        return Ok(result);
+    }
+    let records = output
+        .strip_suffix(b"\0")
+        .ok_or_else(|| eyre::eyre!("Git returned malformed local configuration"))?;
+    for record in records.split(|byte| *byte == 0) {
+        let (key, value) = record
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or((record, b"".as_slice()), |index| (&record[..index], &record[index + 1..]));
+        let prefix = format!("branch.{branch}.");
+        let suffix = key
+            .strip_prefix(prefix.as_bytes())
+            .ok_or_else(|| eyre::eyre!("Git returned an unrequested local configuration key"))?;
+        let values = match suffix {
+            b"pushremote" => &mut result.push_remote,
+            b"remote" => &mut result.remote,
+            b"merge" => &mut result.merge,
+            b"gherritmanaged" => &mut result.management,
+            _ => bail!("Git returned an unrequested local configuration key"),
+        };
+        values.push(value.to_owned());
+    }
+    Ok(result)
+}
+
+impl Repo {
+    /// Read management and owned branch fields in one interpreted occurrence
+    /// stream, preserving local scope, duplicates, empty values, and raw bytes.
+    pub(crate) fn local_branch_config(&self, branch: &str) -> Result<BranchConfigValues> {
+        let branch_pattern = escape_config_subsection(branch);
+        let pattern =
+            format!(r"^branch\.{branch_pattern}\.(pushremote|remote|merge|gherritmanaged)$");
+        let output = self
+            .local_config_command()
+            .args(["--null", "--get-regexp", &pattern])
+            .output()
+            .wrap_err("Failed to inspect local Git configuration")?;
+        match output.status.code() {
+            Some(0) if output.stderr.is_empty() => decode_branch_config(branch, &output.stdout),
+            Some(1) if output.stdout.is_empty() && output.stderr.is_empty() => {
+                decode_branch_config(branch, b"")
+            }
+            _ => bail!("Invalid local Git configuration"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_matches_independent_git_reads_for_exact_case_sensitive_subsections() {
+        let context = testutil::TestContextBuilder::new("unused").build();
+        let branch = "Case.sensitive+(name){value}";
+        for (suffix, value) in [
+            ("pushRemote", "."),
+            ("remote", ""),
+            ("merge", "line\none"),
+            ("gherritManaged", "managedPrivate"),
+        ] {
+            context.run_git(&["config", "--add", &format!("branch.{branch}.{suffix}"), value]);
+        }
+        context.run_git(&["config", "--add", &format!("branch.{branch}.remote"), "duplicate"]);
+        context.run_git(&["config", "branch.case.sensitive+(name){value}.remote", "unrequested"]);
+        let repository = Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let values = repository.local_branch_config(branch).unwrap();
+        for (suffix, actual) in [
+            ("pushRemote", values.push_remote),
+            ("remote", values.remote),
+            ("merge", values.merge),
+            ("gherritManaged", values.management),
+        ] {
+            assert_eq!(
+                actual,
+                repository.local_config_values(&format!("branch.{branch}.{suffix}")).unwrap()
+            );
+        }
+        let missing = repository.local_branch_config("absent").unwrap();
+        assert!(missing.management.is_empty() && missing.remote.is_empty());
+    }
+
+    #[test]
+    fn snapshot_decoder_retains_implicit_empty_and_non_utf8_values_and_rejects_partial_records() {
+        let values = decode_branch_config(
+            "a",
+            b"branch.a.remote\0branch.a.remote\n\xff\0branch.a.merge\nline\none\0",
+        )
+        .unwrap();
+        assert_eq!(values.remote, [Vec::new(), vec![0xff]]);
+        assert_eq!(values.merge, [b"line\none".to_vec()]);
+        for invalid in [
+            b"branch.a.remote\nvalue".as_slice(),
+            b"branch.other.remote\nvalue\0",
+            b"branch.a.unrequested\nvalue\0",
+            b"\0",
+        ] {
+            assert!(decode_branch_config("a", invalid).is_err(), "{invalid:?}");
+        }
+    }
+}

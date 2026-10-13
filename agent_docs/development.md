@@ -41,4 +41,13 @@ out another installer, or establish exclusive ownership of an external path.
 Git uses common-directory default hooks in linked worktrees; explicit relative
 hook paths are resolved from each worktree or the bare Git directory.
 
+## Management edits
+
+Management classifies existing local ownership before constructing a complete
+ordered edit plan. The final management marker follows every branch edit.
+Separate Git config writes are not transactional: an interruption can leave
+partial drift. An unforced invocation preserves that drift rather than adopting
+it; an explicit forced invocation can repair it. Restoring pre-management user
+values remains a separate persistence policy.
+
 *Updated by an AI agent acting on joshlf's behalf.*

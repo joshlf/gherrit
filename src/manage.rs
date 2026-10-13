@@ -47,7 +47,11 @@ impl State {
 
     pub fn read_from(repo: &util::Repo, branch_name: &str) -> Result<Option<State>> {
         let key = format!("branch.{}.gherritManaged", branch_name);
-        match repo.local_config_values(&key)?.as_slice() {
+        Self::from_values(&repo.local_config_values(&key)?)
+    }
+
+    fn from_values(values: &[Vec<u8>]) -> Result<Option<State>> {
+        match values {
             [value] if value == State::PUBLIC.as_bytes() => Ok(Some(State::Public)),
             [value] if value == State::PRIVATE.as_bytes() => Ok(Some(State::Private)),
             [value] if value == State::UNMANAGED.as_bytes() => Ok(Some(State::Unmanaged)),
@@ -97,13 +101,18 @@ impl BranchConfigValue {
         value.map_or(Self::Missing, Self::One)
     }
 
+    #[cfg(test)]
     fn read(repo: &util::Repo, key: &str) -> Result<Self> {
-        Ok(match repo.local_config_values(key)?.as_slice() {
+        Ok(Self::from_values(&repo.local_config_values(key)?))
+    }
+
+    fn from_values(values: &[Vec<u8>]) -> Self {
+        match values {
             [] => Self::Missing,
             [value] => std::str::from_utf8(value)
                 .map_or(Self::Invalid, |value| Self::One(value.to_owned())),
             _ => Self::Invalid,
-        })
+        }
     }
 
     fn one(&self) -> Option<&str> {
@@ -159,6 +168,7 @@ impl BranchConfig {
         }
     }
 
+    #[cfg(test)]
     fn read_from(repo: &util::Repo, branch_name: &str) -> Result<BranchConfig> {
         let key = |suffix: &str| format!("branch.{branch_name}.{suffix}");
         Ok(BranchConfig {
@@ -166,6 +176,14 @@ impl BranchConfig {
             remote: BranchConfigValue::read(repo, &key("remote"))?,
             merge: BranchConfigValue::read(repo, &key("merge"))?,
         })
+    }
+
+    fn from_values(values: &util::BranchConfigValues) -> Self {
+        Self {
+            push_remote: BranchConfigValue::from_values(&values.push_remote),
+            remote: BranchConfigValue::from_values(&values.remote),
+            merge: BranchConfigValue::from_values(&values.merge),
+        }
     }
 
     fn value(&self, key: BranchConfigKey) -> &BranchConfigValue {
@@ -337,28 +355,72 @@ fn log_configuration_drift(
     });
 }
 
-fn apply_config_update(
-    repo: &util::Repo,
-    branch_name: &str,
-    config_key: BranchConfigKey,
-    value: Option<&str>,
-) -> Result<()> {
-    let key = format!("branch.{branch_name}.{}", config_key.suffix());
-    match value {
-        Some(value) => repo.replace_local_config(&key, value),
-        None => repo.unset_local_config(&key),
+#[derive(Debug, Eq, PartialEq)]
+enum ConfigEdit {
+    Replace { key: String, value: String },
+    Unset { key: String },
+}
+
+impl ConfigEdit {
+    fn apply(&self, repo: &util::Repo) -> Result<()> {
+        match self {
+            Self::Replace { key, value } => repo.replace_local_config(key, value),
+            Self::Unset { key } => repo.unset_local_config(key),
+        }
+    }
+}
+
+/// A complete ordered edit plan, with the ownership marker always last.
+/// Separate Git config writes are deliberately not claimed to be atomic.
+struct ManagementPlan {
+    branch_edits: Vec<ConfigEdit>,
+    marker: ConfigEdit,
+}
+
+impl ManagementPlan {
+    fn new(branch: &str, state: State, current: Option<&BranchConfig>) -> Self {
+        let desired = BranchConfig::expected(Some(state), branch);
+        let branch_edits = current
+            .into_iter()
+            .flat_map(|current| {
+                current.changes_to(&desired).map(|(key, _, value)| {
+                    let key = format!("branch.{branch}.{}", key.suffix());
+                    match value {
+                        Some(value) => ConfigEdit::Replace { key, value: value.to_owned() },
+                        None => ConfigEdit::Unset { key },
+                    }
+                })
+            })
+            .collect();
+        Self {
+            branch_edits,
+            marker: ConfigEdit::Replace {
+                key: format!("branch.{branch}.gherritManaged"),
+                value: state.config_value().to_owned(),
+            },
+        }
+    }
+
+    fn execute(self, mut apply: impl FnMut(&ConfigEdit) -> Result<()>) -> Result<()> {
+        self.branch_edits.iter().chain(std::iter::once(&self.marker)).try_for_each(&mut apply)
     }
 }
 
 /// Configures the Git branch state for GHerrit management.
 pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()> {
-    let (branch_name, old_state) = repo.read_current_branch_and_state()?;
+    let branch_name = repo
+        .current_branch()
+        .name()
+        .ok_or_else(|| eyre::eyre!("Cannot get management state in detached HEAD"))?
+        .to_owned();
+    let values = repo.local_branch_config(&branch_name)?;
+    let old_state = State::from_values(&values.management)?;
     if new_state == State::Public {
         PublicBranchName::new(branch_name.clone()).wrap_err(
             "This branch cannot be managed as public. Rename it to a compatible branch name, or run `gherrit manage --private` to keep its stack private",
         )?;
     }
-    match transition_kind(old_state, new_state) {
+    let current = match transition_kind(old_state, new_state) {
         TransitionKind::NoChange => {
             log::debug!(
                 "Branch {} is already in the desired state ({new_state:?}).",
@@ -366,15 +428,14 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
             );
             return Ok(());
         }
-        TransitionKind::RecordUnmanaged => {}
+        TransitionKind::RecordUnmanaged => None,
         TransitionKind::ReconcileConfig => {
-            let current = BranchConfig::read_from(repo, &branch_name)?;
+            let current = BranchConfig::from_values(&values);
             // Compare against the old state's expected configuration, not the
             // requested state's configuration. Otherwise a transition could
             // silently adopt a user's custom value that happens to match the
             // new state, then treat that value as GHerrit-owned in the future.
             let expected = BranchConfig::expected(old_state, &branch_name);
-            let desired = BranchConfig::expected(Some(new_state), &branch_name);
             // `--force` is explicit authority to replace any non-current
             // owned configuration. It must remain usable even when unrelated
             // destination configuration is malformed; exact legacy
@@ -407,14 +468,12 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
                 }
             }
 
-            current.changes_to(&desired).try_for_each(|(key, _, value)| {
-                apply_config_update(repo, &branch_name, key, value)
-            })?;
+            Some(current)
         }
-    }
+    };
 
-    let state_key = format!("branch.{branch_name}.gherritManaged");
-    repo.replace_local_config(&state_key, new_state.config_value())?;
+    ManagementPlan::new(&branch_name, new_state, current.as_ref())
+        .execute(|edit| edit.apply(repo))?;
 
     let branch_name_y = branch_name.yellow();
     match new_state {
@@ -561,6 +620,111 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn next_management_invocation_preserves_partial_drift_until_forced() {
+        for state in [State::Private, State::Public, State::Unmanaged] {
+            for prefix in 0..=4 {
+                let context =
+                    testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+                context.checkout_new("feature-work");
+                let old = if state == State::Unmanaged { State::Private } else { State::Unmanaged };
+                let current = BranchConfig::expected(Some(old), "feature-work");
+                let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+                for (key, _, value) in BranchConfig::default().changes_to(&current) {
+                    repository
+                        .replace_local_config(
+                            &format!("branch.feature-work.{}", key.suffix()),
+                            value.unwrap(),
+                        )
+                        .unwrap();
+                }
+                repository
+                    .replace_local_config("branch.feature-work.gherritManaged", old.config_value())
+                    .unwrap();
+                let plan = ManagementPlan::new("feature-work", state, Some(&current));
+                for edit in
+                    plan.branch_edits.iter().chain(std::iter::once(&plan.marker)).take(prefix)
+                {
+                    edit.apply(&repository).unwrap();
+                }
+                let file = repository.layout().common_git_dir.join("config");
+                let before = std::fs::read(&file).unwrap();
+                set_state(&repository, state, false).unwrap();
+                if (1..=3).contains(&prefix) {
+                    assert_eq!(std::fs::read(&file).unwrap(), before, "partial config was adopted");
+                    assert_eq!(State::read_from(&repository, "feature-work").unwrap(), Some(old));
+                }
+                set_state(&repository, state, true).unwrap();
+                assert_eq!(State::read_from(&repository, "feature-work").unwrap(), Some(state));
+                assert_eq!(
+                    BranchConfig::read_from(&repository, "feature-work").unwrap(),
+                    BranchConfig::expected(Some(state), "feature-work")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn complete_management_plan_preserves_order_and_every_interruption_prefix() {
+        for state in [State::Private, State::Public, State::Unmanaged] {
+            let current = BranchConfig::expected(
+                Some(if state == State::Unmanaged { State::Private } else { State::Unmanaged }),
+                "feature",
+            );
+            let plan = ManagementPlan::new("feature", state, Some(&current));
+            let keys =
+                ["branch.feature.pushRemote", "branch.feature.remote", "branch.feature.merge"];
+            let mut expected: Vec<_> = if state == State::Unmanaged {
+                keys.into_iter().map(|key| ConfigEdit::Unset { key: key.to_owned() }).collect()
+            } else {
+                keys.into_iter()
+                    .zip([".", ".", "refs/heads/feature"])
+                    .map(|(key, value)| ConfigEdit::Replace {
+                        key: key.to_owned(),
+                        value: value.to_owned(),
+                    })
+                    .collect()
+            };
+            expected.push(ConfigEdit::Replace {
+                key: "branch.feature.gherritManaged".to_owned(),
+                value: match state {
+                    State::Private => "managedPrivate",
+                    State::Public => "managedPublic",
+                    State::Unmanaged => "false",
+                }
+                .to_owned(),
+            });
+            let edits: Vec<_> =
+                plan.branch_edits.iter().chain(std::iter::once(&plan.marker)).collect();
+            assert_eq!(edits, expected.iter().collect::<Vec<_>>());
+            for fail_at in 0..=edits.len() {
+                let mut observed = Vec::new();
+                let result =
+                    ManagementPlan::new("feature", state, Some(&current)).execute(|edit| {
+                        if observed.len() == fail_at {
+                            bail!("injected interruption");
+                        }
+                        observed.push(format!("{edit:?}"));
+                        Ok(())
+                    });
+                assert_eq!(result.is_ok(), fail_at == edits.len());
+                assert_eq!(
+                    observed,
+                    expected[..fail_at].iter().map(|edit| format!("{edit:?}")).collect::<Vec<_>>()
+                );
+            }
+        }
+        let unmanaged = ManagementPlan::new("feature", State::Unmanaged, None);
+        assert!(unmanaged.branch_edits.is_empty());
+        assert_eq!(
+            unmanaged.marker,
+            ConfigEdit::Replace {
+                key: "branch.feature.gherritManaged".to_owned(),
+                value: "false".to_owned(),
+            }
+        );
+    }
+
     use super::*;
 
     const REPOSITORY_SELECTION_FIXTURE_MODE: &str = "GHERRIT_REPOSITORY_SELECTION_FIXTURE";
