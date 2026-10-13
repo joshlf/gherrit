@@ -385,6 +385,7 @@ fn every_destination_bearing_git_command_disables_redirects() {
         .to_str()
         .unwrap();
     assert!(parameters.ends_with(&redirect_parameter));
+    assert!(push.get_envs().all(|(name, _)| name != OsStr::new("LC_ALL")));
     assert_eq!(
         push.get_envs()
             .find(|(name, _)| *name == OsStr::new(INTERNAL_PRE_PUSH_REMOTE_ENV))
