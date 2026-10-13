@@ -37,7 +37,8 @@ impl Repo {
         let mut command = self.local_config_command();
         command.args(["--null", "--get-all", key]);
 
-        let output = command.output().wrap_err("Failed to inspect local Git configuration")?;
+        let output =
+            command.bounded_output().wrap_err("Failed to inspect local Git configuration")?;
         match output.status.code() {
             Some(0) if output.stderr.is_empty() => {
                 let Some(values) = output.stdout.strip_suffix(b"\0") else {
@@ -145,7 +146,7 @@ impl Repo {
         let output = self
             .local_config_command()
             .args(["--null", "--get-regexp", &pattern])
-            .output()
+            .bounded_output()
             .wrap_err("Failed to inspect local Git configuration")?;
         match output.status.code() {
             Some(0) if output.stderr.is_empty() => decode_branch_config(branch, &output.stdout),

@@ -11,7 +11,13 @@ pub fn get_github_token() -> Result<String> {
     }
 
     // Priority 2: gh auth token
-    let output = cmd!("gh auth token").output().wrap_err("Failed to run `gh auth token`")?;
+    let output = crate::pre_push::subprocess::local_output(
+        &mut cmd!("gh auth token"),
+        None,
+        std::time::Duration::from_secs(30),
+        64 * 1024,
+    )
+    .wrap_err("Failed to run `gh auth token`")?;
 
     if output.status.success() {
         let token = String::from_utf8(output.stdout)?.trim().to_string();
