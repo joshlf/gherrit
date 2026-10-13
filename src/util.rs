@@ -1,3 +1,5 @@
+mod layout;
+
 use std::{
     env,
     ffi::OsStr,
@@ -266,7 +268,7 @@ impl Repo {
     /// graft files, and a shallow boundary hides real ancestry. This check must
     /// therefore run before publication graph traversal.
     pub fn ensure_publishable_history(&self) -> Result<()> {
-        let common_dir = self.inner.common_dir();
+        let common_dir = self.layout().common_git_dir;
         reject_nonempty_history_file(
             &common_dir.join("info/grafts"),
             "the common Git directory's info/grafts file",

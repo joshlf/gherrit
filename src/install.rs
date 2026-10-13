@@ -69,7 +69,8 @@ pub fn install(repo: &Repo, force: bool, allow_global: bool) -> Result<()> {
 fn resolve_hooks_dir(repo: &Repo, allow_global: bool) -> Result<PathBuf> {
     if let Some(path_buf) = repo.config_path("core.hooksPath")? {
         // Security check: ensure the hooks directory is within the repository.
-        let root = repo.workdir().unwrap_or(repo.path());
+        let layout = repo.layout();
+        let root = layout.workdir.unwrap_or(layout.worktree_git_dir);
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
         // Best effort canonicalization
@@ -92,5 +93,5 @@ fn resolve_hooks_dir(repo: &Repo, allow_global: bool) -> Result<PathBuf> {
     }
 
     // Default: .git/hooks
-    Ok(repo.path().join("hooks"))
+    Ok(repo.layout().worktree_git_dir.join("hooks"))
 }
