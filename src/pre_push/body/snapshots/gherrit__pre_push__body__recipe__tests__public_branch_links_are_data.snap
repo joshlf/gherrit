@@ -1,0 +1,41 @@
+---
+source: src/pre_push/body/recipe.rs
+expression: rendered
+---
+===== "main" =====
+This PR is on branch [main](../tree/main).
+
+===== "feature/public-stack" =====
+This PR is on branch [feature\/public\-stack](../tree/feature/public-stack).
+
+===== "release_(candidate)" =====
+This PR is on branch [release\_\(candidate\)](../tree/release_%28candidate%29).
+
+===== "fix]docs" =====
+This PR is on branch [fix\]docs](../tree/fix%5Ddocs).
+
+===== "hash#fragment" =====
+This PR is on branch [hash\#fragment](../tree/hash%23fragment).
+
+===== "percent%2Fslash" =====
+This PR is on branch [percent\%2Fslash](../tree/percent%252Fslash).
+
+===== "amp&copy;" =====
+This PR is on branch [amp\&copy\;](../tree/amp%26copy%3B).
+
+===== "tick`name" =====
+This PR is on branch [tick\`name](../tree/tick%60name).
+
+===== "angle<tag>" =====
+This PR is on branch [angle\<tag\>](../tree/angle%3Ctag%3E).
+
+===== "paren)tail" =====
+This PR is on branch [paren\)tail](../tree/paren%29tail).
+
+===== "café/東京" =====
+This PR is on branch [café\/東京](../tree/caf%C3%A9/%E6%9D%B1%E4%BA%AC).
+
+===== "feature/🚀" =====
+This PR is on branch [feature\/🚀](../tree/feature/%F0%9F%9A%80).
+
+===== END =====

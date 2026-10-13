@@ -703,6 +703,33 @@ impl ChangeHistory {
 pub(super) struct ValidatedChangeHistory(ChangeHistory);
 
 impl ValidatedChangeHistory {
+    /// Constructs trusted synthetic literal facts for renderer unit tests.
+    ///
+    /// History validation itself is exercised in this module's boundary
+    /// tests. Body tests use this narrow constructor so they do not rebuild a
+    /// repository merely to test deterministic formatting and byte limits.
+    /// Callers are responsible for supplying facts appropriate to their case.
+    #[cfg(test)]
+    pub(super) fn for_body_test(
+        id: GherritPrId,
+        published: &[(ObjectId, ObjectId)],
+        proposal: (ObjectId, ObjectId),
+    ) -> Self {
+        let published = published.split_first().map(|(first, later)| PublishedHistory {
+            first: Revision { head: first.0, first_parent: first.1 },
+            later: later
+                .iter()
+                .map(|(head, first_parent)| Revision { head: *head, first_parent: *first_parent })
+                .collect(),
+            pull_request_marker: None,
+        });
+        Self(ChangeHistory {
+            id,
+            published,
+            proposed: Revision { head: proposal.0, first_parent: proposal.1 },
+        })
+    }
+
     pub(super) fn id(&self) -> &GherritPrId {
         &self.0.id
     }
