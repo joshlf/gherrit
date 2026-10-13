@@ -1680,3 +1680,20 @@ fn is_terminal_probe_close(error: &io::Error) -> bool {
         false
     }
 }
+
+#[test]
+fn synchronous_local_entry_preserves_status_bytes_and_bounds() {
+    let output = local_output(&mut reexec("binary-stdout"), None, TEST_TIMEOUT, 1024).unwrap();
+    assert!(output.status.success());
+    assert_eq!(framed_fixture_stdout(&output.stdout), [1, 128, 255]);
+    let output = local_output(&mut reexec("nonzero"), None, TEST_TIMEOUT, 1024).unwrap();
+    assert_eq!(output.status.code(), Some(23));
+    assert!(matches!(
+        local_output(reexec("stdout-overflow").env(REEXEC_BYTES, "8"), None, TEST_TIMEOUT, 7),
+        Err(CommandError::StdoutTooLarge { limit: 7 })
+    ));
+    assert!(matches!(
+        local_output(&mut reexec("sleep"), None, Duration::ZERO, 7),
+        Err(CommandError::TimedOut)
+    ));
+}

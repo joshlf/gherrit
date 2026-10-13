@@ -135,3 +135,90 @@ fn test_commit_msg_trailers_failure() {
         ctx.assert_failure_consumed();
     }
 }
+
+#[test]
+// Darwin filesystems reject invalid UTF-8 names before the hook can run.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn test_commit_msg_non_utf8_filename() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+    let ctx = testutil::test_context!().build();
+    ctx.gherrit_cmd().arg("manage").assert().success();
+    let path = ctx.repo_path.join(OsString::from_vec(b"message-\xff".to_vec()));
+    std::fs::write(&path, "subject\n").unwrap();
+    ctx.gherrit_cmd().args(["hook", "commit-msg"]).arg(&path).assert().success();
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.starts_with(b"subject\n"));
+    assert!(bytes.windows(b"gherrit-pr-id: G".len()).any(|window| window == b"gherrit-pr-id: G"));
+}
+
+#[test]
+#[cfg(unix)]
+fn test_existing_identity_avoids_committer_lookup() {
+    let ctx = testutil::test_context!().with_git_interceptor().build();
+    ctx.gherrit_cmd().arg("manage").assert().success();
+    let path = ctx.repo_path.join("identified-message");
+    let message = "subject\n\ngherrit-pr-id: Legacy123\n";
+    std::fs::write(&path, message).unwrap();
+    ctx.expect_git_failure(testutil::GitOperation::Var);
+    ctx.gherrit_cmd().args(["hook", "commit-msg"]).arg(&path).assert().success();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), message);
+    // Consume the still-pending failure explicitly: the hook did not query it.
+    ctx.git_cmd().args(["var", "GIT_COMMITTER_IDENT"]).assert().failure();
+    ctx.assert_failure_consumed();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_installed_hook_preserves_git_empty_message_decisions() {
+    use std::os::unix::fs::PermissionsExt as _;
+    #[derive(serde::Deserialize, Debug)]
+    struct Case {
+        character: String,
+        mode: String,
+        allow: bool,
+        message: String,
+        success: bool,
+        stored: String,
+    }
+    // Independent receipts captured from unhooked Git 2.54.0; no production
+    // cleanup helper constructs the expected acceptance or stored message.
+    let cases: Vec<Case> =
+        serde_json::from_str(include_str!("fixtures/message-cleanup.json")).unwrap();
+    let ctx = testutil::test_context!().with_installed_hooks().with_initial_commit().build();
+    ctx.gherrit_cmd().arg("manage").assert().success();
+    let editor = ctx.dir.path().join("message-editor");
+    std::fs::write(&editor, "#!/bin/sh\ncp \"$GHERRIT_MESSAGE_FILE\" \"$1\"\n").unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let input = ctx.dir.path().join("editor-input");
+    for case in cases {
+        ctx.run_git(&["config", "core.commentChar", &case.character]);
+        std::fs::write(&input, &case.message).unwrap();
+        let before = ctx.head_oid();
+        let mut command = ctx.git_cmd();
+        command
+            .args(["commit", "--amend", "--allow-empty"])
+            .env("GIT_EDITOR", &editor)
+            .env("GHERRIT_MESSAGE_FILE", &input);
+        if case.mode != "default" {
+            command.arg(format!("--cleanup={}", case.mode));
+        }
+        if case.allow {
+            command.arg("--allow-empty-message");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.success(), case.success, "{case:?}: {output:?}");
+        if case.success {
+            let stored = ctx
+                .git_cmd()
+                .args(["show", "-s", "--format=%B", "HEAD"])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            assert_eq!(stored, case.stored.as_bytes(), "{case:?}");
+        } else {
+            assert_eq!(ctx.head_oid(), before, "aborted amend moved HEAD: {case:?}");
+        }
+    }
+}

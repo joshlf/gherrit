@@ -453,4 +453,5 @@ fn is_resource_limit_error(error: &Value) -> bool {
 }
 
 #[cfg(test)]
+#[path = "transport/tests.rs"]
 mod tests;
