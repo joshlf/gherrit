@@ -33,6 +33,13 @@ mod legacy_github;
 mod legacy_publication;
 mod legacy_remote;
 mod local;
+// Canonical marker identity is compiled alongside exact history before the
+// exact publisher is activated as one coherent boundary.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "exact history activation must include publication")
+)]
+mod marker;
 #[cfg(test)]
 mod publication;
 mod reconcile;
