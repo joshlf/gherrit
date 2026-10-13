@@ -68,6 +68,9 @@ pub fn run() -> ExitCode {
     }
 
     let system_git = env::var("SYSTEM_GIT_PATH").expect("missing system Git path");
+    // The interceptor is itself a descendant of the bounded hermetic
+    // `TestCommand` that launched fixture Git. Passthrough must remain in that
+    // process group so the outer deadline owns the real Git child as well.
     let mut command = Command::new(system_git);
     command.args(&args[1..]);
     if response.suppress_stdout {
