@@ -1,10 +1,15 @@
 use gix::ObjectId;
 
-use super::*;
+use super::{
+    super::{
+        github::{AbsentPullRequest, ObservedBase},
+        history::ValidatedChangeHistory,
+    },
+    *,
+};
 use crate::pre_push::{
+    batching::MAX_MUTATION_REQUEST_BYTES,
     destination::RepositoryCoordinates,
-    github::{AbsentPullRequest, ObservedBase},
-    history::ValidatedChangeHistory,
     local::{GherritPrId, LocalStack},
 };
 
@@ -190,16 +195,24 @@ fn content_key(change_id: &str) -> &str {
     &change_id[..change_id.len().min(32)]
 }
 
-fn plan(specs: &[EntrySpec]) -> Result<PublicationPlan> {
+fn plan(specs: &[EntrySpec]) -> Result<PlannedPublication> {
     plan_with_public_branch(specs, None)
 }
 
 fn plan_with_public_branch(
     specs: &[EntrySpec],
     public_branch: Option<String>,
-) -> Result<PublicationPlan> {
+) -> Result<PlannedPublication> {
     let Inputs { destination, stack, histories, pull_requests } = inputs(specs);
-    plan_publication(&destination, public_branch, stack, histories, pull_requests)
+    plan_effects(&destination, public_branch, stack, histories, pull_requests)
+}
+
+fn observed_for_plan(
+    destination: &PushDestination,
+    pull_requests: CompleteLocalPullRequests,
+) -> ObservedGithub {
+    let github = Github::for_plan_test(destination);
+    ObservedGithub::for_plan_test(github, pull_requests)
 }
 
 fn tuple_count(pushes: &PreparedPushes) -> usize {
@@ -223,14 +236,14 @@ fn tuple_for_test(history: &ValidatedChangeHistory) -> Option<Result<TupleTransi
     tuple_transition(history, publication_revision(history.proposed()).unwrap())
 }
 
-fn ready(plan: PublicationPlan) -> MarkerStage {
+fn ready(plan: PlannedPublication) -> MarkerStage {
     match plan.after_tuples {
-        AfterTuples::Ready(stage) => stage,
+        AfterTuples::Ready(stage) => *stage,
         AfterTuples::Creates(_) => panic!("expected an all-existing projection"),
     }
 }
 
-fn creates(plan: PublicationPlan) -> CreateStage {
+fn creates(plan: PlannedPublication) -> CreateStage {
     match plan.after_tuples {
         AfterTuples::Creates(stage) => *stage,
         AfterTuples::Ready(_) => panic!("expected a create-dependent projection"),
@@ -349,9 +362,65 @@ fn planner_rejects_an_empty_stack_before_deriving_any_stage() {
     )
     .unwrap();
 
-    let error =
-        plan_publication(&destination, None, stack, Box::new([]), pull_requests).err().unwrap();
+    let error = plan_effects(&destination, None, stack, Box::new([]), pull_requests).err().unwrap();
     assert!(error.to_string().contains("requires a nonempty local stack"));
+}
+
+#[tokio::test]
+async fn publication_plan_retains_its_matching_client_and_exact_git_target() {
+    let spec = EntrySpec {
+        id: "Gone",
+        history: HistorySpec::absent(),
+        pull_request: PullRequestSpec::Absent,
+    };
+    let Inputs { destination, stack, histories, pull_requests } = inputs(&[spec]);
+    let observed = observed_for_plan(&destination, pull_requests);
+    let expected_target = destination.publication_target();
+    let validated = ValidatedPublication::for_plan_test(histories, destination);
+
+    let plan = plan_publication(validated, observed, None, stack).unwrap();
+    assert!(plan.github.publication_target() == &expected_target);
+    assert!(plan.destination.publication_target() == expected_target);
+}
+
+#[tokio::test]
+async fn one_attempt_rejects_a_client_for_another_literal_git_destination() {
+    let spec = EntrySpec {
+        id: "Gone",
+        history: HistorySpec::absent(),
+        pull_request: PullRequestSpec::Absent,
+    };
+    let Inputs { destination, stack, histories, pull_requests } = inputs(&[spec]);
+    let repository = crate::util::Repo::open(".").unwrap();
+    let other = PushDestination::for_test_url_in(&repository, "git@github.com:owner/repo.git");
+    let observed = observed_for_plan(&other, pull_requests);
+    let validated = ValidatedPublication::for_plan_test(histories, destination);
+
+    let error = plan_publication(validated, observed, None, stack)
+        .err()
+        .expect("different literal destinations must not share one attempt");
+    assert!(error.to_string().contains("different repository or push destination"));
+}
+
+#[tokio::test]
+async fn one_attempt_rejects_a_client_for_another_local_repository() {
+    let spec = EntrySpec {
+        id: "Gone",
+        history: HistorySpec::absent(),
+        pull_request: PullRequestSpec::Absent,
+    };
+    let Inputs { destination, stack, histories, pull_requests } = inputs(&[spec]);
+    let directory = tempfile::tempdir().unwrap();
+    gix::init_bare(directory.path()).unwrap();
+    let repository = crate::util::Repo::open(directory.path().to_str().unwrap()).unwrap();
+    let other = PushDestination::for_test_in(&repository);
+    let observed = observed_for_plan(&other, pull_requests);
+    let validated = ValidatedPublication::for_plan_test(histories, destination);
+
+    let error = plan_publication(validated, observed, None, stack)
+        .err()
+        .expect("different local repositories must not share one attempt");
+    assert!(error.to_string().contains("different repository or push destination"));
 }
 
 #[test]
@@ -430,14 +499,13 @@ fn all_counts_and_ordered_joins_are_checked_before_planning() {
         };
         drop(preparation);
         let error =
-            plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+            plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
         assert!(error.to_string().contains("different change counts"), "case={change}");
     }
 
     let Inputs { destination, stack, mut histories, pull_requests } = inputs(&specs);
     histories.swap(0, 1);
-    let error =
-        plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+    let error = plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
     assert!(error.to_string().contains("Git history at stack position 0"));
 
     let Inputs { destination, stack, histories, pull_requests } = inputs(&specs);
@@ -453,8 +521,7 @@ fn all_counts_and_ordered_joins_are_checked_before_planning() {
         &[],
     )
     .unwrap();
-    let error =
-        plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+    let error = plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
     assert!(error.to_string().contains("GitHub evidence at stack position 0"));
 }
 
@@ -474,7 +541,7 @@ fn repository_default_and_proposal_facts_must_match() {
             oid(10),
         );
         let error =
-            plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+            plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
         assert!(error.to_string().contains("different push repository"));
     }
 
@@ -482,22 +549,20 @@ fn repository_default_and_proposal_facts_must_match() {
         let Inputs { destination, stack, histories, pull_requests } =
             inputs_with_repository(std::slice::from_ref(&spec), "owner", "repo", name, tip);
         let error =
-            plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+            plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
         assert!(error.to_string().contains("disagree"));
     }
 
     let Inputs { destination, stack, mut histories, pull_requests } =
         inputs(std::slice::from_ref(&spec));
     histories[0] = validated_history(id("Gone"), &[], (oid(99), oid(10)), None);
-    let error =
-        plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+    let error = plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
     assert!(error.to_string().contains("local proposal and first parent"));
 
     let Inputs { destination, stack, mut histories, pull_requests } =
         inputs(std::slice::from_ref(&spec));
     histories[0] = validated_history(id("Gone"), &[], (oid(20), oid(99)), None);
-    let error =
-        plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+    let error = plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
     assert!(error.to_string().contains("local proposal and first parent"));
 }
 
@@ -624,7 +689,7 @@ fn tuple_selection_uses_only_absence_or_a_changed_current_revision() {
         None,
     );
     let transition = tuple_for_test(&changed).unwrap().unwrap();
-    let pushes = prepare_tuple_pushes(&[transition]).unwrap();
+    let pushes = prepare_tuple_pushes(&PushDestination::for_test(), &[transition]).unwrap();
     let refspecs = pushes.batches().flat_map(|batch| batch.refspecs()).collect::<Vec<_>>();
     assert!(refspecs.iter().any(|value| value.ends_with("refs/tags/gherrit/Gchanged/v4")));
 
@@ -830,11 +895,11 @@ fn exact_update_preflight_after_receipts_still_precedes_marker_release() {
         history: HistorySpec::absent(),
         pull_request: PullRequestSpec::Absent,
     };
-    let oversized_node = "N".repeat(super::super::batching::MAX_MUTATION_REQUEST_BYTES);
+    let oversized_node = "N".repeat(MAX_MUTATION_REQUEST_BYTES);
     let receipts =
         CompleteCreateReceipts::for_plan_test(vec![(id("Gone"), identity(1, &oversized_node))]);
     let error = creates(plan(&[spec]).unwrap()).complete_for_test(receipts).err().unwrap();
-    let limit = super::super::batching::MAX_MUTATION_REQUEST_BYTES;
+    let limit = MAX_MUTATION_REQUEST_BYTES;
     assert!(error.to_string().contains(&format!("exceeds the {limit}-byte request limit")));
 }
 
@@ -848,7 +913,7 @@ fn graphql_stages_are_preflighted_before_a_tuple_plan_can_escape() {
     let Inputs { destination, stack, histories, pull_requests } = inputs(&[fresh]);
     let (github_default, observations, _) =
         pull_requests.into_planning_parts_for(&destination).unwrap();
-    let oversized_repository = "R".repeat(super::super::batching::MAX_MUTATION_REQUEST_BYTES);
+    let oversized_repository = "R".repeat(MAX_MUTATION_REQUEST_BYTES);
     let pull_requests = CompleteLocalPullRequests::for_plan_test_with_repository_node(
         RepositoryCoordinates::for_test("owner", "repo"),
         github_default,
@@ -857,11 +922,10 @@ fn graphql_stages_are_preflighted_before_a_tuple_plan_can_escape() {
         &oversized_repository,
     )
     .unwrap();
-    let error =
-        plan_publication(&destination, None, stack, histories, pull_requests).err().unwrap();
+    let error = plan_effects(&destination, None, stack, histories, pull_requests).err().unwrap();
     assert!(error.to_string().contains("GraphQL create mutation at item 0"));
 
-    let oversized_node = "N".repeat(super::super::batching::MAX_MUTATION_REQUEST_BYTES);
+    let oversized_node = "N".repeat(MAX_MUTATION_REQUEST_BYTES);
     let spec = EntrySpec {
         id: "Gupdate",
         history: HistorySpec { published: vec![(oid(101), oid(10))], marker: Some(7) },
@@ -878,7 +942,7 @@ fn graphql_stages_are_preflighted_before_a_tuple_plan_can_escape() {
         }),
     };
     let error = plan(&[spec]).err().unwrap();
-    let limit = super::super::batching::MAX_MUTATION_REQUEST_BYTES;
+    let limit = MAX_MUTATION_REQUEST_BYTES;
     assert!(error.to_string().contains(&format!("exceeds the {limit}-byte request limit")));
 }
 
