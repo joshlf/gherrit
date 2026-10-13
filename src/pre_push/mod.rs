@@ -14,6 +14,8 @@ mod body;
 mod destination;
 #[cfg(test)]
 mod github;
+#[cfg(test)]
+mod history;
 mod json;
 mod legacy_github;
 mod legacy_publication;
