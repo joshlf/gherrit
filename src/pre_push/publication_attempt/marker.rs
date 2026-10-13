@@ -163,6 +163,31 @@ impl PreparedMarker {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn generated_codec_marker_mutations_cannot_hide_trailing_bytes() {
+        let id = GherritPrId::from_ref_component(b"Gone").unwrap();
+        let v1 = ObjectId::from_hex(b"2222222222222222222222222222222222222222").unwrap();
+        // Independent literal framing, rather than the production encoder.
+        let seed = b"object 2222222222222222222222222222222222222222\ntype commit\ntag gherrit/Gone/pr\ntagger GHerrit <gherrit@invalid> 0 +0000\n\ngherrit-canonical-pr-v1 27\n";
+        assert_eq!(PullRequestMarker::decode(&id, v1, seed).unwrap().number().get(), 27);
+        for byte in 0..=u8::MAX {
+            let mut trailing = seed.to_vec();
+            trailing.push(byte);
+            assert!(PullRequestMarker::decode(&id, v1, &trailing).is_err());
+            for position in 0..=seed.len() {
+                let mut input = seed.to_vec();
+                input.insert(position, byte);
+                if let Ok(marker) = PullRequestMarker::decode(&id, v1, &input) {
+                    assert_eq!(marker.encode(&id, v1).unwrap(), input);
+                }
+            }
+        }
+        for length in [MAX_TAG_BYTES - 1, MAX_TAG_BYTES, MAX_TAG_BYTES + 1] {
+            assert!(PullRequestMarker::decode(&id, v1, &vec![0; length]).is_err());
+        }
+    }
+
     use super::*;
 
     fn id() -> GherritPrId {
