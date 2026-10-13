@@ -17,6 +17,7 @@ use gix::ObjectId;
 use super::{
     destination::DefaultBranch,
     local::{GherritIdTrailer, GherritPrId, LocalChange, LocalStack, gherrit_id_trailers},
+    marker::{MAX_TAG_BYTES, PullRequestMarker},
     remote::{RawExactLocalChange, RawExactLocalChangeParts, RawExactLocalObservation},
     version::Version,
 };
@@ -58,31 +59,13 @@ impl Revision {
 ///
 /// Version numbers are derived from positions: `first` is v1 and position
 /// zero in `later` is v2. Every immutable tag position remains distinct,
-/// including adjacent and nonadjacent repeats. A validated marker retains the
-/// annotated tag object and its mandatory v1 target so later acquisition and
-/// decoding cannot exchange either identity.
+/// including adjacent and nonadjacent repeats. A validated marker retains its
+/// immutable GitHub identity rather than collapsing it to a boolean.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PublishedHistory {
     first: Revision,
     later: Box<[Revision]>,
-    pull_request_marker: Option<ObservedPullRequestMarker>,
-}
-
-/// Exact ref-level marker evidence, before the annotated tag object is loaded.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ObservedPullRequestMarker {
-    tag: ObjectId,
-    v1: ObjectId,
-}
-
-impl ObservedPullRequestMarker {
-    pub(super) fn tag(self) -> ObjectId {
-        self.tag
-    }
-
-    pub(super) fn v1(self) -> ObjectId {
-        self.v1
-    }
+    pull_request_marker: Option<PullRequestMarker>,
 }
 
 impl PublishedHistory {
@@ -116,11 +99,7 @@ impl PublishedHistory {
         CurrentVersion { number, revision }
     }
 
-    fn has_pull_request_marker(&self) -> bool {
-        self.pull_request_marker().is_some()
-    }
-
-    fn pull_request_marker(&self) -> Option<ObservedPullRequestMarker> {
+    fn pull_request_marker(&self) -> Option<PullRequestMarker> {
         self.pull_request_marker
     }
 }
@@ -147,7 +126,7 @@ struct PreparedPublishedHistory {
     first: ObjectId,
     later: Box<[ObjectId]>,
     owned_base: ObjectId,
-    pull_request_marker: Option<ObservedPullRequestMarker>,
+    pull_request_marker: Option<PreparedPullRequestMarker>,
 }
 
 /// Structurally checked version which still owns exact acquisition provenance.
@@ -170,11 +149,55 @@ struct SourcedPreparedHistory {
     published: Option<SourcedPreparedPublishedHistory>,
 }
 
-/// Marker evidence which still owns the exact advertised acquisition source.
+/// Raw marker provenance retained until exact object acquisition is complete.
 struct SourcedPreparedPullRequestMarker {
     tag: ObjectId,
     v1: ObjectId,
     source_ref: Box<str>,
+}
+
+/// Provenance-free marker object fact ready for strict ODB decoding.
+struct PreparedPullRequestMarker {
+    tag: ObjectId,
+    v1: ObjectId,
+}
+
+/// Checks the only object-database facts needed before allocating a complete
+/// marker object. Keeping this separate from byte decoding makes oversized
+/// advertised tags fail before `try_find_object` can allocate their payload,
+/// and gives acquisition preflight and final decoding the same acceptance
+/// rule.
+fn validate_marker_object_header(repository: &util::Repo, tag: ObjectId) -> Result<bool> {
+    let Some(header) = repository
+        .try_find_header(tag)
+        .wrap_err_with(|| format!("Failed to read pull-request marker tag header {tag}"))?
+    else {
+        return Ok(false);
+    };
+    if header.kind() != gix::object::Kind::Tag {
+        bail!("Pull-request marker object {tag} is {}, not an annotated tag", header.kind());
+    }
+    if header.size() > u64::try_from(MAX_TAG_BYTES).expect("tag-byte bound fits in u64") {
+        bail!("Pull-request marker tag object {tag} exceeds the {MAX_TAG_BYTES}-byte limit");
+    }
+    Ok(true)
+}
+
+fn decode_marker_object(
+    repository: &util::Repo,
+    id: &GherritPrId,
+    marker: PreparedPullRequestMarker,
+) -> Result<PullRequestMarker> {
+    if !validate_marker_object_header(repository, marker.tag)? {
+        bail!("Pull-request marker tag object {} is missing", marker.tag);
+    }
+    let object = repository
+        .try_find_object(marker.tag)
+        .wrap_err_with(|| format!("Failed to read pull-request marker tag object {}", marker.tag))?
+        .ok_or_else(|| eyre!("Pull-request marker tag object {} is missing", marker.tag))?;
+    debug_assert_eq!(object.kind, gix::object::Kind::Tag);
+    PullRequestMarker::decode(id, marker.v1, &object.data)
+        .wrap_err_with(|| format!("Pull-request marker tag object {} is invalid", marker.tag))
 }
 
 impl PreparedPublishedHistory {
@@ -190,6 +213,7 @@ impl PreparedPublishedHistory {
         self,
         id: &GherritPrId,
         mut resolve: impl FnMut(ObjectId) -> Result<Revision>,
+        decode_marker: impl FnOnce(PreparedPullRequestMarker, &GherritPrId) -> Result<PullRequestMarker>,
     ) -> Result<PublishedHistory> {
         let mut revisions = self
             .iter()
@@ -215,7 +239,9 @@ impl PreparedPublishedHistory {
                 id.as_str()
             );
         }
-        Ok(PublishedHistory { first, later, pull_request_marker: self.pull_request_marker })
+        let pull_request_marker =
+            self.pull_request_marker.map(|marker| decode_marker(marker, id)).transpose()?;
+        Ok(PublishedHistory { first, later, pull_request_marker })
     }
 }
 
@@ -379,7 +405,7 @@ impl SourcedPreparedHistory {
             let first = heads.next().expect("a sourced prepared history is nonempty");
             let pull_request_marker = pull_request_marker.map(|marker| {
                 consume_marker_source(marker.tag, marker.source_ref);
-                ObservedPullRequestMarker { tag: marker.tag, v1: marker.v1 }
+                PreparedPullRequestMarker { tag: marker.tag, v1: marker.v1 }
             });
             PreparedPublishedHistory {
                 first,
@@ -401,19 +427,28 @@ impl SourcedPreparedHistory {
         let prepared = sourced.into_prepared(|_, _| {}, |_, _| {});
         let graph =
             CommitGraphEvidence::load_for_test(repository, roots).map_err(graph_load_report)?;
-        prepared.resolve_remote_for_test(&graph)
+        prepared.resolve_remote_for_test(repository, &graph)
     }
 }
 
 impl PreparedHistory {
-    fn resolve(self, local: &LocalChange, graph: &CommitGraphEvidence) -> Result<ChangeHistory> {
+    fn resolve(
+        self,
+        local: &LocalChange,
+        graph: &CommitGraphEvidence,
+        repository: &util::Repo,
+    ) -> Result<ChangeHistory> {
         let Self { id, published } = self;
         let proposed = Revision::from_local(local);
         let published = published
             .map(|history| {
-                history.resolve_with(&id, |head| {
-                    if head == proposed.head() { Ok(proposed) } else { graph.revision(head) }
-                })
+                history.resolve_with(
+                    &id,
+                    |head| {
+                        if head == proposed.head() { Ok(proposed) } else { graph.revision(head) }
+                    },
+                    |marker, id| decode_marker_object(repository, id, marker),
+                )
             })
             .transpose()?;
         Ok(ChangeHistory { id, published, proposed })
@@ -422,11 +457,18 @@ impl PreparedHistory {
     #[cfg(test)]
     fn resolve_remote_for_test(
         self,
+        repository: &util::Repo,
         graph: &CommitGraphEvidence,
     ) -> Result<(GherritPrId, Option<PublishedHistory>)> {
         let Self { id, published } = self;
         let published = published
-            .map(|history| history.resolve_with(&id, |head| graph.revision(head)))
+            .map(|history| {
+                history.resolve_with(
+                    &id,
+                    |head| graph.revision(head),
+                    |marker, id| decode_marker_object(repository, id, marker),
+                )
+            })
             .transpose()?;
         Ok((id, published))
     }
@@ -488,17 +530,9 @@ impl<'local, 'repository> PreparedExactLocalHistories<'local, 'repository> {
     ) -> std::result::Result<CommitGraphEvidence, GraphLoadError<'_>> {
         let graph = CommitGraphEvidence::load(self.repository, &self.histories.roots)?;
         for marker in &self.histories.marker_objects {
-            let present = self
-                .repository
-                .try_find_header(marker.oid)
-                .map_err(|error| {
-                    GraphLoadError::Invalid(Report::new(error).wrap_err(format!(
-                        "Failed to read pull-request marker tag header {}",
-                        marker.oid
-                    )))
-                })?
-                .is_some();
-            if !present {
+            if !validate_marker_object_header(self.repository, marker.oid)
+                .map_err(GraphLoadError::Invalid)?
+            {
                 return Err(GraphLoadError::MissingMarkerObject(marker));
             }
         }
@@ -520,7 +554,7 @@ impl<'local, 'repository> PreparedExactLocalHistories<'local, 'repository> {
         self,
         graph: &CommitGraphEvidence,
     ) -> Result<Box<[ValidatedChangeHistory]>> {
-        self.histories.validate(graph)
+        self.histories.validate(graph, self.repository)
     }
 }
 
@@ -615,13 +649,17 @@ impl<'local> StructurallyPreparedHistories<'local> {
         self.roots.iter()
     }
 
-    fn validate(self, graph: &CommitGraphEvidence) -> Result<Box<[ValidatedChangeHistory]>> {
+    fn validate(
+        self,
+        graph: &CommitGraphEvidence,
+        repository: &util::Repo,
+    ) -> Result<Box<[ValidatedChangeHistory]>> {
         let histories = self
             .prepared
             .into_vec()
             .into_iter()
             .zip(self.local.iter())
-            .map(|(prepared, local)| prepared.resolve(local, graph))
+            .map(|(prepared, local)| prepared.resolve(local, graph, repository))
             .collect::<Result<Vec<_>>>()?;
         histories.into_iter().map(|history| history.validate(graph)).collect()
     }
@@ -755,7 +793,11 @@ impl ValidatedChangeHistory {
     }
 
     pub(super) fn has_pull_request_marker(&self) -> bool {
-        self.0.published.as_ref().is_some_and(PublishedHistory::has_pull_request_marker)
+        self.pull_request_marker().is_some()
+    }
+
+    pub(super) fn pull_request_marker(&self) -> Option<PullRequestMarker> {
+        self.0.published.as_ref().and_then(PublishedHistory::pull_request_marker)
     }
 
     pub(super) fn proposed(&self) -> Revision {
@@ -1095,6 +1137,7 @@ mod tests {
     use super::*;
     use crate::pre_push::{
         destination::DefaultBranch,
+        github::PullRequestNumber,
         remote::{RawExactLocalObservation, decode_for_test},
     };
 
@@ -1142,6 +1185,15 @@ mod tests {
                 .expect("write malformed test commit")
         }
 
+        fn marker_tag(&self, id: &GherritPrId, v1: ObjectId, number: u32) -> ObjectId {
+            let bytes = PullRequestMarker::new(PullRequestNumber::for_test(number))
+                .encode(id, v1)
+                .expect("encode canonical test marker");
+            self.writer
+                .write_buf(gix::object::Kind::Tag, &bytes)
+                .expect("write canonical test marker")
+        }
+
         fn corrupt_loose_object(&self, oid: ObjectId) {
             let hex = oid.to_string();
             let directory = self.directory.path().join("objects").join(&hex[..2]);
@@ -1164,6 +1216,80 @@ mod tests {
         DefaultBranch::new(name.to_owned(), tip).unwrap()
     }
 
+    #[test]
+    fn marker_header_rejects_wrong_kind_and_oversized_tag_before_object_load() {
+        let repository = TestRepository::new();
+        let wrong_kind = repository.writer.write_blob(b"not a tag").unwrap().detach();
+        let oversized = repository
+            .writer
+            .write_buf(gix::object::Kind::Tag, &vec![b'x'; MAX_TAG_BYTES + 1])
+            .unwrap();
+        let opened = repository.open();
+
+        assert!(
+            !validate_marker_object_header(&opened, ObjectId::from_bytes_or_panic(&[0x77; 20]))
+                .unwrap()
+        );
+        assert!(validate_marker_object_header(&opened, wrong_kind).is_err());
+        assert!(validate_marker_object_header(&opened, oversized).is_err());
+    }
+
+    #[test]
+    fn aggregate_distinguishes_fetchable_marker_absence_from_invalid_marker_objects() {
+        let repository = TestRepository::new();
+        let root = repository.commit("root", &[]);
+        let published = repository.commit("published\n\ngherrit-pr-id: Gone\n", &[root]);
+        let proposal = repository.commit("proposal\n\ngherrit-pr-id: Gone\n", &[root]);
+        let change_id = id("Gone");
+        let local = LocalStack::for_history_test(
+            default_branch("main", root),
+            [(change_id.clone(), proposal, root)],
+        );
+        let opened = repository.open();
+
+        let missing = ObjectId::from_bytes_or_panic(&[0x77; 20]);
+        let observation = observe_with_marker(
+            &change_id,
+            root,
+            Some(published),
+            Some(root),
+            &[(1, published)],
+            Some((missing, published)),
+        );
+        let prepared = PreparedExactLocalHistories::prepare(observation, &local, &opened).unwrap();
+        assert!(matches!(
+            prepared.load_graph(),
+            Err(GraphLoadError::MissingMarkerObject(marker))
+                if marker.oid == missing
+                    && marker.source_ref.as_ref() == "refs/tags/gherrit/Gone/pr"
+        ));
+
+        let wrong_kind = repository.writer.write_blob(b"not a tag").unwrap().detach();
+        let oversized = repository
+            .writer
+            .write_buf(gix::object::Kind::Tag, &vec![b'x'; MAX_TAG_BYTES + 1])
+            .unwrap();
+        for (marker, expected) in
+            [(wrong_kind, "not an annotated tag"), (oversized, "exceeds the 512-byte limit")]
+        {
+            let observation = observe_with_marker(
+                &change_id,
+                root,
+                Some(published),
+                Some(root),
+                &[(1, published)],
+                Some((marker, published)),
+            );
+            let prepared =
+                PreparedExactLocalHistories::prepare(observation, &local, &opened).unwrap();
+            let error = match prepared.load_graph() {
+                Err(GraphLoadError::Invalid(error)) => error,
+                result => panic!("expected invalid marker object, got {result:?}"),
+            };
+            assert!(error.to_string().contains(expected), "unexpected error: {error:?}");
+        }
+    }
+
     fn version(value: u64) -> Version {
         Version::new(value).expect("test version is nonzero")
     }
@@ -1176,6 +1302,24 @@ mod tests {
         versions: &[(u64, ObjectId)],
         marker_target: Option<ObjectId>,
     ) -> RawExactLocalObservation {
+        observe_with_marker(
+            id,
+            default_tip,
+            candidate_head,
+            owned_base,
+            versions,
+            marker_target.map(|v1| (ObjectId::from_bytes_or_panic(&[0x44; 20]), v1)),
+        )
+    }
+
+    fn observe_with_marker(
+        id: &GherritPrId,
+        default_tip: ObjectId,
+        candidate_head: Option<ObjectId>,
+        owned_base: Option<ObjectId>,
+        versions: &[(u64, ObjectId)],
+        marker: Option<(ObjectId, ObjectId)>,
+    ) -> RawExactLocalObservation {
         let default = default_branch("main", default_tip);
         let mut output = format!("{default_tip}\trefs/heads/main\n");
         if let Some(head) = candidate_head {
@@ -1187,8 +1331,7 @@ mod tests {
         for (version, target) in versions {
             output.push_str(&format!("{target}\trefs/tags/gherrit/{}/v{version}\n", id.as_str()));
         }
-        if let Some(target) = marker_target {
-            let tag = ObjectId::from_bytes_or_panic(&[0x44; 20]);
+        if let Some((tag, target)) = marker {
             output.push_str(&format!("{tag}\trefs/tags/gherrit/{}/pr\n", id.as_str()));
             output.push_str(&format!("{target}\trefs/tags/gherrit/{}/pr^{{}}\n", id.as_str()));
         }
@@ -1238,8 +1381,14 @@ mod tests {
         versions: &[(u64, ObjectId)],
         marker_target: Option<ObjectId>,
     ) -> Result<(GherritPrId, Option<PublishedHistory>)> {
-        let observed =
-            observe(id, default_tip, candidate_head, owned_base, versions, marker_target);
+        let observed = observe_with_marker(
+            id,
+            default_tip,
+            candidate_head,
+            owned_base,
+            versions,
+            marker_target.map(|v1| (repository.marker_tag(id, v1, 37), v1)),
+        );
         SourcedPreparedHistory::normalize_for_test(
             &repository.open(),
             observed.iter().next().unwrap(),
@@ -1285,7 +1434,7 @@ mod tests {
                             assert_eq!(normalized.0, change_id);
                             assert_eq!(normalized.1.is_some(), has_versions);
                             if let Some(history) = normalized.1.as_ref() {
-                                assert_eq!(history.has_pull_request_marker(), has_marker);
+                                assert_eq!(history.pull_request_marker().is_some(), has_marker);
                             }
                         }
                     }
@@ -1469,7 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn marker_must_peel_exactly_to_v1_and_retains_both_ref_objects() {
+    fn validates_marker_peel_exactly_to_v1_then_retains_its_identity() {
         let repository = TestRepository::new();
         let root = repository.commit("root", &[]);
         let a = repository.commit("A", &[root]);
@@ -1481,10 +1630,8 @@ mod tests {
 
         let normalized =
             normalize(&repository, &change_id, root, Some(a), Some(root), &versions, Some(a))
-                .expect("marker peels exactly to v1");
-        let marker = normalized.1.unwrap().pull_request_marker().unwrap();
-        assert_eq!(marker.tag(), ObjectId::from_bytes_or_panic(&[0x44; 20]));
-        assert_eq!(marker.v1(), a);
+                .expect("marker peels to v1");
+        assert_eq!(normalized.1.unwrap().pull_request_marker().unwrap().number().get(), 37);
 
         for marker in [b, root, unrelated, missing] {
             let error = normalize(
@@ -1706,13 +1853,14 @@ mod tests {
             default_branch("main", root),
             [(change_id.clone(), proposal, root)],
         );
-        let observation = observe(
+        let marker = repository.marker_tag(&change_id, published, 37);
+        let observation = observe_with_marker(
             &change_id,
             root,
             Some(published),
             Some(root),
             &[(1, published)],
-            Some(published),
+            Some((marker, published)),
         );
 
         let prepared = StructurallyPreparedHistories::prepare_raw(&observation, &local).unwrap();
@@ -1722,9 +1870,9 @@ mod tests {
             ["refs/tags/gherrit/Gone/v1"]
         );
 
-        let graph =
-            CommitGraphEvidence::load_for_test(&repository.open(), prepared.graph_roots()).unwrap();
-        let mut histories = prepared.validate(&graph).unwrap().into_vec();
+        let repo = repository.open();
+        let graph = CommitGraphEvidence::load_for_test(&repo, prepared.graph_roots()).unwrap();
+        let mut histories = prepared.validate(&graph, &repo).unwrap().into_vec();
         let validated = histories.pop().unwrap();
 
         assert!(histories.is_empty());
@@ -1742,6 +1890,7 @@ mod tests {
             })
         );
         assert!(validated.has_pull_request_marker());
+        assert_eq!(validated.pull_request_marker().unwrap().number().get(), 37);
         assert_eq!(validated.proposed(), Revision { head: proposal, first_parent: root });
         assert!(validated.needs_publication());
         assert_eq!(
@@ -1762,7 +1911,6 @@ mod tests {
         assert!(!validated.contains_published_head(proposal));
         assert!(validated.contains_published_first_parent(root));
 
-        let repo = repository.open();
         let acquisition = PreparedExactLocalHistories::prepare(observation, &local, &repo).unwrap();
         assert_eq!(
             acquisition.acquisition_source_refs().collect::<Vec<_>>(),
@@ -1785,10 +1933,10 @@ mod tests {
         let observation =
             observe(&change_id, root, Some(published), Some(root), &[(1, published)], None);
         let prepared = StructurallyPreparedHistories::prepare_raw(&observation, &local).unwrap();
-        let unrelated_graph =
-            CommitGraphEvidence::load_for_test(&repository.open(), [unrelated]).unwrap();
+        let repo = repository.open();
+        let unrelated_graph = CommitGraphEvidence::load_for_test(&repo, [unrelated]).unwrap();
 
-        let error = prepared.validate(&unrelated_graph).unwrap_err();
+        let error = prepared.validate(&unrelated_graph, &repo).unwrap_err();
         let causes = error.chain().map(ToString::to_string).collect::<Vec<_>>();
 
         assert!(causes.iter().any(|cause| cause.contains(&published.to_string())));
@@ -1810,9 +1958,9 @@ mod tests {
         let absent = observe(&change_id, root, None, None, &[], None);
         let absent = StructurallyPreparedHistories::prepare_raw(&absent, &local).unwrap();
         assert!(absent.graph_roots().is_empty());
-        let empty_graph =
-            CommitGraphEvidence::load_for_test(&repository.open(), absent.graph_roots()).unwrap();
-        let mut histories = absent.validate(&empty_graph).unwrap().into_vec();
+        let repo = repository.open();
+        let empty_graph = CommitGraphEvidence::load_for_test(&repo, absent.graph_roots()).unwrap();
+        let mut histories = absent.validate(&empty_graph, &repo).unwrap().into_vec();
         let absent = histories.pop().unwrap();
         assert!(absent.needs_publication());
         assert_eq!(
@@ -1825,9 +1973,9 @@ mod tests {
             observe(&change_id, root, Some(a), Some(root), &[(1, a), (2, b), (3, a)], None);
         let repeated = StructurallyPreparedHistories::prepare_raw(&repeated, &local).unwrap();
         assert_eq!(repeated.graph_roots().as_ref(), [b]);
-        let graph =
-            CommitGraphEvidence::load_for_test(&repository.open(), repeated.graph_roots()).unwrap();
-        let mut histories = repeated.validate(&graph).unwrap().into_vec();
+        let repo = repository.open();
+        let graph = CommitGraphEvidence::load_for_test(&repo, repeated.graph_roots()).unwrap();
+        let mut histories = repeated.validate(&graph, &repo).unwrap().into_vec();
         let repeated = histories.pop().unwrap();
 
         assert!(!repeated.needs_publication());
@@ -2100,10 +2248,9 @@ mod tests {
             let prepared =
                 StructurallyPreparedHistories::prepare_raw(&observation, &local).unwrap();
             assert_eq!(prepared.graph_roots().as_ref(), [head]);
-            let graph =
-                CommitGraphEvidence::load_for_test(&repository.open(), prepared.graph_roots())
-                    .unwrap();
-            let error = prepared.validate(&graph).unwrap_err();
+            let repo = repository.open();
+            let graph = CommitGraphEvidence::load_for_test(&repo, prepared.graph_roots()).unwrap();
+            let error = prepared.validate(&graph, &repo).unwrap_err();
             assert!(error.to_string().contains("Proper ancestry"), "head={head}");
             assert!(error.to_string().contains(&proposal.to_string()));
         }
@@ -2125,9 +2272,9 @@ mod tests {
             observe(&change_id, root, Some(wrong), Some(duplicate), &[(1, wrong)], None);
         let prepared = StructurallyPreparedHistories::prepare_raw(&observation, &local).unwrap();
         assert_eq!(prepared.graph_roots().as_ref(), [wrong]);
-        let graph =
-            CommitGraphEvidence::load_for_test(&repository.open(), prepared.graph_roots()).unwrap();
-        let error = prepared.validate(&graph).unwrap_err();
+        let repo = repository.open();
+        let graph = CommitGraphEvidence::load_for_test(&repo, prepared.graph_roots()).unwrap();
+        let error = prepared.validate(&graph, &repo).unwrap_err();
 
         assert!(error.to_string().contains("must have exactly one"));
         assert!(error.to_string().contains(&wrong.to_string()));
