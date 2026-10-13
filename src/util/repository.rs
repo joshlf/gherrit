@@ -139,12 +139,49 @@ impl Repo {
     pub fn open(path: &str) -> Result<Self> {
         // NOTE: `gix::discover` is used instead of `gix::open` so that
         // `gherrit` doesn't need to be run from the root of the repository.
-        let inner = gix::ThreadSafeRepository::discover_opts(
+        let inner = match gix::ThreadSafeRepository::discover_opts(
             path,
             Default::default(),
             literal_graph_open_options(),
-        )?
-        .to_thread_local();
+        ) {
+            Ok(repo) => repo.to_thread_local(),
+            Err(error) => {
+                // Diagnose the backend with Git only after discovery failed.
+                // This is a capability diagnostic, not a fallback publisher.
+                let output = cmd(
+                    "git",
+                    [
+                        "-C",
+                        path,
+                        "config",
+                        "--local",
+                        "--no-includes",
+                        "--get",
+                        "extensions.refStorage",
+                    ],
+                )
+                .bounded_output();
+                if output
+                    .is_ok_and(|output| output.status.success() && output.stdout == b"reftable\n")
+                {
+                    bail!(
+                        "This repository uses reftable refs, which GHerrit's current gix backend does not support; `gherrit status` can inspect its Git capabilities without publishing"
+                    );
+                }
+                return Err(error.into());
+            }
+        };
+        // Some gix versions open reftable's compatibility files but fail on
+        // the placeholder HEAD. Name the actual backend before reading refs.
+        if inner
+            .config_snapshot()
+            .string("extensions.refStorage")
+            .is_some_and(|value| value.as_ref() == b"reftable")
+        {
+            bail!(
+                "This repository uses reftable refs, which GHerrit's current gix backend does not support; `gherrit status` can inspect its Git capabilities without publishing"
+            );
+        }
         let current_branch = get_current_branch(&inner)?;
         let git_dir_identity = GitDirIdentity(
             fs::canonicalize(inner.path())
