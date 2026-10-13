@@ -12,21 +12,21 @@ use serde::{
 };
 use serde_json::{Map, Number, Value};
 
-pub(super) struct UniqueJson(Value);
+pub(crate) struct UniqueJson(Value);
 
 impl UniqueJson {
-    pub(super) fn decode(response: &[u8]) -> serde_json::Result<Self> {
+    pub(crate) fn decode(response: &[u8]) -> serde_json::Result<Self> {
         let mut deserializer = serde_json::Deserializer::from_slice(response);
         let value = Self::deserialize(&mut deserializer)?;
         deserializer.end()?;
         Ok(value)
     }
 
-    pub(super) fn as_value(&self) -> &Value {
+    pub(crate) fn as_value(&self) -> &Value {
         &self.0
     }
 
-    pub(super) fn into_value(self) -> Value {
+    pub(crate) fn into_value(self) -> Value {
         self.0
     }
 }

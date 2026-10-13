@@ -1,4 +1,5 @@
 mod commit_msg;
+mod hosted;
 mod identity;
 mod inspect;
 mod install;
@@ -57,6 +58,9 @@ enum Commands {
         /// Local base ref; otherwise use the cached remote HEAD (never fetch).
         #[arg(long)]
         base: Option<String>,
+        /// Explicitly inspect GitHub refs, PR lifecycle, and native membership.
+        #[arg(long)]
+        remote: bool,
     },
     /// Git hooks integration (internal use only).
     #[command(subcommand, hide = true)]
@@ -126,8 +130,8 @@ enum HookCommands {
 /// invocation from Git reads enough hook input to prove the enclosing push has
 /// no ref update.
 pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
-    if let Commands::Status { json, base } = &cli.command {
-        return inspect::run(*json, base.as_deref());
+    if let Commands::Status { json, base, remote } = &cli.command {
+        return inspect::run(*json, base.as_deref(), *remote).await;
     }
     let repo = util::Repo::open(".").wrap_err("Failed to open repo")?;
 

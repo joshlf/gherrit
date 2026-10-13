@@ -11,7 +11,9 @@ use crate::util;
 
 mod autosquash;
 mod destination;
-mod json;
+mod inspection;
+pub(crate) use inspection::observe as inspect_remote;
+pub(crate) mod json;
 mod local;
 mod publication_attempt;
 pub(crate) mod subprocess;
