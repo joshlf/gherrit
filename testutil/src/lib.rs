@@ -12,7 +12,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError},
-        Arc, LazyLock, RwLock,
+        Arc, LazyLock, OnceLock, RwLock,
     },
     thread,
     time::{Duration, Instant},
@@ -35,6 +35,7 @@ pub const MANAGED_PUBLIC: &str = "managedPublic";
 const FIRST_GIT_TIMESTAMP: u64 = 946_684_800;
 const MOCK_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MOCK_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const OBSERVATION_OVERLAP_TIMEOUT: Duration = Duration::from_secs(10);
 const PUBLICATION_OVERLAP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[macro_export]
@@ -52,6 +53,7 @@ pub struct TestContextBuilder {
     initial_commit: bool,
     mock_github: bool,
     git_interceptor: bool,
+    observation_overlap: Option<(String, String)>,
     publication_overlap: bool,
     gherrit_bin: PathBuf,
 }
@@ -66,6 +68,7 @@ impl TestContextBuilder {
             initial_commit: false,
             mock_github: false,
             git_interceptor: false,
+            observation_overlap: None,
             publication_overlap: false,
             gherrit_bin: gherrit_bin.into(),
         }
@@ -104,6 +107,18 @@ impl TestContextBuilder {
 
     #[must_use]
     pub fn with_git_interceptor(mut self) -> Self {
+        self.git_interceptor = true;
+        self
+    }
+
+    /// Gates the expected ID's exact Git and local-ID GitHub observations.
+    ///
+    /// A test can require both requests to arrive before either is released,
+    /// proving that one publication attempt starts the requests concurrently.
+    #[must_use]
+    pub fn with_observation_overlap(mut self, id: &str, default_branch: &str) -> Self {
+        self.observation_overlap = Some((id.to_owned(), default_branch.to_owned()));
+        self.mock_github = true;
         self.git_interceptor = true;
         self
     }
@@ -147,11 +162,19 @@ impl TestContextBuilder {
         }
 
         let mut mock_server_state = None;
+        let observation_overlap = self
+            .observation_overlap
+            .as_ref()
+            .map(|(id, default_branch)| ObservationOverlapSchedule::new(id, default_branch));
         let (overlap_schedule, publication_overlap) = if self.publication_overlap {
             let (schedule, controller) = PublicationOverlapSchedule::new();
             (Some(schedule), Some(controller))
         } else {
             (None, None)
+        };
+        let schedules = MockSchedules {
+            observation_overlap: observation_overlap.clone(),
+            publication_overlap: overlap_schedule,
         };
 
         let mock_server = (self.mock_github || self.git_interceptor).then(|| {
@@ -165,7 +188,7 @@ impl TestContextBuilder {
                 system_git.clone(),
                 test_environment.clone(),
                 dir.clone(),
-                overlap_schedule,
+                schedules,
             )
         });
 
@@ -183,6 +206,7 @@ impl TestContextBuilder {
             next_gherrit_id: AtomicU64::new(1),
             mock_server,
             mock_server_state,
+            observation_overlap,
             publication_overlap,
         };
 
@@ -215,6 +239,7 @@ pub struct TestContext {
     next_gherrit_id: AtomicU64,
     mock_server: Option<MockServerInfo>,
     mock_server_state: Option<Arc<RwLock<mock_server::MockState>>>,
+    observation_overlap: Option<Arc<ObservationOverlapSchedule>>,
     publication_overlap: Option<PublicationOverlapController>,
 }
 
@@ -363,6 +388,12 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: &Path) {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct MockSchedules {
+    pub observation_overlap: Option<Arc<ObservationOverlapSchedule>>,
+    pub publication_overlap: Option<Arc<PublicationOverlapSchedule>>,
+}
+
 pub struct MockServerInfo {
     pub url: String,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -396,7 +427,7 @@ impl MockServerInfo {
         system_git: PathBuf,
         test_environment: TestEnvironment,
         fixture_dir: Arc<TempDir>,
-        publication_overlap: Option<Arc<PublicationOverlapSchedule>>,
+        schedules: MockSchedules,
     ) -> Self {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -418,7 +449,7 @@ impl MockServerInfo {
                         remote_path,
                         system_git,
                         test_environment,
-                        publication_overlap,
+                        schedules,
                         ready_tx,
                         shutdown_rx,
                     ));
@@ -515,6 +546,108 @@ pub enum MalformedJson {
 pub enum PublicationPushStage {
     Initial,
     Marker,
+}
+
+struct ObservationArrival {
+    matches: AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+impl ObservationArrival {
+    fn new() -> Self {
+        Self { matches: AtomicUsize::new(0), notify: tokio::sync::Notify::new() }
+    }
+}
+
+/// A bounded rendezvous for the two observations in one publication attempt.
+///
+/// The first exact Git request and first local-ID GitHub request wait here
+/// before entering mutable fake state. A concurrent implementation releases
+/// both immediately. Sequential awaiting fails within a fixed deadline, and
+/// server shutdown can cancel either handler without a controller thread.
+pub struct ObservationOverlapSchedule {
+    exact_git: ObservationArrival,
+    local_github: ObservationArrival,
+    cancelled: AtomicBool,
+    deadline: OnceLock<tokio::time::Instant>,
+    expected_id: Box<str>,
+    expected_git_patterns: Box<[String]>,
+}
+
+impl ObservationOverlapSchedule {
+    fn new(id: &str, default_branch: &str) -> Arc<Self> {
+        let tag_root = format!("refs/tags/gherrit/{id}");
+        Arc::new(Self {
+            exact_git: ObservationArrival::new(),
+            local_github: ObservationArrival::new(),
+            cancelled: AtomicBool::new(false),
+            deadline: OnceLock::new(),
+            expected_id: id.into(),
+            expected_git_patterns: [
+                format!("refs/heads/{default_branch}"),
+                format!("refs/heads/{id}"),
+                format!("refs/heads/gherrit-bases/{id}"),
+                tag_root.clone(),
+                format!("{tag_root}/*"),
+            ]
+            .into(),
+        })
+    }
+
+    async fn arrive(&self, own: &ObservationArrival, peer: &ObservationArrival) -> bool {
+        if own.matches.fetch_add(1, Ordering::AcqRel) != 0 {
+            self.cancel();
+            return false;
+        }
+        own.notify.notify_one();
+        let deadline = *self
+            .deadline
+            .get_or_init(|| tokio::time::Instant::now() + OBSERVATION_OVERLAP_TIMEOUT);
+        loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return false;
+            }
+            if peer.matches.load(Ordering::Acquire) != 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, peer.notify.notified()).await.is_err() {
+                self.cancel();
+                return false;
+            }
+        }
+    }
+
+    pub(crate) async fn exact_git_arrived(&self) -> bool {
+        self.arrive(&self.exact_git, &self.local_github).await
+    }
+
+    pub(crate) async fn local_github_arrived(&self) -> bool {
+        self.arrive(&self.local_github, &self.exact_git).await
+    }
+
+    pub(crate) fn expected_id(&self) -> &str {
+        &self.expected_id
+    }
+
+    pub(crate) fn expected_git_patterns(&self) -> &[String] {
+        &self.expected_git_patterns
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.exact_git.notify.notify_one();
+        self.local_github.notify.notify_one();
+    }
+
+    pub fn assert_consumed(&self) {
+        assert!(!self.cancelled.load(Ordering::Acquire), "observation schedule was cancelled");
+        assert_eq!(self.exact_git.matches.load(Ordering::Acquire), 1, "exact Git request count");
+        assert_eq!(
+            self.local_github.matches.load(Ordering::Acquire),
+            1,
+            "local GitHub request count"
+        );
+    }
 }
 
 /// Server-side gates for one deliberately scheduled two-publisher overlap.
@@ -813,7 +946,16 @@ impl MockGithub<'_> {
     }
 
     pub fn requests(&self) -> Vec<Vec<GraphQlOperation>> {
-        self.context.inspect_mock_state(|state| state.graphql_requests.clone())
+        self.context.inspect_mock_state(|state| {
+            state.graphql_requests.iter().map(|request| request.operations.clone()).collect()
+        })
+    }
+
+    /// Returns each validated physical GraphQL document in arrival order.
+    pub fn request_documents(&self) -> Vec<String> {
+        self.context.inspect_mock_state(|state| {
+            state.graphql_requests.iter().map(|request| request.document.clone()).collect()
+        })
     }
 
     pub fn redirect_trap_requests(&self) -> usize {
@@ -968,6 +1110,9 @@ impl MockGithub<'_> {
 
 impl Drop for TestContext {
     fn drop(&mut self) {
+        if let Some(overlap) = &self.observation_overlap {
+            overlap.cancel();
+        }
         if let Some(overlap) = &self.publication_overlap {
             overlap.schedule.release_all();
         }
@@ -1307,6 +1452,12 @@ impl TestContext {
     pub fn recorded_git_operations(&self) -> Vec<GitOperation> {
         assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
         self.inspect_mock_state(|state| state.git.operations().to_vec())
+    }
+
+    pub fn observation_overlap(&self) -> &ObservationOverlapSchedule {
+        self.observation_overlap
+            .as_deref()
+            .expect("missing test capability: .with_observation_overlap()")
     }
 
     pub fn publication_overlap(&self) -> &PublicationOverlapController {
@@ -2198,7 +2349,7 @@ mod tests {
             system_git,
             test_environment,
             test_dir,
-            None,
+            MockSchedules::default(),
         );
 
         assert!(weak_state.upgrade().is_some());
