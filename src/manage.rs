@@ -47,7 +47,11 @@ impl State {
 
     pub fn read_from(repo: &util::Repo, branch_name: &str) -> Result<Option<State>> {
         let key = format!("branch.{}.gherritManaged", branch_name);
-        match repo.local_config_values(&key)?.as_slice() {
+        Self::from_values(&repo.local_config_values(&key)?)
+    }
+
+    fn from_values(values: &[Vec<u8>]) -> Result<Option<State>> {
+        match values {
             [value] if value == State::PUBLIC.as_bytes() => Ok(Some(State::Public)),
             [value] if value == State::PRIVATE.as_bytes() => Ok(Some(State::Private)),
             [value] if value == State::UNMANAGED.as_bytes() => Ok(Some(State::Unmanaged)),
@@ -97,13 +101,18 @@ impl BranchConfigValue {
         value.map_or(Self::Missing, Self::One)
     }
 
+    #[cfg(test)]
     fn read(repo: &util::Repo, key: &str) -> Result<Self> {
-        Ok(match repo.local_config_values(key)?.as_slice() {
+        Ok(Self::from_values(&repo.local_config_values(key)?))
+    }
+
+    fn from_values(values: &[Vec<u8>]) -> Self {
+        match values {
             [] => Self::Missing,
             [value] => std::str::from_utf8(value)
                 .map_or(Self::Invalid, |value| Self::One(value.to_owned())),
             _ => Self::Invalid,
-        })
+        }
     }
 
     fn one(&self) -> Option<&str> {
@@ -159,6 +168,7 @@ impl BranchConfig {
         }
     }
 
+    #[cfg(test)]
     fn read_from(repo: &util::Repo, branch_name: &str) -> Result<BranchConfig> {
         let key = |suffix: &str| format!("branch.{branch_name}.{suffix}");
         Ok(BranchConfig {
@@ -166,6 +176,14 @@ impl BranchConfig {
             remote: BranchConfigValue::read(repo, &key("remote"))?,
             merge: BranchConfigValue::read(repo, &key("merge"))?,
         })
+    }
+
+    fn from_values(values: &util::BranchConfigValues) -> Self {
+        Self {
+            push_remote: BranchConfigValue::from_values(&values.push_remote),
+            remote: BranchConfigValue::from_values(&values.remote),
+            merge: BranchConfigValue::from_values(&values.merge),
+        }
     }
 
     fn value(&self, key: BranchConfigKey) -> &BranchConfigValue {
@@ -390,7 +408,13 @@ impl ManagementPlan {
 
 /// Configures the Git branch state for GHerrit management.
 pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()> {
-    let (branch_name, old_state) = repo.read_current_branch_and_state()?;
+    let branch_name = repo
+        .current_branch()
+        .name()
+        .ok_or_else(|| eyre::eyre!("Cannot get management state in detached HEAD"))?
+        .to_owned();
+    let values = repo.local_branch_config(&branch_name)?;
+    let old_state = State::from_values(&values.management)?;
     if new_state == State::Public {
         PublicBranchName::new(branch_name.clone()).wrap_err(
             "This branch cannot be managed as public. Rename it to a compatible branch name, or run `gherrit manage --private` to keep its stack private",
@@ -406,7 +430,7 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
         }
         TransitionKind::RecordUnmanaged => None,
         TransitionKind::ReconcileConfig => {
-            let current = BranchConfig::read_from(repo, &branch_name)?;
+            let current = BranchConfig::from_values(&values);
             // Compare against the old state's expected configuration, not the
             // requested state's configuration. Otherwise a transition could
             // silently adopt a user's custom value that happens to match the
