@@ -79,22 +79,15 @@ When you are ready to upload your changes, simply push:
 git push
 ```
 
-**GHerrit intercepts this push.** Instead of pushing your local branch
-directly, it:
+**GHerrit intercepts this push.** It publishes each changed commit as a
+revision of the PR identified by that commit's `gherrit-pr-id`, records
+immutable patch history, and updates titles, descriptions, and navigation.
+New PRs start as drafts. The Patch History table links directly to submitted
+revisions and comparisons between versions.
 
-1.  Analyzes your stack of commits.
-2.  Atomically publishes each changed commit's head, literal first-parent
-    base, and next immutable version tag.
-3.  For a public stack, appends its GHerrit-owned branch projection as the
-    final indivisible unit of the initial Git stage. It may share the final
-    atomic batch with change tuples and precedes every Pull Request write.
-4.  Creates missing Pull Requests on permanent, change-owned base branches.
-5.  Records each established Pull Request with an immutable Git marker before
-    applying its final base, title, body, and navigation links.
-6.  Injects a "Patch History" table into the PR description. Because GHerrit
-    tracks every version of your commit, this table provides direct links to
-    view the **diff between versions** (e.g., "Compare v3 vs v2"). This allows
-    reviewers to immediately see what changed since their last review.
+The [architecture map](design/architecture.md) explains identities and code
+responsibilities. The [publication contract](design/pre-push.md) specifies
+owned bases, canonical PR markers, ordered effects, and recovery.
 
 <img width="918" height="575" alt="Screenshot 2025-12-05 at 1 13 16 PM" src="https://github.com/user-attachments/assets/97d59a3d-0697-4c74-a833-9cc6da2089ee" />
 
@@ -117,6 +110,19 @@ GHerrit will detect the changes based on the persistent `gherrit-pr-id` in the
 commit trailers and update the corresponding PRs in place. The
 `--rebase-merges` option preserves merge topology in stacks which contain
 merge commits.
+
+### Inspecting a stack
+
+```bash
+gherrit status --base main
+gherrit status --base main --remote --json
+```
+
+Local status reports management drift, repository capabilities, hook paths,
+and commit problems without authentication or networking. `--remote` adds
+current refs, all-lifecycle PR facts, and native membership. Unavailable data
+remains unavailable; reports do not repair or publish. See the
+[inspection contract](design/inspection.md) for byte representations and limits.
 
 ### 4\. Landing a Stack
 
