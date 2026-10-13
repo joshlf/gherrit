@@ -13,7 +13,10 @@ use color_eyre::eyre::{Result, bail, eyre};
 pub(in crate::pre_push) struct PullRequestNumber(NonZeroU32);
 
 impl PullRequestNumber {
-    pub(super) fn new(value: u64) -> Result<Self> {
+    pub(in crate::pre_push) const MAX: Self =
+        Self(NonZeroU32::new(i32::MAX as u32).expect("GraphQL Int maximum is nonzero"));
+
+    fn new(value: u64) -> Result<Self> {
         let value = u32::try_from(value)
             .ok()
             .and_then(NonZeroU32::new)
@@ -25,11 +28,16 @@ impl PullRequestNumber {
     pub(in crate::pre_push) fn get(self) -> u32 {
         self.0.get()
     }
+
+    #[cfg(test)]
+    pub(in crate::pre_push) fn for_test(value: u32) -> Self {
+        Self::new(u64::from(value)).expect("valid test pull request number")
+    }
 }
 
 /// A nonempty opaque GraphQL node ID.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(in crate::pre_push) struct PullRequestNodeId(Box<str>);
+pub(super) struct PullRequestNodeId(Box<str>);
 
 impl PullRequestNodeId {
     pub(super) fn new(value: String) -> Result<Self> {
@@ -39,7 +47,7 @@ impl PullRequestNodeId {
         Ok(Self(value.into_boxed_str()))
     }
 
-    pub(in crate::pre_push) fn as_str(&self) -> &str {
+    pub(super) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -63,36 +71,68 @@ impl PullRequestIdentity {
         self.number
     }
 
-    pub(in crate::pre_push) fn node_id(&self) -> &PullRequestNodeId {
+    pub(super) fn node_id(&self) -> &PullRequestNodeId {
         &self.node_id
     }
 }
 
-/// Both identity namespaces returned by one exact-local observation.
+/// Both pull request identity namespaces retained for one publication attempt.
 ///
-/// This is not a repository-wide uniqueness claim. Numbers and node IDs remain
-/// independent because matching one component does not make a create receipt
-/// safe. The registry stays coupled to the completed observation.
+/// The registry is initially populated by exact-local observation and then
+/// moved through create execution. This is not a repository-wide uniqueness
+/// claim. Numbers and node IDs remain independent because matching one
+/// component does not make a create receipt safe.
 #[derive(Debug, Default)]
-pub(super) struct ExactLocalPullRequestIdentities {
+pub(super) struct PullRequestIdentityRegistry {
     numbers: HashSet<PullRequestNumber>,
     node_ids: HashSet<PullRequestNodeId>,
 }
 
-impl ExactLocalPullRequestIdentities {
-    pub(super) fn insert(&mut self, identity: &PullRequestIdentity) -> Result<()> {
+#[derive(Clone, Copy)]
+enum IdentityEvidence {
+    Observation,
+    CreateReceipt,
+}
+
+impl PullRequestIdentityRegistry {
+    /// Atomically registers both components of an identity.
+    ///
+    /// Neither namespace is changed unless both components are new. The
+    /// evidence kind controls only the bounded diagnostic; it does not change
+    /// the uniqueness rule.
+    fn insert(&mut self, identity: &PullRequestIdentity, evidence: IdentityEvidence) -> Result<()> {
         if self.numbers.contains(&identity.number()) {
-            bail!(
-                "Exact local observation repeats pull request number {}",
-                identity.number().get()
-            );
+            match evidence {
+                IdentityEvidence::Observation => bail!(
+                    "Exact-local observation repeats pull request number {}",
+                    identity.number().get()
+                ),
+                IdentityEvidence::CreateReceipt => {
+                    bail!("A createPullRequest receipt reuses a retained pull request number")
+                }
+            }
         }
         if self.node_ids.contains(identity.node_id()) {
-            bail!("Exact local observation repeats a pull request node ID");
+            match evidence {
+                IdentityEvidence::Observation => {
+                    bail!("Exact-local observation repeats a pull request node ID")
+                }
+                IdentityEvidence::CreateReceipt => {
+                    bail!("A createPullRequest receipt reuses a retained pull request node ID")
+                }
+            }
         }
         assert!(self.numbers.insert(identity.number()));
         assert!(self.node_ids.insert(identity.node_id().clone()));
         Ok(())
+    }
+
+    pub(super) fn insert_observation(&mut self, identity: &PullRequestIdentity) -> Result<()> {
+        self.insert(identity, IdentityEvidence::Observation)
+    }
+
+    pub(super) fn insert_create_receipt(&mut self, identity: &PullRequestIdentity) -> Result<()> {
+        self.insert(identity, IdentityEvidence::CreateReceipt)
     }
 
     #[cfg(test)]
@@ -137,13 +177,13 @@ mod tests {
         let one = PullRequestIdentity::new(1, "NODE_ONE".to_owned()).unwrap();
         let same_number = PullRequestIdentity::new(1, "NODE_TWO".to_owned()).unwrap();
         let same_node = PullRequestIdentity::new(2, "NODE_ONE".to_owned()).unwrap();
-        let mut numbers = ExactLocalPullRequestIdentities::default();
-        numbers.insert(&one).unwrap();
-        assert!(numbers.insert(&same_number).is_err());
+        let mut numbers = PullRequestIdentityRegistry::default();
+        numbers.insert_observation(&one).unwrap();
+        assert!(numbers.insert_observation(&same_number).is_err());
 
-        let mut nodes = ExactLocalPullRequestIdentities::default();
-        nodes.insert(&one).unwrap();
-        assert!(nodes.insert(&same_node).is_err());
+        let mut nodes = PullRequestIdentityRegistry::default();
+        nodes.insert_observation(&one).unwrap();
+        assert!(nodes.insert_observation(&same_node).is_err());
     }
 
     #[test]
@@ -155,13 +195,13 @@ mod tests {
         let number_three = PullRequestIdentity::new(3, "NODE_THREE".to_owned()).unwrap();
         let swapped = PullRequestIdentity::new(1, "NODE_TWO".to_owned()).unwrap();
 
-        let mut identities = ExactLocalPullRequestIdentities::default();
-        identities.insert(&one).unwrap();
-        assert!(identities.insert(&number_two_same_node).is_err());
-        identities.insert(&number_two).unwrap();
-        assert!(identities.insert(&same_number_node_three).is_err());
-        identities.insert(&number_three).unwrap();
-        assert!(identities.insert(&swapped).is_err());
+        let mut identities = PullRequestIdentityRegistry::default();
+        identities.insert_observation(&one).unwrap();
+        assert!(identities.insert_observation(&number_two_same_node).is_err());
+        identities.insert_observation(&number_two).unwrap();
+        assert!(identities.insert_observation(&same_number_node_three).is_err());
+        identities.insert_observation(&number_three).unwrap();
+        assert!(identities.insert_observation(&swapped).is_err());
         assert_eq!(identities.lengths(), (3, 3));
     }
 }
