@@ -1,5 +1,10 @@
 mod commit_msg;
 mod hosted;
+#[cfg(feature = "hosted-contracts")]
+mod hosted_contracts;
+#[cfg(feature = "hosted-contracts")]
+#[doc(hidden)]
+pub use hosted_contracts::main as hosted_contracts_main;
 mod identity;
 mod inspect;
 mod install;
