@@ -11,6 +11,7 @@ use octocrab::Octocrab;
 use serde_json::Value;
 
 use super::{
+    super::failure::{EffectFailure, Operation, Outcome},
     ObservedGithub,
     mutation::MutationRequest,
     observation::{CompleteLocalPullRequests, LocalPullRequestAccumulator, ObservationStep},
@@ -395,7 +396,11 @@ fn json_request(document: &str) -> Value {
 }
 
 pub(super) fn indeterminate_mutation(error: Report) -> Report {
-    error.wrap_err(INDETERMINATE_GRAPHQL_MUTATION)
+    error.wrap_err(EffectFailure::new(
+        Outcome::Indeterminate,
+        Operation::GraphqlMutation,
+        INDETERMINATE_GRAPHQL_MUTATION,
+    ))
 }
 
 #[derive(Debug)]

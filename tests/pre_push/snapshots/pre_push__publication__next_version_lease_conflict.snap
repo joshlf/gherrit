@@ -1,5 +1,6 @@
 ---
 source: tests/pre_push/publication.rs
+assertion_line: 1238
 expression: content
 ---
 EXIT_CODE: 1
@@ -11,3 +12,7 @@ STDERR:
 [gherrit] Branch feature-conflict is MANAGED. Publishing stack...
 [gherrit] [WARN] Using custom GitHub API URL: [MOCK_SERVER_URL]
 [gherrit] [ERROR] Git publication was rejected without changing the requested refs; stop this attempt and run GHerrit again after resolving the conflict
+[gherrit] [ERROR] Publication stage: initial publication
+[gherrit] [ERROR]   change ref refs/heads/[GHERRIT_ID_1]
+[gherrit] [ERROR]   change ref refs/heads/gherrit-bases/[GHERRIT_ID_1]
+[gherrit] [ERROR]   change ref refs/tags/gherrit/[GHERRIT_ID_1]/v2
