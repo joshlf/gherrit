@@ -907,4 +907,27 @@ another ownership state, and transitions from legacy public state to private
 or unmanaged state. No migration path may overwrite configuration which the
 pure classifier has not proved GHerrit-owned.
 
+## Commit-message cancellation
+
+The installed-hook cleanup matrix records independent unhooked Git receipts
+for blank, whitespace, comment-only, and scissors-only edited messages, two
+comment characters, all cleanup modes, and explicit empty-message commits.
+The hook receives no cleanup flags. It conservatively adds no identity when
+comment/scissors cleanup could leave an empty message, preserving Git's own
+abort or acceptance decision. Consequently an explicitly verbatim comment-only
+message can be committed without an identity. Add a trailer explicitly when
+such a message is intended for publication. Existing identified messages and
+ordinary new messages retain their separate regression contracts.
+
+## Identity compatibility
+
+`src/identity.rs` owns values and raw source ranges. Publication still requires
+one final-paragraph raw occurrence with a case-insensitive key, exact `: `
+separator, and 1–128 ASCII alphanumeric value bytes. The hook still recognizes
+the lowercase key in Git-normalized trailer output, including an empty value.
+Its insertion remains Git's `interpret-trailers` operation. These acceptance
+policies are intentionally preserved by the extraction; normalization is not
+proof that the original raw message is publishable. Status should diagnose a
+malformed raw identity rather than silently inventing a replacement.
+
 *Updated by an AI agent acting on joshlf's behalf.*
