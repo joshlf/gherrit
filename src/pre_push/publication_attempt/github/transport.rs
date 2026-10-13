@@ -11,14 +11,18 @@ use octocrab::Octocrab;
 use serde_json::Value;
 
 use super::{
+    ObservedGithub,
     mutation::MutationRequest,
     observation::{CompleteLocalPullRequests, LocalPullRequestAccumulator, ObservationStep},
 };
-use crate::pre_push::{
-    GithubEndpoint,
-    destination::{PushDestination, RepositoryCoordinates},
-    json::UniqueJson,
-    local::LocalStack,
+use crate::{
+    pre_push::{
+        GithubEndpoint,
+        destination::{PublicationTarget, PushDestination},
+        json::UniqueJson,
+        local::LocalStack,
+    },
+    util,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -143,33 +147,56 @@ impl Timeouts {
 }
 
 /// A GitHub client bound to the selected push repository for one attempt.
-pub(in crate::pre_push) struct Github {
+pub(in crate::pre_push::publication_attempt) struct Github {
     http: Octocrab,
-    coordinates: RepositoryCoordinates,
+    target: PublicationTarget,
     timeouts: Timeouts,
 }
 
 impl Github {
-    pub(in crate::pre_push) fn new(
-        token: String,
+    /// Validates the endpoint pairing before asking `gh` for credentials.
+    ///
+    /// An unsupported Git destination therefore reports the destination
+    /// error even when no GitHub credentials are configured.
+    pub(in crate::pre_push::publication_attempt) fn new(
         endpoint: &GithubEndpoint,
         destination: &PushDestination,
     ) -> Result<Self> {
         if endpoint.is_disabled() {
             bail!("Cannot construct a GitHub client while GitHub is disabled");
         }
+        endpoint.validate_destination(destination)?;
         Self::with_timeouts(
-            token,
+            util::get_github_token()?,
             endpoint.custom_url(),
-            destination.coordinates().clone(),
+            destination.publication_target(),
             Timeouts::PRODUCTION,
         )
+    }
+
+    pub(in crate::pre_push::publication_attempt) fn publication_target(
+        &self,
+    ) -> &PublicationTarget {
+        &self.target
+    }
+
+    #[cfg(test)]
+    pub(in crate::pre_push::publication_attempt) fn for_plan_test(
+        destination: &PushDestination,
+    ) -> Self {
+        Self::with_timeouts(
+            "token".to_owned(),
+            Some("http://127.0.0.1:1"),
+            destination.publication_target(),
+            Timeouts::PRODUCTION,
+        )
+        .expect("the fixed test endpoint is valid")
     }
 
     fn with_timeouts(
         token: String,
         api_url: Option<&str>,
-        coordinates: RepositoryCoordinates,
+        target: PublicationTarget,
         timeouts: Timeouts,
     ) -> Result<Self> {
         let mut builder = Octocrab::builder()
@@ -180,27 +207,29 @@ impl Github {
         if let Some(api_url) = api_url {
             builder = builder.base_uri(api_url)?;
         }
-        Ok(Self { http: builder.build()?, coordinates, timeouts })
+        Ok(Self { http: builder.build()?, target, timeouts })
     }
 
     /// Observes every lifecycle state for each change in the sealed stack.
-    pub(in crate::pre_push) async fn observe_local_pull_requests(
-        &self,
+    pub(in crate::pre_push::publication_attempt) async fn observe_local_pull_requests(
+        self,
         local: &LocalStack,
-    ) -> Result<CompleteLocalPullRequests> {
-        tokio::time::timeout(
+    ) -> Result<ObservedGithub> {
+        let pull_requests = tokio::time::timeout(
             self.timeouts.observation,
             self.observe_local_pull_requests_inner(local),
         )
         .await
-        .map_err(|_| eyre!("GitHub exact-local observation exceeded its total deadline"))?
+        .map_err(|_| eyre!("GitHub exact-local observation exceeded its total deadline"))??;
+        Ok(ObservedGithub::new(self, pull_requests))
     }
 
     async fn observe_local_pull_requests_inner(
         &self,
         local: &LocalStack,
     ) -> Result<CompleteLocalPullRequests> {
-        let accumulator = LocalPullRequestAccumulator::for_stack(self.coordinates.clone(), local)?;
+        let accumulator =
+            LocalPullRequestAccumulator::for_stack(self.target.coordinates().clone(), local)?;
         let mut step = accumulator.next()?;
         loop {
             let mut pending = match step {

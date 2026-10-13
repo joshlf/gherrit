@@ -2,6 +2,7 @@ use std::{
     ffi::OsStr,
     fs,
     io::Write as _,
+    path::Path,
     process, thread,
     time::{Duration, Instant},
 };
@@ -29,10 +30,6 @@ fn resolved_result(output: &[u8]) -> Result<ResolvedDestination> {
 
 fn destination() -> PushDestination {
     PushDestination::for_test()
-}
-
-fn git_dir_identity() -> util::GitDirIdentity {
-    util::Repo::open(".").unwrap().git_dir_identity().clone()
 }
 
 fn arguments(command: &Command) -> Vec<&OsStr> {
@@ -90,15 +87,18 @@ fn remote_transport_settings_process_fixture() {
         return;
     };
     let destination = resolved(b"https://github.com/owner/repo.git\n");
-    let settings = destination.inspect_remote_transport_settings().unwrap_or_else(|error| {
-        if mode == "control" {
-            let rendered = error.to_string();
-            assert!(rendered.contains("transport setting containing control characters"));
-            assert!(!rendered.contains("opaque-control-secret"));
-            process::exit(0);
-        }
-        panic!("transport inspection failed: {error:?}");
-    });
+    let repository = util::Repo::open(".").unwrap();
+    let repository = RepositoryBinding::new(&repository).unwrap();
+    let settings =
+        destination.inspect_remote_transport_settings(&repository).unwrap_or_else(|error| {
+            if mode == "control" {
+                let rendered = error.to_string();
+                assert!(rendered.contains("transport setting containing control characters"));
+                assert!(!rendered.contains("opaque-control-secret"));
+                process::exit(0);
+            }
+            panic!("transport inspection failed: {error:?}");
+        });
     match mode.as_str() {
         "last-and-empty" => {
             assert!(settings.proxy.as_deref() == Some(""), "proxy selection mismatch");
@@ -184,6 +184,163 @@ async fn initial_observation_excess_output_enters_bounded_cleanup() {
     assert!(format!("{error:?}").contains("stdout exceeded the 32-byte limit"));
     assert!(!format!("{error:?}").contains(&"x".repeat(32)));
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+fn environment<'command>(
+    command: &'command Command,
+    name: &str,
+) -> Option<Option<&'command OsStr>> {
+    command.get_envs().find(|(candidate, _)| *candidate == OsStr::new(name)).map(|(_, value)| value)
+}
+
+fn successful_git(current_dir: &Path, arguments: &[&str]) {
+    let mut command = Command::new("git");
+    for variable in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ] {
+        command.env_remove(variable);
+    }
+    let output = command.current_dir(current_dir).args(arguments).output().unwrap();
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_repository_binding(
+    repository: &util::Repo,
+    expected_current: &Path,
+    expected_work_tree: Option<&Path>,
+    hostile_repository: &Path,
+) {
+    let binding = RepositoryBinding::new(repository).unwrap();
+    let mut command = Command::new("git");
+    command
+        .env("GIT_CONFIG", hostile_repository)
+        .env("GIT_DIR", hostile_repository)
+        .env("GIT_COMMON_DIR", hostile_repository)
+        .env("GIT_WORK_TREE", hostile_repository)
+        .env("GIT_IMPLICIT_WORK_TREE", "false")
+        .env("GIT_NAMESPACE", "hostile")
+        .env("GIT_CEILING_DIRECTORIES", hostile_repository)
+        .env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "true");
+
+    binding.bind(&mut command);
+
+    assert_eq!(command.get_current_dir(), Some(expected_current));
+    assert_eq!(environment(&command, "GIT_DIR"), Some(Some(binding.git_dir.as_os_str())));
+    assert_eq!(
+        fs::canonicalize(&binding.git_dir).unwrap(),
+        Path::new(binding.git_dir_identity.as_os_str())
+    );
+    assert_eq!(environment(&command, "GIT_COMMON_DIR"), Some(Some(binding.common_dir.as_os_str())));
+    assert_eq!(
+        environment(&command, "GIT_WORK_TREE"),
+        Some(expected_work_tree.map(Path::as_os_str))
+    );
+    for variable in [
+        "GIT_CONFIG",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ] {
+        assert_eq!(environment(&command, variable), Some(None), "variable={variable}");
+    }
+
+    command.args(["rev-parse", "--absolute-git-dir", "--git-common-dir"]);
+    if expected_work_tree.is_some() {
+        command.arg("--show-toplevel");
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "bound git rev-parse failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let paths = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(PathBuf::from)
+        .map(|path| fs::canonicalize(path).unwrap())
+        .collect::<Vec<_>>();
+    let expected = [
+        Some(Path::new(binding.git_dir_identity.as_os_str())),
+        Some(binding.common_dir.as_path()),
+        expected_work_tree,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|path| fs::canonicalize(path).unwrap())
+    .collect::<Vec<_>>();
+    assert_eq!(paths, expected);
+}
+
+#[test]
+fn repository_binding_models_normal_linked_and_bare_repositories() {
+    let root = tempfile::tempdir().unwrap();
+    let ordinary = root.path().join("ordinary");
+    successful_git(root.path(), &["init", ordinary.to_str().unwrap()]);
+    successful_git(
+        &ordinary,
+        &[
+            "-c",
+            "user.name=GHerrit Test",
+            "-c",
+            "user.email=gherrit@example.com",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "--no-verify",
+            "-m",
+            "root",
+        ],
+    );
+
+    let linked = root.path().join("linked");
+    successful_git(&ordinary, &["worktree", "add", "--detach", linked.to_str().unwrap(), "HEAD"]);
+
+    let bare = root.path().join("bare.git");
+    let hostile = root.path().join("hostile.git");
+    gix::init_bare(&bare).unwrap();
+    gix::init_bare(&hostile).unwrap();
+
+    let ordinary_repository = util::Repo::open(ordinary.to_str().unwrap()).unwrap();
+    assert_repository_binding(&ordinary_repository, &ordinary, Some(&ordinary), &hostile);
+
+    let linked_repository = util::Repo::open(linked.to_str().unwrap()).unwrap();
+    assert_repository_binding(&linked_repository, &linked, Some(&linked), &hostile);
+
+    let bare_repository = util::Repo::open(bare.to_str().unwrap()).unwrap();
+    assert_repository_binding(&bare_repository, &bare, None, &hostile);
+}
+
+#[test]
+fn every_destination_command_retains_its_repository_binding() {
+    let destination = destination();
+    for command in [
+        destination.ls_remote(["--quiet".to_owned()], ["HEAD".to_owned()]),
+        destination.exact_object_fetch(ExactObjectFetchMode::Negotiated),
+        destination.push(["--porcelain".to_owned()], ["HEAD:refs/heads/G".to_owned()]),
+    ] {
+        assert_eq!(command.get_current_dir(), Some(destination.repository.current_dir.as_path()));
+        assert_eq!(
+            environment(&command, "GIT_DIR"),
+            Some(Some(destination.repository.git_dir.as_os_str()))
+        );
+        assert_eq!(
+            environment(&command, "GIT_COMMON_DIR"),
+            Some(Some(destination.repository.common_dir.as_os_str()))
+        );
+        assert_eq!(environment(&command, "GIT_NAMESPACE"), Some(None));
+    }
 }
 
 #[test]
@@ -311,11 +468,8 @@ fn configured_trace2_targets_do_not_observe_a_destination_command() {
     )
     .unwrap();
     let literal = literal.trim();
-    let destination = PushDestination {
-        resolved: resolved(format!("{literal}\n").as_bytes()),
-        internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
-        transport: RemoteTransportSettings::default(),
-    };
+    let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+    let destination = PushDestination::for_test_url_in(&repository, literal);
     let (system, global, traces) = configured_trace2_targets(&context);
 
     let mut command = destination.ls_remote(["--symref".to_owned()], ["HEAD".to_owned()]);
@@ -384,9 +538,7 @@ fn every_destination_bearing_git_command_disables_redirects() {
         |argument| *argument != OsStr::new("--heads") && *argument != OsStr::new("--tags")
     ));
 
-    let git_dir = git_dir_identity();
-    let push =
-        destination.push(&git_dir, ["--atomic".to_string()], ["HEAD:refs/heads/Gone".to_string()]);
+    let push = destination.push(["--atomic".to_string()], ["HEAD:refs/heads/Gone".to_string()]);
     assert_eq!(
         arguments(&push),
         [
@@ -436,10 +588,8 @@ fn every_destination_bearing_git_command_disables_redirects() {
         Some(OsStr::new("gherrit-publication"))
     );
     assert_eq!(
-        push.get_envs()
-            .find(|(name, _)| *name == OsStr::new(INTERNAL_PRE_PUSH_GIT_DIR_ENV))
-            .and_then(|(_, value)| value),
-        Some(git_dir.as_os_str())
+        environment(&push, INTERNAL_PRE_PUSH_GIT_DIR_ENV),
+        Some(Some(destination.repository.git_dir_identity.as_os_str()))
     );
 }
 
@@ -454,7 +604,7 @@ fn remote_transport_settings_are_private_command_scoped_state() {
     for command in [
         destination.ls_remote(std::iter::empty(), std::iter::empty()),
         destination.exact_object_fetch(ExactObjectFetchMode::Negotiated),
-        destination.push(&git_dir_identity(), std::iter::empty(), std::iter::empty()),
+        destination.push(std::iter::empty(), std::iter::empty()),
     ] {
         let arguments = arguments(&command);
         assert!(arguments.contains(&OsStr::new(
@@ -635,9 +785,10 @@ async fn exact_object_fetch_ignores_configured_refmaps() {
     let context =
         testutil::TestContextBuilder::new("unused").with_remote().with_initial_commit().build();
     let remote = context.dir.path().join("owner/repo.git");
-    let destination = PushDestination::for_test_url(
+    let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+    let destination = PushDestination::for_test_url_in(
+        &repository,
         remote.to_str().expect("test paths must be UTF-8"),
-        &context.repo_path,
     );
     let remote_only = context
         .remote_git_cmd()
@@ -1004,6 +1155,56 @@ fn rejects_file_urls_with_actionable_redacted_advice() {
     assert!(!error.to_string().contains("secret-owner"));
 }
 
+#[test]
+fn recognizes_only_the_public_github_forge_for_production() {
+    for destination in [
+        "https://github.com/owner/repo.git",
+        "https://GITHUB.COM/owner/repo",
+        "ssh://github.com/owner/repo.git",
+        "git@github.com:owner/repo.git",
+        "github.com:owner/repo",
+    ] {
+        let parsed = parse_destination(destination).unwrap();
+        assert!(targets_production_github(&parsed), "destination={destination:?}");
+    }
+
+    for destination in [
+        "http://github.com/owner/repo.git",
+        "git://github.com/owner/repo.git",
+        "https://evil.example/owner/repo.git",
+        "https://github.com.evil.example/owner/repo.git",
+        "https://github.com:443/owner/repo.git",
+        "evil://github.com/owner/repo.git",
+        "ftp://github.com/owner/repo.git",
+        "git+ssh://github.com/owner/repo.git",
+        "HTTP://github.com/owner/repo.git",
+        "HTTPS://github.com/owner/repo.git",
+        "GIT://github.com/owner/repo.git",
+        "SSH://github.com/owner/repo.git",
+        "git@evil.example:owner/repo.git",
+        "[::1]:owner/repo.git",
+        "user@[2001:db8::1]:owner/repo.git",
+        "alias:owner/repo.git",
+        "file:///tmp/owner/repo.git",
+        "/tmp/owner/repo.git",
+        "owner/repo.git",
+    ] {
+        let parsed = parse_destination(destination).unwrap();
+        assert!(!targets_production_github(&parsed), "destination={destination:?}");
+    }
+}
+
+#[test]
+fn publication_target_retains_repository_and_literal_destination() {
+    let repository = util::Repo::open(".").unwrap();
+    let https = PushDestination::for_test_url_in(&repository, "https://github.com/owner/repo.git");
+    let ssh = PushDestination::for_test_url_in(&repository, "git@github.com:owner/repo.git");
+    let same = PushDestination::for_test_url_in(&repository, "https://github.com/owner/repo.git");
+
+    assert!(https.publication_target() == same.publication_target());
+    assert!(https.publication_target() != ssh.publication_target());
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_accepts_native_paths_and_crlf_output() {
@@ -1122,7 +1323,9 @@ fn child_diagnostic_is_local_bounded_redacted_and_terminal_safe() {
     let literal = private.to_string_lossy().into_owned();
     let canonical = fs::canonicalize(&canonical_path).unwrap().to_string_lossy().into_owned();
     assert_ne!(literal, canonical);
+    let repository = util::Repo::open(".").unwrap();
     let destination = PushDestination {
+        repository: RepositoryBinding::new(&repository).unwrap(),
         resolved: resolved(format!("{literal}\n").as_bytes()),
         internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
         transport: RemoteTransportSettings {

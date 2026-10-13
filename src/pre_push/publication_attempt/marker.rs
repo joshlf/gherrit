@@ -8,7 +8,8 @@
 use color_eyre::eyre::{Result, bail, eyre};
 use gix::{ObjectId, prelude::Write as _};
 
-use super::{github::PullRequestNumber, local::GherritPrId};
+use super::github::PullRequestNumber;
+use crate::pre_push::local::GherritPrId;
 
 /// Deliberately small: the canonical form is under 200 bytes for every valid
 /// GraphQL-safe number. The bound rejects object-database abuse before any

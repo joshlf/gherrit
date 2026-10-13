@@ -10,10 +10,10 @@ use color_eyre::eyre::{Result, bail, eyre};
 
 /// A positive pull request number in GitHub's GraphQL `Int` range.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(in crate::pre_push) struct PullRequestNumber(NonZeroU32);
+pub(in crate::pre_push::publication_attempt) struct PullRequestNumber(NonZeroU32);
 
 impl PullRequestNumber {
-    pub(in crate::pre_push) const MAX: Self =
+    pub(in crate::pre_push::publication_attempt) const MAX: Self =
         Self(NonZeroU32::new(i32::MAX as u32).expect("GraphQL Int maximum is nonzero"));
 
     pub(in crate::pre_push) fn new(value: u64) -> Result<Self> {
@@ -25,12 +25,12 @@ impl PullRequestNumber {
         Ok(Self(value))
     }
 
-    pub(in crate::pre_push) fn get(self) -> u32 {
+    pub(in crate::pre_push::publication_attempt) fn get(self) -> u32 {
         self.0.get()
     }
 
     #[cfg(test)]
-    pub(in crate::pre_push) fn for_test(value: u32) -> Self {
+    pub(in crate::pre_push::publication_attempt) fn for_test(value: u32) -> Self {
         Self::new(u64::from(value)).expect("valid test pull request number")
     }
 }
@@ -54,7 +54,7 @@ impl PullRequestNodeId {
 
 /// The two coupled values which identify one GitHub pull request.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(in crate::pre_push) struct PullRequestIdentity {
+pub(in crate::pre_push::publication_attempt) struct PullRequestIdentity {
     number: PullRequestNumber,
     node_id: PullRequestNodeId,
 }
@@ -67,7 +67,7 @@ impl PullRequestIdentity {
         })
     }
 
-    pub(in crate::pre_push) fn number(&self) -> PullRequestNumber {
+    pub(in crate::pre_push::publication_attempt) fn number(&self) -> PullRequestNumber {
         self.number
     }
 
@@ -76,7 +76,10 @@ impl PullRequestIdentity {
     }
 
     #[cfg(test)]
-    pub(in crate::pre_push) fn for_plan_test(number: u32, node_id: &str) -> Self {
+    pub(in crate::pre_push::publication_attempt) fn for_plan_test(
+        number: u32,
+        node_id: &str,
+    ) -> Self {
         Self::new(u64::from(number), node_id.to_owned()).expect("valid plan-test identity")
     }
 }

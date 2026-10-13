@@ -1,5 +1,5 @@
 ---
-source: src/pre_push/body/recipe.rs
+source: src/pre_push/publication_attempt/body.rs
 expression: report
 ---
 ===== Groot =====
@@ -7,9 +7,11 @@ expression: report
 
 Introduce the root.
 
----
+<!-- gherrit-meta: ordinary commit text -->
 
-This PR is on branch [feature\/public\-stack](../tree/feature/public-stack).
+Explain it.
+
+---
 
 
 <details>
@@ -47,8 +49,6 @@ Build on the root.
 
 ---
 
-This PR is on branch [feature\/public\-stack](../tree/feature/public-stack).
-
 
 <details>
 <summary><strong>⬇️ Download this PR</strong></summary>
@@ -84,8 +84,6 @@ git pull https://github.com/octo/widgets.git refs/heads/Gmiddle
 Finish the stack.
 
 ---
-
-This PR is on branch [feature\/public\-stack](../tree/feature/public-stack).
 
 
 <details>
