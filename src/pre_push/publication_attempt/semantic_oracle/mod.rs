@@ -79,3 +79,5 @@ use driver::*;
 mod assertions;
 use assertions::*;
 mod scenarios;
+
+mod performance;

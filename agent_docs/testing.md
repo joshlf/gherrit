@@ -940,3 +940,6 @@ invariant checks (`assertions`), and restart/concurrency cases (`scenarios`).
 Moving a case does not change its snapshot identity or directory. This model
 still does not parse wire data or derive desired projections in the fake
 world. Native landing needs new literal transitions and assumptions.
+
+[Deterministic performance contracts](performance.md) describe the workload
+invocation, recorded metrics, and the limits of those measurements.
