@@ -21,7 +21,12 @@ use std::{
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::ObjectId;
 
-use super::{PublicBranch, marker::PreparedMarker, version::Version};
+use super::{
+    PublicBranch,
+    failure::{EffectFailure, Operation, Outcome},
+    marker::PreparedMarker,
+    version::Version,
+};
 use crate::pre_push::{
     destination::{PublicationTarget, PushDestination},
     local::GherritPrId,
@@ -400,14 +405,23 @@ impl PreparedPushes {
     /// escapes the execution boundary.
     pub(super) async fn execute(self, destination: &PushDestination) -> Result<()> {
         if self.target != destination.publication_target() {
-            bail!("Git publication action belongs to a different repository or push destination");
+            return Err(EffectFailure::new(
+                Outcome::BeforeSend,
+                Operation::GitPublication,
+                "Git publication action belongs to a different repository or push destination",
+            )
+            .into());
         }
         for batch in self.batches.into_vec() {
             let command =
                 destination.push(batch.options.iter().cloned(), batch.refspecs.iter().cloned());
-            let output = subprocess::output(command, REMOTE_GIT_EXECUTION_TIMEOUT)
-                .await
-                .wrap_err("Git publication process failed; its remote effects are indeterminate")?;
+            let output = subprocess::output(command, REMOTE_GIT_EXECUTION_TIMEOUT).await.wrap_err(
+                EffectFailure::new(
+                    Outcome::Indeterminate,
+                    Operation::GitPublication,
+                    "Git publication process failed; its remote effects are indeterminate",
+                ),
+            )?;
             let outcome = batch.outcome(output.status(), output.stdout());
             let diagnostic = match outcome {
                 PushOutcome::Acknowledged => None,
@@ -441,12 +455,17 @@ fn require_acknowledgement(outcome: PushOutcome, diagnostic: Option<String>) -> 
             "Git publication acknowledgement is indeterminate; requested refs may or may not have changed, so stop this attempt and run GHerrit again to reobserve them"
         }
     };
+    let classification = match outcome {
+        PushOutcome::Rejected => Outcome::Rejected,
+        PushOutcome::Indeterminate => Outcome::Indeterminate,
+        PushOutcome::Acknowledged => unreachable!(),
+    };
     Err(diagnostic.map_or_else(
-        || eyre!(message),
+        || EffectFailure::new(classification, Operation::GitPublication, message).into(),
         |diagnostic| {
-            eyre!(
+            EffectFailure::new(classification, Operation::GitPublication, format!(
                 "{message}\n\nInternal push diagnostic (untrusted and not publication evidence):\n{diagnostic}"
-            )
+            )).into()
         },
     ))
 }
@@ -1332,7 +1351,18 @@ mod tests {
             (PushOutcome::Rejected, "without changing the requested refs"),
             (PushOutcome::Indeterminate, "may or may not have changed"),
         ] {
-            let plain = require_acknowledgement(outcome, None).unwrap_err().to_string();
+            let report = require_acknowledgement(outcome, None).unwrap_err();
+            let typed = report.downcast_ref::<EffectFailure>().unwrap();
+            assert_eq!(typed.operation, Operation::GitPublication);
+            assert_eq!(
+                typed.outcome,
+                match outcome {
+                    PushOutcome::Rejected => Outcome::Rejected,
+                    PushOutcome::Indeterminate => Outcome::Indeterminate,
+                    _ => unreachable!(),
+                }
+            );
+            let plain = report.to_string();
             assert!(plain.contains(classification));
             assert!(!plain.contains("Internal push diagnostic"));
 
