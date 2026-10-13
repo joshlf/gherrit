@@ -23,7 +23,7 @@ use gix::ObjectId;
 
 use super::{
     PublicBranch,
-    failure::{EffectFailure, Operation, Outcome},
+    failure::{EffectFailure, Operation, Outcome, contextualize},
     marker::PreparedMarker,
     version::Version,
 };
@@ -395,6 +395,7 @@ impl AtomicUnit {
 
 /// Fully rendered, bounded push requests bound to one exact destination.
 pub(super) struct PreparedPushes {
+    stage: String,
     target: PublicationTarget,
     batches: Box<[PushBatch]>,
 }
@@ -413,15 +414,26 @@ impl PreparedPushes {
             .into());
         }
         for batch in self.batches.into_vec() {
+            let targets = batch
+                .refspecs
+                .iter()
+                .map(|refspec| {
+                    format!(
+                        "change ref {}",
+                        refspec.split_once(':').expect("preflighted refspec").1
+                    )
+                })
+                .collect::<Vec<_>>();
             let command =
                 destination.push(batch.options.iter().cloned(), batch.refspecs.iter().cloned());
-            let output = subprocess::output(command, REMOTE_GIT_EXECUTION_TIMEOUT).await.wrap_err(
-                EffectFailure::new(
+            let output = subprocess::output(command, REMOTE_GIT_EXECUTION_TIMEOUT)
+                .await
+                .wrap_err(EffectFailure::new(
                     Outcome::Indeterminate,
                     Operation::GitPublication,
                     "Git publication process failed; its remote effects are indeterminate",
-                ),
-            )?;
+                ))
+                .map_err(|error| contextualize(error, &self.stage, &targets))?;
             let outcome = batch.outcome(output.status(), output.stdout());
             let diagnostic = match outcome {
                 PushOutcome::Acknowledged => None,
@@ -429,7 +441,8 @@ impl PreparedPushes {
                     output.child_diagnostic(destination)
                 }
             };
-            require_acknowledgement(outcome, diagnostic)?;
+            require_acknowledgement(outcome, diagnostic)
+                .map_err(|error| contextualize(error, &self.stage, &targets))?;
         }
         Ok(())
     }
@@ -590,7 +603,7 @@ fn prepare_units(
         .map(PushBatch::from_units)
         .collect::<Result<Vec<_>>>()?
         .into_boxed_slice();
-    Ok(PreparedPushes { target: destination.publication_target(), batches })
+    Ok(PreparedPushes { stage: kind.to_owned(), target: destination.publication_target(), batches })
 }
 
 fn validate_unique_destinations<'destination>(
