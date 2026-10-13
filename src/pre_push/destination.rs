@@ -20,7 +20,10 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::{ObjectId, bstr::ByteSlice as _};
 
 use super::{INTERNAL_PRE_PUSH_GIT_DIR_ENV, INTERNAL_PRE_PUSH_REMOTE_ENV, subprocess};
-use crate::{manage::PublicBranchName, util};
+use crate::{
+    manage::PublicBranchName,
+    util::{self, CommandExt as _},
+};
 
 const DESTINATION_ENV: &str = "GHERRIT_PRIVATE_PUSH_DESTINATION";
 const PROXY_ENV: &str = "GHERRIT_PRIVATE_REMOTE_PROXY";
@@ -311,7 +314,7 @@ impl PushDestination {
         );
         repository.bind(&mut command);
         clear_git_transport_diagnostics(&mut command);
-        let output = command.output().wrap_err_with(|| {
+        let output = command.bounded_output().wrap_err_with(|| {
             format!(
                 "Failed to resolve the push destination for GHerrit remote '{}'",
                 configured_remote.as_str()
@@ -398,7 +401,7 @@ impl PushDestination {
                 "--name-only".to_owned(),
                 "--list".to_owned(),
             ])
-            .output()
+            .bounded_output()
             .wrap_err_with(|| {
                 format!(
                     "Failed to inspect the private Git remote for GHerrit remote '{}'",
@@ -417,7 +420,7 @@ impl PushDestination {
                 "--get-all".to_owned(),
                 key,
             ])
-            .output()
+            .bounded_output()
             .wrap_err_with(|| {
                 format!(
                     "Failed to inspect the private Git remote for GHerrit remote '{}'",
@@ -441,7 +444,7 @@ impl PushDestination {
     fn ensure_rewrite_fixed_point(&self) -> Result<()> {
         let output = self
             .ls_remote(["--get-url".to_owned()], std::iter::empty())
-            .output()
+            .bounded_output()
             .wrap_err_with(|| {
                 format!(
                     "Failed to verify Git URL rewriting for GHerrit remote '{}'",
@@ -997,7 +1000,7 @@ impl ResolvedDestination {
         let mut command = util::cmd("git", ["config", "--null", "--name-only", "--list"]);
         repository.bind(&mut command);
         clear_git_transport_diagnostics(&mut command);
-        let output = command.output().wrap_err_with(|| {
+        let output = command.bounded_output().wrap_err_with(|| {
             format!(
                 "Failed to inspect Git configuration while resolving GHerrit remote '{}'",
                 self.configured_remote.as_str()
@@ -1029,7 +1032,7 @@ impl ResolvedDestination {
                     "--list".to_owned(),
                 ],
             )
-            .output()
+            .bounded_output()
             .wrap_err_with(|| {
                 format!(
                     "Failed to inspect private Git configuration while resolving GHerrit remote '{}'",
@@ -1064,7 +1067,7 @@ impl ResolvedDestination {
             util::cmd("git", ["config".to_owned(), "--null".to_owned(), "--get".to_owned(), key]);
         repository.bind(&mut command);
         clear_git_transport_diagnostics(&mut command);
-        let output = command.output().wrap_err_with(|| {
+        let output = command.bounded_output().wrap_err_with(|| {
             format!(
                 "Failed to inspect Git transport configuration for GHerrit remote '{}'",
                 self.configured_remote.as_str()
