@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use super::{
     batching::{MAX_MUTATION_ALIASES, MAX_MUTATION_REQUEST_BYTES},
+    destination::DefaultBranch,
     reconcile::PullRequestState,
 };
 
@@ -258,53 +259,17 @@ pub(super) fn decode_mutation_batch_response<O: MutationOperation>(
     Ok(receipts)
 }
 
-/// A query for the global node ID GitHub requires when creating PRs.
-pub(super) struct RepositoryIdQuery {
-    owner: String,
-    repository: String,
+/// Repository facts which must agree with the exact Git push destination.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct Repository {
+    pub(super) node_id: String,
+    pub(super) default_branch: DefaultBranch,
 }
 
-impl RepositoryIdQuery {
-    const DOCUMENT: &'static str = "query RepositoryID($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }";
-
-    pub(super) fn new(owner: String, repository: String) -> Self {
-        Self { owner, repository }
-    }
-
-    pub(super) fn request(&self) -> Value {
-        json!({
-            "query": Self::DOCUMENT,
-            "variables": {
-                "owner": self.owner,
-                "name": self.repository,
-            }
-        })
-    }
-
-    pub(super) fn decode(&self, response: Value) -> Result<String> {
-        if let Some(errors) = response.get("errors") {
-            bail!("Failed to fetch repository ID: {errors:?}");
-        }
-
-        #[derive(Deserialize)]
-        struct Response {
-            data: Data,
-        }
-
-        #[derive(Deserialize)]
-        struct Data {
-            repository: Repository,
-        }
-
-        #[derive(Deserialize)]
-        struct Repository {
-            id: String,
-        }
-
-        let response: Response =
-            serde_json::from_value(response).wrap_err("Failed to decode repository ID response")?;
-        Ok(response.data.repository.id)
-    }
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct PullRequestLookup {
+    pub(super) pull_request: Option<PullRequest>,
+    pub(super) repository: Option<Repository>,
 }
 
 /// Looks up the PR whose head branch is a GHerrit ID.
@@ -313,16 +278,28 @@ pub(super) struct FindPullRequest {
     owner: String,
     repository: String,
     head_branch: String,
+    include_repository: bool,
 }
 
 impl FindPullRequest {
     pub(super) fn new(owner: String, repository: String, head_branch: String) -> Self {
-        Self { owner, repository, head_branch }
+        Self { owner, repository, head_branch, include_repository: false }
+    }
+
+    /// Includes repository facts in the first local-ID lookup so binding the
+    /// Git and GitHub defaults does not cost another network request.
+    pub(super) fn with_repository(owner: String, repository: String, head_branch: String) -> Self {
+        Self { owner, repository, head_branch, include_repository: true }
+    }
+
+    #[cfg(test)]
+    pub(super) fn decode(&self, response: Value) -> Result<Option<PullRequest>> {
+        <Self as QueryOperation>::decode(self, response).map(|lookup| lookup.pull_request)
     }
 }
 
 impl QueryOperation for FindPullRequest {
-    type Output = Option<PullRequest>;
+    type Output = PullRequestLookup;
 
     fn document(&self) -> String {
         let connection = |alias: &str, states: &str| {
@@ -331,8 +308,13 @@ impl QueryOperation for FindPullRequest {
                 json!(self.head_branch),
             )
         };
+        let repository = if self.include_repository {
+            "id, defaultBranchRef { name, target { oid } } "
+        } else {
+            ""
+        };
         format!(
-            "repository(owner: {}, name: {}) {{ {} {} }}",
+            "repository(owner: {}, name: {}) {{ {repository}{} {} }}",
             json!(self.owner),
             json!(self.repository),
             connection("open", "[OPEN]"),
@@ -344,8 +326,21 @@ impl QueryOperation for FindPullRequest {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Response {
+            id: Option<String>,
+            default_branch_ref: Option<DefaultBranchRef>,
             open: PullRequests,
             historical: PullRequests,
+        }
+
+        #[derive(Deserialize)]
+        struct DefaultBranchRef {
+            name: String,
+            target: Option<GitObject>,
+        }
+
+        #[derive(Deserialize)]
+        struct GitObject {
+            oid: Option<String>,
         }
 
         #[derive(Deserialize)]
@@ -408,18 +403,44 @@ impl QueryOperation for FindPullRequest {
             Some(open) => Some(open),
             None => select("historical", response.historical)?,
         };
-        let Some(node) = node else {
-            return Ok(None);
+        let pull_request = node
+            .map(|node| -> Result<_> {
+                Ok(PullRequest {
+                    number: PullRequestNumber::new(node.number)?,
+                    node_id: PullRequestNodeId::new(node.id)?,
+                    title: node.title,
+                    body: node.body,
+                    base_branch: node.base_ref_name,
+                    head_branch: self.head_branch.clone(),
+                    state: node.state,
+                })
+            })
+            .transpose()?;
+        let repository = if self.include_repository {
+            let node_id =
+                response.id.ok_or_else(|| eyre!("GitHub omitted the repository node ID"))?;
+            if node_id.is_empty() {
+                bail!("GitHub reported an empty repository node ID");
+            }
+            let default_branch = response
+                .default_branch_ref
+                .ok_or_else(|| eyre!("GitHub omitted the repository default branch"))?;
+            let target = default_branch
+                .target
+                .ok_or_else(|| eyre!("GitHub omitted the default branch target"))?;
+            let oid =
+                target.oid.ok_or_else(|| eyre!("GitHub omitted the default branch object ID"))?;
+            let tip = ObjectId::from_hex(oid.as_bytes())
+                .wrap_err("GitHub reported an invalid default branch object ID")?;
+            Some(Repository {
+                node_id,
+                default_branch: DefaultBranch::new(default_branch.name, tip)
+                    .wrap_err("GitHub reported an invalid default branch")?,
+            })
+        } else {
+            None
         };
-        Ok(Some(PullRequest {
-            number: PullRequestNumber::new(node.number)?,
-            node_id: PullRequestNodeId::new(node.id)?,
-            title: node.title,
-            body: node.body,
-            base_branch: node.base_ref_name,
-            head_branch: self.head_branch.clone(),
-            state: node.state,
-        }))
+        Ok(PullRequestLookup { pull_request, repository })
     }
 }
 
@@ -432,7 +453,7 @@ pub(super) struct CreatePullRequest {
     title: String,
     body: String,
     head_oid: ObjectId,
-    expected_base_oid: Option<ObjectId>,
+    base_oid: ObjectId,
     client_mutation_id: String,
 }
 
@@ -444,7 +465,7 @@ impl CreatePullRequest {
         title: String,
         body: String,
         head_oid: ObjectId,
-        expected_base_oid: Option<ObjectId>,
+        base_oid: ObjectId,
     ) -> Self {
         let client_mutation_id = format!("gherrit:create:{head_branch}");
         Self {
@@ -454,7 +475,7 @@ impl CreatePullRequest {
             title,
             body,
             head_oid,
-            expected_base_oid,
+            base_oid,
             client_mutation_id,
         }
     }
@@ -559,8 +580,7 @@ impl MutationOperation for CreatePullRequest {
         if parse_oid("head", &created.head_ref_oid)? != self.head_oid {
             bail!("createPullRequest returned a different head object ID");
         }
-        let base_oid = parse_oid("base", &created.base_ref_oid)?;
-        if self.expected_base_oid.is_some_and(|expected| base_oid != expected) {
+        if parse_oid("base", &created.base_ref_oid)? != self.base_oid {
             bail!("createPullRequest returned a different base object ID");
         }
         let number = PullRequestNumber::new(created.number)
@@ -738,22 +758,6 @@ mod tests {
     }
 
     #[test]
-    fn repository_id_query_uses_an_exact_document_and_variables() {
-        let query = RepositoryIdQuery::new("o\"wner".to_string(), "repo\nname".to_string());
-
-        assert_eq!(
-            query.request(),
-            json!({
-                "query": RepositoryIdQuery::DOCUMENT,
-                "variables": {
-                    "owner": "o\"wner",
-                    "name": "repo\nname",
-                }
-            })
-        );
-    }
-
-    #[test]
     fn query_document_escapes_every_repository_identity_component() {
         let query = FindPullRequest::new(
             "o\"wner".to_string(),
@@ -768,6 +772,20 @@ mod tests {
     }
 
     #[test]
+    fn first_lookup_includes_repository_facts_in_the_same_document() {
+        let query = FindPullRequest::with_repository(
+            "owner".to_owned(),
+            "repo".to_owned(),
+            "G123".to_owned(),
+        );
+
+        assert_eq!(
+            query.document(),
+            r#"repository(owner: "owner", name: "repo") { id, defaultBranchRef { name, target { oid } } open: pullRequests(headRefName: "G123", first: 100, states: [OPEN]) { nodes { number, id, title, body, baseRefName, state, isCrossRepository } pageInfo { hasNextPage } } historical: pullRequests(headRefName: "G123", first: 100, states: [CLOSED, MERGED]) { nodes { number, id, title, body, baseRefName, state, isCrossRepository } pageInfo { hasNextPage } } }"#
+        );
+    }
+
+    #[test]
     fn create_document_escapes_every_input() {
         let create = CreatePullRequest::new(
             "repo\"id".to_string(),
@@ -776,7 +794,7 @@ mod tests {
             "A \"title\"".to_string(),
             "line one\nline two".to_string(),
             object_id(b'1'),
-            Some(object_id(b'2')),
+            object_id(b'2'),
         );
 
         assert_eq!(
@@ -830,17 +848,76 @@ mod tests {
     }
 
     #[test]
-    fn decodes_repository_id_and_reports_graphql_errors() {
-        let query = RepositoryIdQuery::new("owner".to_string(), "repo".to_string());
+    fn decodes_complete_repository_facts_with_the_first_lookup() {
+        let query = FindPullRequest::with_repository(
+            "owner".to_owned(),
+            "repo".to_owned(),
+            "G123".to_owned(),
+        );
+        let response = |oid: Value| {
+            json!({
+                "id": "R_1",
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": { "oid": oid },
+                },
+                "open": empty_connection(),
+                "historical": empty_connection(),
+            })
+        };
 
         assert_eq!(
-            query.decode(json!({ "data": { "repository": { "id": "R_1" } } })).unwrap(),
-            "R_1"
+            <FindPullRequest as QueryOperation>::decode(
+                &query,
+                response(json!(object_id(b'1').to_string())),
+            )
+            .unwrap(),
+            PullRequestLookup {
+                pull_request: None,
+                repository: Some(Repository {
+                    node_id: "R_1".to_owned(),
+                    default_branch: DefaultBranch::new("main".to_owned(), object_id(b'1')).unwrap(),
+                }),
+            }
         );
-        assert_eq!(
-            query.decode(json!({ "errors": [{ "message": "denied" }] })).unwrap_err().to_string(),
-            "Failed to fetch repository ID: Array [Object {\"message\": String(\"denied\")}]"
-        );
+
+        for incomplete in [
+            response(Value::Null),
+            json!({
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": { "oid": object_id(b'1').to_string() },
+                },
+                "open": empty_connection(),
+                "historical": empty_connection(),
+            }),
+            json!({
+                "id": "",
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": { "oid": object_id(b'1').to_string() },
+                },
+                "open": empty_connection(),
+                "historical": empty_connection(),
+            }),
+            json!({
+                "id": "R_1",
+                "defaultBranchRef": null,
+                "open": empty_connection(),
+                "historical": empty_connection(),
+            }),
+            json!({
+                "id": "R_1",
+                "defaultBranchRef": { "name": "main", "target": null },
+                "open": empty_connection(),
+                "historical": empty_connection(),
+            }),
+        ] {
+            assert!(
+                <FindPullRequest as QueryOperation>::decode(&query, incomplete).is_err(),
+                "repository facts must be complete",
+            );
+        }
     }
 
     #[test]
@@ -1186,7 +1263,7 @@ mod tests {
             "Title".to_string(),
             "Body".to_string(),
             object_id(b'1'),
-            Some(object_id(b'2')),
+            object_id(b'2'),
         )
     }
 
@@ -1273,7 +1350,7 @@ mod tests {
             "\u{1}".repeat(256),
             "\u{1}".repeat(MAX_BODY_SIZE_BYTES),
             object_id(b'1'),
-            Some(object_id(b'2')),
+            object_id(b'2'),
         );
         let empty = CreatePullRequest::new(
             "R_1".to_string(),
@@ -1282,7 +1359,7 @@ mod tests {
             "\u{1}".repeat(256),
             String::new(),
             object_id(b'1'),
-            Some(object_id(b'2')),
+            object_id(b'2'),
         );
         let empty_bytes = mutation_request(&[empty]).unwrap().1;
 
@@ -1607,27 +1684,5 @@ mod tests {
             .unwrap_err();
             assert!(format!("{error:?}").contains(expected), "error={error:?}");
         });
-    }
-
-    #[test]
-    fn create_receipt_without_authoritative_base_still_validates_its_shape() {
-        let mut operation = create();
-        operation.expected_base_oid = None;
-        let mut receipt = create_receipt();
-        receipt["pullRequest"]["baseRefOid"] = json!(object_id(b'3').to_string());
-        decode_mutation_batch_response(
-            std::slice::from_ref(&operation),
-            json!({ "data": { "op0": receipt } }),
-        )
-        .unwrap();
-
-        let mut malformed = create_receipt();
-        malformed["pullRequest"]["baseRefOid"] = json!("invalid");
-        let error = decode_mutation_batch_response(
-            std::slice::from_ref(&operation),
-            json!({ "data": { "op0": malformed } }),
-        )
-        .unwrap_err();
-        assert!(format!("{error:?}").contains("invalid base object ID"));
     }
 }
