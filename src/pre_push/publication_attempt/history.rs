@@ -1154,6 +1154,60 @@ impl CommitGraphEvidence {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn performance_contract_history_slots_and_shared_ancestry_are_distinct_counts() {
+        for depth in [1, 8, 64, 256] {
+            let repository = TestRepository::new();
+            let root = repository.commit("default", &[]);
+            let heads: Vec<_> = (0..depth)
+                .map(|index| {
+                    repository.commit(&format!("Revision {index}\n\ngherrit-pr-id: Gone"), &[root])
+                })
+                .collect();
+            let roots = (0..16).flat_map(|_| heads.iter().copied()).collect::<Vec<_>>();
+            let graph = CommitGraphEvidence::load_for_test(&repository.open(), roots).unwrap();
+            assert_eq!(graph.commits.len(), depth + 1);
+            assert_eq!(
+                graph.commits.values().map(|commit| commit.parents.len()).sum::<usize>(),
+                depth
+            );
+            let versions: Vec<_> = heads
+                .iter()
+                .flat_map(|head| [*head, *head])
+                .enumerate()
+                .map(|(index, head)| ((index + 1) as u64, head))
+                .collect();
+            let (_, history) = normalize(
+                &repository,
+                &id("Gone"),
+                root,
+                heads.last().copied(),
+                Some(root),
+                &versions,
+                None,
+            )
+            .unwrap();
+            let history = history.unwrap();
+            assert_eq!(
+                history.len(),
+                depth * 2,
+                "repeated OIDs must not collapse version positions"
+            );
+            assert_eq!(
+                history.iter().map(|revision| revision.head()).collect::<Vec<_>>(),
+                versions.iter().map(|(_, head)| *head).collect::<Vec<_>>()
+            );
+            println!(
+                "GHERRIT_PERFORMANCE {}",
+                serde_json::json!({
+                    "workload": "history", "distinct_revision_oids": depth,
+                    "root_positions": depth * 16, "version_positions": history.len(),
+                    "retained_commit_records": graph.commits.len(), "retained_parent_edges": depth,
+                })
+            );
+        }
+    }
+
     use gix::{ObjectId, prelude::Write as _};
     use tempfile::TempDir;
 
