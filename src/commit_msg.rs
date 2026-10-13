@@ -18,7 +18,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fs, path::Path};
+use std::{
+    fs,
+    io::{Seek as _, Write as _},
+    path::Path,
+    process::Stdio,
+};
 
 use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
@@ -38,6 +43,39 @@ fn is_temporary_squash(message: &str) -> bool {
 
 fn has_gherrit_id(trailers: &str) -> bool {
     trailers.lines().any(|line| line.starts_with("gherrit-pr-id: "))
+}
+
+/// The hook does not receive `--cleanup` or `--allow-empty-message` flags.
+/// Conservatively leave messages empty under comment/scissors cleanup alone.
+/// Git then owns cancellation and explicit empty-message acceptance. Ambiguous
+/// comment-only verbatim messages are committed without a generated identity.
+fn may_cancel_commit(repo: &util::Repo, message: &str) -> Result<bool> {
+    let config = repo.config_snapshot();
+    let prefix = config
+        .string("core.commentString")
+        .map(|value| value.as_ref().to_vec())
+        .or_else(|| {
+            config.string("core.commentChar").map(|value| {
+                if value.as_ref() == b"auto" { b"#".to_vec() } else { value.as_ref().to_vec() }
+            })
+        })
+        .unwrap_or_else(|| b"#".to_vec());
+    let mut scissors = prefix;
+    scissors.extend_from_slice(b" ------------------------ >8 ------------------------");
+    let mut length = 0;
+    for line in message.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']).as_bytes() == scissors {
+            break;
+        }
+        length += line.len();
+    }
+    // Prepared private file input avoids a pipe producer or shell quoting.
+    let mut input = tempfile::tempfile().wrap_err("Failed to prepare message cleanup")?;
+    input.write_all(&message.as_bytes()[..length])?;
+    input.rewind()?;
+    let output =
+        cmd!("git stripspace --strip-comments").stdin(Stdio::from(input)).checked_output()?;
+    Ok(output.stdout.is_empty())
 }
 
 fn derive_gherrit_id(mut entropy: IdEntropy, object_hash: &[u8]) -> String {
@@ -84,6 +122,10 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
     let trailers = String::from_utf8_lossy(&output.stdout);
 
     if has_gherrit_id(&trailers) {
+        return Ok(());
+    }
+
+    if may_cancel_commit(repo, &msg_content)? {
         return Ok(());
     }
 

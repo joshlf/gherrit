@@ -906,3 +906,15 @@ drift repair, idempotent migration, refusal to adopt a legacy-shaped tuple in
 another ownership state, and transitions from legacy public state to private
 or unmanaged state. No migration path may overwrite configuration which the
 pure classifier has not proved GHerrit-owned.
+
+## Commit-message cancellation
+
+The installed-hook cleanup matrix records independent unhooked Git receipts
+for blank, whitespace, comment-only, and scissors-only edited messages, two
+comment characters, all cleanup modes, and explicit empty-message commits.
+The hook receives no cleanup flags. It conservatively adds no identity when
+comment/scissors cleanup could leave an empty message, preserving Git's own
+abort or acceptance decision. Consequently an explicitly verbatim comment-only
+message can be committed without an identity. Add a trailer explicitly when
+such a message is intended for publication. Existing identified messages and
+ordinary new messages retain their separate regression contracts.

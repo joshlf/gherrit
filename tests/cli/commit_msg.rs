@@ -166,3 +166,59 @@ fn test_existing_identity_avoids_committer_lookup() {
     ctx.git_cmd().args(["var", "GIT_COMMITTER_IDENT"]).assert().failure();
     ctx.assert_failure_consumed();
 }
+
+#[test]
+#[cfg(unix)]
+fn test_installed_hook_preserves_git_empty_message_decisions() {
+    use std::os::unix::fs::PermissionsExt as _;
+    #[derive(serde::Deserialize, Debug)]
+    struct Case {
+        character: String,
+        mode: String,
+        allow: bool,
+        message: String,
+        success: bool,
+        stored: String,
+    }
+    // Independent receipts captured from unhooked Git 2.54.0; no production
+    // cleanup helper constructs the expected acceptance or stored message.
+    let cases: Vec<Case> =
+        serde_json::from_str(include_str!("fixtures/message-cleanup.json")).unwrap();
+    let ctx = testutil::test_context!().with_installed_hooks().with_initial_commit().build();
+    ctx.gherrit_cmd().arg("manage").assert().success();
+    let editor = ctx.dir.path().join("message-editor");
+    std::fs::write(&editor, "#!/bin/sh\ncp \"$GHERRIT_MESSAGE_FILE\" \"$1\"\n").unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let input = ctx.dir.path().join("editor-input");
+    for case in cases {
+        ctx.run_git(&["config", "core.commentChar", &case.character]);
+        std::fs::write(&input, &case.message).unwrap();
+        let before = ctx.head_oid();
+        let mut command = ctx.git_cmd();
+        command
+            .args(["commit", "--amend", "--allow-empty"])
+            .env("GIT_EDITOR", &editor)
+            .env("GHERRIT_MESSAGE_FILE", &input);
+        if case.mode != "default" {
+            command.arg(format!("--cleanup={}", case.mode));
+        }
+        if case.allow {
+            command.arg("--allow-empty-message");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.success(), case.success, "{case:?}: {output:?}");
+        if case.success {
+            let stored = ctx
+                .git_cmd()
+                .args(["show", "-s", "--format=%B", "HEAD"])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            assert_eq!(stored, case.stored.as_bytes(), "{case:?}");
+        } else {
+            assert_eq!(ctx.head_oid(), before, "aborted amend moved HEAD: {case:?}");
+        }
+    }
+}
