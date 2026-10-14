@@ -1,3 +1,5 @@
+// Captured-head entry points are used when the consuming planner is composed.
+#![allow(dead_code)]
 use std::{
     env,
     ffi::OsStr,
@@ -8,7 +10,7 @@ use std::{
 };
 
 use eyre::{OptionExt, Result, WrapErr, bail, eyre};
-use gix::{Commit, Id, bstr::ByteSlice as _, state::InProgress};
+use gix::{Commit, ObjectId, bstr::ByteSlice as _, state::InProgress};
 
 use super::{CommandExt as _, clear_git_repository_overrides};
 use crate::{cmd, manage::State};
@@ -41,6 +43,23 @@ impl HeadState {
     }
 }
 
+/// A logical branch identity and its exact `HEAD` target.
+///
+/// This value exists only while `HEAD` is attached to a local branch. A
+/// missing target is the real unborn-branch state, while detached `HEAD` is
+/// represented by the absence of this value. A symbolic `HEAD` outside the
+/// local-branch namespace is rejected.
+pub(crate) struct BranchHeadSnapshot {
+    branch_name: String,
+    target: Option<gix::ObjectId>,
+}
+
+impl BranchHeadSnapshot {
+    pub(crate) fn into_parts(self) -> (String, Option<gix::ObjectId>) {
+        (self.branch_name, self.target)
+    }
+}
+
 pub struct Repo {
     pub(super) inner: gix::Repository,
     pub(super) current_branch: HeadState,
@@ -61,7 +80,7 @@ impl GitDirIdentity {
     }
 }
 
-pub(super) fn literal_graph_open_options() -> gix::sec::trust::Mapping<gix::open::Options> {
+pub(crate) fn literal_graph_open_options() -> gix::sec::trust::Mapping<gix::open::Options> {
     fn harden(mut options: gix::open::Options) -> gix::open::Options {
         // gix 0.75 groups replacement controls under this permission.
         // Deny ambient graph rewriting independently of object location.
@@ -147,6 +166,10 @@ fn repository_uses_reftable(path: &str) -> Result<bool> {
 }
 
 impl Repo {
+    pub(crate) fn branch_head_snapshot(&self) -> Result<Option<BranchHeadSnapshot>> {
+        branch_head_snapshot(&self.inner)
+    }
+
     pub fn open(path: &str) -> Result<Self> {
         // Object location is not ancestry rewriting. Preserve it for native
         // Git, but do not silently collect from a different ODB in gix 0.75.
@@ -252,7 +275,7 @@ impl Repo {
         })
     }
 
-    pub(super) fn has_promisor_remote(&self) -> Result<bool> {
+    pub(crate) fn has_promisor_remote(&self) -> Result<bool> {
         let configured_by_extension = self
             .partial_clone_remote_from_direct_common_config()?
             .is_some_and(|remote| promisor_loader_accepts_remote_name(&remote));
@@ -457,7 +480,7 @@ pub(super) fn reject_nonempty_history_file(
     }
 }
 
-pub(super) fn parse_git_version(output: &[u8]) -> Result<(u64, u64, u64)> {
+pub(crate) fn parse_git_version(output: &[u8]) -> Result<(u64, u64, u64)> {
     let version = str::from_utf8(output)?
         .trim()
         .strip_prefix("git version ")
@@ -521,8 +544,8 @@ impl Repo {
     /// Returns the first-parent commits from `ancestor` to `descendant`.
     pub fn first_parent_commits_between(
         &self,
-        ancestor: Id<'_>,
-        descendant: Id<'_>,
+        ancestor: ObjectId,
+        descendant: ObjectId,
     ) -> Result<Vec<Commit<'_>>, FirstParentCommitsBetweenError> {
         // A GHerrit stack is a first-parent path. A merge base is insufficient:
         // it can be reachable only through another parent of a merge commit.
@@ -578,6 +601,20 @@ fn repository_format_value(common_dir: &Path, key: &str) -> Result<Option<Vec<u8
         Some(1) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(None),
         _ => bail!("Invalid repository-format configuration"),
     }
+}
+
+pub(super) fn branch_head_snapshot(repo: &gix::Repository) -> Result<Option<BranchHeadSnapshot>> {
+    let head = repo.head()?;
+    let Some(name) = head.referent_name() else {
+        return Ok(None);
+    };
+    let Some((gix::refs::Category::LocalBranch, short_name)) = name.category_and_short_name()
+    else {
+        bail!("Cannot push because symbolic HEAD does not target a local branch");
+    };
+    let branch_name = decode_branch_name(short_name.as_ref())?;
+    let target = head.id().map(|id| id.detach());
+    Ok(Some(BranchHeadSnapshot { branch_name, target }))
 }
 
 pub(super) fn get_head_state(repo: &gix::Repository, head: &gix::Head<'_>) -> Result<HeadState> {

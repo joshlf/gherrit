@@ -10,6 +10,37 @@ pub enum State {
     Public,
 }
 
+/// A checked public branch whose remote ref cannot overlap GHerrit's owned
+/// head or base namespaces.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PublicBranchName(String);
+
+#[allow(dead_code)] // Exercised as the protocol is assembled, before activation.
+impl PublicBranchName {
+    pub(crate) fn new(value: String) -> Result<Self> {
+        let full_name = format!("refs/heads/{value}");
+        if gix::refs::FullName::try_from(full_name.as_str()).is_err() {
+            bail!("A public GHerrit branch must have a valid Git branch name");
+        }
+        if value == "gherrit-bases" || value.starts_with("gherrit-bases/") {
+            bail!(
+                "A public GHerrit branch cannot use GHerrit's reserved 'gherrit-bases' namespace"
+            );
+        }
+        let first_component = value.split('/').next().expect("validated branch is nonempty");
+        if first_component.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            bail!(
+                "A public GHerrit branch's first path component must contain a character other than an ASCII letter or digit so it cannot collide with a change-owned head"
+            );
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl State {
     const UNMANAGED: &str = "false";
     const PRIVATE: &str = "managedPrivate";
