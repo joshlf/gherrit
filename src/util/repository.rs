@@ -122,12 +122,47 @@ impl Repo {
     pub fn open(path: &str) -> Result<Self> {
         // NOTE: `gix::discover` is used instead of `gix::open` so that
         // `gherrit` doesn't need to be run from the root of the repository.
-        let inner = gix::ThreadSafeRepository::discover_opts(
+        let inner = match gix::ThreadSafeRepository::discover_opts(
             path,
             Default::default(),
             literal_graph_open_options(),
-        )?
-        .to_thread_local();
+        ) {
+            Ok(repo) => repo.to_thread_local(),
+            Err(error) => {
+                // Diagnose the backend with Git only after discovery failed.
+                // This is a capability diagnostic, not a fallback publisher.
+                let output = cmd(
+                    "git",
+                    [
+                        "-C",
+                        path,
+                        "config",
+                        "--local",
+                        "--no-includes",
+                        "--get",
+                        "extensions.refStorage",
+                    ],
+                )
+                .bounded_output();
+                if output
+                    .is_ok_and(|output| output.status.success() && output.stdout == b"reftable\n")
+                {
+                    bail!(
+                        "This repository uses reftable refs, which GHerrit's current gix backend does not support; `gherrit status` can inspect its Git capabilities without publishing"
+                    );
+                }
+                return Err(error.into());
+            }
+        };
+        // Some gix versions open reftable's compatibility files but fail on
+        // the placeholder HEAD. Name the actual backend before reading refs.
+        if repository_format_value(inner.common_dir(), "extensions.refStorage")?
+            .is_some_and(|value| value == b"reftable")
+        {
+            bail!(
+                "This repository uses reftable refs, which GHerrit's current gix backend does not support; `gherrit status` can inspect its Git capabilities without publishing"
+            );
+        }
         let current_branch = get_current_branch(&inner)?;
         let git_dir_identity = GitDirIdentity(
             fs::canonicalize(inner.path())
@@ -243,32 +278,7 @@ impl Repo {
     /// from the common directory's direct `config` file, without includes or
     /// configuration inherited from another scope.
     fn partial_clone_remote_from_direct_common_config(&self) -> Result<Option<Vec<u8>>> {
-        let mut command = cmd("git", ["config", "--file"]);
-        command.arg(self.inner.common_dir().join("config")).args([
-            "--no-includes",
-            "--null",
-            "--get",
-            "extensions.partialClone",
-        ]);
-        clear_git_repository_overrides(&mut command);
-        // These are Git command scope rather than part of the repository
-        // format file. Other bound children keep them so enclosing `git -c`
-        // settings continue to reach hooks.
-        command.env_remove("GIT_CONFIG_PARAMETERS");
-        command.env_remove("GIT_CONFIG_COUNT");
-
-        let output = command
-            .output()
-            .wrap_err("Failed to inspect the repository partial-clone configuration")?;
-        match output.status.code() {
-            Some(0) if output.stderr.is_empty() => output
-                .stdout
-                .strip_suffix(b"\0")
-                .map(|remote| Some(remote.to_owned()))
-                .ok_or_else(|| eyre!("Git returned malformed partial-clone configuration")),
-            Some(1) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(None),
-            _ => bail!("Invalid repository partial-clone configuration"),
-        }
+        repository_format_value(self.inner.common_dir(), "extensions.partialClone")
     }
 
     pub fn current_branch(&self) -> &HeadState {
@@ -558,4 +568,22 @@ pub(super) fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     }
 
     Ok(HeadState::Detached)
+}
+
+fn repository_format_value(common_dir: &Path, key: &str) -> Result<Option<Vec<u8>>> {
+    let mut command = cmd("git", ["config", "--file"]);
+    command.arg(common_dir.join("config")).args(["--no-includes", "--null", "--get", key]);
+    clear_git_repository_overrides(&mut command);
+    command.env_remove("GIT_CONFIG_PARAMETERS");
+    command.env_remove("GIT_CONFIG_COUNT");
+    let output = command.bounded_output().wrap_err("Failed to inspect repository format")?;
+    match output.status.code() {
+        Some(0) if output.stderr.is_empty() => output
+            .stdout
+            .strip_suffix(b"\0")
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(|| eyre!("Git returned malformed repository-format configuration")),
+        Some(1) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(None),
+        _ => bail!("Invalid repository-format configuration"),
+    }
 }
