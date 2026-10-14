@@ -1,5 +1,3 @@
-// Reexports are consumed when the planner is composed in the next review.
-#![allow(unused_imports)]
 //! GitHub boundary for exact-local observation and publication.
 //!
 //! Observation consumes the client which performs it. The resulting value
