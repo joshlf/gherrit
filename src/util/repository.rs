@@ -1,3 +1,5 @@
+// Captured-head entry points are used when the consuming planner is composed.
+#![allow(dead_code)]
 use std::{
     env,
     ffi::OsStr,
@@ -8,7 +10,7 @@ use std::{
 };
 
 use eyre::{OptionExt, Result, WrapErr, bail, eyre};
-use gix::{Commit, Id, bstr::ByteSlice as _, state::InProgress};
+use gix::{Commit, ObjectId, bstr::ByteSlice as _, state::InProgress};
 
 use super::{CommandExt as _, clear_git_repository_overrides};
 use crate::{cmd, manage::State};
@@ -36,6 +38,23 @@ impl HeadState {
             HeadState::Attached(name) | HeadState::Pending(name) => Some(name),
             HeadState::Detached => None,
         }
+    }
+}
+
+/// A logical branch identity and its exact `HEAD` target.
+///
+/// This value exists only while `HEAD` is attached to a local branch. A
+/// missing target is the real unborn-branch state, while detached `HEAD` is
+/// represented by the absence of this value. A symbolic `HEAD` outside the
+/// local-branch namespace is rejected.
+pub(crate) struct BranchHeadSnapshot {
+    branch_name: String,
+    target: Option<gix::ObjectId>,
+}
+
+impl BranchHeadSnapshot {
+    pub(crate) fn into_parts(self) -> (String, Option<gix::ObjectId>) {
+        (self.branch_name, self.target)
     }
 }
 
@@ -119,6 +138,10 @@ pub(super) fn default_remote_name_from_values<'a>(
 }
 
 impl Repo {
+    pub(crate) fn branch_head_snapshot(&self) -> Result<Option<BranchHeadSnapshot>> {
+        branch_head_snapshot(&self.inner)
+    }
+
     pub fn open(path: &str) -> Result<Self> {
         // NOTE: `gix::discover` is used instead of `gix::open` so that
         // `gherrit` doesn't need to be run from the root of the repository.
@@ -243,7 +266,7 @@ impl Repo {
         })
     }
 
-    pub(super) fn has_promisor_remote(&self) -> Result<bool> {
+    pub(crate) fn has_promisor_remote(&self) -> Result<bool> {
         let configured_by_extension = self
             .partial_clone_remote_from_direct_common_config()?
             .is_some_and(|remote| promisor_loader_accepts_remote_name(&remote));
@@ -447,7 +470,7 @@ pub(super) fn reject_nonempty_history_file(
     }
 }
 
-pub(super) fn parse_git_version(output: &[u8]) -> Result<(u64, u64)> {
+pub(crate) fn parse_git_version(output: &[u8]) -> Result<(u64, u64)> {
     let version = str::from_utf8(output)?
         .trim()
         .strip_prefix("git version ")
@@ -503,8 +526,8 @@ impl Repo {
     /// Returns the first-parent commits from `ancestor` to `descendant`.
     pub fn first_parent_commits_between(
         &self,
-        ancestor: Id<'_>,
-        descendant: Id<'_>,
+        ancestor: ObjectId,
+        descendant: ObjectId,
     ) -> Result<Vec<Commit<'_>>, FirstParentCommitsBetweenError> {
         // A GHerrit stack is a first-parent path. A merge base is insufficient:
         // it can be reachable only through another parent of a merge commit.
@@ -586,4 +609,67 @@ fn repository_format_value(common_dir: &Path, key: &str) -> Result<Option<Vec<u8
         Some(1) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(None),
         _ => bail!("Invalid repository-format configuration"),
     }
+}
+
+pub(super) fn branch_head_snapshot(repo: &gix::Repository) -> Result<Option<BranchHeadSnapshot>> {
+    let head = repo.head()?;
+    let Some(name) = head.referent_name() else {
+        return Ok(None);
+    };
+    let Some((gix::refs::Category::LocalBranch, short_name)) = name.category_and_short_name()
+    else {
+        bail!("Cannot push because symbolic HEAD does not target a local branch");
+    };
+    let branch_name = decode_branch_name(short_name.as_ref())?;
+    let target = head.id().map(|id| id.detach());
+    Ok(Some(BranchHeadSnapshot { branch_name, target }))
+}
+
+pub(super) fn get_head_state(repo: &gix::Repository, head: &gix::Head<'_>) -> Result<HeadState> {
+    if let Some(name) = head.referent_name() {
+        let name = decode_branch_name(name.shorten().as_ref())?;
+        return Ok(HeadState::Attached(name));
+    }
+
+    // Try to recover the branch name – we only care about states that detach
+    // HEAD but preserve a branch identity. All other states besides these two
+    // are either unreachable (because they're states in which the HEAD is
+    // considered attached, and so we would have already returned above) or
+    // are states in which we don't have any branch name at all.
+    if let Some(InProgress::Rebase) | Some(InProgress::RebaseInteractive) = repo.state() {
+        let git_dir = repo.path();
+        let try_read_ref = |path: PathBuf| -> Result<Option<String>> {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error)
+                        .wrap_err_with(|| format!("Failed to read {}", path.display()));
+                }
+            };
+            let bytes = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+            let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+            let bytes = bytes.strip_prefix(b"refs/heads/").unwrap_or(bytes);
+            Ok(Some(decode_branch_name(bytes)?))
+        };
+
+        if let Some(name) = try_read_ref(git_dir.join("rebase-merge/head-name"))? {
+            return Ok(HeadState::Pending(name));
+        }
+
+        if let Some(name) = try_read_ref(git_dir.join("rebase-apply/head-name"))? {
+            return Ok(HeadState::Pending(name));
+        }
+    }
+
+    Ok(HeadState::Detached)
+}
+
+pub(super) fn decode_branch_name(bytes: &[u8]) -> Result<String> {
+    if bytes.is_empty() {
+        bail!("GHerrit requires a nonempty branch name");
+    }
+    Ok(str::from_utf8(bytes)
+        .wrap_err("GHerrit requires branch names to be valid UTF-8")?
+        .to_owned())
 }
