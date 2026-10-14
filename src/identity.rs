@@ -54,6 +54,13 @@ impl GherritPrId {
         Self::from_ref_component(value)
     }
 
+    /// IDs occupy one path component, so their heads can equal or contain
+    /// a branch ref, but cannot lie below a distinct branch path.
+    pub(crate) fn head_conflicts_with_branch(&self, branch: &str) -> bool {
+        branch == self.as_str()
+            || branch.strip_prefix(self.as_str()).is_some_and(|suffix| suffix.starts_with('/'))
+    }
+
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
