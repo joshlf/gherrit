@@ -6,6 +6,7 @@ mod hosted_contracts;
 #[cfg(feature = "hosted-contracts")]
 #[doc(hidden)]
 pub use hosted_contracts::main as hosted_contracts_main;
+mod hosted;
 mod identity;
 mod inspect;
 mod install;
@@ -61,6 +62,8 @@ enum Commands {
         json: bool,
         #[arg(long)]
         base: Option<String>,
+        #[arg(long)]
+        remote: bool,
     },
 
     /// Git hooks integration (internal use only).
@@ -124,8 +127,8 @@ enum HookCommands {
 /// hooks, parse process arguments, terminate the process, or create a nested
 /// async runtime. Standalone binaries own those policies.
 pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
-    if let Commands::Status { json, base } = &cli.command {
-        return inspect::run(*json, base.as_deref());
+    if let Commands::Status { json, base, remote } = &cli.command {
+        return inspect::run(*json, base.as_deref(), *remote).await;
     }
     let repo = util::Repo::open(".").wrap_err("Failed to open repo")?;
 
