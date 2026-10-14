@@ -59,52 +59,13 @@ pub(crate) use crate::subprocess;
 
 const INDETERMINATE_GRAPHQL_MUTATION: &str = "GraphQL mutation acknowledgement is indeterminate; stop this publication attempt and retry the push to reobserve GitHub state";
 const MAX_GRAPHQL_MUTATION_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const INTERNAL_PRE_PUSH_GIT_DIR_ENV: &str = "GHERRIT_INTERNAL_PRE_PUSH_GIT_DIR";
-const INTERNAL_PRE_PUSH_REMOTE_ENV: &str = "GHERRIT_INTERNAL_PRE_PUSH_REMOTE";
-
-/// Returns whether Git invoked this hook for a push started by GHerrit.
-///
-/// This marker is cooperative recursion control, not a private value or a
-/// security boundary. Binding it to the exact per-worktree Git directory and
-/// Git's remote-name argument prevents an inherited marker from disabling
-/// GHerrit for an unrelated nested push.
-pub(crate) fn is_internal_publication_push(
-    repository: &util::Repo,
-    remote_name: Option<&str>,
-    remote_location: Option<&str>,
-) -> bool {
-    internal_publication_push_matches(
-        repository.git_dir_identity().as_os_str(),
-        remote_name,
-        remote_location,
-        env::var_os(INTERNAL_PRE_PUSH_REMOTE_ENV).as_deref(),
-        env::var_os(INTERNAL_PRE_PUSH_GIT_DIR_ENV).as_deref(),
-    )
-}
-
-fn internal_publication_push_matches(
-    git_dir: &OsStr,
-    remote_name: Option<&str>,
-    remote_location: Option<&str>,
-    remote_marker: Option<&OsStr>,
-    git_dir_marker: Option<&OsStr>,
-) -> bool {
-    matches!(
-        (remote_name, remote_location, remote_marker, git_dir_marker),
-        (Some(remote_name), Some(remote_location), Some(remote_marker), Some(git_dir_marker))
-            if !remote_name.is_empty()
-                && !remote_location.is_empty()
-                && remote_marker == OsStr::new(remote_name)
-                && git_dir_marker == git_dir
-    )
-}
-
 /// The complete externally relevant shape of one hook invocation.
 ///
 /// GHerrit's own nested pushes return before constructing this value. Direct
 /// invocation has no enclosing effect. For a managed Git invocation, one byte
 /// is enough to distinguish a no-op from a push which could mutate a ref after
 /// this hook returns. Unmanaged invocations never consume their input.
+#[allow(dead_code)]
 pub(crate) struct Invocation {
     source: InvocationSource,
 }
@@ -119,6 +80,7 @@ enum InvocationSource {
     },
 }
 
+#[allow(dead_code)]
 impl Invocation {
     pub(crate) fn new(
         remote_name: Option<OsString>,
@@ -172,6 +134,46 @@ impl Invocation {
             ),
         }
     }
+}
+
+const INTERNAL_PRE_PUSH_GIT_DIR_ENV: &str = "GHERRIT_INTERNAL_PRE_PUSH_GIT_DIR";
+const INTERNAL_PRE_PUSH_REMOTE_ENV: &str = "GHERRIT_INTERNAL_PRE_PUSH_REMOTE";
+
+/// Returns whether Git invoked this hook for a push started by GHerrit.
+///
+/// This marker is cooperative recursion control, not a private value or a
+/// security boundary. Binding it to the exact per-worktree Git directory and
+/// Git's remote-name argument prevents an inherited marker from disabling
+/// GHerrit for an unrelated nested push.
+pub(crate) fn is_internal_publication_push(
+    repository: &util::Repo,
+    remote_name: Option<&str>,
+    remote_location: Option<&str>,
+) -> bool {
+    internal_publication_push_matches(
+        repository.git_dir_identity().as_os_str(),
+        remote_name,
+        remote_location,
+        env::var_os(INTERNAL_PRE_PUSH_REMOTE_ENV).as_deref(),
+        env::var_os(INTERNAL_PRE_PUSH_GIT_DIR_ENV).as_deref(),
+    )
+}
+
+fn internal_publication_push_matches(
+    git_dir: &OsStr,
+    remote_name: Option<&str>,
+    remote_location: Option<&str>,
+    remote_marker: Option<&OsStr>,
+    git_dir_marker: Option<&OsStr>,
+) -> bool {
+    matches!(
+        (remote_name, remote_location, remote_marker, git_dir_marker),
+        (Some(remote_name), Some(remote_location), Some(remote_marker), Some(git_dir_marker))
+            if !remote_name.is_empty()
+                && !remote_location.is_empty()
+                && remote_marker == OsStr::new(remote_name)
+                && git_dir_marker == git_dir
+    )
 }
 
 #[derive(Eq, PartialEq)]
