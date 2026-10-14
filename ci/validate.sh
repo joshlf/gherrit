@@ -14,6 +14,7 @@ check() {
     doc) cargo test --workspace --doc --all-features --locked ;;
     markers) ci/check_todo.sh ;;
     unit) cargo test --workspace --lib --all-features --locked ;;
+    semantic) cargo test --lib --all-features --locked publication_attempt::semantic_oracle ;;
     adapters) cargo test --test pre_push --all-features --locked ;;
     hooks) cargo test --test hooks --all-features --locked ;;
     cli) cargo test --test cli --all-features --locked ;;
@@ -21,7 +22,7 @@ check() {
       for step in production fmt lint tests doc markers; do check "$step"; done
       ;;
     *)
-      echo "Usage: ci/validate.sh [all|production|fmt|lint|tests|doc|markers|unit|adapters|hooks|cli]" >&2
+      echo "Usage: ci/validate.sh [all|production|fmt|lint|tests|doc|markers|unit|semantic|adapters|hooks|cli]" >&2
       return 2
       ;;
   esac
