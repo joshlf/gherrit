@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 mod commit_msg;
+mod github_http;
 mod identity;
 mod install;
 mod manage;
