@@ -319,3 +319,17 @@ fn installed_pre_push_blocks_an_inherited_custom_shallow_file() {
     assert_eq!(ctx.remote_ref_oid("refs/heads/custom-shallow-boundary"), None);
     assert_eq!(ctx.remote_ref_oid(&format!("refs/heads/{id}")), None);
 }
+
+#[test]
+fn installed_post_checkout_adopts_a_fresh_default_upstream() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_installed_hooks()
+        .with_initial_commit()
+        .build();
+    ctx.git_cmd().args(["switch", "-c", "from-origin", "origin/main"]).assert().success();
+    ctx.assert_config("branch.from-origin.gherritManaged", Some(testutil::MANAGED_PRIVATE));
+    ctx.assert_config("branch.from-origin.pushRemote", Some("."));
+    ctx.assert_config("branch.from-origin.remote", Some("."));
+    ctx.assert_config("branch.from-origin.merge", Some("refs/heads/from-origin"));
+}
