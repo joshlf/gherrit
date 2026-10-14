@@ -1069,6 +1069,27 @@ fn known_updates_are_preflighted_before_a_mixed_create_stage_escapes() {
 }
 
 #[test]
+fn known_updates_reserve_the_full_json_body_budget_before_effects() {
+    let mut existing = OpenSpec::new(20, oid(20), BaseKind::Default, oid(10));
+    existing.node = "N".repeat(MAX_MUTATION_REQUEST_BYTES - 512 * 1024);
+    let error = plan(&[
+        EntrySpec {
+            id: "Gexisting",
+            history: HistorySpec::current(oid(20), oid(10), Some(20)),
+            pull_request: PullRequestSpec::Open(existing),
+        },
+        EntrySpec {
+            id: "Gmissing",
+            history: HistorySpec::absent(),
+            pull_request: PullRequestSpec::Absent,
+        },
+    ])
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("pull request mutation"));
+}
+
+#[test]
 fn known_duplicate_closes_survive_create_receipt_binding() {
     let mut existing = OpenSpec::new(20, oid(20), BaseKind::Default, oid(10));
     existing.additional.push(AdditionalOpenSpec::new(10, oid(20), BaseKind::Owned, oid(10)));
@@ -1926,25 +1947,4 @@ async fn empty_effect_stages_cross_without_attempting_a_durable_write() {
     result.unwrap();
     driver.assert_consumed();
     assert!(driver.attempts.is_empty());
-}
-
-#[test]
-fn known_updates_reserve_the_full_json_body_budget_before_effects() {
-    let mut existing = OpenSpec::new(20, oid(20), BaseKind::Default, oid(10));
-    existing.node = "N".repeat(MAX_MUTATION_REQUEST_BYTES - 512 * 1024);
-    let error = plan(&[
-        EntrySpec {
-            id: "Gexisting",
-            history: HistorySpec::current(oid(20), oid(10), Some(20)),
-            pull_request: PullRequestSpec::Open(existing),
-        },
-        EntrySpec {
-            id: "Gmissing",
-            history: HistorySpec::absent(),
-            pull_request: PullRequestSpec::Absent,
-        },
-    ])
-    .err()
-    .unwrap();
-    assert!(error.to_string().contains("pull request mutation"));
 }
