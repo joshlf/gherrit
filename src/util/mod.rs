@@ -1,7 +1,6 @@
 mod auth;
 mod command;
 mod config;
-pub(crate) use config::BranchConfigValues;
 mod layout {
     //! Path roles are distinct in a linked worktree. Keep the original spelling
     //! for child processes; canonical identity is a separate repository contract.
@@ -30,6 +29,7 @@ mod layout {
     }
 }
 mod repository;
+
 pub use auth::get_github_token;
 pub use command::{CommandExt, cmd};
 pub(crate) use command::{clear_git_repository_overrides, cmd_macro};
@@ -39,5 +39,6 @@ pub(crate) use repository::{GitDirIdentity, literal_graph_open_options, require_
 #[cfg(test)]
 mod tests;
 
+pub(crate) use config::BranchConfigValues;
 #[cfg(test)]
 pub(crate) use repository::parse_git_version;

@@ -207,6 +207,7 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
     if matches!(repo.current_branch(), util::HeadState::UnsupportedName) {
         bail!("GHerrit requires branch names to be valid UTF-8");
     }
+
     // Get current branch (supporting rebase)
     let Some(branch_name) = repo.current_branch().name() else {
         log::debug!("Could not determine branch name (detached head?). Skipping.");
