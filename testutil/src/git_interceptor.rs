@@ -225,8 +225,12 @@ mod tests {
         assert_eq!(subcommand(&args(&["git", "--unknown", "interpret-trailers"])), None);
     }
     #[test]
-    fn recognizes_only_the_product_command_shape() {
+    fn recognizes_product_and_direct_fixture_command_shapes() {
         assert_eq!(subcommand(&args(&["git", "push", "origin"])), Some("push"));
+        assert_eq!(
+            subcommand(&args(&["git", "--no-replace-objects", "push", "origin"])),
+            Some("push")
+        );
         assert_eq!(subcommand(&args(&["git", "ls-remote", "origin"])), Some("ls-remote"));
         assert_eq!(subcommand(&args(&["git"])), None);
         assert_eq!(subcommand(&args(&["git", "--version"])), None);
