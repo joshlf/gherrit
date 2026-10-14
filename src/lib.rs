@@ -7,6 +7,7 @@ mod hosted_contracts;
 #[doc(hidden)]
 pub use hosted_contracts::main as hosted_contracts_main;
 mod identity;
+mod inspect;
 mod install;
 mod manage;
 mod pre_push;
@@ -53,6 +54,15 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect local management, paths, capabilities, and commit identities.
+    #[command(visible_alias = "inspect")]
+    Status {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        base: Option<String>,
+    },
+
     /// Git hooks integration (internal use only).
     #[command(subcommand, hide = true)]
     Hook(HookCommands),
@@ -114,6 +124,9 @@ enum HookCommands {
 /// hooks, parse process arguments, terminate the process, or create a nested
 /// async runtime. Standalone binaries own those policies.
 pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
+    if let Commands::Status { json, base } = &cli.command {
+        return inspect::run(*json, base.as_deref());
+    }
     let repo = util::Repo::open(".").wrap_err("Failed to open repo")?;
 
     if let Commands::Hook(HookCommands::PrePush { remote_name, remote_location }) = &cli.command
@@ -154,6 +167,7 @@ pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
         }
         Commands::Unmanage { force } => manage::set_state(&repo, State::Unmanaged, force)?,
         Commands::Install { force, allow_global } => install::install(&repo, force, allow_global)?,
+        Commands::Status { .. } => unreachable!("inspection has its own read-only entry"),
     }
 
     Ok(())
