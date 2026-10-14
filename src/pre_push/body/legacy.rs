@@ -7,7 +7,7 @@ use color_eyre::eyre::{Result, bail};
 // of that limit as a safety factor.
 pub(super) const MAX_BODY_SIZE_BYTES: usize = 131_072;
 
-pub(super) struct PrBody<'a> {
+pub(in crate::pre_push) struct PrBody<'a> {
     pub commit_body: &'a str,
     pub repo_url: &'a str,
     pub repo_fetch_url: &'a str,
