@@ -12,6 +12,8 @@ mod marker;
 mod plan;
 mod refs;
 mod remote;
+#[cfg(test)]
+mod semantic_oracle;
 mod version;
 mod version_object;
 
