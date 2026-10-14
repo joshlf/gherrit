@@ -25,9 +25,9 @@ Ubuntu CI job. Set `RUSTUP_TOOLCHAIN=1.89.0` to reproduce its declared version.
 The formatter still uses nightly. The Windows job retains its native test
 invocation.
 
-For focused feedback, select `production`, `fmt`, `lint`, `unit`,
+For focused feedback, select `production`, `fmt`, `lint`, `unit`, `semantic`,
 `adapters`, `hooks`, `cli`, `doc`, or `markers`. `unit` includes all library
-tests; `adapters` selects the
+tests; `semantic` selects the durable recovery model; `adapters` selects the
 pre-push integration target; `hooks` and `cli` select complete process tests.
 These commands do not replace the full validation required for submission.
 
