@@ -10,6 +10,36 @@ pub enum State {
     Public,
 }
 
+/// A public name which cannot equal a change head or enter owned-base refs.
+/// Ancestor conflicts require the actual collected IDs or native Git storage.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PublicBranchName(String);
+
+#[allow(dead_code)] // Exercised as the protocol is assembled, before activation.
+impl PublicBranchName {
+    pub(crate) fn new(value: String) -> Result<Self> {
+        let full_name = format!("refs/heads/{value}");
+        if gix::refs::FullName::try_from(full_name.as_str()).is_err() {
+            bail!("A public GHerrit branch must have a valid Git branch name");
+        }
+        if value == "gherrit-bases" || value.starts_with("gherrit-bases/") {
+            bail!(
+                "A public GHerrit branch cannot use GHerrit's reserved 'gherrit-bases' namespace"
+            );
+        }
+        if crate::identity::GherritPrId::from_ref_component(value.as_bytes()).is_ok() {
+            bail!(
+                "A public GHerrit branch cannot use an exact change-ID name; add a slash or a non-alphanumeric character, or manage it as private"
+            );
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl State {
     const UNMANAGED: &str = "false";
     const PRIVATE: &str = "managedPrivate";
@@ -853,6 +883,24 @@ mod tests {
             .args(["config", "--local", "--get", "branch.selected-repository.gherritManaged"])
             .assert()
             .code(1);
+    }
+
+    #[test]
+    fn public_branch_names_exclude_exact_change_heads_and_reserved_bases() {
+        for branch in [
+            "feature/foo",
+            "Gchange/child",
+            "feature-one",
+            "feature.one",
+            "café",
+            "gherrit-bases-other",
+        ] {
+            assert_eq!(PublicBranchName::new(branch.to_owned()).unwrap().as_str(), branch);
+        }
+
+        for branch in ["Gchange", "feature", "gherrit-bases", "gherrit-bases/Gchange"] {
+            assert!(PublicBranchName::new(branch.to_owned()).is_err(), "branch={branch:?}");
+        }
     }
 
     const BRANCH: &str = "feature";
