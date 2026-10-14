@@ -8,6 +8,7 @@ pub(super) const MAX_BODY_SIZE_BYTES: usize = 131_072;
 pub(super) struct PrBody<'a> {
     pub commit_body: &'a str,
     pub repo_url: &'a str,
+    pub repo_fetch_url: &'a str,
     pub public_branch: Option<&'a str>,
     pub stack_pr_numbers: &'a [u64],
     pub current_pr_number: u64,
@@ -157,12 +158,13 @@ impl PrBody<'_> {
         // the full `refs/heads/` syntax to avoid ambiguity with tags of the
         // same name.
         let id = self.gherrit_id;
-        let fetch = format!("git fetch origin refs/heads/{id}");
+        let repository = self.repo_fetch_url;
+        let fetch = format!("git fetch {repository} refs/heads/{id}");
         let commands = [
             ("Branch", format!("{fetch} && git checkout -b pr-{id} FETCH_HEAD")),
             ("Checkout", format!("{fetch} && git checkout FETCH_HEAD")),
             ("Cherry Pick", format!("{fetch} && git cherry-pick FETCH_HEAD")),
-            ("Pull", format!("git pull origin refs/heads/{id}")),
+            ("Pull", format!("git pull {repository} refs/heads/{id}")),
         ];
 
         commands.into_iter().try_for_each(|(title, command)| {
@@ -199,6 +201,7 @@ mod tests {
         PrBody {
             commit_body,
             repo_url: "/octo/widgets",
+            repo_fetch_url: "https://github.com/octo/widgets.git",
             public_branch,
             stack_pr_numbers: STACK,
             current_pr_number,

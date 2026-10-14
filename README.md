@@ -15,6 +15,8 @@ synchronizes them to GitHub as a chain of dependent Pull Requests.
 ### Prerequisites
 
   * **Rust**: You must have a working Rust toolchain (`cargo`).
+  * **Git**: Version 2.31 or newer. Promisor and partial-clone repositories
+    require Git 2.45 or newer.
   * **GitHub CLI (`gh`)**: GHerrit uses the `gh` tool to authenticate to GitHub
     so it can create and manage PRs. Ensure you are authenticated (`gh auth
     login`).
@@ -101,8 +103,25 @@ merge commits.
 
 Merge only the root PR, whose base is the repository's default branch. After it
 lands, advance your local default branch from the same repository that GHerrit
-publishes to. Remove the merged local root from the remaining stack, publish
-again, and repeat from the new root until the stack is landed.
+publishes to. Remove the merged local root from the remaining stack, and
+publish again. For a repository whose default branch is `main`:
+
+```bash
+git switch main
+gherrit_remote="$(git config --default origin --get gherrit.remote)"
+gherrit_destination="$(git remote get-url --push -- "$gherrit_remote")"
+git pull --ff-only -- "$gherrit_destination" main
+git switch -
+git rebase --rebase-merges --onto main <merged-root-commit>
+git push
+```
+
+Replace `<merged-root-commit>` with the commit ID of the local root which just
+landed. The two assignments select the same push destination that GHerrit uses:
+`gherrit.remote` when configured and `origin` otherwise. Naming both that
+destination and `main` prevents the local branch's upstream or the remote's
+fetch URL from selecting a different repository. Repeat from the new root until
+the stack is landed.
 
 ## Configuration
 

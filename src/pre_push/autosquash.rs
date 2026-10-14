@@ -1,5 +1,7 @@
 use std::{error::Error, fmt};
 
+use super::destination::DefaultBranch;
+
 const RESERVED_PREFIXES: [&str; 3] = ["fixup!", "squash!", "amend!"];
 
 fn is_pending(subject: &str) -> bool {
@@ -8,8 +10,7 @@ fn is_pending(subject: &str) -> bool {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct PendingAutosquash {
-    remote: String,
-    default_branch: String,
+    default_ref: String,
 }
 
 impl fmt::Display for PendingAutosquash {
@@ -19,9 +20,9 @@ impl fmt::Display for PendingAutosquash {
             concat!(
                 "Stack contains pending fixup/squash/amend commits.\n",
                 "Please squash your history before syncing:\n",
-                "    git rebase -i --autosquash {}/{}",
+                "    git rebase -i --autosquash {}",
             ),
-            self.remote, self.default_branch,
+            self.default_ref,
         )
     }
 }
@@ -33,25 +34,28 @@ impl Error for PendingAutosquash {}
 /// This policy runs over the entire stack before commit metadata is validated.
 /// A temporary commit therefore takes precedence over errors that are only
 /// meaningful once the stack is ready to publish, such as a missing GHerrit
-/// ID.
+/// ID. Guidance names the local ref whose tip was validated against the push
+/// repository; the configured remote name need not name that same history.
 pub(super) fn ensure_publishable<'a>(
     subjects: impl IntoIterator<Item = &'a str>,
-    remote: &str,
-    default_branch: &str,
+    default_branch: &DefaultBranch,
 ) -> Result<(), PendingAutosquash> {
     subjects
         .into_iter()
         .any(is_pending)
-        .then(|| PendingAutosquash {
-            remote: remote.to_owned(),
-            default_branch: default_branch.to_owned(),
-        })
+        .then(|| PendingAutosquash { default_ref: default_branch.full_ref_name() })
         .map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
 mod tests {
+    use gix::ObjectId;
+
     use super::*;
+
+    fn default_branch(name: &str) -> DefaultBranch {
+        DefaultBranch::new(name.to_owned(), ObjectId::from_bytes_or_panic(&[1; 20])).unwrap()
+    }
 
     #[test]
     fn classifies_reserved_subject_prefixes() {
@@ -95,7 +99,7 @@ mod tests {
                     .collect::<Vec<_>>();
 
                 assert!(
-                    ensure_publishable(subjects, "origin", "main").is_err(),
+                    ensure_publishable(subjects, &default_branch("main")).is_err(),
                     "prefix: {prefix:?}, position: {pending_index}",
                 );
             });
@@ -104,28 +108,28 @@ mod tests {
 
     #[test]
     fn accepts_empty_and_ordinary_stacks() {
-        assert_eq!(ensure_publishable([], "origin", "main"), Ok(()));
-        assert_eq!(ensure_publishable(["one", "two", "three"], "origin", "main"), Ok(()));
+        let default_branch = default_branch("main");
+        assert_eq!(ensure_publishable([], &default_branch), Ok(()));
+        assert_eq!(ensure_publishable(["one", "two", "three"], &default_branch), Ok(()));
     }
 
     #[test]
-    fn reports_the_configured_rebase_target() {
-        [("origin", "main"), ("upstream", "master"), (".", "trunk")].into_iter().for_each(
-            |(remote, branch)| {
-                let error = ensure_publishable(["fixup! subject"], remote, branch).unwrap_err();
+    fn reports_the_validated_local_rebase_target() {
+        ["main", "master", "release/trunk"].into_iter().for_each(|branch| {
+            let error =
+                ensure_publishable(["fixup! subject"], &default_branch(branch)).unwrap_err();
 
-                assert_eq!(
-                    error.to_string(),
-                    format!(
-                        concat!(
-                            "Stack contains pending fixup/squash/amend commits.\n",
-                            "Please squash your history before syncing:\n",
-                            "    git rebase -i --autosquash {}/{}",
-                        ),
-                        remote, branch,
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    concat!(
+                        "Stack contains pending fixup/squash/amend commits.\n",
+                        "Please squash your history before syncing:\n",
+                        "    git rebase -i --autosquash refs/heads/{}",
                     ),
-                );
-            },
-        );
+                    branch,
+                ),
+            );
+        });
     }
 }

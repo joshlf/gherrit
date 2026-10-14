@@ -93,6 +93,7 @@ pub(super) async fn output(
 /// This deliberately does not admit an arbitrary [`Stdio`], pipe, or in-memory
 /// producer: all input is finite and complete before the command deadline
 /// begins, with no producer lifetime to supervise.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) async fn output_with_regular_file_stdin(
     command: Command,
     input: RegularFileStdin,
