@@ -26,6 +26,7 @@ use owo_colors::OwoColorize;
 use crate::{
     cmd,
     identity::has_normalized_id as has_gherrit_id,
+    manage::State,
     util::{self, CommandExt as _},
 };
 
@@ -195,7 +196,7 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
         return Ok(());
     };
 
-    if !repo.is_managed(branch_name)? {
+    if State::read_required_from(repo, branch_name)? == State::Unmanaged {
         log::warn!("Branch {} is not managed. Skipping.", branch_name.yellow());
         return Ok(());
     }
