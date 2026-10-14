@@ -7,6 +7,7 @@
 use std::{ops::Range, str};
 
 use eyre::{Result, bail};
+use gix::ObjectId;
 
 pub(crate) const MAX_GHERRIT_PR_ID_BYTES: usize = 128;
 
@@ -35,6 +36,22 @@ impl GherritPrId {
             bail!("invalid GHerrit change ID");
         }
         Ok(Self(str::from_utf8(value)?.to_owned()))
+    }
+
+    pub(crate) fn from_trailer(commit: ObjectId, value: &[u8]) -> Result<Self> {
+        if value.is_empty() {
+            bail!("Commit {commit} missing gherrit-pr-id trailer");
+        }
+        if value.len() > MAX_GHERRIT_PR_ID_BYTES {
+            bail!(
+                "Commit {commit} has a gherrit-pr-id trailer longer than the {MAX_GHERRIT_PR_ID_BYTES}-byte limit"
+            );
+        }
+        if !value.iter().all(u8::is_ascii_alphanumeric) {
+            bail!("Commit {commit} has invalid gherrit-pr-id trailer");
+        }
+
+        Self::from_ref_component(value)
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -106,19 +123,8 @@ pub(crate) fn trailer_sections(message: &[u8]) -> impl Iterator<Item = (usize, &
 /// recognizing the final block. Continuations are unfolded so validation
 /// rejects a continued value rather than silently accepting its first line.
 pub(crate) fn gherrit_id_trailers(message: &[u8]) -> Vec<GherritIdTrailer> {
-    gherrit_id_trailers_with_separators(message, &[])
-}
-
-/// Also recognize configured legacy separators as malformed raw occurrences.
-/// Native legacy queries stop at scissors, so their caller must count these
-/// occurrences across every section. Stored publication keeps the fixed raw
-/// grammar above, independent of later repository configuration.
-pub(crate) fn gherrit_id_trailers_with_separators(
-    message: &[u8],
-    separators: &[u8],
-) -> Vec<GherritIdTrailer> {
     trailer_sections(message)
-        .flat_map(|(offset, section)| id_trailers_in_section(section, offset, separators))
+        .flat_map(|(offset, section)| id_trailers_in_section(section, offset))
         .collect()
 }
 
@@ -146,11 +152,7 @@ pub(crate) fn footer_lines(message: &[u8], offset: usize) -> Vec<(Range<usize>, 
     lines
 }
 
-fn id_trailers_in_section(
-    message: &[u8],
-    offset: usize,
-    separators: &[u8],
-) -> Vec<GherritIdTrailer> {
+fn id_trailers_in_section(message: &[u8], offset: usize) -> Vec<GherritIdTrailer> {
     let lines = footer_lines(message, offset);
     let mut identities = Vec::<GherritIdTrailer>::new();
     let mut has_entry = false;
@@ -175,23 +177,10 @@ fn id_trailers_in_section(
             continue;
         }
 
-        let key_end = b"gherrit-pr-id".len();
-        let legacy_separator = line
-            .get(..key_end)
-            .filter(|key| key.eq_ignore_ascii_case(b"gherrit-pr-id"))
-            .and_then(|_| {
-                let padding =
-                    line[key_end..].iter().take_while(|byte| matches!(byte, b' ' | b'\t')).count();
-                let index = key_end + padding;
-                line.get(index).filter(|byte| separators.contains(byte)).map(|_| index)
-            });
-        let Some(separator) = legacy_separator
-            .or_else(|| line.iter().position(|byte| matches!(byte, b':' | b'=')))
-            .or_else(|| line.iter().position(|byte| separators.contains(byte)))
-        else {
+        let Some(separator) = line.iter().position(|byte| matches!(byte, b':' | b'=')) else {
             return Vec::new();
         };
-        let key = &line[..if legacy_separator.is_some() { key_end } else { separator }];
+        let key = &line[..separator];
         if key.is_empty()
             || key.iter().any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
         {
@@ -201,7 +190,7 @@ fn id_trailers_in_section(
         has_entry = true;
         continued_identity = None;
         if key.eq_ignore_ascii_case(b"gherrit-pr-id") {
-            if separator == key_end && line.get(separator..separator + 2) == Some(b": ") {
+            if line.get(separator..separator + 2) == Some(b": ") {
                 identities.push(GherritIdTrailer::Exact {
                     value: trim_value_padding(&line[separator + 2..]).to_vec(),
                     line: raw_line.clone(),
@@ -313,34 +302,6 @@ mod tests {
             } else {
                 assert!(occurrences.is_empty(), "substantive final line {line:?}");
             }
-        }
-    }
-    #[test]
-    fn legacy_separator_occurrences_remain_visible_across_scissors() {
-        for separator in ["%", "$", "@"] {
-            let message = format!(
-                "Subject\n\ngherrit-pr-id: Gbefore\n# ------------------------ >8 ------------------------\nSubject\n\ngherrit-pr-id{separator}Gafter\n"
-            );
-            assert_eq!(gherrit_id_trailers(message.as_bytes()).len(), 1);
-            let occurrences =
-                gherrit_id_trailers_with_separators(message.as_bytes(), separator.as_bytes());
-            assert!(
-                matches!(occurrences.as_slice(), [GherritIdTrailer::Exact {value, ..}, GherritIdTrailer::Malformed] if value == b"Gbefore")
-            );
-        }
-    }
-    #[test]
-    fn legacy_separators_inside_keys_or_values_do_not_hide_identity_occurrences() {
-        let canonical = b"Subject\n\ngherrit-pr-id: Gone\nReviewed-by: Person\n";
-        assert!(
-            matches!(gherrit_id_trailers_with_separators(canonical, b":r").as_slice(), [GherritIdTrailer::Exact {value, ..}] if value == b"Gone")
-        );
-        for suffix in ["%Gone:later", " %Gone", "$Gone"] {
-            let message = format!("Subject\n\ngherrit-pr-id{suffix}\nOther%value\n");
-            assert_eq!(
-                gherrit_id_trailers_with_separators(message.as_bytes(), b":%$").as_slice(),
-                [GherritIdTrailer::Malformed]
-            );
         }
     }
 }
