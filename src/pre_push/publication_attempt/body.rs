@@ -145,6 +145,14 @@ fn write_public_branch_link(
 pub(super) struct GeneratedBody(Box<str>);
 
 impl GeneratedBody {
+    /// A request-budget witness, never a transmitted body. Every admitted final
+    /// body has at most this many UTF-8 bytes; JSON expands any one byte into
+    /// at most the six bytes used to escape NUL. This upper bound also covers
+    /// a full-history body selected only after exact PR numbers are known.
+    pub(super) fn request_budget_witness() -> Self {
+        Self("\0".repeat(MAX_BODY_SIZE_BYTES).into_boxed_str())
+    }
+
     pub(super) fn as_str(&self) -> &str {
         &self.0
     }
