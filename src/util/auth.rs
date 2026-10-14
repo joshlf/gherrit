@@ -1,6 +1,7 @@
 use eyre::{Result, WrapErr, eyre};
 
 use crate::cmd;
+
 pub fn get_github_token() -> Result<String> {
     // Priority 1: GITHUB_TOKEN env var
     if let Ok(token) = std::env::var("GITHUB_TOKEN")
@@ -11,7 +12,7 @@ pub fn get_github_token() -> Result<String> {
 
     // The API destination is github.com regardless of GH_HOST.
     // Priority 2: gh auth token --hostname github.com
-    let output = crate::subprocess::local_output(
+    let output = crate::pre_push::subprocess::local_output(
         &mut cmd!("gh auth token --hostname github.com"),
         None,
         std::time::Duration::from_secs(30),

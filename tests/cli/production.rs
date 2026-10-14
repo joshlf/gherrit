@@ -1,11 +1,9 @@
-use std::process::Command;
-
-use assert_cmd::prelude::*;
 use predicates::prelude::*;
 
 #[test]
 fn production_binary_rejects_the_test_driver_protocol() {
-    Command::new(assert_cmd::cargo::cargo_bin!("gherrit"))
+    let ctx = testutil::TestContextBuilder::new(assert_cmd::cargo::cargo_bin!("gherrit")).build();
+    ctx.gherrit_cmd()
         .arg("__test-git")
         .assert()
         .failure()
@@ -21,7 +19,7 @@ fn test_driver_without_github_endpoint_fails_closed() {
 
     ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().failure().stderr(
         predicate::str::contains(
-            "test driver cannot sync PRs without a configured GitHub endpoint",
+            "test driver cannot publish PRs without a configured GitHub endpoint",
         ),
     );
 
