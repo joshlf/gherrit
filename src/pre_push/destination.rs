@@ -732,7 +732,7 @@ impl ResolvedDestination {
                 Some(coordinates)
             }
             Some(ParsedDestination::Uri { scheme, authority, path }) => {
-                if authority.contains('@') {
+                if authority.contains('@') && !(scheme == "ssh" && github_ssh_authority(authority)) {
                     bail!(
                         "The push destination for GHerrit remote '{}' contains URI user information, which GHerrit does not support; use a Git credential helper or an SCP-style SSH destination instead",
                         configured_remote.as_str()
@@ -1411,6 +1411,11 @@ fn repository_components(owner: &str, repository: &str) -> Option<(String, Strin
     Some((owner.to_owned(), repository.to_owned()))
 }
 
+// SSH preserves username case; DNS hostname matching does not.
+fn github_ssh_authority(authority: &str) -> bool {
+    authority.strip_prefix("git@").is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+}
+
 /// Whether one parsed destination uses a supported authenticated push
 /// transport to the public GitHub service.
 ///
@@ -1421,11 +1426,11 @@ fn repository_components(owner: &str, repository: &str) -> Option<(String, Strin
 fn targets_production_github(destination: &ParsedDestination<'_>) -> bool {
     match destination {
         ParsedDestination::Uri { scheme, authority, .. } => {
-            ["https", "ssh"].contains(scheme) && authority.eq_ignore_ascii_case("github.com")
+            (["https", "ssh"].contains(scheme) && authority.eq_ignore_ascii_case("github.com"))
+                || (*scheme == "ssh" && github_ssh_authority(authority))
         }
         ParsedDestination::Scp { authority, .. } => {
-            authority.eq_ignore_ascii_case("git@github.com")
-                || authority.eq_ignore_ascii_case("github.com")
+            github_ssh_authority(authority) || authority.eq_ignore_ascii_case("github.com")
         }
         ParsedDestination::Local { .. } => false,
     }
