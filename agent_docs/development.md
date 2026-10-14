@@ -50,3 +50,32 @@ handle or ignore a forwarded signal, just as in the original caller group;
 uncatchable termination and escaped descendants have no cleanup guarantee.
 
 *Updated by an AI agent acting on joshlf's behalf.*
+
+## Ambiguous commit cleanup
+
+Git selects `core.commentChar=auto` before running prepare-commit-msg and the
+editor, and does not pass the selected character to commit-msg hooks. Identical
+hook inputs can therefore represent a valid `-F` subject or a message Git will
+strip to nothing. GHerrit conservatively leaves a comment-only message alone
+and warns when automatic selection makes the identity decision ambiguous. Use
+a fixed comment character which does not begin the intended message when an
+identity is required. The same conservative cancellation rule applies to
+comment-only verbatim input; the hook does not receive cleanup flags.
+
+
+## Scissors cleanup
+
+Git withholds the cleanup mode. When the cleaned prefix before scissors is
+empty but its suffix has message text, GHerrit edits only that suffix. Scissors
+cleanup still discards it and preserves cancellation; modes which retain the
+text also retain its identity. Comment-only or otherwise ambiguous input keeps
+the conservative cancellation rule and warning. The native cleanup matrix
+checks both acceptance and cancellation, including explicit empty acceptance.
+
+## Existing identity separators
+
+Hook recognition accepts Git's configured legacy trailer separators while new
+identities use canonical `: ` syntax. An existing recognized identity keeps its
+original bytes and value during amendment. Recognition does not broaden the raw
+publication grammar; convert an unsupported legacy separator explicitly while
+retaining its ID instead of generating a replacement review identity.
