@@ -22,8 +22,6 @@ impl UniqueJson {
         Ok(value)
     }
 
-
-
     pub(crate) fn into_value(self) -> Value {
         self.0
     }
