@@ -88,7 +88,7 @@ fn test_commit_msg_trailer_failure() {
         .args(["hook", "commit-msg", msg_file.to_str().unwrap()])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("is not writable by user"));
+        .stderr(predicates::str::contains("Failed to write the validated identity"));
     assert_eq!(std::fs::read_to_string(&msg_file).unwrap(), "feat: broken trailers");
 }
 
@@ -154,15 +154,635 @@ fn test_commit_msg_non_utf8_filename() {
 #[test]
 #[cfg(unix)]
 fn test_existing_identity_avoids_committer_lookup() {
-    let ctx = testutil::test_context!().with_git_interceptor().build();
+    for (separators, message) in [
+        (":", "subject\n\ngherrit-pr-id: Legacy123\n"),
+        (":=", "subject\n\ngherrit-pr-id=Legacy123\n"),
+    ] {
+        let ctx = testutil::test_context!().with_git_interceptor().build();
+        ctx.gherrit_cmd().arg("manage").assert().success();
+        let path = ctx.repo_path.join("identified-message");
+        ctx.set_config("trailer.separators", Some(separators));
+        std::fs::write(&path, message).unwrap();
+        ctx.expect_git_failure(testutil::GitOperation::Var);
+        ctx.gherrit_cmd().args(["hook", "commit-msg"]).arg(&path).assert().success();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), message);
+        // Consume the failure explicitly: the hook did not query it.
+        ctx.git_cmd().args(["var", "GIT_COMMITTER_IDENT"]).assert().failure();
+        ctx.assert_failure_consumed();
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn test_installed_hook_preserves_git_empty_message_decisions() {
+    use std::os::unix::fs::PermissionsExt as _;
+    #[derive(serde::Deserialize, Debug)]
+    struct Case {
+        character: String,
+        mode: String,
+        allow: bool,
+        message: String,
+        success: bool,
+        stored: String,
+    }
+    // Independent receipts captured from unhooked Git 2.54.0; no production
+    // cleanup helper constructs the expected acceptance or stored message.
+    let cases: Vec<Case> =
+        serde_json::from_str(include_str!("fixtures/message-cleanup.json")).unwrap();
+    let ctx = testutil::test_context!().with_installed_hooks().with_initial_commit().build();
     ctx.gherrit_cmd().arg("manage").assert().success();
-    let path = ctx.repo_path.join("identified-message");
-    let message = "subject\n\ngherrit-pr-id: Legacy123\n";
+    let editor = ctx.dir.path().join("message-editor");
+    std::fs::write(&editor, "#!/bin/sh\ncp \"$GHERRIT_MESSAGE_FILE\" \"$1\"\n").unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let input = ctx.dir.path().join("editor-input");
+    for case in cases {
+        ctx.run_git(&["config", "core.commentChar", &case.character]);
+        std::fs::write(&input, &case.message).unwrap();
+        let before = ctx.head_oid();
+        let mut command = ctx.git_cmd();
+        command
+            .args(["commit", "--amend", "--allow-empty"])
+            .env("GIT_EDITOR", &editor)
+            .env("GHERRIT_MESSAGE_FILE", &input);
+        if case.mode != "default" {
+            command.arg(format!("--cleanup={}", case.mode));
+        }
+        if case.allow {
+            command.arg("--allow-empty-message");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.success(), case.success, "{case:?}: {output:?}");
+        if case.success {
+            let stored = ctx
+                .git_cmd()
+                .args(["show", "-s", "--format=%B", "HEAD"])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            if case.message.contains(" ------------------------ >8 ------------------------")
+                && !case.stored.trim().is_empty()
+            {
+                let stored = String::from_utf8(stored).unwrap();
+                let identities =
+                    stored.lines().filter(|line| line.starts_with("gherrit-pr-id: ")).count();
+                assert_eq!(identities, 1, "{case:?}: {stored}");
+                let without_identity = stored
+                    .lines()
+                    .filter(|line| !line.starts_with("gherrit-pr-id: "))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert_eq!(without_identity.trim_end(), case.stored.trim_end(), "{case:?}");
+            } else {
+                assert_eq!(stored, case.stored.as_bytes(), "{case:?}");
+            }
+        } else {
+            assert_eq!(ctx.head_oid(), before, "aborted amend moved HEAD: {case:?}");
+        }
+    }
+}
+
+#[test]
+fn configured_trailer_separators_cannot_corrupt_new_identities() {
+    let ctx = testutil::test_context!().build();
+    ctx.gherrit_cmd().arg("manage").assert().success();
+    ctx.run_git(&["config", "trailer.separators", "="]);
+    let path = ctx.repo_path.join("MESSAGE");
+    std::fs::write(&path, "subject\n").unwrap();
+    ctx.gherrit_cmd().args(["hook", "commit-msg"]).arg(&path).assert().success();
+    let message = std::fs::read_to_string(path).unwrap();
+    let value = message.lines().find_map(|line| line.strip_prefix("gherrit-pr-id: ")).unwrap();
+    assert!(value.bytes().all(|b| b.is_ascii_alphanumeric()));
+    assert_eq!(message.lines().filter(|line| line.starts_with("gherrit-pr-id")).count(), 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn interactive_message_comments_do_not_hide_the_inserted_identity() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for (key, prefix) in
+        [("core.commentChar", "#"), ("core.commentChar", ";"), ("core.commentString", "//")]
+    {
+        for mode in ["default", "strip", "whitespace", "verbatim", "scissors"] {
+            let ctx =
+                testutil::test_context!().with_installed_hooks().with_initial_commit().build();
+            ctx.gherrit_cmd().arg("manage").assert().success();
+            ctx.run_git(&["config", key, prefix]);
+            let editor = ctx.dir.path().join("message-editor");
+            // Retain Git's own status/comment suffix, exactly as a normal
+            // interactive editor does, and prepend the user's subject.
+            std::fs::write(&editor, "#!/bin/sh\nset -e\ncp \"$1\" \"$1.saved\"\nprintf 'Interactive subject\\n\\n' > \"$1\"\ncat \"$1.saved\" >> \"$1\"\n").unwrap();
+            std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+            ctx.git_cmd()
+                .args(["commit", "--allow-empty", &format!("--cleanup={mode}")])
+                .env("GIT_EDITOR", &editor)
+                .assert()
+                .success();
+            let stored =
+                ctx.git_cmd().args(["show", "-s", "--format=%B", "HEAD"]).output().unwrap();
+            let message = String::from_utf8(stored.stdout).unwrap();
+            assert!(message.starts_with("Interactive subject\n"), "{key}/{mode}: {message}");
+            assert_eq!(
+                message.lines().filter(|line| line.starts_with("gherrit-pr-id: G")).count(),
+                1,
+                "{key}/{mode}: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn automatic_comments_preserve_native_git_decisions_for_ambiguous_hook_inputs() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for installed in [false, true] {
+        for from_file in [false, true] {
+            let builder = testutil::test_context!().with_initial_commit();
+            let ctx =
+                if installed { builder.with_installed_hooks().build() } else { builder.build() };
+            if installed {
+                ctx.manage_cmd().arg("--private").assert().success();
+            }
+            ctx.run_git(&["config", "core.commentChar", "auto"]);
+            let prepare = ctx.repo_path.join(".git/hooks/prepare-commit-msg");
+            std::fs::create_dir_all(prepare.parent().unwrap()).unwrap();
+            std::fs::write(&prepare, "#!/bin/sh\nset -e\nprintf '# subject\\n' > \"$1\"\n")
+                .unwrap();
+            std::fs::set_permissions(&prepare, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let input = ctx.dir.path().join("message");
+            std::fs::write(&input, "# subject\n").unwrap();
+            let before = ctx.head_oid();
+            let mut command = ctx.git_cmd();
+            command
+                .args(["commit", "--allow-empty", "--no-status", "--cleanup=strip"])
+                .env("GIT_EDITOR", ":");
+            if from_file {
+                command.arg("--file").arg(&input);
+            }
+            let output = command.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                from_file,
+                "installed={installed}, file={from_file}: {output:?}"
+            );
+            if from_file {
+                let message = ctx
+                    .git_cmd()
+                    .args(["show", "-s", "--format=%B", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout;
+                assert!(message.starts_with(b"# subject\n"));
+                assert!(!String::from_utf8_lossy(&message).contains("gherrit-pr-id:"));
+                if installed {
+                    assert!(
+                        String::from_utf8_lossy(&output.stderr)
+                            .contains("automatic comment character")
+                    );
+                }
+            } else {
+                assert_eq!(ctx.head_oid(), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn patch_dividers_do_not_hide_new_identities() {
+    let ctx = testutil::test_context!().with_initial_commit().with_installed_hooks().build();
+    ctx.manage_cmd().arg("--private").assert().success();
+    let message =
+        "Patch subject\n\nDescription\n\n---\n file | 1 +\n\ndiff --git a/file b/file\n+content\n";
+    ctx.git_cmd()
+        .args(["commit", "--allow-empty", "--cleanup=verbatim", "-m", message])
+        .assert()
+        .success();
+    let stored = ctx.git_cmd().args(["show", "-s", "--format=%B", "HEAD"]).output().unwrap().stdout;
+    assert!(stored.starts_with(message.as_bytes()));
+    assert!(ctx.gherrit_id("HEAD").is_ok());
+    let before = ctx.head_oid();
+    ctx.git_cmd().args(["commit", "--amend", "--allow-empty", "--no-edit"]).assert().success();
+    assert_eq!(ctx.gherrit_id("HEAD").unwrap(), ctx.gherrit_id(&before).unwrap());
+}
+
+#[test]
+fn existing_identity_uses_the_same_pinned_trailer_separators() {
+    let ctx = testutil::test_context!().with_initial_commit().with_installed_hooks().build();
+    ctx.manage_cmd().arg("--private").assert().success();
+    ctx.git_cmd().args(["commit", "--allow-empty", "-m", "Keep identity"]).assert().success();
+    let id = ctx.gherrit_id("HEAD").unwrap();
+    ctx.set_config("trailer.separators", Some("="));
+    ctx.git_cmd().args(["commit", "--amend", "--allow-empty", "--no-edit"]).assert().success();
+    assert_eq!(ctx.gherrit_id("HEAD").unwrap(), id);
+}
+
+#[test]
+fn retained_comments_precede_the_stored_trailer_block() {
+    for prefix in ["#", "!"] {
+        for mode in ["verbatim", "strip"] {
+            let ctx =
+                testutil::test_context!().with_initial_commit().with_installed_hooks().build();
+            ctx.manage_cmd().arg("--private").assert().success();
+            ctx.set_config("core.commentChar", Some(prefix));
+            let message = format!(
+                "Retain comments\n\nBody\n\nSigned-off-by: Example <example@invalid>\n{prefix} retained note\n"
+            );
+            ctx.git_cmd()
+                .args(["commit", "--allow-empty", &format!("--cleanup={mode}"), "-m", &message])
+                .assert()
+                .success();
+            let stored =
+                ctx.git_cmd().args(["show", "-s", "--format=%B", "HEAD"]).output().unwrap().stdout;
+            let footer =
+                std::str::from_utf8(&stored).unwrap().trim_end().rsplit("\n\n").next().unwrap();
+            assert!(footer.contains("gherrit-pr-id: "));
+            assert!(footer.contains("Signed-off-by: Example <example@invalid>"));
+            assert!(!footer.contains("retained note"));
+            assert_eq!(
+                String::from_utf8_lossy(&stored).contains("retained note"),
+                mode == "verbatim"
+            );
+            let id = ctx.gherrit_id("HEAD").unwrap();
+            ctx.git_cmd()
+                .args(["commit", "--amend", "--allow-empty", "--no-edit"])
+                .assert()
+                .success();
+            assert_eq!(ctx.gherrit_id("HEAD").unwrap(), id);
+        }
+    }
+}
+
+#[test]
+fn identity_key_casing_retains_an_existing_value() {
+    let ctx = testutil::test_context!().with_initial_commit().with_installed_hooks().build();
+    ctx.manage_cmd().arg("--private").assert().success();
+    ctx.git_cmd()
+        .args([
+            "commit",
+            "--allow-empty",
+            "--cleanup=verbatim",
+            "-m",
+            "Subject\n\nGherrit-pr-id: Gold",
+        ])
+        .assert()
+        .success();
+    let message =
+        ctx.git_cmd().args(["show", "-s", "--format=%B", "HEAD"]).output().unwrap().stdout;
+    assert!(String::from_utf8(message).unwrap().contains("Gherrit-pr-id: Gold"));
+    ctx.git_cmd().args(["commit", "--amend", "--allow-empty", "--no-edit"]).assert().success();
+    let message =
+        ctx.git_cmd().args(["show", "-s", "--format=%B", "HEAD"]).output().unwrap().stdout;
+    assert_eq!(String::from_utf8(message).unwrap().matches("Gherrit-pr-id: Gold").count(), 1);
+}
+
+#[test]
+fn a_verbatim_scissors_suffix_does_not_reclassify_the_original_squash_input() {
+    let ctx = testutil::test_context!().with_initial_commit().with_installed_hooks().build();
+    ctx.manage_cmd().arg("--private").assert().success();
+    let message = "# ------------------------ >8 ------------------------\nsquash! retained text\n";
+    ctx.git_cmd()
+        .args(["commit", "--allow-empty", "--cleanup=verbatim", "-m", message])
+        .assert()
+        .success();
+    assert!(ctx.gherrit_id("HEAD").is_ok());
+    let title = ctx.git_cmd().args(["show", "-s", "--format=%s", "HEAD"]).output().unwrap().stdout;
+    assert!(title.starts_with(b"# ------------------------"));
+}
+
+#[test]
+fn compatibility_recognition_does_not_reorder_interleaved_literal_body_text() {
+    let ctx = testutil::test_context!().with_initial_commit().build();
+    ctx.manage_cmd().arg("--private").assert().success();
+    ctx.set_config("core.commentChar", Some("!"));
+    let message = "Subject\n\nSigned-off-by: Person\n# Literal body text\ngherrit-pr-id: Gone\n! retained note\n";
+    let path = ctx.repo_path.join("MESSAGE");
     std::fs::write(&path, message).unwrap();
-    ctx.expect_git_failure(testutil::GitOperation::Var);
+    ctx.gherrit_cmd().args(["hook", "commit-msg"]).arg(&path).assert().success();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), message);
+}
+
+#[test]
+fn configured_legacy_identity_separators_survive_native_amend() {
+    for (separators, separator) in [(":=", "="), ("=:%", "%"), ("%=$", "$")] {
+        let ctx = testutil::test_context!().with_initial_commit().with_installed_hooks().build();
+        ctx.checkout_managed_private("legacy-separator");
+        ctx.set_config("trailer.separators", Some(separators));
+        let message = format!("Preserve owner\n\nGhErRiT-pR-Id{separator}Gone\n");
+        ctx.git_cmd()
+            .args(["commit", "--allow-empty", "--no-verify", "--cleanup=verbatim", "-m", &message])
+            .assert()
+            .success();
+        let before = ctx
+            .git_cmd()
+            .args(["show", "-s", "--format=%B", "HEAD"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        ctx.git_cmd()
+            .args(["commit", "--amend", "--allow-empty", "--no-edit", "--cleanup=verbatim"])
+            .assert()
+            .success();
+        ctx.git_cmd().args(["show", "-s", "--format=%B", "HEAD"]).assert().success().stdout(before);
+    }
+}
+
+#[test]
+fn native_amend_ignores_the_config_builtin_file_override() {
+    let ctx = testutil::test_context!().with_initial_commit().with_installed_hooks().build();
+    ctx.checkout_managed_private("config-file-override");
+    ctx.set_config("trailer.separators", Some(":="));
+    let message = "Preserve owner\n\nGhErRiT-pR-Id=Gone\n";
+    ctx.git_cmd()
+        .args(["commit", "--allow-empty", "--no-verify", "--cleanup=verbatim", "-m", message])
+        .assert()
+        .success();
+    let redirect = ctx.repo_path.join("redirect-config");
+    std::fs::write(&redirect, "[trailer]\nseparators = :\n").unwrap();
+    ctx.git_cmd()
+        .args(["commit", "--amend", "--allow-empty", "--no-edit", "--cleanup=verbatim"])
+        .env("GIT_CONFIG", &redirect)
+        .assert()
+        .success();
+    ctx.git_cmd()
+        .args(["show", "-s", "--format=%B", "HEAD"])
+        .assert()
+        .success()
+        .stdout(format!("{message}\n"));
+}
+
+#[test]
+fn native_commit_accepts_a_message_larger_than_the_local_command_cap() {
+    for trailer in [false, true] {
+        let ctx = testutil::test_context!().with_initial_commit().with_installed_hooks().build();
+        ctx.checkout_managed_private("large-message");
+        let path = ctx.repo_path.join("large-message.txt");
+        let prefix = if trailer { "Unrelated: " } else { "" };
+        std::fs::write(
+            &path,
+            format!("Large message\n\n{prefix}{}\n", "x".repeat(5 * 1024 * 1024)),
+        )
+        .unwrap();
+        ctx.git_cmd().args(["commit", "--allow-empty", "-F"]).arg(&path).assert().success();
+        ctx.git_cmd()
+            .args(["log", "-1", "--format=%s"])
+            .assert()
+            .success()
+            .stdout("Large message\n");
+        ctx.git_cmd()
+            .args(["log", "-1", "--format=%(trailers:key=gherrit-pr-id,valueonly)"])
+            .assert()
+            .success()
+            .stdout(predicates::str::contains("G"));
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn native_comment_aliases_keep_retained_comments_before_the_identity() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for entries in [
+        [("core.commentChar", ";"), ("core.commentString", "//")],
+        [("core.commentString", "//"), ("core.commentChar", ";")],
+    ] {
+        let ctx = testutil::test_context!().with_installed_hooks().with_initial_commit().build();
+        ctx.gherrit_cmd().arg("manage").assert().success();
+        for (key, value) in entries {
+            ctx.run_git(&["config", "--add", key, value]);
+        }
+        let editor = ctx.dir.path().join("alias-editor");
+        std::fs::write(&editor, "#!/bin/bash\nset -eo pipefail\ncp \"$1\" \"$1.saved\"\nprintf 'Alias subject\\n\\n' > \"$1\"\ncat \"$1.saved\" >> \"$1\"\n").unwrap();
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ctx.git_cmd()
+            .args(["commit", "--allow-empty", "--cleanup=verbatim"])
+            .env("GIT_EDITOR", &editor)
+            .assert()
+            .success();
+        let output = ctx
+            .git_cmd()
+            .args(["show", "-s", "--format=%B", "HEAD"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let message = String::from_utf8(output).unwrap();
+        assert!(message.starts_with("Alias subject\n"), "{message}");
+        assert_eq!(
+            message.lines().filter(|line| line.starts_with("gherrit-pr-id: G")).count(),
+            1,
+            "{message}"
+        );
+        assert!(
+            message
+                .lines()
+                .rev()
+                .find(|line| !line.is_empty())
+                .unwrap()
+                .starts_with("gherrit-pr-id: G"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn multiple_substantive_scissors_sections_are_refused_before_commit() {
+    for character in ["#", ";"] {
+        for mode in ["strip", "whitespace", "verbatim", "scissors"] {
+            let ctx =
+                testutil::test_context!().with_installed_hooks().with_initial_commit().build();
+            ctx.manage_cmd().arg("--private").assert().success();
+            ctx.run_git(&["config", "core.commentChar", character]);
+            let input = ctx.dir.path().join("scissors-input");
+            std::fs::write(&input, format!("Subject\n\n{character} ------------------------ >8 ------------------------\nRetained suffix\n")).unwrap();
+            let before = ctx.head_oid();
+            ctx.git_cmd()
+                .args(["commit", "--allow-empty", &format!("--cleanup={mode}"), "-F"])
+                .arg(&input)
+                .assert()
+                .failure()
+                .stderr(predicates::str::contains("text in multiple scissors sections"));
+            assert_eq!(ctx.head_oid(), before);
+        }
+    }
+}
+
+#[test]
+fn one_substantive_section_after_multiple_scissors_boundaries_keeps_its_identity() {
+    let ctx = testutil::test_context!().with_installed_hooks().with_initial_commit().build();
+    ctx.manage_cmd().arg("--private").assert().success();
+    let input = ctx.dir.path().join("nested-scissors");
+    std::fs::write(&input, "# ------------------------ >8 ------------------------\n# comment\n# ------------------------ >8 ------------------------\nSubject\n").unwrap();
+    ctx.git_cmd()
+        .args(["commit", "--allow-empty", "--cleanup=strip", "-F"])
+        .arg(&input)
+        .assert()
+        .success();
+    let output = ctx
+        .git_cmd()
+        .args(["show", "-s", "--format=%B", "HEAD"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let message = std::str::from_utf8(&output).unwrap();
+    assert!(message.starts_with("Subject\n"), "{message}");
+    assert!(
+        message
+            .lines()
+            .rev()
+            .find(|line| !line.is_empty())
+            .unwrap()
+            .starts_with("gherrit-pr-id: G"),
+        "{message}"
+    );
+    assert_eq!(message.lines().filter(|line| line.starts_with("gherrit-pr-id: ")).count(), 1);
+}
+
+#[test]
+fn scissors_sections_follow_native_git_control_character_cleanup() {
+    for control in ["\u{000b}", "\u{000c}"] {
+        for prefix in ["", "Subject\n\n"] {
+            let ctx =
+                testutil::test_context!().with_installed_hooks().with_initial_commit().build();
+            ctx.manage_cmd().arg("--private").assert().success();
+            let path = ctx.dir.path().join("control-scissors");
+            std::fs::write(
+                &path,
+                format!(
+                    "{prefix}# ------------------------ >8 ------------------------\n{control}\n"
+                ),
+            )
+            .unwrap();
+            let before = ctx.head_oid();
+            let output = ctx
+                .git_cmd()
+                .args(["commit", "--allow-empty", "--cleanup=strip", "-F"])
+                .arg(&path)
+                .assert();
+            if prefix.is_empty() {
+                output.success();
+                let stored = ctx
+                    .git_cmd()
+                    .args(["show", "-s", "--format=%B", "HEAD"])
+                    .assert()
+                    .success()
+                    .get_output()
+                    .stdout
+                    .clone();
+                let message = std::str::from_utf8(&stored).unwrap();
+                assert!(message.starts_with(control), "{message:?}");
+                assert_eq!(
+                    message.lines().filter(|line| line.starts_with("gherrit-pr-id: ")).count(),
+                    1,
+                    "{message:?}"
+                );
+            } else {
+                output
+                    .failure()
+                    .stderr(predicates::str::contains("text in multiple scissors sections"));
+                assert_eq!(ctx.head_oid(), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn abbreviated_trailer_keys_receive_a_literal_identity_without_rewriting_the_key() {
+    for message in [
+        "Subject\n\ng: owner\n",
+        "Subject\n\ngherrit-pr: owner\n",
+        "Subject\n\nBody mentions gherrit-pr-id: body\n\ng: owner\n",
+    ] {
+        let ctx = testutil::test_context!().with_initial_commit().with_installed_hooks().build();
+        ctx.checkout_managed_private("abbreviated-key");
+        ctx.commit(message);
+        let output = ctx.git_cmd().args(["log", "-1", "--format=%B"]).output().unwrap();
+        assert!(output.status.success());
+        let stored = String::from_utf8(output.stdout).unwrap();
+        assert!(stored.contains(message.lines().last().unwrap()));
+        let identities = stored
+            .lines()
+            .filter_map(|line| line.strip_prefix("gherrit-pr-id: "))
+            .collect::<Vec<_>>();
+        assert_eq!(identities.len(), 1, "{stored}");
+        assert!(identities[0].starts_with('G'));
+        assert!(identities[0].bytes().all(|byte| byte.is_ascii_alphanumeric()));
+    }
+}
+
+#[test]
+fn trailer_aliases_that_rewrite_an_abbreviation_fail_before_editing_the_message() {
+    let ctx = testutil::test_context!().with_initial_commit().build();
+    ctx.checkout_managed_private("alias-config");
+    ctx.set_config("trailer.g.key", Some("gherrit-pr-id"));
+    let path = ctx.repo_path.join("alias-message");
+    let message = "Subject\n\ng: owner\n";
+    std::fs::write(&path, message).unwrap();
+    ctx.gherrit_cmd()
+        .args(["hook", "commit-msg"])
+        .arg(&path)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("did not produce one canonical GHerrit identity"));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), message);
+}
+
+#[test]
+fn native_value_padding_keeps_the_same_published_identity() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_installed_hooks()
+        .with_mock_github()
+        .build();
+    ctx.checkout_managed_private("padded-identity");
+    let path = ctx.repo_path.join("padded-message");
+    let message = "Padded identity\n\nBody text\n\ngherrit-pr-id: \tGone \t\r\n";
+    std::fs::write(&path, message).unwrap();
     ctx.gherrit_cmd().args(["hook", "commit-msg"]).arg(&path).assert().success();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), message);
-    // Consume the still-pending failure explicitly: the hook did not query it.
-    ctx.git_cmd().args(["var", "GIT_COMMITTER_IDENT"]).assert().failure();
-    ctx.assert_failure_consumed();
+    ctx.git_cmd()
+        .args(["commit", "--allow-empty", "--cleanup=verbatim", "-F"])
+        .arg(&path)
+        .assert()
+        .success();
+    let head = ctx.head_oid();
+    ctx.hook_cmd("pre-push").assert().success();
+    assert_eq!(ctx.remote_ref_oid("refs/heads/Gone"), Some(head));
+}
+
+#[test]
+fn substantive_control_suffixes_are_not_publication_footer_padding() {
+    for suffix in ["\u{b}", "\u{c}"] {
+        let ctx = testutil::test_context!()
+            .with_remote()
+            .with_initial_commit()
+            .with_mock_github()
+            .with_git_interceptor()
+            .build();
+        ctx.checkout_managed_private("control-suffix");
+        ctx.git_cmd()
+            .args([
+                "commit",
+                "--allow-empty",
+                "--no-verify",
+                "--cleanup=verbatim",
+                "-m",
+                &format!("Subject\n\ngherrit-pr-id: Gone\n{suffix}\n"),
+            ])
+            .assert()
+            .success();
+        let before = ctx.recorded_pushes();
+        ctx.hook_cmd("pre-push")
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("missing gherrit-pr-id trailer"));
+        assert_eq!(ctx.recorded_pushes(), before);
+        assert!(ctx.github().requests().is_empty());
+        assert!(ctx.remote_ref_oid("refs/heads/Gone").is_none());
+    }
 }
