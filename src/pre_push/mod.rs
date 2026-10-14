@@ -1,3 +1,5 @@
+// Adapter entry points are compiled/tested before the separate runtime switch.
+#![allow(dead_code)]
 use std::{
     collections::HashMap,
     env,
@@ -20,36 +22,38 @@ mod autosquash;
 mod batching;
 mod body;
 mod destination;
-mod github;
 mod inspection;
 pub(crate) mod json;
 pub(crate) use inspection::observe as inspect_remote;
+mod legacy_github;
+mod legacy_publication;
+mod legacy_remote;
 mod local;
-mod publication;
-// Pure protocol components are exercised before runtime activation.
+// The exact-local workflow is assembled behind one private boundary. It
+// becomes reachable only when hook validation, observation, and publication
+// switch together.
 #[allow(dead_code)]
 mod publication_attempt;
 mod reconcile;
-mod remote;
 use batching::{
     BatchPlan, INITIAL_QUERY_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
     classify_response, query_exceeds_limit,
 };
 use body::PrBody;
 use destination::{DefaultBranch, PushDestination};
-use github::{
+use json::UniqueJson;
+use legacy_github::{
     CreatePullRequest, CreatedPullRequest, FindPullRequest, MutationOperation,
     PullRequest as PrState, PullRequestNodeId, PullRequestNumber, QueryOperation,
     Repository as GithubRepository, UpdatePullRequest, decode_mutation_batch_response,
     decode_query_batch_response, prepare_mutation_batches, query_batch_document,
 };
-use json::UniqueJson;
+use legacy_publication::{plan_change, plan_push, push_batches};
+use legacy_remote::observe_publications;
 use local::LocalStack;
-use publication::{plan_change, plan_push, push_batches};
 use reconcile::{
     CurrentPr, DesiredPr, PullRequestState, ensure_pull_requests_open, link_stack, plan_update,
 };
-use remote::observe_publications;
 
 pub(crate) use crate::subprocess;
 
@@ -150,17 +154,17 @@ pub(crate) enum GithubEndpoint {
     Production,
     #[cfg(feature = "test-driver")]
     Custom(String),
-    #[cfg(feature = "test-driver")]
+    #[cfg(any(test, feature = "test-driver"))]
     Disabled,
 }
 
 impl GithubEndpoint {
     fn is_disabled(&self) -> bool {
-        #[cfg(feature = "test-driver")]
+        #[cfg(any(test, feature = "test-driver"))]
         {
             *self == Self::Disabled
         }
-        #[cfg(not(feature = "test-driver"))]
+        #[cfg(not(any(test, feature = "test-driver")))]
         {
             false
         }
@@ -176,6 +180,11 @@ impl GithubEndpoint {
 
     /// Validates that the API endpoint and Git destination identify the same
     /// service boundary before any remote Git command runs.
+    ///
+    /// A custom endpoint is an explicit test dependency and may accompany a
+    /// custom Git transport. A disabled endpoint can execute only plans which
+    /// need no GitHub operation. The production endpoint accepts only HTTPS or
+    /// SSH destinations on the public GitHub service.
     fn validate_destination(&self, destination: &PushDestination) -> Result<()> {
         if matches!(self, Self::Production) && !destination.supports_production_github() {
             bail!("Production publication requires an HTTPS or SSH destination on github.com");
@@ -218,9 +227,12 @@ pub async fn run(
     let configured_remote =
         repo.default_remote_name().wrap_err("Failed to read the configured GHerrit remote")?;
     let destination = PushDestination::resolve(repo, configured_remote)?;
+    // This is load-bearing for Git ref evidence as well as API identity:
+    // GitHub's contract makes requested heads and tags absent or direct, while
+    // an arbitrary Git server could hide a symbolic ref behind that output.
     github_endpoint.validate_destination(&destination)?;
     let git_default_branch = destination.observe_default_branch().await?;
-    let commits = LocalStack::collect_captured(repo, &branch_name, head, &git_default_branch)
+    let commits = LocalStack::collect_captured(repo, &branch_name, head, git_default_branch)
         .wrap_err("Failed to collect commits")?;
 
     if commits.is_empty() {
@@ -250,11 +262,14 @@ pub async fn run(
         batch_fetch_prs(&octocrab, &destination, &gherrit_ids).await?;
     let repository = GithubRepository {
         node_id: repository.node_id,
-        default_branch: DefaultBranch::agree(git_default_branch, repository.default_branch)?,
+        default_branch: DefaultBranch::agree(
+            commits.default_branch().clone(),
+            repository.default_branch,
+        )?,
     };
     ensure_pull_requests_open(prs.iter().map(|pr| (pr.number.get(), pr.state)))?;
 
-    let latest_versions = push_to_origin(repo.git_dir_identity(), &destination, &commits).await?;
+    let latest_versions = push_to_origin(&destination, &commits).await?;
     let public_branch = public_stack_branch(repo, &branch_name);
 
     let num_commits = commits.len();
@@ -275,7 +290,6 @@ pub async fn run(
 
 #[allow(clippy::too_many_lines)]
 async fn push_to_origin(
-    git_dir: &util::GitDirIdentity,
     destination: &PushDestination,
     commits: &LocalStack,
 ) -> Result<HashMap<String, usize>> {
@@ -296,11 +310,11 @@ async fn push_to_origin(
 
     for chunk in push_batches(&targets) {
         let plan = plan_push(chunk);
-        let publication::PushPlan { options, refspecs } = plan;
+        let legacy_publication::PushPlan { options, refspecs } = plan;
 
         log::info!("Pushing chunk to remote...");
         let output = subprocess::output(
-            destination.push(git_dir, options, refspecs),
+            destination.push(options, refspecs),
             subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
         )
         .await
@@ -347,8 +361,10 @@ async fn ensure_publications_current(
             .get(change.id().as_str())
             .copied()
             .ok_or_else(|| eyre!("Missing frozen publication version"))?;
-        let expected =
-            remote::RemotePublication::Published { head: change.head(), latest_version: version };
+        let expected = legacy_remote::RemotePublication::Published {
+            head: change.head(),
+            latest_version: version,
+        };
         if actual != expected {
             bail!(
                 "Publication changed before pull request synchronization; retry to reobserve remote state"
@@ -1707,6 +1723,44 @@ mod tests {
             (0..MAX_MUTATION_ALIASES + PARTIAL_SECOND_BATCH_EFFECTS).collect::<Vec<_>>(),
             "acknowledged and ambiguous partial effects remain committed"
         );
+    }
+
+    #[cfg(feature = "test-driver")]
+    #[test]
+    fn endpoint_compatibility_is_an_explicit_runtime_matrix() {
+        let repository = util::Repo::open(".").unwrap();
+        let https = PushDestination::for_test_url_in(
+            &repository,
+            "https://github.com/owner/repository.git",
+        );
+        let ssh =
+            PushDestination::for_test_url_in(&repository, "git@github.com:owner/repository.git");
+        let http =
+            PushDestination::for_test_url_in(&repository, "http://github.com/owner/repository.git");
+        let git =
+            PushDestination::for_test_url_in(&repository, "git://github.com/owner/repository.git");
+        let helper = PushDestination::for_test_url_in(
+            &repository,
+            "fixture://example.test/owner/repository.git",
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("owner/repository.git");
+        std::fs::create_dir_all(&local).unwrap();
+        let local = PushDestination::for_test_url_in(&repository, local.to_str().unwrap());
+        let custom = GithubEndpoint::Custom("http://127.0.0.1:1".to_owned());
+        let disabled = GithubEndpoint::Disabled;
+
+        assert!(GithubEndpoint::Production.validate_destination(&https).is_ok());
+        assert!(GithubEndpoint::Production.validate_destination(&ssh).is_ok());
+        assert!(GithubEndpoint::Production.validate_destination(&http).is_err());
+        assert!(GithubEndpoint::Production.validate_destination(&git).is_err());
+        assert!(GithubEndpoint::Production.validate_destination(&local).is_err());
+        assert!(GithubEndpoint::Production.validate_destination(&helper).is_err());
+        assert!(custom.validate_destination(&http).is_ok());
+        assert!(custom.validate_destination(&git).is_ok());
+        assert!(custom.validate_destination(&local).is_ok());
+        assert!(custom.validate_destination(&helper).is_ok());
+        assert!(disabled.validate_destination(&local).is_ok());
     }
 
     #[test]
