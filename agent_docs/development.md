@@ -42,3 +42,12 @@ Git uses common-directory default hooks in linked worktrees; explicit relative
 hook paths are resolved from each worktree or the bare Git directory.
 
 *Updated by an AI agent acting on joshlf's behalf.*
+
+## Object store locations
+
+The gix 0.75 backend does not implement native Git's
+`GIT_OBJECT_DIRECTORY` or `GIT_ALTERNATE_OBJECT_DIRECTORIES` lookup. GHerrit
+refuses those overrides explicitly before opening its repository, rather than
+silently reading or writing a different object store. On-disk
+`objects/info/alternates` remains supported. Object location is independent of
+replacement objects and grafts, which must not rewrite publication ancestry.
