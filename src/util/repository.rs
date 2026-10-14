@@ -2,12 +2,18 @@ use std::{
     env, fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    str,
 };
 
 use eyre::{OptionExt, Result, WrapErr, bail, eyre};
-use gix::{Commit, Id, state::InProgress};
+use gix::{Commit, Id, bstr::ByteSlice as _, state::InProgress};
 
-use crate::{manage::State, re};
+use super::{CommandExt as _, command::clear_git_repository_overrides};
+use crate::{cmd, manage::State, re};
+
+#[cfg(test)]
+pub(super) const REMOTE_PROMISOR_CONFIG_PATTERN: &str =
+    r"^remote\..*\.(promisor|partialclonefilter)$";
 
 /// Represents the state of the HEAD reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +61,29 @@ pub(super) fn literal_graph_open_options() -> gix::sec::trust::Mapping<gix::open
     options.full.modify(harden);
     options.reduced.modify(harden);
     options
+}
+
+/// Git reads repository-format extensions only from the direct common config.
+fn repository_format_value(common_dir: &Path, key: &str) -> Result<Option<Vec<u8>>> {
+    let mut command = cmd("git", ["config", "--file"]);
+    command.arg(common_dir.join("config")).args(["--no-includes", "--null"]);
+    if key == "core.repositoryformatversion" {
+        command.arg("--type=int");
+    }
+    command.args(["--get", key]);
+    clear_git_repository_overrides(&mut command);
+    command.env_remove("GIT_CONFIG_PARAMETERS");
+    command.env_remove("GIT_CONFIG_COUNT");
+    let output = command.bounded_output().wrap_err("Failed to inspect repository format")?;
+    match output.status.code() {
+        Some(0) => output
+            .stdout
+            .strip_suffix(b"\0")
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(|| eyre!("Git returned malformed repository-format configuration")),
+        Some(1) if output.stdout.is_empty() => Ok(None),
+        _ => bail!("Invalid repository-format configuration"),
+    }
 }
 
 impl Repo {
@@ -125,6 +154,13 @@ impl Repo {
             )?;
         }
 
+        if self.has_promisor_remote()? {
+            let output = cmd("git", ["--version"])
+                .checked_output()
+                .wrap_err("Failed to determine the installed Git version")?;
+            require_git_no_lazy_fetch(&output.stdout)?;
+        }
+
         Ok(())
     }
 
@@ -141,6 +177,61 @@ impl Repo {
             Some(workdir) => workdir.join(path),
             None => env::current_dir()?.join(path),
         })
+    }
+
+    pub(crate) fn has_promisor_remote(&self) -> Result<bool> {
+        let configured_by_extension = self
+            .partial_clone_remote_from_direct_common_config()?
+            .is_some_and(|remote| promisor_loader_accepts_remote_name(&remote));
+
+        // Git adds a remote for any true promisor value or filter; later
+        // false values do not remove it. Preserve every occurrence and let
+        // Git canonicalize booleans, including its numeric radix/suffix rules.
+        // Filters are strings and need a separate untyped occurrence query.
+        let mut records = Vec::new();
+        for args in [
+            &["config", "--null", "--type=bool", "--get-regexp", r"^remote\..*\.promisor$"][..],
+            &["config", "--null", "--get-regexp", r"^remote\..*\.partialclonefilter$"][..],
+        ] {
+            let mut command = cmd("git", args);
+            clear_git_repository_overrides(&mut command);
+            command
+                .env("GIT_DIR", self.inner.path())
+                .env("GIT_COMMON_DIR", self.inner.common_dir())
+                .current_dir(self.inner.workdir().unwrap_or(self.inner.path()));
+            if let Some(worktree) = self.inner.workdir() {
+                command.env("GIT_WORK_TREE", worktree);
+            }
+            let output = command
+                .bounded_output()
+                .wrap_err("Failed to inspect remote promisor configuration")?;
+            match output.status.code() {
+                Some(0) => records.extend_from_slice(&output.stdout),
+                Some(1) if output.stdout.is_empty() => {}
+                _ => bail!("Invalid remote promisor configuration"),
+            }
+        }
+        if records.is_empty() {
+            return Ok(configured_by_extension);
+        }
+        Ok(configured_by_extension | parse_remote_promisor_config(&records)?)
+    }
+
+    /// Reads `extensions.partialClone` exactly as Git reads repository format:
+    /// from the common directory's direct `config` file, without includes or
+    /// configuration inherited from another scope.
+    fn partial_clone_remote_from_direct_common_config(&self) -> Result<Option<Vec<u8>>> {
+        // Missing and exactly -1 clear format data; other negative values do not.
+        // Explicit format 0 still retains partialClone.
+        let Some(version) =
+            repository_format_value(self.inner.common_dir(), "core.repositoryformatversion")?
+        else {
+            return Ok(None);
+        };
+        if str::from_utf8(&version)?.parse::<i64>()? == -1 {
+            return Ok(None);
+        }
+        repository_format_value(self.inner.common_dir(), "extensions.partialClone")
     }
 
     pub fn current_branch(&self) -> &HeadState {
@@ -259,6 +350,52 @@ impl Repo {
     }
 }
 
+pub(super) fn parse_remote_promisor_config(output: &[u8]) -> Result<bool> {
+    let Some(records) = output.strip_suffix(b"\0") else {
+        bail!("Git returned malformed remote promisor configuration");
+    };
+    records.split(|byte| *byte == 0).try_fold(false, |has_promisor, record| {
+        let newline = record.iter().position(|byte| *byte == b'\n');
+        let (key, value) = newline
+            .map_or((record, None), |newline| (&record[..newline], Some(&record[newline + 1..])));
+
+        if key.ends_with(b".promisor") {
+            let value = match value {
+                Some(value) => bool::from(
+                    gix::config::Boolean::try_from(value.as_bstr())
+                        .wrap_err("Invalid remote promisor configuration")?,
+                ),
+                None => true,
+            };
+            let remote = promisor_remote_name(key, b".promisor")?;
+            Ok(has_promisor | (value && promisor_loader_accepts_remote_name(remote)))
+        } else if key.ends_with(b".partialclonefilter") {
+            let remote = promisor_remote_name(key, b".partialclonefilter")?;
+            if !promisor_loader_accepts_remote_name(remote) {
+                return Ok(has_promisor);
+            }
+            if value.is_none() {
+                bail!("Invalid remote partial-clone filter configuration");
+            }
+            Ok(true)
+        } else {
+            bail!("Git returned unexpected remote promisor configuration");
+        }
+    })
+}
+
+pub(super) fn promisor_remote_name<'a>(key: &'a [u8], suffix: &[u8]) -> Result<&'a [u8]> {
+    key.strip_prefix(b"remote.")
+        .and_then(|key| key.strip_suffix(suffix))
+        .ok_or_else(|| eyre!("Git returned unexpected remote promisor configuration"))
+}
+
+/// Git ignores a promisor remote whose name starts with `/` so that a remote
+/// name cannot be confused with a repository path.
+pub(super) fn promisor_loader_accepts_remote_name(name: &[u8]) -> bool {
+    !name.starts_with(b"/")
+}
+
 pub(super) fn reject_nonempty_history_file(
     path: &Path,
     description: &str,
@@ -275,6 +412,44 @@ pub(super) fn reject_nonempty_history_file(
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).wrap_err_with(|| format!("Failed to inspect {description}")),
     }
+}
+
+pub(super) fn parse_git_version(output: &[u8]) -> Result<(u64, u64, u64)> {
+    let version = str::from_utf8(output)?
+        .trim()
+        .strip_prefix("git version ")
+        .ok_or_else(|| eyre!("Unexpected `git --version` output"))?;
+    let mut components = version.split('.');
+    let major = components
+        .next()
+        .ok_or_else(|| eyre!("Git version omitted its major component"))?
+        .parse()
+        .wrap_err("Git reported an invalid major version")?;
+    let minor = components
+        .next()
+        .ok_or_else(|| eyre!("Git version omitted its minor component"))?
+        .parse()
+        .wrap_err("Git reported an invalid minor version")?;
+    let patch = components
+        .next()
+        .unwrap_or("0")
+        .split_whitespace()
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .wrap_err("Git reported an invalid patch version")?;
+    Ok((major, minor, patch))
+}
+
+pub(super) fn require_git_no_lazy_fetch(output: &[u8]) -> Result<()> {
+    let (major, minor, patch) = parse_git_version(output)?;
+    if (major, minor, patch) < (2, 45, 1) {
+        bail!(
+            "GHerrit requires Git 2.45.1 or newer for a promisor repository so implicit object \
+             fetches can be disabled; found Git {major}.{minor}.{patch}"
+        );
+    }
+    Ok(())
 }
 
 pub enum FirstParentCommitsBetweenError {
