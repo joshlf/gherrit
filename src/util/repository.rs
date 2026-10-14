@@ -1,6 +1,10 @@
-use std::path::PathBuf;
+use std::{
+    env, fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
-use eyre::{OptionExt, Result, bail, eyre};
+use eyre::{OptionExt, Result, WrapErr, bail, eyre};
 use gix::{Commit, Id, state::InProgress};
 
 use crate::{manage::State, re};
@@ -33,13 +37,110 @@ pub struct Repo {
     pub(super) current_branch: HeadState,
 }
 
+pub(super) fn literal_graph_open_options() -> gix::sec::trust::Mapping<gix::open::Options> {
+    fn harden(mut options: gix::open::Options) -> gix::open::Options {
+        // gix 0.75 groups replacement controls under this permission.
+        // Deny ambient graph rewriting independently of object location.
+        // Object-store environment overrides are rejected explicitly at open:
+        // this gix release does not resolve them as native Git does.
+        options.permissions.env.objects = gix::sec::Permission::Deny;
+
+        // In gix 0.75, `true` here means that replacement-object discovery is
+        // disabled. The polarity is intentionally the opposite of the value
+        // which makes this release load replacements.
+        options.cli_overrides(["core.useReplaceRefs=true"])
+    }
+
+    let mut options = gix::sec::trust::Mapping::<gix::open::Options>::default();
+    options.full.modify(harden);
+    options.reduced.modify(harden);
+    options
+}
+
 impl Repo {
     pub fn open(path: &str) -> Result<Self> {
+        // Object location is not ancestry rewriting. Preserve it for native
+        // Git, but do not silently collect from a different ODB in gix 0.75.
+        for variable in ["GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"] {
+            if env::var_os(variable)
+                .is_some_and(|value| variable == "GIT_OBJECT_DIRECTORY" || !value.is_empty())
+            {
+                bail!(
+                    "{variable} is unsupported by GHerrit's repository backend; use the repository's objects/info/alternates file instead"
+                );
+            }
+        }
         // NOTE: `gix::discover` is used instead of `gix::open` so that
         // `gherrit` doesn't need to be run from the root of the repository.
-        let inner = gix::discover(path)?;
+        let inner = gix::ThreadSafeRepository::discover_opts(
+            path,
+            Default::default(),
+            literal_graph_open_options(),
+        )?
+        .to_thread_local();
         let current_branch = get_current_branch(&inner)?;
         Ok(Self { inner, current_branch })
+    }
+
+    /// Rejects repository state which can rewrite or truncate publication
+    /// history.
+    ///
+    /// The safety checks performed by the pre-push hook are meaningful only
+    /// for the graph GitHub receives. Git has no flag which disables legacy
+    /// graft files, and a shallow boundary hides real ancestry. This check must
+    /// therefore run before publication graph traversal.
+    pub fn ensure_publishable_history(&self) -> Result<()> {
+        let common_dir = self.layout().common_git_dir;
+        reject_nonempty_history_file(
+            &common_dir.join("info/grafts"),
+            "the common Git directory's info/grafts file",
+            "grafts rewrite commit ancestry",
+        )?;
+        if let Some(grafts) = env::var_os("GIT_GRAFT_FILE").filter(|path| !path.is_empty()) {
+            reject_nonempty_history_file(
+                &self.git_environment_path(grafts)?,
+                "the file named by GIT_GRAFT_FILE",
+                "the enclosing Git push retains that graft setting after the hook returns",
+            )?;
+        }
+
+        // Always inspect the real common shallow file. gix permits its
+        // effective shallow path to be redirected, which must not hide the
+        // ordinary Git boundary from publication validation.
+        reject_nonempty_history_file(
+            &common_dir.join("shallow"),
+            "the common Git directory's shallow file",
+            "shallow history omits commit ancestry",
+        )?;
+        reject_nonempty_history_file(
+            &self.inner.shallow_file(),
+            "the effective shallow file",
+            "shallow history omits commit ancestry",
+        )?;
+        if let Some(shallow) = env::var_os("GIT_SHALLOW_FILE").filter(|path| !path.is_empty()) {
+            reject_nonempty_history_file(
+                &self.git_environment_path(shallow)?,
+                "the file named by GIT_SHALLOW_FILE",
+                "the enclosing Git push retains that shallow boundary after the hook returns",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn git_environment_path(&self, path: std::ffi::OsString) -> Result<PathBuf> {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            return Ok(path);
+        }
+
+        // Git runs an installed hook from the worktree root in a non-bare
+        // repository and from the Git directory in a bare repository. Resolve
+        // the enclosing push's relative environment path from the same place.
+        Ok(match self.inner.workdir() {
+            Some(workdir) => workdir.join(path),
+            None => env::current_dir()?.join(path),
+        })
     }
 
     pub fn current_branch(&self) -> &HeadState {
@@ -158,39 +259,57 @@ impl Repo {
     }
 }
 
-pub enum CommitsBetweenError {
-    NotAncestor,
+pub(super) fn reject_nonempty_history_file(
+    path: &Path,
+    description: &str,
+    reason: &str,
+) -> Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            bail!("GHerrit cannot publish because {description} is not a regular file");
+        }
+        Ok(metadata) if metadata.len() != 0 => {
+            bail!("GHerrit cannot publish while {description} is nonempty because {reason}");
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).wrap_err_with(|| format!("Failed to inspect {description}")),
+    }
+}
+
+pub enum FirstParentCommitsBetweenError {
+    NotOnFirstParentPath,
     Eyre(eyre::Error),
 }
 
 impl Repo {
-    /// Returns the commits from `ancestor` to `descendant` (in that order).
-    pub fn commits_between(
+    /// Returns the first-parent commits from `ancestor` to `descendant`.
+    pub fn first_parent_commits_between(
         &self,
         ancestor: Id<'_>,
         descendant: Id<'_>,
-    ) -> Result<Vec<Commit<'_>>, CommitsBetweenError> {
-        // If there is no common ancestor (e.g., an orphan branch), `merge_base`
-        // returns an error. We treat this as "not an ancestor".
-        let is_ancestor = self
-            .inner
-            .merge_base(ancestor, descendant)
-            .map(|merge_base| merge_base.detach() == ancestor)
-            .unwrap_or(false);
-        if !is_ancestor {
-            return Err(CommitsBetweenError::NotAncestor);
+    ) -> Result<Vec<Commit<'_>>, FirstParentCommitsBetweenError> {
+        // A GHerrit stack is a first-parent path. A merge base is insufficient:
+        // it can be reachable only through another parent of a merge commit.
+        // Walk the one path that defines stack order and require it to reach the
+        // requested ancestor.
+        let mut commits = Vec::new();
+        for commit in self
+            .rev_walk([descendant])
+            .first_parent_only()
+            .all()
+            .map_err(|e| FirstParentCommitsBetweenError::Eyre(e.into()))?
+        {
+            let commit = commit.map_err(|e| FirstParentCommitsBetweenError::Eyre(e.into()))?;
+            if commit.id == ancestor {
+                commits.reverse();
+                return Ok(commits);
+            }
+            commits
+                .push(commit.object().map_err(|e| FirstParentCommitsBetweenError::Eyre(e.into()))?);
         }
 
-        let mut commits = self
-            .rev_walk([descendant])
-            .all()
-            .map_err(|e| CommitsBetweenError::Eyre(e.into()))?
-            .take_while(|res| res.as_ref().map(|info| info.id != ancestor).unwrap_or(true))
-            .map(|res| -> color_eyre::eyre::Result<_> { Ok(res?.object()?) })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(CommitsBetweenError::Eyre)?;
-        commits.reverse();
-        Ok(commits)
+        Err(FirstParentCommitsBetweenError::NotOnFirstParentPath)
     }
 }
 
@@ -218,7 +337,7 @@ impl Remote {
 }
 
 /// Determines the current HEAD state.
-fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
+pub(super) fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     if let Some(name) = repo.head()?.referent_name() {
         let name = name.shorten().to_string();
         return Ok(HeadState::Attached(name));
