@@ -1,6 +1,7 @@
 ---
 source: tests/pre_push/publication.rs
-expression: state.graphql_requests
+assertion_line: 461
+expression: requests
 ---
 [
     [
@@ -15,9 +16,6 @@ expression: state.graphql_requests
     ],
     [
         Query,
-        Query,
-    ],
-    [
         Query,
     ],
     [
