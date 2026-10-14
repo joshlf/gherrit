@@ -234,33 +234,39 @@ fn test_stack_id_cannot_be_a_ref_path_ancestor_of_a_nested_default_branch() {
 }
 
 #[test]
-fn test_autosquash_guidance_uses_the_validated_local_ref_with_split_destinations() {
-    let ctx = testutil::test_context!()
-        .with_remote()
-        .with_initial_commit()
-        .with_mock_github()
-        .with_git_interceptor()
-        .build();
-    let push_destination = configured_remote_url(&ctx, "origin");
-    let fetch_repository = ctx.dir.path().join("fetch-only.git");
-    ctx.init_bare_repo(&fetch_repository);
-    let fetch_destination =
-        fetch_repository.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
-    ctx.set_config("remote.origin.url", Some(&fetch_destination));
-    ctx.set_config("remote.origin.pushurl", Some(&push_destination));
-    ctx.run_git(&["update-ref", "refs/remotes/origin/main", "refs/heads/main"]);
-    ctx.checkout_managed_private("split-destination-autosquash");
-    ctx.commit_with_explicit_gherrit_id("fixup! pending work", "Gpending");
-
-    ctx.hook_cmd("pre-push")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("git rebase -i --autosquash refs/heads/main"))
-        .stderr(predicate::str::contains("origin/main").not())
-        .stderr(predicate::str::contains("refs/remotes/origin/main").not());
-
-    assert!(ctx.github().requests().is_empty());
-    assert!(ctx.recorded_pushes().is_empty());
+fn test_autosquash_guidance_uses_the_observed_tip_with_split_destinations() {
+    for divergent_alias in [false, true] {
+        let ctx = testutil::test_context!()
+            .with_remote()
+            .with_initial_commit()
+            .with_mock_github()
+            .with_git_interceptor()
+            .build();
+        let default_tip = ctx.head_oid();
+        let push_destination = configured_remote_url(&ctx, "origin");
+        let fetch_repository = ctx.dir.path().join("fetch-only.git");
+        ctx.init_bare_repo(&fetch_repository);
+        let fetch_destination =
+            fetch_repository.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        ctx.set_config("remote.origin.url", Some(&fetch_destination));
+        ctx.set_config("remote.origin.pushurl", Some(&push_destination));
+        ctx.run_git(&["update-ref", "refs/remotes/origin/main", "refs/heads/main"]);
+        ctx.checkout_managed_private("split-destination-autosquash");
+        ctx.commit_with_explicit_gherrit_id("fixup! pending work", "Gpending");
+        if divergent_alias {
+            ctx.run_git(&["update-ref", "refs/heads/main", &ctx.head_oid()]);
+        } else {
+            ctx.run_git(&["update-ref", "-d", "refs/heads/main"]);
+        }
+        ctx.hook_cmd("pre-push")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(format!("git rebase -i --autosquash {default_tip}")))
+            .stderr(predicate::str::contains("refs/heads/main").not())
+            .stderr(predicate::str::contains("origin/main").not());
+        assert!(ctx.github().requests().is_empty());
+        assert!(ctx.recorded_pushes().is_empty());
+    }
 }
 
 #[test]
@@ -392,7 +398,7 @@ fn test_default_branch_must_be_on_the_first_parent_stack_path() {
     ctx.hook_cmd("pre-push")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("does not descend from 'main' on its first-parent path"));
+        .stderr(predicate::str::contains("does not descend from the observed push-destination default 'main' on its first-parent path"));
 
     assert!(ctx.github().requests().is_empty());
     assert_eq!(ctx.recorded_pushes(), fixture_pushes);

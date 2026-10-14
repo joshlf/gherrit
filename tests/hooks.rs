@@ -261,14 +261,11 @@ fn empty_managed_stack_returns_before_history_and_github_requirements() {
         .with_installed_hooks()
         .with_initial_commit()
         .build();
+    ctx.checkout_new("empty-history-topic");
     ctx.gherrit_cmd().args(["manage", "--private"]).assert().success();
     fs::write(ctx.repo_path.join("custom-grafts"), format!("{}\n", ctx.head_oid())).unwrap();
 
-    ctx.git_cmd()
-        .env("GIT_GRAFT_FILE", "custom-grafts")
-        .args(["push", "origin", "main"])
-        .assert()
-        .success();
+    ctx.git_cmd().env("GIT_GRAFT_FILE", "custom-grafts").arg("push").assert().success();
 }
 
 #[test]
