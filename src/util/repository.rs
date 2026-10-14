@@ -1,118 +1,9 @@
-mod layout {
-    //! Path roles are distinct in a linked worktree. Keep the original spelling
-    //! for child processes; canonical identity is a separate repository contract.
-
-    use std::path::Path;
-
-    use super::Repo;
-
-    #[derive(Clone, Copy, Debug)]
-    pub(crate) struct RepositoryLayout<'repo> {
-        /// HEAD, the index, and rebase state belong to this worktree.
-        pub(crate) worktree_git_dir: &'repo Path,
-        /// Objects, ordinary refs, common config, and default hooks are shared.
-        pub(crate) common_git_dir: &'repo Path,
-        pub(crate) workdir: Option<&'repo Path>,
-    }
-
-    impl Repo {
-        pub(crate) fn layout(&self) -> RepositoryLayout<'_> {
-            RepositoryLayout {
-                worktree_git_dir: self.inner.path(),
-                common_git_dir: self.inner.common_dir(),
-                workdir: self.inner.workdir(),
-            }
-        }
-    }
-}
-
-use std::{ffi::OsStr, process::Command};
-
-use eyre::{OptionExt, Result, WrapErr, bail, eyre};
-use gix::{Commit, Id, bstr::ByteSlice, state::InProgress};
-
-use crate::manage::State;
-
-/// Constructs a `std::process::Command`.
-///
-/// # Usage
-///
-/// The first argument must be a string literal representing the command and any initial arguments.
-/// This string is split by whitespace to determine the command name and initial arguments.
-///
-/// Subsequent arguments are treated as individual arguments to the command. They are NOT split
-/// by whitespace, allowing for safe passing of arguments that contain spaces.
-///
-/// # Example
-///
-/// ```text
-/// // - "git" is the command; "config" is an argument.
-/// // - "branch.{branch_name}.gherritManaged" is a single argument (even if it contains spaces when formatted).
-/// // - `state` is a single argument (even if it contains spaces when formatted).
-/// cmd!("git config", "branch.{branch_name}.gherritManaged", state)
-/// ```
-macro_rules! cmd {
-    ($bin:literal $(, $($rest:tt)*)?) => {{
-        // The first argument is a literal, so we can safely split it by whitespace.
-        // This allows `cmd!("git config", ...)` to work as expected.
-        let bin_str: &str = $bin;
-        let parts: Vec<&str> = bin_str.split_whitespace().collect();
-        let (bin, pre_args) = match parts.as_slice() {
-            [bin, args @ ..] => (bin, args),
-            [] => panic!("Command cannot be empty"),
-        };
-
-        #[allow(unused_mut)]
-        let mut args: Vec<String> = pre_args.iter().map(|s| s.to_string()).collect();
-        $crate::cmd!(@inner args $(, $($rest)*)?);
-
-        log::debug!("exec: {} {}", bin, args.iter().map(|s| if s.contains(" ") {
-            format!("'{}'", s)
-        } else {
-            s.clone()
-        }).collect::<Vec<_>>().join(" "));
-        $crate::util::cmd(bin, &args)
-    }};
-
-    // String literal (treated as a format string, but not broken apart).
-    (@inner $vec:ident, $l:literal $(, $($rest:tt)*)?) => {
-        $vec.push(format!($l));
-        $crate::cmd!(@inner $vec $(, $($rest)*)?);
-    };
-
-    // Expression (not broken apart).
-    (@inner $vec:ident, $e:expr $(, $($rest:tt)*)?) => {
-        $vec.push($e.to_string());
-        $crate::cmd!(@inner $vec $(, $($rest)*)?);
-    };
-
-    (@inner $vec:ident $(,)?) => {};
-}
-pub(crate) use cmd as cmd_macro;
-
-macro_rules! re {
-    ($name:ident, $re:literal) => {
-        fn $name() -> &'static regex::Regex {
-            $crate::re!(@inner $re)
-        }
-    };
-    ($re:literal) => {
-        $crate::re!(@inner $re)
-    };
-    (@inner $re:literal) => {{
-        static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new($re).unwrap());
-        &*RE
-    }};
-}
-pub(crate) use re as re_macro;
-
-pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Command {
-    let mut c = Command::new(name);
-    c.args(args);
-    c
-}
-
 use std::path::PathBuf;
+
+use eyre::{OptionExt, Result, bail, eyre};
+use gix::{Commit, Id, state::InProgress};
+
+use crate::{manage::State, re};
 
 /// Represents the state of the HEAD reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,8 +29,8 @@ impl HeadState {
 }
 
 pub struct Repo {
-    inner: gix::Repository,
-    current_branch: HeadState,
+    pub(super) inner: gix::Repository,
+    pub(super) current_branch: HeadState,
 }
 
 impl Repo {
@@ -153,33 +44,6 @@ impl Repo {
 
     pub fn current_branch(&self) -> &HeadState {
         &self.current_branch
-    }
-
-    pub fn config_string(&self, key: &str) -> Result<Option<String>> {
-        let Some(cow) = self.inner.config_snapshot().string(key) else {
-            return Ok(None);
-        };
-        let s = std::str::from_utf8(cow.as_ref())?;
-        Ok(Some(s.trim().to_string()))
-    }
-
-    pub fn config_path(&self, key: &str) -> Result<Option<PathBuf>> {
-        let snapshot = self.inner.config_snapshot();
-        let Some(path_val) = snapshot.path(key) else {
-            return Ok(None);
-        };
-
-        let bstr: &gix::bstr::BStr = path_val.as_ref();
-        let raw_path = bstr.to_path()?.to_path_buf();
-
-        // Resolve relative paths against the workdir (or gitdir for bare repos)
-        if raw_path.is_absolute() {
-            Ok(Some(raw_path))
-        } else {
-            // Use `.canonicalize` to guarantee an absolute path.
-            let root = self.workdir().unwrap_or(self.path()).canonicalize()?;
-            Ok(Some(root.join(raw_path)))
-        }
     }
 
     pub fn is_newly_created_branch(&self, branch_name: &str) -> Result<bool> {
@@ -385,53 +249,6 @@ fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     Ok(HeadState::Detached)
 }
 
-pub trait CommandExt {
-    fn success(&mut self) -> Result<()>;
-    fn checked_output(&mut self) -> Result<std::process::Output>;
-}
-
-impl CommandExt for Command {
-    fn success(&mut self) -> Result<()> {
-        let status = self.status()?;
-        if !status.success() {
-            bail!("Command failed with status: {}", status);
-        }
-        Ok(())
-    }
-
-    fn checked_output(&mut self) -> Result<std::process::Output> {
-        let output = self.output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Command {self:?} failed with status: {}. Stderr: {stderr}", output.status,);
-        }
-        Ok(output)
-    }
-}
-
-pub fn get_github_token() -> Result<String> {
-    // Priority 1: GITHUB_TOKEN env var
-    if let Ok(token) = std::env::var("GITHUB_TOKEN")
-        && !token.is_empty()
-    {
-        return Ok(token);
-    }
-
-    // Priority 2: gh auth token
-    let output = cmd!("gh auth token").output().wrap_err("Failed to run `gh auth token`")?;
-
-    if output.status.success() {
-        let token = String::from_utf8(output.stdout)?.trim().to_string();
-        if !token.is_empty() {
-            return Ok(token);
-        }
-    }
-
-    Err(eyre!(
-        "Could not find GitHub token. Please set GITHUB_TOKEN environment variable or login via `gh auth login`."
-    ))
-}
-
 /// Parses the owner and repository name from a remote URL.
 ///
 /// Supports the following formats:
@@ -440,7 +257,7 @@ pub fn get_github_token() -> Result<String> {
 /// - http://localhost:port/owner/repo(.git)
 /// - /absolute/path/to/owner/repo(.git) (for tests)
 /// - owner/repo (for tests)
-fn get_repo_owner_name(remote_url: &str) -> Result<(String, String)> {
+pub(super) fn get_repo_owner_name(remote_url: &str) -> Result<(String, String)> {
     let re = re!(r"^(?:.*[/:])?(?P<owner>[^/:]+)/(?P<repo>[^/]+?)(?:\.git)?$");
 
     let caps = re
@@ -449,48 +266,4 @@ fn get_repo_owner_name(remote_url: &str) -> Result<(String, String)> {
     let owner = caps.name("owner").unwrap().as_str().to_string();
     let repo = caps.name("repo").unwrap().as_str().to_string();
     Ok((owner, repo))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[should_panic(expected = "Command cannot be empty")]
-    fn test_cmd_macro_empty_panic() {
-        cmd!("");
-    }
-
-    #[test]
-    #[should_panic(expected = "Command cannot be empty")]
-    fn test_cmd_macro_whitespace_panic() {
-        cmd!("   ");
-    }
-
-    #[test]
-    fn test_get_repo_owner_name() {
-        for (url, (owner, repo)) in [
-            ("https://github.com/owner/repo.git", ("owner", "repo")),
-            ("https://github.com/owner/repo", ("owner", "repo")),
-            ("git@github.com:owner/repo.git", ("owner", "repo")),
-            ("git@github.com:owner/repo", ("owner", "repo")),
-            ("alias:owner/repo.git", ("owner", "repo")),
-            ("alias:owner/repo", ("owner", "repo")),
-            ("http://localhost:3000/owner/repo.git", ("owner", "repo")),
-            ("http://my-gh.com/owner/repo", ("owner", "repo")),
-            ("/tmp/test/owner/repo.git", ("owner", "repo")),
-            ("/tmp/owner/repo", ("owner", "repo")),
-            ("owner/repo", ("owner", "repo")),
-            ("https://github.com/user-name/repo", ("user-name", "repo")),
-            ("https://github.com/user_name/repo", ("user_name", "repo")),
-            ("https://github.com/user.name/repo", ("user.name", "repo")),
-            ("https://github.com/user/repo-name", ("user", "repo-name")),
-            ("https://github.com/user/repo_name", ("user", "repo_name")),
-            ("https://github.com/user/repo.name", ("user", "repo.name")),
-            ("https://github.com/user/repo.name.git", ("user", "repo.name")),
-        ] {
-            let expect = (owner.to_string(), repo.to_string());
-            assert_eq!(get_repo_owner_name(url).unwrap(), expect);
-        }
-    }
 }
