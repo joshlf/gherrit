@@ -116,8 +116,12 @@ pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
 
     match cli.command {
         Commands::Hook(cmd) => match cmd {
-            HookCommands::PrePush { .. } => {
-                pre_push::run(&repo, &runtime.github_endpoint).await?;
+            HookCommands::PrePush { remote_name, remote_location } => {
+                let invocation = pre_push::Invocation::new(
+                    remote_name.map(Into::into),
+                    remote_location.map(Into::into),
+                )?;
+                pre_push::run(&repo, &runtime.github_endpoint, invocation).await?;
             }
             HookCommands::PostCheckout { prev, new, flag } => {
                 manage::post_checkout(&repo, &prev, &new, &flag)?

@@ -94,6 +94,21 @@ original bytes and value during amendment. Recognition does not broaden the raw
 publication grammar; convert an unsupported legacy separator explicitly while
 retaining its ID instead of generating a replacement review identity.
 
+## Enclosing pushes from promisor repositories
+
+The legacy route still allows the original Git process to push after this hook
+returns. GHerrit uses the actual hook destination, including explicit remote/URL
+or refspec overrides; branch configuration cannot prove an enclosing loopback.
+Direct invocation has no parent push. A standard `.`/`.` loopback is exempt only
+when its input proves no ref update. Other enclosing pushes require a true
+`GIT_NO_LAZY_FETCH` value on the original Git invocation and Git 2.45.1 or
+newer.
+Setting the variable only in a hook wrapper cannot change its parent. Git parses
+the inherited boolean; bound child environment edits cannot constrain the
+parent.
+The later loopback activation excludes every enclosing ref effect and removes
+this legacy-specific environment requirement.
+
 ## Trailer aliases
 
 Identity retention requires the literal full gherrit-pr-id key in the source

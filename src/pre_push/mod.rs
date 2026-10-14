@@ -1,4 +1,10 @@
-use std::{collections::HashMap, process::Stdio, time::Duration};
+use std::{
+    collections::HashMap,
+    ffi::{OsStr, OsString},
+    io,
+    process::Stdio,
+    time::Duration,
+};
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
 use gix::{reference::Category, refs::transaction::PreviousValue};
@@ -43,6 +49,56 @@ use remote::observe_managed_branches;
 const INDETERMINATE_GRAPHQL_MUTATION: &str = "GraphQL mutation acknowledgement is indeterminate; stop this publication attempt and retry the push to reobserve GitHub state";
 const MAX_GRAPHQL_MUTATION_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
+/// The complete externally relevant shape of one hook invocation.
+///
+/// GHerrit's own nested pushes return before constructing this value. Direct
+/// invocation has no enclosing effect. For a managed Git invocation, one byte
+/// is enough to distinguish a no-op from a push which could mutate a ref after
+/// this hook returns. Unmanaged invocations never consume their input.
+pub(crate) struct Invocation {
+    source: InvocationSource,
+}
+
+enum InvocationSource {
+    /// Direct invocation of the hidden hook command has no enclosing Git
+    /// process and therefore no later ref effect.
+    Direct,
+    Git {
+        remote_name: OsString,
+        remote_location: OsString,
+    },
+}
+
+impl Invocation {
+    pub(crate) fn new(
+        remote_name: Option<OsString>,
+        remote_location: Option<OsString>,
+    ) -> Result<Self> {
+        let source = match (remote_name, remote_location) {
+            (None, None) => InvocationSource::Direct,
+            (Some(remote_name), Some(remote_location)) => {
+                InvocationSource::Git { remote_name, remote_location }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                bail!("Git pre-push hook arguments are incomplete")
+            }
+        };
+        Ok(Self { source })
+    }
+
+    fn input_has_ref_updates(input: &mut impl io::Read) -> Result<bool> {
+        let mut first = [0_u8; 1];
+        loop {
+            match input.read(&mut first) {
+                Ok(0) => return Ok(false),
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error).wrap_err("Failed to read Git pre-push input"),
+            }
+        }
+    }
+}
+
 #[derive(Eq, PartialEq)]
 pub(crate) enum GithubEndpoint {
     Production,
@@ -73,7 +129,11 @@ impl GithubEndpoint {
     }
 }
 
-pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<()> {
+pub async fn run(
+    repo: &util::Repo,
+    github_endpoint: &GithubEndpoint,
+    invocation: Invocation,
+) -> Result<()> {
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) | HeadState::Pending(bn) => bn,
@@ -89,6 +149,8 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
         }
         true => log::info!("Branch {} is MANAGED. Syncing stack...", branch_name.yellow()),
     }
+
+    require_enclosing_no_lazy_fetch(repo, &invocation)?;
 
     let commits = LocalStack::collect(repo).wrap_err("Failed to collect commits")?;
 
@@ -859,6 +921,42 @@ where
         batches.accept();
     }
     Ok(outputs)
+}
+
+/// Only the actual invocation can identify an enclosing loopback. Branch
+/// configuration cannot rule out an explicit destination or refspec override.
+fn require_enclosing_no_lazy_fetch(repo: &util::Repo, invocation: &Invocation) -> Result<()> {
+    use crate::util::CommandExt as _;
+    if matches!(&invocation.source, InvocationSource::Direct) || !repo.has_promisor_remote()? {
+        return Ok(());
+    }
+    if let Some(value) = std::env::var_os("GIT_NO_LAZY_FETCH") {
+        let mut setting = std::ffi::OsString::from("gherrit.enclosingNoLazyFetch=");
+        setting.push(value);
+        let output = util::cmd("git", ["-c"])
+            .arg(setting)
+            .env_remove("GIT_CONFIG")
+            .args(["config", "--type=bool", "--get", "gherrit.enclosingNoLazyFetch"])
+            .bounded_output()
+            .wrap_err("Failed to inspect the enclosing push's lazy-fetch setting")?;
+        if output.status.success() && output.stdout == b"true\n" {
+            util::Repo::require_git_no_lazy_fetch_capability()?;
+            return Ok(());
+        }
+    }
+    // A standard loopback with no ref update cannot generate an outgoing
+    // object pack. Read only without a valid flag: accepted update pushes keep
+    // their stdin untouched for other checks in a composite hook.
+    if let InvocationSource::Git { remote_name, remote_location } = &invocation.source
+        && remote_name == OsStr::new(".")
+        && remote_location == OsStr::new(".")
+        && !Invocation::input_has_ref_updates(&mut std::io::stdin().lock())?
+    {
+        return Ok(());
+    }
+    bail!(
+        "This push from a promisor repository requires GIT_NO_LAZY_FETCH=1 on the enclosing Git process; set it before starting 'git push'"
+    )
 }
 
 #[cfg(test)]
