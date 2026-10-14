@@ -1052,6 +1052,7 @@ name = "gherrit"
 version = "0.1.0-alpha"
 dependencies = [
  "assert_cmd",
+ "chrono",
  "clap",
  "color-eyre",
  "data-encoding",
@@ -1076,6 +1077,7 @@ dependencies = [
  "tempfile",
  "testutil",
  "tokio",
+ "url",
  "windows-sys 0.61.2",
 ]
 
