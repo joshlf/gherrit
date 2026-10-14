@@ -130,6 +130,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
         HeadState::Detached => {
             bail!("Cannot push from detached HEAD");
         }
+        HeadState::UnsupportedName => bail!("GHerrit requires branch names to be valid UTF-8"),
     };
 
     match repo.is_managed(branch_name)? {
