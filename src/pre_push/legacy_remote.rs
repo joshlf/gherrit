@@ -53,6 +53,7 @@ pub(super) async fn observe_publications(
                 destination.configured_remote()
             );
         }
+
         observed.extend(parse_publications(output.stdout(), query.ids())?);
     }
     Ok(observed)
