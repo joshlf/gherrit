@@ -118,6 +118,32 @@ pub(super) fn default_remote_name_from_values<'a>(
     RemoteName::from_config(value)
 }
 
+/// Prefer Git's actual backend. Older Git does not recognize the query and
+/// only interprets refStorage as an extension under repository format 1.
+fn repository_uses_reftable(path: &str) -> Result<bool> {
+    let command = |args: &[&str]| {
+        let mut command = cmd("git", ["-C", path]);
+        command.args(args);
+        clear_git_repository_overrides(&mut command);
+        command
+    };
+    let output = command(&["rev-parse", "--show-ref-format"]).bounded_output()?;
+    if output.status.success() {
+        match output.stdout.as_slice() {
+            b"files\n" => return Ok(false),
+            b"reftable\n" => return Ok(true),
+            _ => {}
+        }
+    }
+    let direct_value = |key| -> Result<Option<Vec<u8>>> {
+        let output =
+            command(&["config", "--local", "--no-includes", "--get", key]).bounded_output()?;
+        Ok(output.status.success().then_some(output.stdout))
+    };
+    Ok(direct_value("core.repositoryformatversion")?.as_deref() == Some(b"1\n")
+        && direct_value("extensions.refStorage")?.as_deref() == Some(b"reftable\n"))
+}
+
 impl Repo {
     pub fn open(path: &str) -> Result<Self> {
         // Object location is not ancestry rewriting. Preserve it for native
@@ -133,6 +159,11 @@ impl Repo {
         }
         // NOTE: `gix::discover` is used instead of `gix::open` so that
         // `gherrit` doesn't need to be run from the root of the repository.
+        if repository_uses_reftable(path)? {
+            bail!(
+                "This repository uses reftable refs, which GHerrit's current gix backend does not support; `gherrit status` can inspect its Git capabilities without publishing"
+            );
+        }
         let inner = gix::ThreadSafeRepository::discover_opts(
             path,
             Default::default(),
@@ -254,32 +285,7 @@ impl Repo {
     /// from the common directory's direct `config` file, without includes or
     /// configuration inherited from another scope.
     fn partial_clone_remote_from_direct_common_config(&self) -> Result<Option<Vec<u8>>> {
-        let mut command = cmd("git", ["config", "--file"]);
-        command.arg(self.inner.common_dir().join("config")).args([
-            "--no-includes",
-            "--null",
-            "--get",
-            "extensions.partialClone",
-        ]);
-        clear_git_repository_overrides(&mut command);
-        // These are Git command scope rather than part of the repository
-        // format file. Other bound children keep them so enclosing `git -c`
-        // settings continue to reach hooks.
-        command.env_remove("GIT_CONFIG_PARAMETERS");
-        command.env_remove("GIT_CONFIG_COUNT");
-
-        let output = command
-            .output()
-            .wrap_err("Failed to inspect the repository partial-clone configuration")?;
-        match output.status.code() {
-            Some(0) if output.stderr.is_empty() => output
-                .stdout
-                .strip_suffix(b"\0")
-                .map(|remote| Some(remote.to_owned()))
-                .ok_or_else(|| eyre!("Git returned malformed partial-clone configuration")),
-            Some(1) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(None),
-            _ => bail!("Invalid repository partial-clone configuration"),
-        }
+        repository_format_value(self.inner.common_dir(), "extensions.partialClone")
     }
 
     pub fn current_branch(&self) -> &HeadState {
@@ -542,7 +548,9 @@ impl std::ops::Deref for Repo {
 /// Determines the current HEAD state.
 pub(super) fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     if let Some(name) = repo.head()?.referent_name() {
-        let name = name.shorten().to_string();
+        let name = std::str::from_utf8(name.shorten().as_ref())
+            .wrap_err("GHerrit requires branch names to be valid UTF-8")?
+            .to_owned();
         return Ok(HeadState::Attached(name));
     }
 
@@ -569,4 +577,22 @@ pub(super) fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     }
 
     Ok(HeadState::Detached)
+}
+
+fn repository_format_value(common_dir: &Path, key: &str) -> Result<Option<Vec<u8>>> {
+    let mut command = cmd("git", ["config", "--file"]);
+    command.arg(common_dir.join("config")).args(["--no-includes", "--null", "--get", key]);
+    clear_git_repository_overrides(&mut command);
+    command.env_remove("GIT_CONFIG_PARAMETERS");
+    command.env_remove("GIT_CONFIG_COUNT");
+    let output = command.bounded_output().wrap_err("Failed to inspect repository format")?;
+    match output.status.code() {
+        Some(0) if output.stderr.is_empty() => output
+            .stdout
+            .strip_suffix(b"\0")
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(|| eyre!("Git returned malformed repository-format configuration")),
+        Some(1) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(None),
+        _ => bail!("Invalid repository-format configuration"),
+    }
 }
