@@ -1069,9 +1069,11 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "signal-hook",
  "tempfile",
  "testutil",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

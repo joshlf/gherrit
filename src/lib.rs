@@ -4,6 +4,10 @@ mod install;
 mod manage;
 mod pre_push;
 mod util;
+// The local path is active; remote entry points have adapter-contract tests
+// here and are integrated by the separate destination review.
+#[cfg_attr(not(test), allow(dead_code))]
+mod subprocess;
 
 use clap::{Parser, Subcommand};
 use eyre::{Result, WrapErr};
