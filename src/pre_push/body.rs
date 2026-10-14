@@ -1,7 +1,5 @@
 use std::fmt::{self, Write};
 
-use crate::re;
-
 // Per https://github.com/orgs/community/discussions/27190#discussioncomment-3254953,
 // GitHub stores PR bodies in a `mediumblob` with a 262,144-byte limit. Use half
 // of that limit as a safety factor.
@@ -175,10 +173,6 @@ impl PrBody<'_> {
     }
 }
 
-pub(super) fn gherrit_pr_id_re() -> &'static regex::Regex {
-    re!(r"(?m)^gherrit-pr-id[=:][ \t]*([a-zA-Z0-9]+)[ \t]*\r?$")
-}
-
 struct ByteCounter(usize);
 
 impl Write for ByteCounter {
@@ -193,12 +187,6 @@ mod tests {
     use super::*;
 
     const STACK: &[u64] = &[11, 22, 33];
-
-    #[test]
-    fn gherrit_id_trailers_require_a_nonempty_identifier() {
-        assert!(gherrit_pr_id_re().is_match("gherrit-pr-id: Gone"));
-        assert!(!gherrit_pr_id_re().is_match("gherrit-pr-id: "));
-    }
 
     fn body<'a>(
         commit_body: &'a str,

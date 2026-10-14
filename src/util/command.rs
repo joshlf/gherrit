@@ -77,6 +77,16 @@ pub(crate) use re as re_macro;
 
 pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Command {
     let mut c = Command::new(name);
+    if name == "git" {
+        // Replacement objects can make Git subprocesses observe a different
+        // graph from the one sent to the remote. Keep every production Git
+        // invocation on the literal local graph.
+        c.arg("--no-replace-objects");
+        c.env("GIT_NO_REPLACE_OBJECTS", "1");
+        for variable in ["GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE", "GIT_SHALLOW_FILE"] {
+            c.env_remove(variable);
+        }
+    }
     c.args(args);
     c
 }
