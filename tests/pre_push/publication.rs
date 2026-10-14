@@ -225,3 +225,59 @@ fn test_graphql_batch_backoff() {
         .count();
     assert_eq!(v1_refs, 4, "Expected every v1 tag on the remote");
 }
+
+#[test]
+fn canonical_trailers_allow_key_case_and_whitespace_paragraphs() {
+    for message in ["Subject\n\nGherrit-pr-id: Gold", "Subject\n \ngherrit-pr-id: Gone\n \t\n"] {
+        let ctx = testutil::test_context!()
+            .with_remote()
+            .with_initial_commit()
+            .with_mock_github()
+            .with_git_interceptor()
+            .with_installed_hooks()
+            .build();
+        ctx.checkout_managed_private("raw-trailer-variants");
+        ctx.git_cmd()
+            .args(["commit", "--allow-empty", "--cleanup=verbatim", "-m", message])
+            .assert()
+            .success();
+        ctx.hook_cmd("pre-push").assert().success();
+        let id = if message.contains("Gold") { "Gold" } else { "Gone" };
+        assert_eq!(
+            ctx.remote_ref_oid(&format!("refs/heads/{id}")).as_deref(),
+            Some(ctx.head_oid().as_str())
+        );
+    }
+}
+
+#[test]
+fn retained_leading_scissors_suffixes_receive_publishable_identities() {
+    for mode in ["strip", "whitespace", "verbatim"] {
+        let ctx = testutil::test_context!()
+            .with_remote()
+            .with_initial_commit()
+            .with_mock_github()
+            .with_git_interceptor()
+            .with_installed_hooks()
+            .build();
+        ctx.checkout_managed_private("scissors-suffix");
+        ctx.git_cmd()
+            .args([
+                "commit",
+                "--allow-empty",
+                &format!("--cleanup={mode}"),
+                "-m",
+                "# ------------------------ >8 ------------------------\nRetained suffix\n",
+            ])
+            .assert()
+            .success();
+        ctx.hook_cmd("pre-push").assert().success();
+        let id = ctx.gherrit_id("HEAD").unwrap();
+        assert_eq!(
+            ctx.remote_ref_oid(&format!("refs/heads/{id}")).as_deref(),
+            Some(ctx.head_oid().as_str())
+        );
+        ctx.git_cmd().args(["commit", "--amend", "--allow-empty", "--no-edit"]).assert().success();
+        assert_eq!(ctx.gherrit_id("HEAD").unwrap(), id);
+    }
+}
