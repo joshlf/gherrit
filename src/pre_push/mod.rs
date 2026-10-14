@@ -20,6 +20,9 @@ pub(crate) mod json;
 pub(crate) use inspection::observe as inspect_remote;
 mod local;
 mod publication;
+// Pure protocol components are exercised before runtime activation.
+#[allow(dead_code)]
+mod publication_attempt;
 mod reconcile;
 mod remote;
 use batching::{
