@@ -1,5 +1,3 @@
-// Captured-head entry points are used when the consuming planner is composed.
-#![allow(dead_code)]
 use std::{
     env,
     ffi::OsStr,
@@ -60,7 +58,7 @@ impl BranchHeadSnapshot {
 
 pub struct Repo {
     pub(super) inner: gix::Repository,
-    pub(super) current_branch: HeadState,
+    current_branch: HeadState,
     git_dir_identity: GitDirIdentity,
 }
 
@@ -137,6 +135,25 @@ pub(super) fn default_remote_name_from_values<'a>(
     RemoteName::from_config(value)
 }
 
+/// Git reads repository-format extensions only from the direct common config.
+fn repository_format_value(common_dir: &Path, key: &str) -> Result<Option<Vec<u8>>> {
+    let mut command = cmd("git", ["config", "--file"]);
+    command.arg(common_dir.join("config")).args(["--no-includes", "--null", "--get", key]);
+    clear_git_repository_overrides(&mut command);
+    command.env_remove("GIT_CONFIG_PARAMETERS");
+    command.env_remove("GIT_CONFIG_COUNT");
+    let output = command.bounded_output().wrap_err("Failed to inspect repository format")?;
+    match output.status.code() {
+        Some(0) if output.stderr.is_empty() => output
+            .stdout
+            .strip_suffix(b"\0")
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(|| eyre!("Git returned malformed repository-format configuration")),
+        Some(1) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(None),
+        _ => bail!("Invalid repository-format configuration"),
+    }
+}
+
 /// Prefer Git's actual backend. Older Git does not recognize the query and
 /// only interprets refStorage as an extension under repository format 1.
 fn repository_uses_reftable(path: &str) -> Result<bool> {
@@ -164,10 +181,6 @@ fn repository_uses_reftable(path: &str) -> Result<bool> {
 }
 
 impl Repo {
-    pub(crate) fn branch_head_snapshot(&self) -> Result<Option<BranchHeadSnapshot>> {
-        branch_head_snapshot(&self.inner)
-    }
-
     pub fn open(path: &str) -> Result<Self> {
         // Object location is not ancestry rewriting. Preserve it for native
         // Git, but do not silently collect from a different ODB in gix 0.75.
@@ -273,6 +286,12 @@ impl Repo {
         })
     }
 
+    /// Returns whether repository configuration declares a promisor object
+    /// source, either through partial-clone configuration or a promisor remote.
+    ///
+    /// History validation and repository preflight use the same interpretation
+    /// when deciding whether missing ancestry may be repaired with an explicit
+    /// refetch.
     pub(crate) fn has_promisor_remote(&self) -> Result<bool> {
         let configured_by_extension = self
             .partial_clone_remote_from_direct_common_config()?
@@ -296,7 +315,7 @@ impl Repo {
         }
 
         let output =
-            command.output().wrap_err("Failed to inspect remote promisor configuration")?;
+            command.bounded_output().wrap_err("Failed to inspect remote promisor configuration")?;
         match output.status.code() {
             Some(0) => Ok(configured_by_extension | parse_remote_promisor_config(&output.stdout)?),
             Some(1) if output.stdout.is_empty() => Ok(configured_by_extension),
@@ -313,6 +332,15 @@ impl Repo {
 
     pub fn current_branch(&self) -> &HeadState {
         &self.current_branch
+    }
+
+    /// Reads the logical branch identity and exact `HEAD` target together.
+    ///
+    /// `gix::Head` is a snapshot of the persisted HEAD and referent state. Use
+    /// its retained target rather than resolving the name again after another
+    /// process has had an opportunity to move the branch.
+    pub(crate) fn branch_head_snapshot(&self) -> Result<Option<BranchHeadSnapshot>> {
+        branch_head_snapshot(&self.inner)
     }
 
     pub fn is_newly_created_branch(&self, branch_name: &str) -> Result<bool> {
@@ -382,21 +410,6 @@ impl Repo {
         let remote_name = self.default_remote_name()?;
         let branches = self.find_default_branches(&remote_name)?;
         Ok(branches.iter().any(|branch| branch == branch_name))
-    }
-
-    // Check whether the branch is managed by GHerrit.
-    pub fn is_managed(&self, branch_name: &str) -> Result<bool> {
-        match State::read_from(self, branch_name)? {
-            Some(State::Unmanaged) => Ok(false),
-            Some(State::Private | State::Public) => Ok(true),
-            None => {
-                bail!(
-                    "It is unclear whether branch '{branch_name}' should be managed by GHerrit.\n\
-                    Run 'gherrit manage' to sync it as a GHerrit stack.\n\
-                    Run 'gherrit unmanage' to push it as a standard Git branch."
-                );
-            }
-        }
     }
 
     pub fn read_current_branch_and_state(&self) -> Result<(String, Option<State>)> {
@@ -568,58 +581,6 @@ impl std::ops::Deref for Repo {
     }
 }
 
-/// Determines the current HEAD state.
-pub(super) fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
-    if let Some(name) = repo.head()?.referent_name() {
-        let name = std::str::from_utf8(name.shorten().as_ref())
-            .wrap_err("GHerrit requires branch names to be valid UTF-8")?
-            .to_owned();
-        return Ok(HeadState::Attached(name));
-    }
-
-    // Try to recover the branch name – we only care about states that detach
-    // HEAD but preserve a branch identity. All other states besides these two
-    // are either unreachable (because they're states in which the HEAD is
-    // considered attached, and so we would have already returned above) or
-    // are states in which we don't have any branch name at all.
-    if let Some(InProgress::Rebase) | Some(InProgress::RebaseInteractive) = repo.state() {
-        let git_dir = repo.path();
-        let try_read_ref = |path: PathBuf| -> Option<String> {
-            std::fs::read_to_string(path).ok().map(|content| {
-                content.trim().strip_prefix("refs/heads/").unwrap_or(content.trim()).to_string()
-            })
-        };
-
-        if let Some(name) = try_read_ref(git_dir.join("rebase-merge/head-name")) {
-            return Ok(HeadState::Pending(name));
-        }
-
-        if let Some(name) = try_read_ref(git_dir.join("rebase-apply/head-name")) {
-            return Ok(HeadState::Pending(name));
-        }
-    }
-
-    Ok(HeadState::Detached)
-}
-
-fn repository_format_value(common_dir: &Path, key: &str) -> Result<Option<Vec<u8>>> {
-    let mut command = cmd("git", ["config", "--file"]);
-    command.arg(common_dir.join("config")).args(["--no-includes", "--null", "--get", key]);
-    clear_git_repository_overrides(&mut command);
-    command.env_remove("GIT_CONFIG_PARAMETERS");
-    command.env_remove("GIT_CONFIG_COUNT");
-    let output = command.bounded_output().wrap_err("Failed to inspect repository format")?;
-    match output.status.code() {
-        Some(0) if output.stderr.is_empty() => output
-            .stdout
-            .strip_suffix(b"\0")
-            .map(|value| Some(value.to_owned()))
-            .ok_or_else(|| eyre!("Git returned malformed repository-format configuration")),
-        Some(1) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(None),
-        _ => bail!("Invalid repository-format configuration"),
-    }
-}
-
 pub(super) fn branch_head_snapshot(repo: &gix::Repository) -> Result<Option<BranchHeadSnapshot>> {
     let head = repo.head()?;
     let Some(name) = head.referent_name() else {
@@ -634,6 +595,7 @@ pub(super) fn branch_head_snapshot(repo: &gix::Repository) -> Result<Option<Bran
     Ok(Some(BranchHeadSnapshot { branch_name, target }))
 }
 
+/// Determines the logical branch identity from one retained HEAD snapshot.
 pub(super) fn get_head_state(repo: &gix::Repository, head: &gix::Head<'_>) -> Result<HeadState> {
     if let Some(name) = head.referent_name() {
         let name = decode_branch_name(name.shorten().as_ref())?;
@@ -672,6 +634,11 @@ pub(super) fn get_head_state(repo: &gix::Repository, head: &gix::Head<'_>) -> Re
     }
 
     Ok(HeadState::Detached)
+}
+
+pub(super) fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
+    let head = repo.head()?;
+    get_head_state(repo, &head)
 }
 
 pub(super) fn decode_branch_name(bytes: &[u8]) -> Result<String> {

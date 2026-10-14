@@ -9,8 +9,8 @@ change. They match the checks run in CI, including the required test-build
 configuration.
 
 Use [testing.md](./testing.md) when choosing a test layer or extending the test
-infrastructure. It defines the product-risk model and the target architecture
-for the ongoing migration away from broad system fixtures.
+infrastructure. It defines the product-risk model and the implemented
+architecture for pure, adapter-contract, semantic-recovery, and system tests.
 
 - `cargo build`: Builds the project.
 
@@ -40,6 +40,15 @@ repairs that prefix. This does not guarantee durability after power loss, lock
 out another installer, or establish exclusive ownership of an external path.
 Git uses common-directory default hooks in linked worktrees; explicit relative
 hook paths are resolved from each worktree or the bare Git directory.
+
+## Management edits
+
+Management classifies existing local ownership before constructing a complete
+ordered edit plan. The final management marker follows every branch edit.
+Separate Git config writes are not transactional: an interruption can leave
+partial drift. An unforced invocation preserves that drift rather than adopting
+it; an explicit forced invocation can repair it. Restoring pre-management user
+values remains a separate persistence policy.
 
 *Updated by an AI agent acting on joshlf's behalf.*
 

@@ -20,7 +20,10 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::{ObjectId, bstr::ByteSlice as _};
 
 use super::{INTERNAL_PRE_PUSH_GIT_DIR_ENV, INTERNAL_PRE_PUSH_REMOTE_ENV, subprocess};
-use crate::{manage::PublicBranchName, util};
+use crate::{
+    manage::PublicBranchName,
+    util::{self, CommandExt as _},
+};
 
 const DESTINATION_ENV: &str = "GHERRIT_PRIVATE_PUSH_DESTINATION";
 const PROXY_ENV: &str = "GHERRIT_PRIVATE_REMOTE_PROXY";
@@ -258,7 +261,14 @@ pub(super) enum ExactObjectFetchMode {
     Refetch,
 }
 
+impl crate::subprocess::DiagnosticRenderer for PushDestination {
+    fn render(&self, stderr: &[u8], total_bytes: u64) -> Option<String> {
+        self.render_child_diagnostic(stderr, total_bytes)
+    }
+}
+
 impl PushDestination {
+    /// Write only a preflighted annotation to this exact bound local ODB.
     pub(crate) fn materialize_version_object(
         &self,
         expected: ObjectId,
@@ -328,7 +338,7 @@ impl PushDestination {
         );
         repository.bind(&mut command);
         clear_git_transport_diagnostics(&mut command);
-        let output = command.output().wrap_err_with(|| {
+        let output = command.bounded_output().wrap_err_with(|| {
             format!(
                 "Failed to resolve the push destination for GHerrit remote '{}'",
                 configured_remote.as_str()
@@ -415,7 +425,7 @@ impl PushDestination {
                 "--name-only".to_owned(),
                 "--list".to_owned(),
             ])
-            .output()
+            .bounded_output()
             .wrap_err_with(|| {
                 format!(
                     "Failed to inspect the private Git remote for GHerrit remote '{}'",
@@ -434,7 +444,7 @@ impl PushDestination {
                 "--get-all".to_owned(),
                 key,
             ])
-            .output()
+            .bounded_output()
             .wrap_err_with(|| {
                 format!(
                     "Failed to inspect the private Git remote for GHerrit remote '{}'",
@@ -458,7 +468,7 @@ impl PushDestination {
     fn ensure_rewrite_fixed_point(&self) -> Result<()> {
         let output = self
             .ls_remote(["--get-url".to_owned()], std::iter::empty())
-            .output()
+            .bounded_output()
             .wrap_err_with(|| {
                 format!(
                     "Failed to verify Git URL rewriting for GHerrit remote '{}'",
@@ -539,23 +549,6 @@ impl PushDestination {
             ["--quiet".to_owned(), "--heads".to_owned(), "--tags".to_owned()],
             ref_patterns,
         )
-    }
-
-    /// Observes destination refs through the sole bounded execution path.
-    ///
-    /// This compatibility entry point remains for the active legacy runtime.
-    /// The exact-local workflow uses [`Self::observe_refs_from`] so its
-    /// repository binding remains explicit while that workflow is dormant.
-    pub(super) async fn observe_refs(
-        &self,
-        options: impl IntoIterator<Item = String>,
-        ref_patterns: impl IntoIterator<Item = String>,
-    ) -> std::result::Result<subprocess::CommandOutput, subprocess::CommandError> {
-        subprocess::output(
-            self.ls_remote(options, ref_patterns),
-            subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
-        )
-        .await
     }
 
     /// Observes refs from the exact repository bound to an acquisition plan.
@@ -677,13 +670,6 @@ impl PushDestination {
         Ok(self.repository == RepositoryBinding::new(repository)?)
     }
 
-    pub(super) fn pr_url(&self, pr_number: u64) -> String {
-        format!(
-            "https://github.com/{}/{}/pull/{pr_number}",
-            self.resolved.coordinates.owner, self.resolved.coordinates.repository
-        )
-    }
-
     pub(super) fn repo_url_relative(&self) -> String {
         format!("/{}/{}", self.resolved.coordinates.owner, self.resolved.coordinates.repository)
     }
@@ -719,20 +705,6 @@ impl PushDestination {
         )
         .await?;
         Ok(InitialRemoteObservation { destination: self, refs })
-    }
-
-    /// Observes only the symbolic default for the active legacy runtime.
-    ///
-    /// Keep this path independent from the dormant exact-local observation so
-    /// the preparatory public-branch model does not change active behavior.
-    pub(super) async fn observe_default_branch(&self) -> Result<DefaultBranch> {
-        observe_default_branch_command(
-            self.ls_remote(["--symref".to_string()], ["HEAD".to_string()]),
-            self.configured_remote(),
-            subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
-            subprocess::REMOTE_GIT_STDOUT_LIMIT,
-        )
-        .await
     }
 
     fn initial_observation_command(&self, public_branch: Option<&PublicBranchName>) -> Command {
@@ -874,20 +846,6 @@ impl PushDestination {
         spellings.dedup();
         spellings
     }
-}
-
-async fn observe_default_branch_command(
-    command: Command,
-    configured_remote: &str,
-    timeout: Duration,
-    stdout_limit: usize,
-) -> Result<DefaultBranch> {
-    let output = run_initial_observation(command, configured_remote, timeout, stdout_limit).await?;
-    parse_default_branch(output.stdout()).wrap_err_with(|| {
-        format!(
-            "GHerrit remote '{configured_remote}' did not report one valid symbolic default branch"
-        )
-    })
 }
 
 async fn observe_initial_command(
@@ -1066,7 +1024,7 @@ impl ResolvedDestination {
         let mut command = util::cmd("git", ["config", "--null", "--name-only", "--list"]);
         repository.bind(&mut command);
         clear_git_transport_diagnostics(&mut command);
-        let output = command.output().wrap_err_with(|| {
+        let output = command.bounded_output().wrap_err_with(|| {
             format!(
                 "Failed to inspect Git configuration while resolving GHerrit remote '{}'",
                 self.configured_remote.as_str()
@@ -1098,7 +1056,7 @@ impl ResolvedDestination {
                     "--list".to_owned(),
                 ],
             )
-            .output()
+            .bounded_output()
             .wrap_err_with(|| {
                 format!(
                     "Failed to inspect private Git configuration while resolving GHerrit remote '{}'",
@@ -1133,7 +1091,7 @@ impl ResolvedDestination {
             util::cmd("git", ["config".to_owned(), "--null".to_owned(), "--get".to_owned(), key]);
         repository.bind(&mut command);
         clear_git_transport_diagnostics(&mut command);
-        let output = command.output().wrap_err_with(|| {
+        let output = command.bounded_output().wrap_err_with(|| {
             format!(
                 "Failed to inspect Git transport configuration for GHerrit remote '{}'",
                 self.configured_remote.as_str()
@@ -1672,6 +1630,7 @@ fn valid_repository_component(component: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+#[cfg(test)]
 fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
     let ParsedInitialRemoteObservation { default_branch, public_branch } =
         parse_initial_remote_observation(output, None)?;
@@ -1789,10 +1748,5 @@ pub(super) fn git_output_records(output: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 #[cfg(test)]
+#[path = "destination/tests.rs"]
 mod tests;
-
-impl crate::subprocess::DiagnosticRenderer for PushDestination {
-    fn render(&self, stderr: &[u8], total_bytes: u64) -> Option<String> {
-        self.render_child_diagnostic(stderr, total_bytes)
-    }
-}
