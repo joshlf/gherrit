@@ -606,3 +606,16 @@ moving lower.
 The target is not the fewest tests. It is the smallest set of independent,
 high-information tests that makes unsafe behavior difficult to introduce and
 failures cheap to understand.
+
+## Commit-message cancellation
+
+The installed-hook cleanup matrix records independent unhooked Git receipts
+for blank, whitespace, comment-only, and scissors-only edited messages, two
+comment characters, all cleanup modes, and explicit empty-message commits.
+The hook receives no cleanup flags. It conservatively adds no identity when
+comment/scissors cleanup could leave an empty message, preserving Git's own
+abort or acceptance decision. Consequently an explicitly verbatim comment-only
+message can be committed without an identity. Add a trailer explicitly when
+such a message is intended for publication. Existing identified messages and
+ordinary new messages retain their separate regression contracts.
+
