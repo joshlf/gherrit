@@ -59,22 +59,6 @@ macro_rules! cmd {
 }
 pub(crate) use cmd as cmd_macro;
 
-macro_rules! re {
-    ($name:ident, $re:literal) => {
-        fn $name() -> &'static regex::Regex {
-            $crate::re!(@inner $re)
-        }
-    };
-    ($re:literal) => {
-        $crate::re!(@inner $re)
-    };
-    (@inner $re:literal) => {{
-        static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new($re).unwrap());
-        &*RE
-    }};
-}
-pub(crate) use re as re_macro;
-
 pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Command {
     let mut c = Command::new(name);
     if name == "git" {
