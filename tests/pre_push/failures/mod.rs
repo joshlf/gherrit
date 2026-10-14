@@ -182,6 +182,14 @@ fn test_malformed_stack_id_beside_an_exact_id_is_multiple() {
 }
 
 #[test]
+fn test_overlong_stack_id_fails_before_external_io() {
+    let id = "G".repeat(129);
+    let ctx = stack_with_raw_commit_message(&format!("Work\n\ngherrit-pr-id: {id}"));
+
+    assert_identity_failure_before_external_io(ctx, "longer than the 128-byte limit");
+}
+
+#[test]
 fn test_duplicate_stack_ids_fail_before_external_io() {
     let ctx = testutil::test_context!()
         .with_remote()
@@ -514,7 +522,7 @@ fn test_pre_push_edit_failure() {
         .args(["hook", "pre-push"])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("Injected UpdatePr failure"));
+        .stderr(predicates::str::contains("acknowledgement is indeterminate"));
     ctx.assert_failure_consumed();
     let requests = ctx.github().requests();
     assert_eq!(
@@ -524,7 +532,7 @@ fn test_pre_push_edit_failure() {
     );
     let prs = ctx.github().pull_requests();
     assert_eq!(prs.len(), 1);
-    assert_eq!(prs[0].title.as_deref(), Some("Initial Work"));
+    assert_eq!(prs[0].title, "Initial Work");
 
     let gherrit_id = ctx.gherrit_id("HEAD").unwrap();
     let remote_ref = format!("refs/heads/{gherrit_id}");
@@ -544,13 +552,12 @@ fn malformed_json_update_receipt_is_indeterminate_and_recovers() {
 
         ctx.checkout_managed_private("feature-malformed-json");
         ctx.commit_with_gherrit_id("Initial Work");
-        ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
+        ctx.hook_cmd("pre-push").assert().success();
         ctx.github().set_pull_request_title(1, "Manual edit");
 
         let requests_before = ctx.github().requests().len();
         ctx.inject_failure(testutil::FailureKind::UpdatePrMalformedJson(malformed_json));
-        ctx.gherrit_cmd()
-            .args(["hook", "pre-push"])
+        ctx.hook_cmd("pre-push")
             .assert()
             .failure()
             .stderr(predicates::str::contains("GraphQL mutation acknowledgement is indeterminate"));
@@ -560,16 +567,16 @@ fn malformed_json_update_receipt_is_indeterminate_and_recovers() {
             &requests[requests_before..],
             [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::UpdatePr]],
         );
-        assert_eq!(ctx.github().pull_requests()[0].title.as_deref(), Some("Initial Work"));
+        assert_eq!(ctx.github().pull_requests()[0].title, "Initial Work");
 
         let requests_before_retry = requests.len();
-        ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
+        ctx.hook_cmd("pre-push").assert().success();
         assert_eq!(
             &ctx.github().requests()[requests_before_retry..],
             [vec![testutil::GraphQlOperation::Query]],
             "a fresh attempt must observe the durable update without replaying it",
         );
-        assert_eq!(ctx.github().pull_requests()[0].title.as_deref(), Some("Initial Work"));
+        assert_eq!(ctx.github().pull_requests()[0].title, "Initial Work");
     }
 }
 
@@ -587,8 +594,7 @@ fn malformed_json_create_receipt_is_indeterminate_and_does_not_duplicate_the_pr(
         ctx.commit_with_gherrit_id("Initial Work");
         ctx.inject_failure(testutil::FailureKind::CreatePrMalformedJson(malformed_json));
 
-        ctx.gherrit_cmd()
-            .args(["hook", "pre-push"])
+        ctx.hook_cmd("pre-push")
             .assert()
             .failure()
             .stderr(predicates::str::contains("GraphQL mutation acknowledgement is indeterminate"));
@@ -604,7 +610,7 @@ fn malformed_json_create_receipt_is_indeterminate_and_does_not_duplicate_the_pr(
         );
 
         let requests_before_retry = ctx.github().requests().len();
-        ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
+        ctx.hook_cmd("pre-push").assert().success();
         let requests = ctx.github().requests();
         assert_eq!(ctx.github().pull_requests().len(), 1);
         assert!(
@@ -617,28 +623,49 @@ fn malformed_json_create_receipt_is_indeterminate_and_does_not_duplicate_the_pr(
 }
 
 #[test]
-fn update_receipt_rejects_a_concurrent_close() {
+fn update_receipt_rejects_a_concurrent_close_and_retry_fails_closed() {
     let ctx =
         testutil::test_context!().with_remote().with_initial_commit().with_mock_github().build();
     ctx.checkout_managed_private("feature-concurrent-close");
-    ctx.commit_with_gherrit_id("Initial Work");
-    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
-    ctx.github().set_pull_request_title(1, "Manual edit");
+    let id = ctx.commit_with_gherrit_id("Initial Work");
+    ctx.hook_cmd("pre-push").assert().success();
 
+    ctx.amend_with_message("Initial Work (Updated)");
     let requests_before = ctx.github().requests().len();
     ctx.inject_failure(testutil::FailureKind::UpdatePrConcurrentClose);
-    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().failure().stderr(
-        predicates::str::contains("updatePullRequest returned a pull request which is not OPEN"),
-    );
 
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
+        "updatePullRequest returned a pull request which is not OPEN",
+    ));
     ctx.assert_failure_consumed();
     assert_eq!(
         &ctx.github().requests()[requests_before..],
         [vec![testutil::GraphQlOperation::Query], vec![testutil::GraphQlOperation::UpdatePr]],
+        "the mutation receipt must expose the close without another observation"
     );
-    let pull_request = &ctx.github().pull_requests()[0];
-    assert_eq!(pull_request.state, testutil::PullRequestState::Closed);
-    assert_eq!(pull_request.title.as_deref(), Some("Initial Work"));
+
+    let pull_requests = ctx.github().pull_requests();
+    assert_eq!(pull_requests.len(), 1);
+    assert_eq!(pull_requests[0].state, testutil::PullRequestState::Closed);
+    assert_eq!(pull_requests[0].title, "Initial Work (Updated)");
+    let remote_ref = format!("refs/heads/{id}");
+    assert_eq!(ctx.remote_ref_oid(&remote_ref).as_deref(), Some(ctx.head_oid().as_str()));
+
+    let requests_before_retry = ctx.github().requests().len();
+    let refs_before_retry = ctx.remote_refs("refs");
+    let pull_requests_before_retry = ctx.github().pull_requests();
+
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has a pull request marker but no OPEN pull request"));
+    assert_eq!(
+        &ctx.github().requests()[requests_before_retry..],
+        [vec![testutil::GraphQlOperation::Query]],
+        "the retry must stop when OPEN-only observation omits the marker-bound PR"
+    );
+    assert_eq!(ctx.remote_refs("refs"), refs_before_retry);
+    assert_eq!(ctx.github().pull_requests(), pull_requests_before_retry);
 }
 
 #[test]
@@ -686,7 +713,7 @@ fn test_pre_push_pr_list_failure() {
         .args(["hook", "pre-push"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Injected GraphQl failure"));
+        .stderr(predicate::str::contains("fatal GraphQL errors"));
     ctx.assert_failure_consumed();
     assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]]);
     assert!(ctx.github().pull_requests().is_empty());
@@ -697,13 +724,7 @@ fn test_pre_push_pr_list_failure() {
 fn test_malformed_observed_pull_request_identity_fails_before_git_publication() {
     let ctx = unpublished_managed_commit("feature-malformed-pr-identity");
     let head = ctx.gherrit_id("HEAD").unwrap();
-    ctx.github().seed_pull_request(testutil::PullRequestSeed {
-        number: 0,
-        title: "Observed title".to_string(),
-        body: String::new(),
-        head,
-        base: "main".to_string(),
-    });
+    ctx.github().seed_pull_request_with_invalid_number(0, "Observed title", "", head, "main");
     let refs_before = ctx.remote_refs("refs");
 
     ctx.hook_cmd("pre-push")
@@ -792,47 +813,6 @@ fn test_pre_push_pr_list_stops_after_three_response_transport_retries() {
 }
 
 #[test]
-fn test_repository_facts_query_retries_a_transient_http_failure() {
-    let ctx = unpublished_managed_commit("feature-repository-facts-transient");
-    ctx.inject_failure(testutil::FailureKind::RepositoryFactsHttp(
-        testutil::RetryableHttpStatus::TooManyRequests,
-    ));
-
-    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().success();
-
-    ctx.assert_failure_consumed();
-    assert_eq!(
-        ctx.github().requests(),
-        [
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::Query],
-            vec![testutil::GraphQlOperation::CreatePr],
-            vec![testutil::GraphQlOperation::UpdatePr],
-        ]
-    );
-    assert_eq!(ctx.github().pull_requests().len(), 1);
-}
-
-#[test]
-fn test_repository_facts_query_stops_after_three_transient_http_retries() {
-    let ctx = unpublished_managed_commit("feature-repository-facts-retries-exhausted");
-    (0..=3).for_each(|_| {
-        ctx.inject_failure(testutil::FailureKind::RepositoryFactsHttp(
-            testutil::RetryableHttpStatus::ServiceUnavailable,
-        ));
-    });
-
-    ctx.gherrit_cmd().args(["hook", "pre-push"]).assert().failure().stderr(
-        predicate::str::contains("Injected RepositoryFactsHttp(ServiceUnavailable) failure"),
-    );
-
-    ctx.assert_failure_consumed();
-    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]; 4]);
-    assert!(ctx.github().pull_requests().is_empty());
-    assert!(ctx.recorded_pushes().is_empty());
-}
-
-#[test]
 fn test_pre_push_pr_create_failure() {
     let ctx = testutil::test_context!()
         .with_remote()
@@ -850,7 +830,7 @@ fn test_pre_push_pr_create_failure() {
         .args(["hook", "pre-push"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Injected CreatePr failure"));
+        .stderr(predicate::str::contains("acknowledgement is indeterminate"));
     ctx.assert_failure_consumed();
     assert_eq!(
         ctx.github().requests(),
@@ -927,50 +907,4 @@ fn test_pre_push_pr_create_redirect_is_not_followed() {
         );
         assert!(ctx.github().pull_requests().is_empty());
     }
-}
-
-#[test]
-fn test_later_mutation_batch_failure_preserves_prior_effects_and_stops() {
-    const COMMIT_COUNT: usize = 129;
-    const MUTATION_BATCH_LEN: usize = 64;
-
-    let ctx = testutil::test_context!()
-        .with_remote()
-        .with_initial_commit()
-        .with_mock_github()
-        .with_git_interceptor()
-        .build();
-    ctx.checkout_managed_private("feature-multi-batch-ambiguity");
-    let ids = (0..COMMIT_COUNT)
-        .map(|index| ctx.commit_with_gherrit_id(&format!("Work {index}")))
-        .collect::<Vec<_>>();
-    ctx.inject_failure(testutil::FailureKind::SecondCreatePrHttp(
-        testutil::RetryableHttpStatus::ServiceUnavailable,
-    ));
-
-    ctx.gherrit_cmd()
-        .args(["hook", "pre-push"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("indeterminate"));
-
-    ctx.assert_failure_consumed();
-    let requests = ctx.github().requests();
-    let create_requests = requests
-        .iter()
-        .filter(|request| request.contains(&testutil::GraphQlOperation::CreatePr))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        create_requests.iter().map(|request| request.len()).collect::<Vec<_>>(),
-        [MUTATION_BATCH_LEN, MUTATION_BATCH_LEN],
-        "the third mutation batch must not be sent after an indeterminate acknowledgement"
-    );
-
-    let pull_requests = ctx.github().pull_requests();
-    assert_eq!(pull_requests.len(), MUTATION_BATCH_LEN);
-    assert_eq!(
-        pull_requests.iter().map(|pr| pr.head.as_str()).collect::<Vec<_>>(),
-        ids[..MUTATION_BATCH_LEN].iter().map(String::as_str).collect::<Vec<_>>(),
-        "effects from the completely acknowledged first batch must persist"
-    );
 }

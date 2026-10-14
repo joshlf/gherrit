@@ -1,8 +1,13 @@
-use std::{env, ffi::OsStr, fs, path::Path, process::Command};
+use std::{env, ffi::OsStr, fs, path::Path, process::Command, str};
 
 use super::{
-    command::{clear_git_repository_overrides, command_invocation},
-    repository::*,
+    command::command_invocation,
+    repository::{
+        REMOTE_PROMISOR_CONFIG_PATTERN, decode_branch_name, default_remote_name_from_values,
+        literal_graph_open_options, parse_git_version, parse_remote_promisor_config,
+        require_git_config_env_output, require_git_no_lazy_fetch,
+    },
+    *,
 };
 use crate::cmd;
 
@@ -11,12 +16,14 @@ const PROMISOR_CONFIGURATION_FIXTURE_TEST: &str =
     "util::tests::promisor_configuration_process_fixture";
 
 fn promisor_configuration_fixture(
+    context: &testutil::TestContext,
     current_dir: &Path,
     global: &Path,
     overridden_config: &Path,
     expected: bool,
 ) {
-    let output = Command::new(env::current_exe().unwrap())
+    let output = context
+        .reexec_test_cmd()
         .args(["--exact", PROMISOR_CONFIGURATION_FIXTURE_TEST, "--nocapture"])
         .current_dir(current_dir)
         .env(PROMISOR_CONFIGURATION_FIXTURE_MODE, expected.to_string())
@@ -45,6 +52,14 @@ fn promisor_configuration_process_fixture() {
     let expected: bool = expected.parse().unwrap();
     let repository = Repo::open(".").unwrap();
     assert_eq!(repository.has_promisor_remote().unwrap(), expected);
+}
+
+#[test]
+fn branch_names_are_decoded_without_lossy_substitution() {
+    assert_eq!(decode_branch_name("révision".as_bytes()).unwrap(), "révision");
+    assert!(decode_branch_name(b"").is_err());
+    let error = decode_branch_name(b"bad\xffbranch").unwrap_err();
+    assert!(error.to_string().contains("valid UTF-8"));
 }
 
 #[test]
@@ -229,10 +244,13 @@ fn promisor_configuration_is_additive_across_every_occurrence() {
 
 #[test]
 fn git_config_preserves_each_promisor_occurrence_for_decoding() {
+    let context = testutil::TestContextBuilder::new("unused").build();
     let parse = |contents: &str| {
         let config = tempfile::NamedTempFile::new().unwrap();
         fs::write(config.path(), contents).unwrap();
-        let output = cmd("git", ["config", "--file"])
+        let output = context
+            .git_cmd()
+            .args(["config", "--file"])
             .arg(config.path())
             .args(["--null", "--get-regexp", REMOTE_PROMISOR_CONFIG_PATTERN])
             .output()
@@ -290,7 +308,7 @@ fn promisor_configuration_uses_direct_common_config_and_bound_repository() {
 
     // Global, command, and GIT_CONFIG scopes may describe a different
     // repository. None may create a partial-clone extension here.
-    promisor_configuration_fixture(&context.repo_path, &global, &redirected, false);
+    promisor_configuration_fixture(&context, &context.repo_path, &global, &redirected, false);
 
     context.run_git(&["config", "core.repositoryFormatVersion", "1"]);
     context.run_git(&["config", "extensions.partialClone", "origin"]);
@@ -304,13 +322,13 @@ fn promisor_configuration_uses_direct_common_config_and_bound_repository() {
         .arg("HEAD")
         .assert()
         .success();
-    promisor_configuration_fixture(&linked, &global, &empty, true);
+    promisor_configuration_fixture(&context, &linked, &global, &empty, true);
 
     context.run_git(&["config", "--unset-all", "extensions.partialClone"]);
     context.run_git(&["config", "remote.origin.promisor", "true"]);
     // `GIT_CONFIG` must neither supply a false promisor remote nor hide
     // the selected repository's local promisor remote.
-    promisor_configuration_fixture(&context.repo_path, &global, &empty, true);
+    promisor_configuration_fixture(&context, &context.repo_path, &global, &empty, true);
 }
 
 #[test]
