@@ -80,6 +80,8 @@ fn commit_fact(commit: gix::Commit<'_>, seen: &mut HashSet<String>) -> Result<Va
     Ok(json!({"oid": commit.id.to_string(), "id": id, "title": bytes(title), "problems": problems}))
 }
 
+/// Match publication's complete-HEAD identity rule while bounding diagnostic
+/// work. Incomplete ancestry evidence is explicit, never an all-clear result.
 fn inspect_identity_ancestry(
     repo: &util::Repo,
     head: gix::ObjectId,
@@ -171,7 +173,7 @@ pub(crate) fn report(base: Option<&str>) -> Result<Value> {
     // ref backend. Ordinary commands still require gix's supported format.
     git(&["rev-parse", "--git-dir"])?.ok_or_else(|| eyre::eyre!("No repository"))?;
     let mut report = json!({"schema_version": 1, "mode": "local", "binary_version": env!("CARGO_PKG_VERSION"),
-        "formats": {"report": 1, "publication": "legacy commit-head publication", "canonical_pr_marker": null, "persistent_binary_marker": null},
+        "formats": {"report": 1, "publication": "owned-base tuple with nonce-bearing annotated versions", "canonical_pr_marker": "gherrit-canonical-pr-v1", "persistent_binary_marker": null},
         "git_version": fact(&["--version"]),
         "paths": {
             "worktree_git_dir": fact(&["rev-parse", "--absolute-git-dir"]),
