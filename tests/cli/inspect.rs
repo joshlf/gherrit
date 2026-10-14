@@ -79,22 +79,6 @@ fn native_git_status_survives_an_unsupported_reftable_backend() {
 }
 
 #[test]
-fn user_configuration_does_not_select_the_repository_ref_backend() {
-    let context = testutil::test_context!().with_initial_commit().build();
-    let global = context.dir.path().join("global-ref-storage.config");
-    std::fs::write(&global, "[extensions]\n\trefStorage = reftable\n").unwrap();
-    context.gherrit_cmd().arg("manage").env("GIT_CONFIG_GLOBAL", &global).assert().success();
-    context
-        .gherrit_cmd()
-        .arg("manage")
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "extensions.refStorage")
-        .env("GIT_CONFIG_VALUE_0", "reftable")
-        .assert()
-        .success();
-}
-
-#[test]
 fn remote_inspection_is_explicit_and_unsupported_destinations_are_unavailable() {
     let context = testutil::test_context!().with_remote().with_initial_commit().build();
     context.checkout_managed_private("status-remote");
@@ -109,4 +93,20 @@ fn remote_inspection_is_explicit_and_unsupported_destinations_are_unavailable() 
     assert_eq!(report["remote"]["state"], "unavailable");
     assert!(report["remote"]["reason"].as_str().unwrap().contains("github.com"));
     assert_eq!(report["stack"]["commits"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn user_configuration_does_not_select_the_repository_ref_backend() {
+    let context = testutil::test_context!().with_initial_commit().build();
+    let global = context.dir.path().join("global-ref-storage.config");
+    std::fs::write(&global, "[extensions]\n\trefStorage = reftable\n").unwrap();
+    context.gherrit_cmd().arg("manage").env("GIT_CONFIG_GLOBAL", &global).assert().success();
+    context
+        .gherrit_cmd()
+        .arg("manage")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "extensions.refStorage")
+        .env("GIT_CONFIG_VALUE_0", "reftable")
+        .assert()
+        .success();
 }
