@@ -9,8 +9,8 @@ change. They match the checks run in CI, including the required test-build
 configuration.
 
 Use [testing.md](./testing.md) when choosing a test layer or extending the test
-infrastructure. It defines the product-risk model and the target architecture
-for the ongoing migration away from broad system fixtures.
+infrastructure. It defines the product-risk model and the implemented
+architecture for pure, adapter-contract, semantic-recovery, and system tests.
 
 - `cargo build`: Builds the project.
 
@@ -41,13 +41,19 @@ out another installer, or establish exclusive ownership of an external path.
 Git uses common-directory default hooks in linked worktrees; explicit relative
 hook paths are resolved from each worktree or the bare Git directory.
 
-Catchable Unix termination signals (HUP, INT, QUIT and TERM) are forwarded to
-registered child groups before GHerrit performs the signal's default
-termination. Spawn/registration and reap/removal share a mutex
-with the normal signal-delivery thread, preventing missed children and recycled
-identity signalling. Inherited ignored signals stay ignored. Child handlers may
-handle or ignore a forwarded signal, just as in the original caller group;
-uncatchable termination and escaped descendants have no cleanup guarantee.
+## Management edits
+
+Management classifies existing local ownership before constructing a complete
+ordered edit plan. The final management marker follows every branch edit.
+Managed merge targets must remain a singleton across all effective scopes.
+Nonlocal merge occurrences are additive and cannot be replaced by local edits;
+management rejects them before writing even when their value matches. Scalar
+keys retain Git's precedence rules.
+
+Separate Git config writes are not transactional: an interruption can leave
+partial drift. An unforced invocation preserves that drift rather than adopting
+it; an explicit forced invocation can repair it. Restoring pre-management user
+values remains a separate persistence policy.
 
 *Updated by an AI agent acting on joshlf's behalf.*
 
@@ -71,6 +77,7 @@ silently reading or writing a different object store. On-disk
 `objects/info/alternates` remains supported. Object location is independent of
 replacement objects and grafts, which must not rewrite publication ancestry.
 
+
 ## Scissors cleanup
 
 Git withholds the cleanup mode. When the cleaned prefix before scissors is
@@ -93,14 +100,3 @@ identities use canonical `: ` syntax. An existing recognized identity keeps its
 original bytes and value during amendment. Recognition does not broaden the raw
 publication grammar; convert an unsupported legacy separator explicitly while
 retaining its ID instead of generating a replacement review identity.
-
-## Enclosing public pushes from promisor repositories
-
-The legacy public route still allows the original Git process to push after
-this hook returns. Set a true `GIT_NO_LAZY_FETCH` value before starting that
-Git process; setting it only in a pre-push wrapper cannot change its parent.
-GHerrit checks its inherited value with Git's boolean parser before observing
-or publishing a managed public stack. Child-only environment changes cannot
-constrain the enclosing pack generation. Private loopback pushes need no such
-setting. The later loopback activation removes the enclosing ref effect and
-this legacy-specific requirement.
