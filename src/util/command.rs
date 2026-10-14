@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, process::Command};
+use std::{ffi::OsStr, io::Write as _, process::Command};
 
 use eyre::{Result, bail};
 
@@ -82,13 +82,33 @@ pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Co
 }
 
 pub trait CommandExt {
+    fn bounded_output(&mut self) -> Result<std::process::Output>;
     fn success(&mut self) -> Result<()>;
     fn checked_output(&mut self) -> Result<std::process::Output>;
+    fn checked_output_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<std::process::Output>;
+}
+
+pub(super) fn command_invocation(command: &Command) -> String {
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|part| format!("{part:?}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl CommandExt for Command {
+    fn bounded_output(&mut self) -> Result<std::process::Output> {
+        local_output(self)
+    }
     fn success(&mut self) -> Result<()> {
-        let status = self.status()?;
+        let output = local_output(self)?;
+        // Preserve the old status-entry output contract after bounded capture.
+        std::io::stdout().write_all(&output.stdout)?;
+        std::io::stderr().write_all(&output.stderr)?;
+        let status = output.status;
         if !status.success() {
             bail!("Command failed with status: {}", status);
         }
@@ -96,11 +116,31 @@ impl CommandExt for Command {
     }
 
     fn checked_output(&mut self) -> Result<std::process::Output> {
-        let output = self.output()?;
+        self.checked_output_with_timeout(std::time::Duration::from_secs(60))
+    }
+
+    fn checked_output_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<std::process::Output> {
+        let output = crate::subprocess::local_output(self, None, timeout, 4 * 1024 * 1024)?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Command {self:?} failed with status: {}. Stderr: {stderr}", output.status,);
+            let stderr = output.stderr.escape_ascii().to_string();
+            let invocation = command_invocation(self);
+            bail!("Command {invocation} failed with status: {}. Stderr: {stderr}", output.status,);
         }
         Ok(output)
     }
+}
+
+/// Local commands never consult a remote: one minute and four MiB of stdout.
+/// Stderr retains the supervisor's final 16 KiB. Configuration predicates only
+/// test emptiness, so truncation cannot turn a diagnostic into empty output.
+pub(crate) fn local_output(command: &mut Command) -> Result<std::process::Output> {
+    Ok(crate::subprocess::local_output(
+        command,
+        None,
+        std::time::Duration::from_secs(60),
+        4 * 1024 * 1024,
+    )?)
 }
