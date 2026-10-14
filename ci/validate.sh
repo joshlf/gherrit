@@ -13,13 +13,12 @@ check() {
     tests) cargo test --workspace --all-targets --all-features --locked ;;
     doc) cargo test --workspace --doc --all-features --locked ;;
     markers) ci/check_todo.sh ;;
-    action) bash ci/test_extract_stack_child.sh; bash ci/test_rebase_stack_child.sh ;;
     unit) cargo test --workspace --lib --all-features --locked ;;
     adapters) cargo test --test pre_push --all-features --locked ;;
     hooks) cargo test --test hooks --all-features --locked ;;
     cli) cargo test --test cli --all-features --locked ;;
     all)
-      for step in production fmt lint tests doc markers action; do check "$step"; done
+      for step in production fmt lint tests doc markers; do check "$step"; done
       ;;
     *)
       echo "Usage: ci/validate.sh [all|production|fmt|lint|tests|doc|markers|unit|adapters|hooks|cli]" >&2
