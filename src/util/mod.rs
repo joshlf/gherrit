@@ -31,7 +31,8 @@ mod layout {
 mod repository;
 pub use auth::get_github_token;
 pub use command::{CommandExt, cmd};
-pub(crate) use command::{cmd_macro, re_macro};
-pub use repository::{FirstParentCommitsBetweenError, HeadState, Remote, Repo};
+pub(crate) use command::{clear_git_repository_overrides, cmd_macro};
+pub use repository::{FirstParentCommitsBetweenError, HeadState, RemoteName, Repo};
+pub(crate) use repository::{GitDirIdentity, require_git_config_env};
 #[cfg(test)]
 mod tests;

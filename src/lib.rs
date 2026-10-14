@@ -10,16 +10,13 @@ mod identity;
 mod install;
 mod manage;
 mod pre_push;
-mod util;
-// The local path is active; remote entry points have adapter-contract tests
-// here and are integrated by the separate destination review.
-#[cfg_attr(not(test), allow(dead_code))]
 mod subprocess;
+mod util;
 
 use clap::{Parser, Subcommand};
 use eyre::{Result, WrapErr};
 use manage::State;
-pub(crate) use util::{cmd_macro as cmd, re_macro as re};
+pub(crate) use util::cmd_macro as cmd;
 
 pub struct Runtime {
     github_endpoint: pre_push::GithubEndpoint,
@@ -118,6 +115,16 @@ enum HookCommands {
 /// async runtime. Standalone binaries own those policies.
 pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
     let repo = util::Repo::open(".").wrap_err("Failed to open repo")?;
+
+    if let Commands::Hook(HookCommands::PrePush { remote_name, remote_location }) = &cli.command
+        && pre_push::is_internal_publication_push(
+            &repo,
+            remote_name.as_deref(),
+            remote_location.as_deref(),
+        )
+    {
+        return Ok(());
+    }
 
     match cli.command {
         Commands::Hook(cmd) => match cmd {
