@@ -144,16 +144,8 @@ impl LocalStack {
         head: ObjectId,
         default_branch: &DefaultBranch,
     ) -> Result<Self> {
-        let default_ref_name = default_branch.full_ref_name();
-        let default_ref = repo.rev_parse_single(default_ref_name.as_str()).wrap_err_with(|| {
-            format!("Local default branch '{}' is unavailable", default_branch.name())
-        })?;
-        if default_ref.detach() != default_branch.tip() {
-            bail!(
-                "Local default branch '{}' does not match the push repository",
-                default_branch.name()
-            );
-        }
+        let default_oid = default_branch.tip().to_string();
+        let default_ref = repo.rev_parse_single(default_oid.as_str())?;
         if head == default_ref.detach() {
             return Self::new(default_branch, Vec::new());
         }
