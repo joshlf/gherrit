@@ -638,23 +638,28 @@ fn remote_and_github_default_branches_must_agree() {
 }
 
 #[test]
-fn local_default_branch_must_match_the_push_repository() {
-    let ctx = testutil::test_context!()
-        .with_remote()
-        .with_initial_commit()
-        .with_mock_github()
-        .with_git_interceptor()
-        .build();
-    ctx.checkout_managed_private("divergent-local-default");
-    ctx.commit_with_gherrit_id("Reject a divergent local foundation");
-    ctx.run_git(&["branch", "--force", "main", "HEAD"]);
-
-    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
-        "Local default branch 'main' does not match the push repository",
-    ));
-
-    assert!(ctx.github().requests().is_empty());
-    assert!(ctx.recorded_pushes().is_empty());
+fn remote_default_is_authoritative_even_when_the_local_alias_differs() {
+    for remove_local in [false, true] {
+        let ctx = testutil::test_context!()
+            .with_remote()
+            .with_initial_commit()
+            .with_mock_github()
+            .with_git_interceptor()
+            .build();
+        ctx.checkout_managed_private("divergent-local-default");
+        ctx.commit_with_gherrit_id("Use the destination foundation");
+        let id = ctx.gherrit_id("HEAD").unwrap();
+        if remove_local {
+            ctx.run_git(&["branch", "-D", "main"]);
+        } else {
+            ctx.run_git(&["branch", "--force", "main", "HEAD"]);
+        }
+        ctx.hook_cmd("pre-push").assert().success();
+        assert_eq!(
+            ctx.remote_ref_oid(&format!("refs/heads/{id}")).as_deref(),
+            Some(ctx.head_oid().as_str())
+        );
+    }
 }
 
 #[test]
