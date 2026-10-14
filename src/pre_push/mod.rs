@@ -1,23 +1,20 @@
-use std::{
-    collections::{HashMap, HashSet},
-    process::Stdio,
-    str,
-};
+use std::{collections::HashMap, process::Stdio};
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
-use gix::{ObjectId, reference::Category, refs::transaction::PreviousValue};
+use gix::{reference::Category, refs::transaction::PreviousValue};
 use octocrab::Octocrab;
 use owo_colors::OwoColorize;
 
 use crate::{
     re,
-    util::{self, CommandExt as _, HeadState},
+    util::{self, HeadState},
 };
 
 mod autosquash;
 mod batching;
 mod body;
 mod github;
+mod local;
 mod publication;
 mod reconcile;
 mod remote;
@@ -32,6 +29,7 @@ use github::{
     PullRequest as PrState, RepositoryIdQuery, UpdatePullRequest, batch_document,
     decode_batch_response,
 };
+use local::LocalStack;
 use publication::{PushTarget, plan_push, push_batches};
 use reconcile::{
     CurrentPr, DesiredPr, PrUpdate, PullRequestState, ensure_pull_requests_open, link_stack,
@@ -86,7 +84,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
         true => log::info!("Branch {} is MANAGED. Syncing stack...", branch_name.yellow()),
     }
 
-    let commits = collect_commits(repo).wrap_err("Failed to collect commits")?;
+    let commits = LocalStack::collect(repo).wrap_err("Failed to collect commits")?;
 
     if commits.is_empty() {
         log::info!("No commits to sync.");
@@ -110,7 +108,8 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
 
     let octocrab = builder.build()?;
 
-    let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
+    let gherrit_ids =
+        commits.iter().map(|commit| commit.id().as_str().to_owned()).collect::<Vec<_>>();
     let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
     ensure_pull_requests_open(prs.iter().map(|pr| (pr.number, pr.state)))?;
 
@@ -118,92 +117,41 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     let default_branch = repo.find_default_branch_on_default_remote();
 
     let num_commits = commits.len();
-    sync_prs(repo, &octocrab, branch_name, &default_branch, commits, latest_versions, prs).await?;
+    sync_prs(repo, &octocrab, branch_name, &default_branch, &commits, latest_versions, prs).await?;
 
     log::info!("Successfully synced {num_commits} commits.");
     Ok(())
 }
 
-fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
-    let head = repo.rev_parse_single("HEAD")?;
-    let default_branch = repo.find_default_branch_on_default_remote();
-    let default_ref = repo.rev_parse_single(format!("refs/heads/{}", default_branch).as_str())?;
-
-    let commits = repo.commits_between(default_ref, head).map_err(|err| match err {
-        util::CommitsBetweenError::NotAncestor => {
-            let branch_name = repo.current_branch().name().unwrap_or("current branch");
-            eyre!(
-                "The branch '{branch_name}' is not based on '{default_branch}'.\n\
-                 GHerrit only supports stacked branches that share history with the default branch.\n\
-                 Maybe you want to 'git rebase' on '{default_branch}' before pushing?"
-            )
-        }
-        util::CommitsBetweenError::Eyre(e) => e,
-    })?;
-
-    let commits = commits
-        .into_iter()
-        .map(|commit| -> Result<_> {
-            let title = core::str::from_utf8(commit.message()?.title)?.to_owned();
-            Ok((commit, title))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    autosquash::ensure_publishable(
-        commits.iter().map(|(_, title)| title.as_str()),
-        &repo.default_remote_name(),
-        &default_branch,
-    )?;
-
-    let separators = legacy_trailer_separators_in(repo.workdir().unwrap_or(repo.path()))?;
-    let trailers = read_commit_trailers(&commits, &separators)?;
-    let commits = commits
-        .into_iter()
-        .zip(trailers)
-        .map(|((commit, _), trailers)| Commit::from_git(commit, &trailers, separators.as_bytes()))
-        .collect::<Result<Vec<_>>>()?;
-    ensure_unique_gherrit_ids(commits.iter().map(|commit| commit.gherrit_id.as_str()))?;
-    Ok(commits)
-}
-
-fn ensure_unique_gherrit_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Result<()> {
-    ids.into_iter().try_fold(HashSet::new(), |mut seen, id| {
-        if !seen.insert(id) {
-            bail!("Stack contains multiple commits with gherrit-pr-id '{id}'");
-        }
-        Ok(seen)
-    })?;
-    Ok(())
-}
-
 #[allow(clippy::too_many_lines)]
-fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<String, usize>> {
-    let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
+fn push_to_origin(repo: &util::Repo, commits: &LocalStack) -> Result<HashMap<String, usize>> {
+    let gherrit_ids =
+        commits.iter().map(|commit| commit.id().as_str().to_owned()).collect::<Vec<_>>();
 
     // Fetch remote branch states to ensure we don't act on stale information.
     let remote_branch_states = observe_managed_branches(repo, &gherrit_ids)?;
 
     let mut next_versions = HashMap::new();
 
-    for chunk in push_batches(commits) {
+    for chunk in push_batches(commits.as_slice()) {
         let mut targets = Vec::with_capacity(chunk.len());
 
         for c in chunk {
             // Determine the next version based on local tags (Optimistic
             // Locking).
-            let local_max = get_local_version(repo, &c.gherrit_id).unwrap_or(0);
+            let local_max = get_local_version(repo, c.id().as_str()).unwrap_or(0);
             let next_ver = local_max + 1;
-            next_versions.insert(c.gherrit_id.clone(), next_ver);
+            next_versions.insert(c.id().as_str().to_owned(), next_ver);
 
             // Lease the branch to ensure it hasn't changed since our fetch.
             // If we know the remote SHA, we expect it. If we don't (None), we
             // expect "" (creation).
             let expected_sha =
-                remote_branch_states.get(&c.gherrit_id).map(String::as_str).unwrap_or("");
+                remote_branch_states.get(c.id().as_str()).map(String::as_str).unwrap_or("");
 
             targets.push(PushTarget {
-                object_id: c.id,
-                gherrit_id: &c.gherrit_id,
+                object_id: c.head(),
+                gherrit_id: c.id().as_str(),
                 version: next_ver,
                 expected_remote_sha: expected_sha,
             });
@@ -311,13 +259,13 @@ async fn sync_prs(
     octocrab: &Octocrab,
     branch_name: &str,
     base_branch: &str,
-    commits: Vec<Commit>,
+    commits: &LocalStack,
     latest_versions: HashMap<String, usize>,
     prs: Vec<PrState>,
 ) -> Result<()> {
     let remote = repo.default_remote()?;
 
-    let commits = link_stack(base_branch, commits, |commit| commit.gherrit_id.clone());
+    let commits = link_stack(base_branch, commits.iter(), |commit| commit.id().as_str().to_owned());
 
     enum PrResolution {
         Existing(PrState),
@@ -330,16 +278,20 @@ async fn sync_prs(
         .map(|entry| {
             let c = &entry.item;
 
-            if let Some(pr) = prs.iter().find(|pr| pr.head_branch == c.gherrit_id) {
-                log::debug!("Found existing PR #{} for {}", pr.number.green().bold(), c.gherrit_id);
+            if let Some(pr) = prs.iter().find(|pr| pr.head_branch == c.id().as_str()) {
+                log::debug!(
+                    "Found existing PR #{} for {}",
+                    pr.number.green().bold(),
+                    c.id().as_str()
+                );
                 PrResolution::Existing(pr.clone())
             } else {
-                log::debug!("No GitHub PR exists for {}; queuing creation...", c.gherrit_id);
+                log::debug!("No GitHub PR exists for {}; queuing creation...", c.id().as_str());
                 PrResolution::ToCreate(BatchCreate {
-                    title: c.message_title.clone(),
-                    body: c.message_body.clone(),
+                    title: c.title().to_owned(),
+                    body: c.body().to_owned(),
                     base_branch: entry.base_branch.clone(),
-                    head_branch: c.gherrit_id.clone(),
+                    head_branch: c.id().as_str().to_owned(),
                 })
             }
         })
@@ -417,17 +369,17 @@ async fn sync_prs(
         .iter()
         .filter_map(|(entry, pr_state)| {
             let c = &entry.item;
-            let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
+            let latest_version = latest_versions.get(c.id().as_str()).copied().unwrap_or(1);
 
             let body = PrBody {
-                commit_body: &c.message_body,
+                commit_body: c.body(),
                 repo_url: &repo_url,
                 public_branch: public_branch.as_deref(),
                 stack_pr_numbers: &stack_pr_numbers,
                 current_pr_number: pr_state.number,
                 latest_version,
                 base_branch: &entry.base_branch,
-                gherrit_id: &c.gherrit_id,
+                gherrit_id: c.id().as_str(),
             }
             .render();
 
@@ -441,7 +393,7 @@ async fn sync_prs(
                     body: pr_state.body.as_deref(),
                     base_branch: &pr_state.base_branch,
                 },
-                DesiredPr { title: &c.message_title, body: &body, base_branch: &entry.base_branch },
+                DesiredPr { title: c.title(), body: &body, base_branch: &entry.base_branch },
             );
 
             if update.is_some() {
@@ -470,92 +422,6 @@ fn is_private_stack(repo: &util::Repo, branch: &str) -> bool {
     repo.config_string(&format!("branch.{}.pushRemote", branch))
         .map(|val| val.as_deref() == Some("."))
         .unwrap_or(false)
-}
-
-struct Commit {
-    id: ObjectId,
-    gherrit_id: String,
-    message_title: String,
-    message_body: String,
-}
-
-impl Commit {
-    fn from_git(c: gix::Commit<'_>, trailers: &[u8], separators: &[u8]) -> Result<Self> {
-        let message = c.message()?;
-        let message_title = core::str::from_utf8(message.title)?.to_string();
-        let message_body = message
-            .body
-            .map(|body| core::str::from_utf8(body))
-            .transpose()?
-            .unwrap_or("")
-            .to_string();
-        let native = trailers
-            .split(|byte| *byte == b'\n')
-            .filter_map(|line| {
-                let (key, suffix) = line.split_at_checked(b"gherrit-pr-id".len())?;
-                key.eq_ignore_ascii_case(b"gherrit-pr-id").then(|| suffix.strip_prefix(b": "))?
-            })
-            .collect::<Vec<_>>();
-        let occurrences = crate::identity::gherrit_id_trailers(c.message_raw()?.as_ref());
-        if occurrences.len() > 1 || native.len() > 1 {
-            bail!("Commit {} has multiple gherrit-pr-id trailers", c.id);
-        }
-        let gherrit_id = match occurrences.as_slice() {
-            [crate::identity::GherritIdTrailer::Exact { value, .. }] => {
-                if let [native] = native.as_slice()
-                    && *native != value.as_slice()
-                {
-                    bail!("Commit {} has contradictory gherrit-pr-id trailers", c.id);
-                }
-                value.clone()
-            }
-            _ => match native.as_slice() {
-                [value] => value.to_vec(),
-                [] if occurrences.is_empty() => {
-                    bail!("Commit {} missing gherrit-pr-id trailer", c.id)
-                }
-                [] => bail!("Commit {} has invalid gherrit-pr-id trailer syntax", c.id),
-                _ => unreachable!("multiple native identities rejected above"),
-            },
-        };
-        if gherrit_id.is_empty() {
-            bail!("Commit {} missing gherrit-pr-id trailer", c.id);
-        }
-        if !gherrit_id.iter().all(u8::is_ascii_alphanumeric) {
-            bail!("Commit {} has invalid gherrit-pr-id trailer", c.id);
-        }
-        let gherrit_id = str::from_utf8(&gherrit_id)?.to_string();
-        let message_body = strip_gherrit_id(&message_body, &gherrit_id, separators);
-
-        Ok(Commit { id: c.id, gherrit_id, message_title, message_body })
-    }
-}
-
-fn strip_gherrit_id(body: &str, id: &str, separators: &[u8]) -> String {
-    let matching = crate::identity::trailer_sections(body.as_bytes())
-        .flat_map(|(offset, section)| crate::identity::footer_lines(section, offset))
-        .filter_map(|(range, line)| {
-            // Indented lines continue the preceding trailer, not a new key.
-            if line.first().is_some_and(u8::is_ascii_whitespace) {
-                return None;
-            }
-            let (key, suffix) = line.split_at_checked(b"gherrit-pr-id".len())?;
-            let (&separator, value) = suffix.trim_ascii_start().split_first()?;
-            (key.eq_ignore_ascii_case(b"gherrit-pr-id")
-                && separators.contains(&separator)
-                && value.trim_ascii() == id.as_bytes())
-            .then_some(range)
-        })
-        .last();
-    let mut body = body.to_owned();
-    if let Some(mut line) = matching {
-        // Preserve the legacy body's line terminator at this presentation edge.
-        if body.as_bytes().get(line.end - 1) == Some(&b'\n') {
-            line.end -= 1;
-        }
-        body.replace_range(line, "");
-    }
-    body
 }
 
 /// A request to create a new PR in a batch.
@@ -735,131 +601,4 @@ where
         batches.accept();
     }
     Ok(outputs)
-}
-
-fn read_commit_trailers(
-    commits: &[(gix::Commit<'_>, String)],
-    separators: &str,
-) -> Result<Vec<Vec<u8>>> {
-    const QUERY_BATCH_LEN: usize = 120;
-    const FORMAT: &str = "--format=tformat:%H%x00%(trailers:only,unfold)";
-
-    commits.chunks(QUERY_BATCH_LEN).try_fold(
-        Vec::with_capacity(commits.len()),
-        |mut parsed, chunk| {
-            let separator_config = format!("trailer.separators={separators}");
-            let arguments = ["-c", &separator_config, "log", "--no-walk=unsorted", "-z", FORMAT]
-                .into_iter()
-                .map(ToString::to_string)
-                .chain(chunk.iter().map(|(commit, _)| commit.id.to_string()));
-            let output = util::cmd("git", arguments)
-                .checked_output()
-                .wrap_err("Failed to parse commit trailers")?;
-            let mut fields = output.stdout.split(|byte| *byte == 0);
-
-            chunk.iter().try_for_each(|(commit, _)| {
-                let object_id = fields
-                    .next()
-                    .ok_or_else(|| eyre!("Git omitted trailer data for commit {}", commit.id))?;
-                if object_id != commit.id.to_string().as_bytes() {
-                    bail!("Git returned commit trailers out of order");
-                }
-                let trailers = fields
-                    .next()
-                    .ok_or_else(|| eyre!("Git omitted trailer data for commit {}", commit.id))?;
-                parsed.push(trailers.to_vec());
-                Ok(())
-            })?;
-
-            if fields.next() != Some(&[][..]) || fields.next().is_some() {
-                bail!("Git returned malformed commit trailer data");
-            }
-            Ok(parsed)
-        },
-    )
-}
-
-fn legacy_trailer_separators_in(directory: &std::path::Path) -> Result<String> {
-    let output = util::cmd("git", ["config", "--null", "--get", "trailer.separators"])
-        .env_remove("GIT_CONFIG")
-        .current_dir(directory)
-        .bounded_output()?;
-    let mut separators = ":".to_owned();
-    match output.status.code() {
-        Some(0) => separators.push_str(str::from_utf8(
-            output
-                .stdout
-                .strip_suffix(b"\0")
-                .ok_or_else(|| eyre!("Malformed Git trailer separator configuration"))?,
-        )?),
-        Some(1) if output.stdout.is_empty() => {}
-        _ => bail!("Failed to read Git trailer separator configuration"),
-    }
-    Ok(separators)
-}
-
-#[cfg(test)]
-mod identity_presentation_tests {
-    use super::*;
-    #[test]
-    fn legacy_native_footer_selection_preserves_body_mentions_and_removes_identity() {
-        for (configured, separator) in [(":=", "="), ("=:%", "%"), ("%=$", "$"), ("r", ": ")] {
-            let ctx = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
-            ctx.run_git(&["config", "trailer.separators", configured]);
-            let body = format!(
-                "Body mentions gherrit-pr-id{separator}Gone\n\nReviewed-by: Person\nGhErRiT-pR-Id{separator}Gone\nNote: text\n gherrit-pr-id{separator}Gone\n"
-            );
-            let message = format!("Subject\n\n{body}");
-            ctx.run_git(&[
-                "-c",
-                "core.hooksPath=/dev/null",
-                "commit",
-                "--allow-empty",
-                "--cleanup=verbatim",
-                "-m",
-                &message,
-            ]);
-            let repo = gix::open(&ctx.repo_path).unwrap();
-            let commit = repo.head_commit().unwrap();
-            let separators = legacy_trailer_separators_in(ctx.repo_path.as_path()).unwrap();
-            let raw = util::cmd(
-                "git",
-                [
-                    "-c",
-                    &format!("trailer.separators={separators}"),
-                    "log",
-                    "-1",
-                    "--format=%(trailers:only,unfold)",
-                ],
-            )
-            .current_dir(&ctx.repo_path)
-            .checked_output()
-            .unwrap();
-            let parsed = Commit::from_git(commit, &raw.stdout, separators.as_bytes()).unwrap();
-            assert_eq!(parsed.gherrit_id, "Gone");
-            assert_eq!(
-                parsed.message_body,
-                format!(
-                    "Body mentions gherrit-pr-id{separator}Gone\n\nReviewed-by: Person\n\nNote: text\n gherrit-pr-id{separator}Gone\n"
-                )
-            );
-        }
-    }
-    #[test]
-    fn raw_commit_sources_are_validated_before_native_identity_acceptance() {
-        for (message, native, expected) in [
-            (b"Subject\n\ngherrit-pr-id: Gbefore\n\n# ------------------------ >8 ------------------------\nSuffix\n\ngherrit-pr-id: Gafter\n".as_slice(), b"gherrit-pr-id: Gbefore\n".as_slice(), "multiple"),
-            (b"Subject\n\ngherrit-pr-id: Gactual\n".as_slice(), b"gherrit-pr-id: Gother\n".as_slice(), "contradictory"),
-            (b"Subject\n\n\xff\n\ngherrit-pr-id: Gbefore\n".as_slice(), b"gherrit-pr-id: Gbefore\n".as_slice(), "utf-8"),
-        ] {
-            let ctx = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
-            let path = ctx.dir.path().join("raw-message");
-            std::fs::write(&path, message).unwrap();
-            ctx.git_cmd().args(["-c", "i18n.commitEncoding=ISO-8859-1", "commit", "--allow-empty", "--no-verify", "--cleanup=verbatim", "-F"]).arg(&path).assert().success();
-            let repo = util::Repo::open(ctx.repo_path.to_str().unwrap()).unwrap();
-            let commit = repo.rev_parse_single("HEAD").unwrap().object().unwrap().peel_to_commit().unwrap();
-            let error = Commit::from_git(commit, native, b":").err().expect("invalid source must be rejected");
-            assert!(error.to_string().contains(expected), "{error:?}");
-        }
-    }
 }
