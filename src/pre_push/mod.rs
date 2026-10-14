@@ -15,7 +15,7 @@ mod autosquash;
 mod batching;
 mod body;
 mod github;
-mod json;
+pub(crate) mod json;
 mod local;
 mod publication;
 mod reconcile;
