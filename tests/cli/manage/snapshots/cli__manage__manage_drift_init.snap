@@ -9,4 +9,4 @@ STDOUT:
 
 STDERR:
 [gherrit] Branch drift-feature is now managed by GHerrit in private mode.
-[gherrit]   - 'git push' will sync PRs only, but will not push drift-feature itself.
+[gherrit]   - 'git push' will publish the stack without projecting drift-feature to the push destination.
