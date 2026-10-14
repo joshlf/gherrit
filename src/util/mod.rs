@@ -1,6 +1,7 @@
 mod auth;
 mod command;
 mod config;
+pub(crate) use config::BranchConfigValues;
 mod layout {
     //! Path roles are distinct in a linked worktree. Keep the original spelling
     //! for child processes; canonical identity is a separate repository contract.
