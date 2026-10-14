@@ -15,6 +15,11 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Constructs the dependencies used by the production CLI.
+    ///
+    /// ```
+    /// let _runtime = gherrit::Runtime::production();
+    /// ```
     pub fn production() -> Self {
         Self { github_endpoint: pre_push::GithubEndpoint::Production, id_entropy: rand::random }
     }

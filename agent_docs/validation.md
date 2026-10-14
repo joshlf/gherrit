@@ -17,15 +17,20 @@ rustup toolchain install nightly --profile minimal --component rustfmt
 Run the same formatting, linting, test, and task-marker checks as CI:
 
 ```bash
-cargo +nightly fmt --all -- --check
-cargo check --workspace --all-targets --locked
-cargo clippy --workspace --all-targets --all-features \
-  --locked -- -D warnings
-cargo test --workspace --all-targets --all-features --locked
-ci/check_todo.sh
-bash ci/test_extract_stack_child.sh
-bash ci/test_rebase_stack_child.sh
+ci/validate.sh
 ```
+
+The helper uses the caller's stable toolchain and runs the same checks as the
+Ubuntu CI job. Set `RUSTUP_TOOLCHAIN=1.89.0` to reproduce its declared version.
+The formatter still uses nightly. The Windows job retains its native test
+invocation.
+
+For focused feedback, select `production`, `fmt`, `lint`, `unit`,
+`adapters`, `hooks`, `cli`, `doc`, or `markers`. `unit` includes all library
+tests; `adapters` selects the
+pre-push integration target; `hooks` and `cli` select complete process tests.
+These commands do not replace the full validation required for submission.
+
 
 The `test-driver` feature builds a separate, non-shipping process adapter for
 system tests. The production `gherrit` binary never reads test endpoints,
@@ -41,14 +46,18 @@ adapter contracts and complete process-boundary scenarios.
 
 ### Updating Snapshots
 
-When tests fail due to snapshot mismatches (e.g., changed CLI output), you can
-force update all snapshots to match the new output:
+Select the failing scenario and check its owning state or effect oracle
+before accepting new output. For example:
 
 ```bash
-INSTA_UPDATE=always cargo test \
-  --workspace --all-targets --all-features --locked
+INSTA_UPDATE=always cargo test --all-features --locked \
+  --test cli test_commit_msg_hook
+git diff -- tests/cli/snapshots
 ```
 
-**Note:** This will update ALL snapshots for executed tests. You should use `git
-diff` to review the changes to the `.snap` files to ensure they are correct
-before committing.
+Review every changed snapshot. Confirm that exact refs, object IDs, lifecycle,
+and effect assertions still support the new output. Avoid regenerating the
+entire suite as an ordinary repair step: unrelated snapshots can hide a
+regression. Run the full validation helper after reviewing the focused update.
+
+*Updated by an AI agent acting on joshlf's behalf.*
