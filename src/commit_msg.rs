@@ -18,13 +18,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fs, path::Path};
+use std::{fs, io::Write as _, path::Path};
 
 use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
 
 use crate::{
     cmd,
+    identity::has_normalized_id as has_gherrit_id,
     util::{self, CommandExt as _},
 };
 
@@ -35,8 +36,142 @@ fn is_temporary_squash(message: &str) -> bool {
     message.lines().next().is_some_and(|line| line.starts_with("squash! "))
 }
 
-fn has_gherrit_id(trailers: &str) -> bool {
-    trailers.lines().any(|line| line.starts_with("gherrit-pr-id: "))
+fn comment_prefix(repo: &util::Repo) -> Vec<u8> {
+    let config = repo.config_snapshot();
+    config
+        .string("core.commentString")
+        .map(|value| value.as_ref().to_vec())
+        .or_else(|| {
+            config.string("core.commentChar").map(|value| {
+                if value.as_ref() == b"auto" { b"#".to_vec() } else { value.as_ref().to_vec() }
+            })
+        })
+        .unwrap_or_else(|| b"#".to_vec())
+}
+
+/// A comment/scissors-cleaned view for hook decisions only. The hook does not
+/// receive `--cleanup` or `--allow-empty-message` flags, so conservatively leave
+/// empty messages alone. Git owns cancellation and explicit empty acceptance.
+/// Stored commits are still parsed with the exact raw-message grammar.
+fn message_view(repo: &util::Repo, message: &[u8]) -> Result<Vec<u8>> {
+    let prefix = comment_prefix(repo);
+    let mut scissors = prefix;
+    scissors.extend_from_slice(b" ------------------------ >8 ------------------------");
+    let mut length = 0;
+    for line in message.split_inclusive(|byte| *byte == b'\n') {
+        let content = line.strip_suffix(b"\n").unwrap_or(line);
+        let content = content.strip_suffix(b"\r").unwrap_or(content);
+        if content == scissors {
+            break;
+        }
+        length += line.len();
+    }
+    // Prepared private file input avoids a pipe producer or shell quoting.
+    let mut input = crate::subprocess::RegularFileStdinBuilder::new()
+        .wrap_err("Failed to prepare message cleanup")?;
+    input.write_all(&message[..length])?;
+    let output = crate::subprocess::local_output(
+        &mut cmd!("git stripspace --strip-comments"),
+        Some(input.finish()?),
+        std::time::Duration::from_secs(60),
+        4 * 1024 * 1024,
+    )?;
+    if !output.status.success() {
+        bail!("Git message cleanup failed");
+    }
+    Ok(output.stdout)
+}
+
+/// Keep retained comment text before the raw trailer block. Git may leave it
+/// after trailers for later cleanup, but verbatim commits retain those bytes.
+/// The stored identity grammar must stay independent of later configuration.
+fn relocate_trailing_comments(repo: &util::Repo, message: &[u8]) -> Vec<u8> {
+    fn content(line: &[u8]) -> &[u8] {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        line.strip_suffix(b"\r").unwrap_or(line)
+    }
+    fn line_before(message: &[u8], end: usize) -> (usize, &[u8]) {
+        let content_end = if message[end - 1] == b'\n' { end - 1 } else { end };
+        let start = message[..content_end]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        (start, content(&message[start..content_end]))
+    }
+    let prefix = comment_prefix(repo);
+    let mut scissors = prefix.clone();
+    scissors.extend_from_slice(b" ------------------------ >8 ------------------------");
+    if message.split(|byte| *byte == b'\n').any(|line| content(line) == scissors) {
+        return message.to_vec();
+    }
+    let mut end = message.len();
+    let mut found_comment = false;
+    while end > 0 {
+        let (start, line) = line_before(message, end);
+        if line.starts_with(&prefix) {
+            found_comment = true;
+        } else if !line.iter().all(u8::is_ascii_whitespace) {
+            break;
+        }
+        end = start;
+    }
+    if !found_comment {
+        return message.to_vec();
+    }
+    let mut start = end;
+    while start > 0 {
+        let (previous, line) = line_before(message, start);
+        if line.iter().all(u8::is_ascii_whitespace) {
+            break;
+        }
+        start = previous;
+    }
+    let block = &message[start..end];
+    // Compatibility recognition does not authorize moving interleaved body
+    // comments. Preserve the prior contiguous-block rewrite boundary.
+    if block.split(|byte| *byte == b'\n').any(|line| line.starts_with(b"#")) {
+        return message.to_vec();
+    }
+    match crate::identity::gherrit_id_trailers(block).as_slice() {
+        [crate::identity::GherritIdTrailer::Exact { value, .. }]
+            if crate::identity::GherritPrId::from_ref_component(value).is_ok() => {}
+        _ => return message.to_vec(),
+    }
+    let separator_bytes: usize = message[end..]
+        .split_inclusive(|byte| *byte == b'\n')
+        .take_while(|line| content(line).iter().all(u8::is_ascii_whitespace))
+        .map(|line| line.len())
+        .sum();
+    let mut output = message[..start].to_vec();
+    output.extend_from_slice(&message[end + separator_bytes..]);
+    if !output.ends_with(b"\n") {
+        output.push(b'\n');
+    }
+    if !output.ends_with(b"\n\n") {
+        output.push(b'\n');
+    }
+    output.extend_from_slice(block);
+    output
+}
+
+/// Only the suffix can distinguish a retained message from scissors cancellation
+/// when the cleaned prefix is empty. Editing there preserves both outcomes.
+fn retained_scissors_suffix(repo: &util::Repo, message: &[u8]) -> Result<Option<usize>> {
+    let mut scissors = comment_prefix(repo);
+    scissors.extend_from_slice(b" ------------------------ >8 ------------------------");
+    let mut offset = 0;
+    for line in message.split_inclusive(|byte| *byte == b'\n') {
+        let content = line.strip_suffix(b"\n").unwrap_or(line);
+        let content = content.strip_suffix(b"\r").unwrap_or(content);
+        if content == scissors {
+            let after = offset + line.len();
+            return Ok((message_view(repo, &message[..offset])?.is_empty()
+                && !message_view(repo, &message[after..])?.is_empty())
+            .then_some(after));
+        }
+        offset += line.len();
+    }
+    Ok(None)
 }
 
 fn derive_gherrit_id(mut entropy: IdEntropy, object_hash: &[u8]) -> String {
@@ -70,25 +205,72 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
         return Ok(());
     }
 
-    // Skip temporary squash commits (e.g. from `git commit --squash`) to
-    // prevent creating "phantom" PRs for changes destined to be merged away.
-    // These commits are transient and shouldn't be part of the persistent
-    // managed stack.
+    // Skip temporary squash commits (e.g. from `git commit --squash`) so
+    // changes intended to be folded into another commit do not receive a
+    // persistent review identity or enter the managed stack.
     let msg_content = fs::read_to_string(msg_path).wrap_err("Failed to read msg file")?;
     if is_temporary_squash(&msg_content) {
         return Ok(());
     }
 
+    if let Some(offset) = retained_scissors_suffix(repo, msg_content.as_bytes())? {
+        let mut suffix = tempfile::NamedTempFile::new()?;
+        suffix.write_all(&msg_content.as_bytes()[offset..])?;
+        edit_identity(repo, suffix.path(), &msg_content[offset..], acquire_entropy)?;
+        let mut written = msg_content.as_bytes()[..offset].to_vec();
+        written.extend_from_slice(&fs::read(suffix.path())?);
+        fs::write(msg_path, written).wrap_err("Failed to write the retained scissors suffix")?;
+        return Ok(());
+    }
+    edit_identity(repo, msg_file, &msg_content, acquire_entropy)
+}
+
+fn edit_identity(
+    repo: &util::Repo,
+    msg_file: &Path,
+    msg_content: &str,
+    acquire_entropy: fn() -> IdEntropy,
+) -> Result<()> {
+    let msg_path = msg_file;
     // Check if trailer exists
-    let output = cmd!("git interpret-trailers --parse").arg(msg_file).checked_output()?;
+    let output =
+        cmd!("git -c trailer.separators=: -c trailer.gherrit-pr-id.key=gherrit-pr-id interpret-trailers --no-divider --parse").arg(msg_file).checked_output()?;
     let trailers = String::from_utf8_lossy(&output.stdout);
 
     if has_gherrit_id(&trailers) {
+        let normalized = relocate_trailing_comments(repo, msg_content.as_bytes());
+        if normalized != msg_content.as_bytes() {
+            fs::write(msg_path, normalized).wrap_err("Failed to retain the raw trailer block")?;
+        }
         return Ok(());
     }
 
-    // Calculate Change-ID
-    // Construct the input: "Ident\nRefHash\nMsgContent"
+    if message_view(repo, msg_content.as_bytes())?.is_empty() {
+        let mut scissors = comment_prefix(repo);
+        scissors.extend_from_slice(b" ------------------------ >8 ------------------------");
+        if msg_content
+            .as_bytes()
+            .split(|byte| *byte == b'\n')
+            .any(|line| line.strip_suffix(b"\r").unwrap_or(line) == scissors)
+        {
+            log::warn!(
+                "Git's cleanup mode is unavailable to commit-msg hooks. Preserving possible scissors cancellation without generating an identity; remove the scissors boundary before committing text below it."
+            );
+        }
+        let config = repo.config_snapshot();
+        if !msg_content.trim().is_empty()
+            && config.string("core.commentString").is_none()
+            && config.string("core.commentChar").is_some_and(|value| value.as_ref() == b"auto")
+        {
+            log::warn!(
+                "Git's automatic comment character is unavailable to commit-msg hooks. Preserving this message without generating an identity; configure a fixed comment character if it should receive an ID."
+            );
+        }
+        return Ok(());
+    }
+
+    // Construct the stable GHerrit ID input:
+    // "Ident\nRefHash\nMsgContent".
     let input_data = {
         let committer_ident = cmd!("git var GIT_COMMITTER_IDENT").checked_output()?;
         let committer_ident =
@@ -114,14 +296,28 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
     let gherrit_id = derive_gherrit_id(acquire_entropy(), object_id.as_bytes());
 
     // Insert trailer
+    // Stored identities use the final trailer paragraph, even after patch text.
+    // --no-divider: keep parsing and writing on that same grammar
     // --where start: puts it at the top of the trailer block
     // --if-exists doNothing: prevents duplicates
     cmd!(
-        "git interpret-trailers --in-place --where start --if-exists doNothing --trailer",
+        "git -c trailer.separators=: -c trailer.gherrit-pr-id.key=gherrit-pr-id interpret-trailers --no-divider --in-place --where start --if-exists doNothing --trailer",
         "gherrit-pr-id: {gherrit_id}"
     )
     .arg(msg_file)
     .success()?;
+    let written = fs::read(msg_path).wrap_err("Failed to validate the written identity")?;
+    let normalized = relocate_trailing_comments(repo, &written);
+    if normalized != written {
+        fs::write(msg_path, &normalized).wrap_err("Failed to retain the raw trailer block")?;
+    }
+    let written = normalized;
+    // COMMIT_EDITMSG can still contain Git status comments below the trailer.
+    match crate::identity::gherrit_id_trailers(&message_view(repo, &written)?).as_slice() {
+        [crate::identity::GherritIdTrailer::Exact { value, .. }]
+            if crate::identity::GherritPrId::from_ref_component(value)?.as_str() == gherrit_id => {}
+        _ => bail!("Git trailer configuration did not produce one canonical GHerrit identity"),
+    }
     Ok(())
 }
 
