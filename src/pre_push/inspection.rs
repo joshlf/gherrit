@@ -51,7 +51,7 @@ fn decode_refs(bytes: &[u8], ids: &[GherritPrId]) -> Result<Vec<Value>> {
 
 pub(crate) async fn observe(repo: &util::Repo, ids: &[GherritPrId]) -> Result<Value> {
     let remote = repo.default_remote_name()?;
-    let destination = PushDestination::resolve(remote)?;
+    let destination = PushDestination::resolve(repo, remote)?;
     if !destination.supports_production_github() {
         bail!("Remote inspection requires a github.com push repository");
     }
