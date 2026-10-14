@@ -2,6 +2,7 @@ use std::{
     ffi::OsStr,
     fs,
     io::Write as _,
+    path::Path,
     process, thread,
     time::{Duration, Instant},
 };
@@ -28,16 +29,7 @@ fn resolved_result(output: &[u8]) -> Result<ResolvedDestination> {
 }
 
 fn destination() -> PushDestination {
-    PushDestination {
-        repository: RepositoryBinding::new(&util::Repo::open(".").unwrap()).unwrap(),
-        resolved: resolved(b"https://github.com/owner/repo.git\n"),
-        internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
-        transport: RemoteTransportSettings::default(),
-    }
-}
-
-fn git_dir_identity() -> util::GitDirIdentity {
-    util::Repo::open(".").unwrap().git_dir_identity().clone()
+    PushDestination::for_test()
 }
 
 fn arguments(command: &Command) -> Vec<&OsStr> {
@@ -95,11 +87,10 @@ fn remote_transport_settings_process_fixture() {
         return;
     };
     let destination = resolved(b"https://github.com/owner/repo.git\n");
-    let settings = destination
-        .inspect_remote_transport_settings(
-            &RepositoryBinding::new(&util::Repo::open(".").unwrap()).unwrap(),
-        )
-        .unwrap_or_else(|error| {
+    let repository = util::Repo::open(".").unwrap();
+    let repository = RepositoryBinding::new(&repository).unwrap();
+    let settings =
+        destination.inspect_remote_transport_settings(&repository).unwrap_or_else(|error| {
             if mode == "control" {
                 let rendered = error.to_string();
                 assert!(rendered.contains("transport setting containing control characters"));
@@ -160,9 +151,10 @@ fn effective_remote_transport_settings_follow_git_value_semantics() {
 #[tokio::test(flavor = "current_thread")]
 async fn initial_observation_hang_is_bounded_off_the_async_runtime() {
     let started = Instant::now();
-    let observation = observe_default_branch_command(
+    let observation = observe_initial_command(
         observation_fixture("hang"),
         "origin",
+        None,
         Duration::from_millis(50),
         1024,
     );
@@ -181,9 +173,10 @@ async fn initial_observation_hang_is_bounded_off_the_async_runtime() {
 #[tokio::test(flavor = "current_thread")]
 async fn initial_observation_excess_output_enters_bounded_cleanup() {
     let started = Instant::now();
-    let error = observe_default_branch_command(
+    let error = observe_initial_command(
         observation_fixture("overflow"),
         "origin",
+        None,
         Duration::from_secs(2),
         32,
     )
@@ -193,6 +186,163 @@ async fn initial_observation_excess_output_enters_bounded_cleanup() {
     assert!(format!("{error:?}").contains("stdout exceeded the 32-byte limit"));
     assert!(!format!("{error:?}").contains(&"x".repeat(32)));
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+fn environment<'command>(
+    command: &'command Command,
+    name: &str,
+) -> Option<Option<&'command OsStr>> {
+    command.get_envs().find(|(candidate, _)| *candidate == OsStr::new(name)).map(|(_, value)| value)
+}
+
+fn successful_git(current_dir: &Path, arguments: &[&str]) {
+    let mut command = Command::new("git");
+    for variable in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ] {
+        command.env_remove(variable);
+    }
+    let output = command.current_dir(current_dir).args(arguments).output().unwrap();
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_repository_binding(
+    repository: &util::Repo,
+    expected_current: &Path,
+    expected_work_tree: Option<&Path>,
+    hostile_repository: &Path,
+) {
+    let binding = RepositoryBinding::new(repository).unwrap();
+    let mut command = Command::new("git");
+    command
+        .env("GIT_CONFIG", hostile_repository)
+        .env("GIT_DIR", hostile_repository)
+        .env("GIT_COMMON_DIR", hostile_repository)
+        .env("GIT_WORK_TREE", hostile_repository)
+        .env("GIT_IMPLICIT_WORK_TREE", "false")
+        .env("GIT_NAMESPACE", "hostile")
+        .env("GIT_CEILING_DIRECTORIES", hostile_repository)
+        .env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "true");
+
+    binding.bind(&mut command);
+
+    assert_eq!(command.get_current_dir(), Some(expected_current));
+    assert_eq!(environment(&command, "GIT_DIR"), Some(Some(binding.git_dir.as_os_str())));
+    assert_eq!(
+        fs::canonicalize(&binding.git_dir).unwrap(),
+        Path::new(binding.git_dir_identity.as_os_str())
+    );
+    assert_eq!(environment(&command, "GIT_COMMON_DIR"), Some(Some(binding.common_dir.as_os_str())));
+    assert_eq!(
+        environment(&command, "GIT_WORK_TREE"),
+        Some(expected_work_tree.map(Path::as_os_str))
+    );
+    for variable in [
+        "GIT_CONFIG",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ] {
+        assert_eq!(environment(&command, variable), Some(None), "variable={variable}");
+    }
+
+    command.args(["rev-parse", "--absolute-git-dir", "--git-common-dir"]);
+    if expected_work_tree.is_some() {
+        command.arg("--show-toplevel");
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "bound git rev-parse failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let paths = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(PathBuf::from)
+        .map(|path| fs::canonicalize(path).unwrap())
+        .collect::<Vec<_>>();
+    let expected = [
+        Some(Path::new(binding.git_dir_identity.as_os_str())),
+        Some(binding.common_dir.as_path()),
+        expected_work_tree,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|path| fs::canonicalize(path).unwrap())
+    .collect::<Vec<_>>();
+    assert_eq!(paths, expected);
+}
+
+#[test]
+fn repository_binding_models_normal_linked_and_bare_repositories() {
+    let root = tempfile::tempdir().unwrap();
+    let ordinary = root.path().join("ordinary");
+    successful_git(root.path(), &["init", ordinary.to_str().unwrap()]);
+    successful_git(
+        &ordinary,
+        &[
+            "-c",
+            "user.name=GHerrit Test",
+            "-c",
+            "user.email=gherrit@example.com",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "--no-verify",
+            "-m",
+            "root",
+        ],
+    );
+
+    let linked = root.path().join("linked");
+    successful_git(&ordinary, &["worktree", "add", "--detach", linked.to_str().unwrap(), "HEAD"]);
+
+    let bare = root.path().join("bare.git");
+    let hostile = root.path().join("hostile.git");
+    gix::init_bare(&bare).unwrap();
+    gix::init_bare(&hostile).unwrap();
+
+    let ordinary_repository = util::Repo::open(ordinary.to_str().unwrap()).unwrap();
+    assert_repository_binding(&ordinary_repository, &ordinary, Some(&ordinary), &hostile);
+
+    let linked_repository = util::Repo::open(linked.to_str().unwrap()).unwrap();
+    assert_repository_binding(&linked_repository, &linked, Some(&linked), &hostile);
+
+    let bare_repository = util::Repo::open(bare.to_str().unwrap()).unwrap();
+    assert_repository_binding(&bare_repository, &bare, None, &hostile);
+}
+
+#[test]
+fn every_destination_command_retains_its_repository_binding() {
+    let destination = destination();
+    for command in [
+        destination.ls_remote(["--quiet".to_owned()], ["HEAD".to_owned()]),
+        destination.exact_object_fetch(ExactObjectFetchMode::Negotiated),
+        destination.push(["--porcelain".to_owned()], ["HEAD:refs/heads/G".to_owned()]),
+    ] {
+        assert_eq!(command.get_current_dir(), Some(destination.repository.current_dir.as_path()));
+        assert_eq!(
+            environment(&command, "GIT_DIR"),
+            Some(Some(destination.repository.git_dir.as_os_str()))
+        );
+        assert_eq!(
+            environment(&command, "GIT_COMMON_DIR"),
+            Some(Some(destination.repository.common_dir.as_os_str()))
+        );
+        assert_eq!(environment(&command, "GIT_NAMESPACE"), Some(None));
+    }
 }
 
 #[test]
@@ -247,29 +397,9 @@ fn transport_diagnostics_remove_future_families_and_disable_trace2_config_target
     }
 }
 
-#[test]
-fn configured_trace2_targets_do_not_observe_a_destination_command() {
-    let context =
-        testutil::TestContextBuilder::new("unused").with_remote().with_initial_commit().build();
-    let literal = String::from_utf8(
-        context
-            .git_cmd()
-            .args(["remote", "get-url", "origin"])
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone(),
-    )
-    .unwrap();
-    let literal = literal.trim();
-    let destination = PushDestination {
-        repository: RepositoryBinding::new(&util::Repo::open(".").unwrap()).unwrap(),
-        resolved: resolved(format!("{literal}\n").as_bytes()),
-        internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
-        transport: RemoteTransportSettings::default(),
-    };
-
+fn configured_trace2_targets(
+    context: &testutil::TestContext,
+) -> (PathBuf, PathBuf, [(PathBuf, Vec<u8>); 3]) {
     let system = context.dir.path().join("trace2-system.config");
     let global = context.dir.path().join("trace2-global.config");
     let traces = [
@@ -306,7 +436,43 @@ fn configured_trace2_targets_do_not_observe_a_destination_command() {
         .args(["rev-parse", "--git-dir"])
         .assert()
         .success();
-    traces.iter().for_each(|trace| fs::remove_file(trace).unwrap());
+    let traces = traces.map(|trace| {
+        let snapshot = fs::read(&trace).expect("the probe must activate every Trace2 target");
+        assert!(!snapshot.is_empty(), "the Trace2 probe must emit evidence");
+        (trace, snapshot)
+    });
+    (system, global, traces)
+}
+
+fn assert_trace2_unchanged(traces: &[(PathBuf, Vec<u8>); 3]) {
+    for (trace, snapshot) in traces {
+        assert_eq!(
+            fs::read(trace).unwrap(),
+            *snapshot,
+            "a destination-bearing Git command appended to {trace:?}"
+        );
+    }
+}
+
+#[test]
+fn configured_trace2_targets_do_not_observe_a_destination_command() {
+    let context =
+        testutil::TestContextBuilder::new("unused").with_remote().with_initial_commit().build();
+    let literal = String::from_utf8(
+        context
+            .git_cmd()
+            .args(["remote", "get-url", "origin"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let literal = literal.trim();
+    let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+    let destination = PushDestination::for_test_url_in(&repository, literal);
+    let (system, global, traces) = configured_trace2_targets(&context);
 
     let mut command = destination.ls_remote(["--symref".to_owned()], ["HEAD".to_owned()]);
     command
@@ -317,7 +483,7 @@ fn configured_trace2_targets_do_not_observe_a_destination_command() {
     let output = command.output().unwrap();
 
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert!(traces.iter().all(|trace| !trace.exists()));
+    assert_trace2_unchanged(&traces);
 }
 
 #[test]
@@ -347,9 +513,34 @@ fn every_destination_bearing_git_command_disables_redirects() {
         .map(OsStr::new)
     );
 
-    let git_dir = git_dir_identity();
-    let push =
-        destination.push(&git_dir, ["--atomic".to_string()], ["HEAD:refs/heads/Gone".to_string()]);
+    let exact_observation = destination.exact_ref_observation_command([
+        "refs/heads/main".to_owned(),
+        "refs/tags/gherrit/Gone".to_owned(),
+    ]);
+    assert_eq!(
+        arguments(&exact_observation),
+        [
+            "--no-replace-objects",
+            "--config-env=remote.gherrit-publication.url=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            "--config-env=remote.gherrit-publication.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            "-c",
+            "http.followRedirects=false",
+            "ls-remote",
+            "--quiet",
+            "--heads",
+            "--tags",
+            "--",
+            "gherrit-publication",
+            "refs/heads/main",
+            "refs/tags/gherrit/Gone",
+        ]
+        .map(OsStr::new)
+    );
+    assert!(arguments(&ls_remote).iter().all(
+        |argument| *argument != OsStr::new("--heads") && *argument != OsStr::new("--tags")
+    ));
+
+    let push = destination.push(["--atomic".to_string()], ["HEAD:refs/heads/Gone".to_string()]);
     assert_eq!(
         arguments(&push),
         [
@@ -391,6 +582,7 @@ fn every_destination_bearing_git_command_disables_redirects() {
         .to_str()
         .unwrap();
     assert!(parameters.ends_with(&redirect_parameter));
+    assert!(push.get_envs().all(|(name, _)| name != OsStr::new("LC_ALL")));
     assert_eq!(
         push.get_envs()
             .find(|(name, _)| *name == OsStr::new(INTERNAL_PRE_PUSH_REMOTE_ENV))
@@ -398,10 +590,8 @@ fn every_destination_bearing_git_command_disables_redirects() {
         Some(OsStr::new("gherrit-publication"))
     );
     assert_eq!(
-        push.get_envs()
-            .find(|(name, _)| *name == OsStr::new(INTERNAL_PRE_PUSH_GIT_DIR_ENV))
-            .and_then(|(_, value)| value),
-        Some(git_dir.as_os_str())
+        environment(&push, INTERNAL_PRE_PUSH_GIT_DIR_ENV),
+        Some(Some(destination.repository.git_dir_identity.as_os_str()))
     );
 }
 
@@ -415,7 +605,8 @@ fn remote_transport_settings_are_private_command_scoped_state() {
 
     for command in [
         destination.ls_remote(std::iter::empty(), std::iter::empty()),
-        destination.push(&git_dir_identity(), std::iter::empty(), std::iter::empty()),
+        destination.exact_object_fetch(ExactObjectFetchMode::Negotiated),
+        destination.push(std::iter::empty(), std::iter::empty()),
     ] {
         let arguments = arguments(&command);
         assert!(arguments.contains(&OsStr::new(
@@ -516,6 +707,139 @@ fn exact_redirect_parameter_preserves_non_utf8_command_scope_bytes() {
     assert_eq!(&bytes[..inherited.len()], inherited.as_bytes());
     assert_eq!(bytes[inherited.len()], b' ');
     assert!(bytes.ends_with(b"='false'"));
+}
+
+#[test]
+fn initial_observation_adds_only_the_checked_public_branch() {
+    let destination = destination();
+    let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+    let command = destination.initial_observation_command(Some(&branch));
+    let arguments = arguments(&command);
+
+    assert_eq!(
+        &arguments[arguments.len() - 2..],
+        [OsStr::new("HEAD"), OsStr::new("refs/heads/release-candidate")]
+    );
+}
+
+#[test]
+fn exact_object_fetch_has_one_fixed_source_only_stdin_grammar() {
+    let destination = destination();
+    for (mode, mode_argument) in [
+        (ExactObjectFetchMode::Negotiated, None),
+        (ExactObjectFetchMode::Refetch, Some("--refetch")),
+    ] {
+        let command = destination.exact_object_fetch(mode);
+        let expected = [
+            "--no-replace-objects",
+            "--config-env=remote.gherrit-publication.url=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            "--config-env=remote.gherrit-publication.pushurl=GHERRIT_PRIVATE_PUSH_DESTINATION",
+            "-c",
+            "http.followRedirects=false",
+            "-c",
+            "fetch.bundleURI=",
+            "fetch",
+            "--quiet",
+            "--no-progress",
+            "--no-write-fetch-head",
+            "--no-tags",
+            "--no-prune",
+            "--no-prune-tags",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--no-write-commit-graph",
+            "--no-update-shallow",
+            "--no-filter",
+            "--refmap=",
+        ]
+        .into_iter()
+        .chain(mode_argument)
+        .chain(["--stdin", "--", "gherrit-publication"])
+        .map(OsStr::new)
+        .collect::<Vec<_>>();
+        assert_eq!(arguments(&command), expected);
+        assert_eq!(arguments(&command).last(), Some(&OsStr::new("gherrit-publication")));
+        assert!(arguments(&command).iter().all(|argument| {
+            let argument = argument.to_string_lossy();
+            !argument.contains("refs/") && !argument.contains("https://github.com")
+        }));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(name, _)| *name == OsStr::new(DESTINATION_ENV))
+                .and_then(|(_, value)| value),
+            Some(OsStr::new("https://github.com/owner/repo.git"))
+        );
+        for variable in ["GIT_TRACE", "GIT_CURL_VERBOSE"] {
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find(|(name, _)| *name == OsStr::new(variable))
+                    .and_then(|(_, value)| value),
+                None
+            );
+        }
+        for variable in ["GIT_TRACE2", "GIT_TRACE2_PERF", "GIT_TRACE2_EVENT"] {
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find(|(name, _)| *name == OsStr::new(variable))
+                    .and_then(|(_, value)| value),
+                Some(OsStr::new("0"))
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn exact_object_fetch_ignores_configured_refmaps() {
+    const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    const SOURCE: &str = "refs/tags/gherrit/Local/v1";
+    const SENTINEL: &str = "refs/gherrit-test/refmap-sentinel";
+
+    let context =
+        testutil::TestContextBuilder::new("unused").with_remote().with_initial_commit().build();
+    let remote = context.dir.path().join("owner/repo.git");
+    let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+    let destination = PushDestination::for_test_url_in(
+        &repository,
+        remote.to_str().expect("test paths must be UTF-8"),
+    );
+    let remote_only = context
+        .remote_git_cmd()
+        .args(["commit-tree", EMPTY_TREE, "-p", "refs/heads/main", "-m", "remote only"])
+        .output()
+        .unwrap();
+    assert!(remote_only.status.success(), "{remote_only:?}");
+    let remote_only = str::from_utf8(&remote_only.stdout).unwrap().trim();
+    context.remote_git_cmd().args(["update-ref", SOURCE, remote_only]).assert().success();
+    context.git_cmd().args(["cat-file", "-e", remote_only]).assert().failure();
+    context.git_cmd().args(["show-ref", "--verify", "--quiet", SENTINEL]).assert().failure();
+    let (system, global, traces) = configured_trace2_targets(&context);
+
+    let mut command = destination.exact_object_fetch(ExactObjectFetchMode::Negotiated);
+    command
+        .current_dir(&context.repo_path)
+        .env("GIT_CONFIG_NOSYSTEM", "0")
+        .env("GIT_CONFIG_SYSTEM", system)
+        .env("GIT_CONFIG_GLOBAL", global)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "remote.gherrit-publication.fetch")
+        .env("GIT_CONFIG_VALUE_0", format!("+{SOURCE}:{SENTINEL}"));
+    let mut input = subprocess::RegularFileStdinBuilder::new().unwrap();
+    input.write_all(format!("{SOURCE}\n").as_bytes()).unwrap();
+    let output = subprocess::output_with_regular_file_stdin(
+        command,
+        input.finish().unwrap(),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    assert!(output.status().success(), "{output:?}");
+    assert_trace2_unchanged(&traces);
+    context.git_cmd().args(["cat-file", "-e", remote_only]).assert().success();
+    context.git_cmd().args(["show-ref", "--verify", "--quiet", SENTINEL]).assert().failure();
 }
 
 #[test]
@@ -846,6 +1170,56 @@ fn rejects_file_urls_with_actionable_redacted_advice() {
     assert!(!error.to_string().contains("secret-owner"));
 }
 
+#[test]
+fn recognizes_only_the_public_github_forge_for_production() {
+    for destination in [
+        "https://github.com/owner/repo.git",
+        "https://GITHUB.COM/owner/repo",
+        "ssh://github.com/owner/repo.git",
+        "git@github.com:owner/repo.git",
+        "github.com:owner/repo",
+    ] {
+        let parsed = parse_destination(destination).unwrap();
+        assert!(targets_production_github(&parsed), "destination={destination:?}");
+    }
+
+    for destination in [
+        "http://github.com/owner/repo.git",
+        "git://github.com/owner/repo.git",
+        "https://evil.example/owner/repo.git",
+        "https://github.com.evil.example/owner/repo.git",
+        "https://github.com:443/owner/repo.git",
+        "evil://github.com/owner/repo.git",
+        "ftp://github.com/owner/repo.git",
+        "git+ssh://github.com/owner/repo.git",
+        "HTTP://github.com/owner/repo.git",
+        "HTTPS://github.com/owner/repo.git",
+        "GIT://github.com/owner/repo.git",
+        "SSH://github.com/owner/repo.git",
+        "git@evil.example:owner/repo.git",
+        "[::1]:owner/repo.git",
+        "user@[2001:db8::1]:owner/repo.git",
+        "alias:owner/repo.git",
+        "file:///tmp/owner/repo.git",
+        "/tmp/owner/repo.git",
+        "owner/repo.git",
+    ] {
+        let parsed = parse_destination(destination).unwrap();
+        assert!(!targets_production_github(&parsed), "destination={destination:?}");
+    }
+}
+
+#[test]
+fn publication_target_retains_repository_and_literal_destination() {
+    let repository = util::Repo::open(".").unwrap();
+    let https = PushDestination::for_test_url_in(&repository, "https://github.com/owner/repo.git");
+    let ssh = PushDestination::for_test_url_in(&repository, "git@github.com:owner/repo.git");
+    let same = PushDestination::for_test_url_in(&repository, "https://github.com/owner/repo.git");
+
+    assert!(https.publication_target() == same.publication_target());
+    assert!(https.publication_target() != ssh.publication_target());
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_accepts_native_paths_and_crlf_output() {
@@ -922,11 +1296,6 @@ fn rejects_ambiguous_or_malformed_destinations_without_disclosure() {
 
 #[test]
 fn rejects_uri_user_information_without_disclosure() {
-    assert!(
-        resolved_result(b"ssh://git@github.com/owner/repo.git\n")
-            .unwrap()
-            .supports_production_github
-    );
     for destination in [
         "ssh://GIT@github.com/owner/repo.git",
         "ssh://Git@GITHUB.COM/owner/repo.git",
@@ -944,17 +1313,9 @@ fn rejects_uri_user_information_without_disclosure() {
     }
 
     assert!(resolved_result(b"git@github.com:owner/repo.git\n").is_ok());
-    assert!(
-        resolved_result(b"ssh://git@GITHUB.COM/owner/repo.git\n")
-            .unwrap()
-            .supports_production_github
-    );
-    assert!(
-        resolved_result(b"git@GITHUB.COM:owner/repo.git\n").unwrap().supports_production_github
-    );
-    assert!(
-        !resolved_result(b"GIT@github.com:owner/repo.git\n").unwrap().supports_production_github
-    );
+    assert!(resolved_result(b"ssh://git@GITHUB.COM/owner/repo.git\n").unwrap().production_github);
+    assert!(resolved_result(b"git@GITHUB.COM:owner/repo.git\n").unwrap().production_github);
+    assert!(!resolved_result(b"GIT@github.com:owner/repo.git\n").unwrap().production_github);
 }
 
 #[test]
@@ -983,8 +1344,9 @@ fn child_diagnostic_is_local_bounded_redacted_and_terminal_safe() {
     let literal = private.to_string_lossy().into_owned();
     let canonical = fs::canonicalize(&canonical_path).unwrap().to_string_lossy().into_owned();
     assert_ne!(literal, canonical);
+    let repository = util::Repo::open(".").unwrap();
     let destination = PushDestination {
-        repository: RepositoryBinding::new(&util::Repo::open(".").unwrap()).unwrap(),
+        repository: RepositoryBinding::new(&repository).unwrap(),
         resolved: resolved(format!("{literal}\n").as_bytes()),
         internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
         transport: RemoteTransportSettings {
@@ -1093,6 +1455,111 @@ fn parses_exact_symbolic_default_branch_observation() {
 }
 
 #[test]
+fn initial_observation_reports_exact_public_branch_presence_or_absence() {
+    let head = "1111111111111111111111111111111111111111";
+    let public = "2222222222222222222222222222222222222222";
+    let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+
+    for (extra, expected) in [
+        (String::new(), RemoteBranchState::Absent),
+        (
+            format!("{public}\trefs/heads/release-candidate\n"),
+            RemoteBranchState::At(ObjectId::from_hex(public.as_bytes()).unwrap()),
+        ),
+    ] {
+        let output = format!("ref: refs/heads/main\tHEAD\n{head}\tHEAD\n{extra}");
+        let observation =
+            parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).unwrap();
+        let (default, observed) = observation.into_parts();
+        assert_eq!(default.name(), "main");
+        let (observed_name, observed_state) = observed.unwrap().into_parts();
+        assert_eq!(observed_name, branch);
+        assert_eq!(observed_state, expected);
+    }
+}
+
+#[test]
+fn initial_observation_preserves_valid_unicode_c1_public_branch_data() {
+    let head = "1111111111111111111111111111111111111111";
+    let public = "2222222222222222222222222222222222222222";
+    let branch = PublicBranchName::new("release-/\u{85}candidate".to_owned()).unwrap();
+    let output = format!(
+        "ref: refs/heads/main\tHEAD\n{head}\tHEAD\n{public}\trefs/heads/{}\n",
+        branch.as_str()
+    );
+
+    let observation =
+        parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).unwrap();
+    let (_, observed) = observation.into_parts();
+    let (observed_name, observed_state) = observed.unwrap().into_parts();
+
+    assert_eq!(observed_name, branch);
+    assert_eq!(
+        observed_state,
+        RemoteBranchState::At(ObjectId::from_hex(public.as_bytes()).unwrap())
+    );
+}
+
+#[test]
+fn initial_observation_rejects_ambiguous_public_branch_records() {
+    let oid = "1111111111111111111111111111111111111111";
+    let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+    for extra in [
+        format!("{oid}\trefs/heads/release-candidate\n{oid}\trefs/heads/release-candidate\n"),
+        "ref: refs/heads/other\trefs/heads/release-candidate\n".to_owned(),
+    ] {
+        let output = format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n{extra}");
+        assert!(
+            parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).is_err(),
+            "extra={extra:?}"
+        );
+    }
+}
+
+#[test]
+fn initial_observation_rejects_malformed_public_branch_records() {
+    let oid = "1111111111111111111111111111111111111111";
+    let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+    for extra in [
+        "not-an-object-id\trefs/heads/release-candidate\n".to_owned(),
+        "0000000000000000000000000000000000000000\trefs/heads/release-candidate\n".to_owned(),
+        format!("{oid}\trefs/heads/invalid..branch\n"),
+    ] {
+        let output = format!("ref: refs/heads/main\tHEAD\n{oid}\tHEAD\n{extra}");
+        assert!(
+            parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).is_err(),
+            "extra={extra:?}"
+        );
+    }
+}
+
+#[test]
+fn initial_observation_ignores_valid_unrequested_records_in_any_order() {
+    let head = "1111111111111111111111111111111111111111";
+    let public = "2222222222222222222222222222222222222222";
+    let unrelated = "3333333333333333333333333333333333333333";
+    let branch = PublicBranchName::new("release-candidate".to_owned()).unwrap();
+    let output = format!(
+        "{unrelated}\trefs/heads/candidate\n\
+         {public}\trefs/heads/release-candidate\n\
+         {head}\tHEAD\n\
+         ref: refs/heads/other\trefs/remotes/upstream/HEAD\n\
+         ref: refs/heads/main\tHEAD\n"
+    );
+
+    let observation =
+        parse_initial_remote_observation(output.as_bytes(), Some(branch.clone())).unwrap();
+    let (default, observed) = observation.into_parts();
+    assert_eq!(default.name(), "main");
+    let (observed_name, observed_state) = observed.unwrap().into_parts();
+    assert_eq!(observed_name, branch);
+    assert_eq!(
+        observed_state,
+        RemoteBranchState::At(ObjectId::from_hex(public.as_bytes()).unwrap())
+    );
+}
+
+#[test]
 fn default_branch_rejects_the_owned_base_namespace() {
     let oid = ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
     for name in ["gherrit-bases", "gherrit-bases/main"] {
@@ -1185,130 +1652,4 @@ fn rejects_every_malformed_default_branch_observation() {
     ] {
         assert!(parse_default_branch(&output).is_err(), "output: {output:?}");
     }
-}
-
-fn environment<'command>(
-    command: &'command Command,
-    name: &str,
-) -> Option<Option<&'command OsStr>> {
-    command.get_envs().find(|(candidate, _)| *candidate == OsStr::new(name)).map(|(_, value)| value)
-}
-
-fn successful_git(context: &testutil::TestContext, current_dir: &Path, arguments: &[&str]) {
-    context.git_cmd().current_dir(current_dir).args(arguments).assert().success();
-}
-
-fn assert_repository_binding(
-    context: &testutil::TestContext,
-    repository: &util::Repo,
-    expected_current: &Path,
-    expected_work_tree: Option<&Path>,
-    hostile_repository: &Path,
-) {
-    let binding = RepositoryBinding::new(repository).unwrap();
-    let mut command = Command::new("git");
-    command
-        .env("GIT_CONFIG", hostile_repository)
-        .env("GIT_DIR", hostile_repository)
-        .env("GIT_COMMON_DIR", hostile_repository)
-        .env("GIT_WORK_TREE", hostile_repository)
-        .env("GIT_IMPLICIT_WORK_TREE", "false")
-        .env("GIT_NAMESPACE", "hostile")
-        .env("GIT_CEILING_DIRECTORIES", hostile_repository)
-        .env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "true");
-
-    binding.bind(&mut command);
-
-    assert_eq!(command.get_current_dir(), Some(expected_current));
-    assert_eq!(environment(&command, "GIT_DIR"), Some(Some(binding.git_dir.as_os_str())));
-    assert_eq!(
-        fs::canonicalize(&binding.git_dir).unwrap(),
-        Path::new(binding.git_dir_identity.as_os_str())
-    );
-    assert_eq!(environment(&command, "GIT_COMMON_DIR"), Some(Some(binding.common_dir.as_os_str())));
-    assert_eq!(
-        environment(&command, "GIT_WORK_TREE"),
-        Some(expected_work_tree.map(Path::as_os_str))
-    );
-    for variable in [
-        "GIT_CONFIG",
-        "GIT_IMPLICIT_WORK_TREE",
-        "GIT_NAMESPACE",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    ] {
-        assert_eq!(environment(&command, variable), Some(None), "variable={variable}");
-    }
-
-    command.args(["rev-parse", "--absolute-git-dir", "--git-common-dir"]);
-    if expected_work_tree.is_some() {
-        command.arg("--show-toplevel");
-    }
-    let output = context.bounded_cmd(command).output().unwrap();
-    assert!(
-        output.status.success(),
-        "bound git rev-parse failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let paths = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(PathBuf::from)
-        .map(|path| fs::canonicalize(path).unwrap())
-        .collect::<Vec<_>>();
-    let expected = [
-        Some(Path::new(binding.git_dir_identity.as_os_str())),
-        Some(binding.common_dir.as_path()),
-        expected_work_tree,
-    ]
-    .into_iter()
-    .flatten()
-    .map(|path| fs::canonicalize(path).unwrap())
-    .collect::<Vec<_>>();
-    assert_eq!(paths, expected);
-}
-
-#[test]
-fn repository_binding_models_normal_linked_and_bare_repositories() {
-    let context = testutil::TestContextBuilder::new("unused").build();
-    let root = tempfile::tempdir().unwrap();
-    let ordinary = root.path().join("ordinary");
-    successful_git(&context, root.path(), &["init", ordinary.to_str().unwrap()]);
-    successful_git(
-        &context,
-        &ordinary,
-        &[
-            "-c",
-            "user.name=GHerrit Test",
-            "-c",
-            "user.email=gherrit@example.com",
-            "commit",
-            "--allow-empty",
-            "--no-gpg-sign",
-            "--no-verify",
-            "-m",
-            "root",
-        ],
-    );
-
-    let linked = root.path().join("linked");
-    successful_git(
-        &context,
-        &ordinary,
-        &["worktree", "add", "--detach", linked.to_str().unwrap(), "HEAD"],
-    );
-
-    let bare = root.path().join("bare.git");
-    let hostile = root.path().join("hostile.git");
-    gix::init_bare(&bare).unwrap();
-    gix::init_bare(&hostile).unwrap();
-
-    let ordinary_repository = util::Repo::open(ordinary.to_str().unwrap()).unwrap();
-    assert_repository_binding(&context, &ordinary_repository, &ordinary, Some(&ordinary), &hostile);
-
-    let linked_repository = util::Repo::open(linked.to_str().unwrap()).unwrap();
-    assert_repository_binding(&context, &linked_repository, &linked, Some(&linked), &hostile);
-
-    let bare_repository = util::Repo::open(bare.to_str().unwrap()).unwrap();
-    assert_repository_binding(&context, &bare_repository, &bare, None, &hostile);
 }
