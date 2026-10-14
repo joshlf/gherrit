@@ -1,7 +1,5 @@
 use std::fmt::{self, Write};
 
-use serde::Serialize;
-
 use crate::re;
 
 // Per https://github.com/orgs/community/discussions/27190#discussioncomment-3254953,
@@ -18,8 +16,6 @@ pub(super) struct PrBody<'a> {
     pub latest_version: usize,
     pub base_branch: &'a str,
     pub gherrit_id: &'a str,
-    pub parent_id: Option<&'a str>,
-    pub child_id: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -61,11 +57,7 @@ impl PrBody<'_> {
         self.write_history_table(&mut output, history_format)?;
         self.write_download_section(&mut output)?;
         output.write_str("\n\n")?;
-        output.write_str(
-            "*Stacked PRs enabled by [GHerrit](https://github.com/joshlf/gherrit).*\n\n",
-        )?;
-        output.write_str("<!-- WARNING: GHerrit relies on the following metadata to work properly. DO NOT EDIT OR REMOVE. -->")?;
-        output.write_str(&metadata_comment(self.gherrit_id, self.parent_id, self.child_id))
+        output.write_str("*Stacked PRs enabled by [GHerrit](https://github.com/joshlf/gherrit).*")
     }
 
     fn write_navigation(&self, mut output: impl Write) -> fmt::Result {
@@ -187,19 +179,6 @@ pub(super) fn gherrit_pr_id_re() -> &'static regex::Regex {
     re!(r"(?m)^gherrit-pr-id[=:][ \t]*([a-zA-Z0-9]+)[ \t]*\r?$")
 }
 
-fn metadata_comment(id: &str, parent: Option<&str>, child: Option<&str>) -> String {
-    #[derive(Serialize)]
-    struct Metadata<'a> {
-        id: &'a str,
-        parent: Option<&'a str>,
-        child: Option<&'a str>,
-    }
-
-    let metadata = serde_json::to_string(&Metadata { id, parent, child })
-        .expect("serializing GHerrit metadata cannot fail");
-    format!("<!-- gherrit-meta: {metadata} -->")
-}
-
 struct ByteCounter(usize);
 
 impl Write for ByteCounter {
@@ -227,8 +206,7 @@ mod tests {
         current_pr_number: u64,
         latest_version: usize,
         gherrit_id: &'a str,
-        parent_id: Option<&'a str>,
-        child_id: Option<&'a str>,
+        base_branch: &'a str,
     ) -> PrBody<'a> {
         PrBody {
             commit_body,
@@ -237,10 +215,8 @@ mod tests {
             stack_pr_numbers: STACK,
             current_pr_number,
             latest_version,
-            base_branch: parent_id.unwrap_or("main"),
+            base_branch,
             gherrit_id,
-            parent_id,
-            child_id,
         }
     }
 
@@ -253,8 +229,7 @@ mod tests {
                 11,
                 1,
                 "Groot",
-                None,
-                Some("Gmiddle"),
+                "main",
             )
             .render()
         );
@@ -268,8 +243,7 @@ mod tests {
             22,
             2,
             "Gmiddle",
-            Some("Groot"),
-            Some("Gtip"),
+            "Groot",
         )
         .render());
     }
@@ -277,41 +251,39 @@ mod tests {
     #[test]
     fn renders_full_patch_history() {
         insta::assert_snapshot!(
-            body("Finish the stack\n\n", None, 33, 4, "Gtip", Some("Gmiddle"), None,).render()
+            body("Finish the stack\n\n", None, 33, 4, "Gtip", "Gmiddle").render()
         );
     }
 
     #[test]
     fn renders_sparse_patch_history() {
-        let body = body("", None, 22, 6, "Gmiddle", Some("Groot"), Some("Gtip"));
+        let body = body("", None, 22, 6, "Gmiddle", "Groot");
         insta::assert_snapshot!(body.render_with_history(HistoryTableFormat::Sparse));
     }
 
     #[test]
-    fn metadata_is_json_escaped() {
-        insta::assert_snapshot!(metadata_comment(
-            "G\"雪",
-            Some("parent\\branch"),
-            Some("child\nline"),
-        ));
+    fn metadata_like_text_is_ordinary_commit_body_content() {
+        let commit_body = "Keep <!-- gherrit-meta: ordinary commit text --> exactly.";
+        let rendered = body(commit_body, None, 22, 1, "Gmiddle", "Groot").render();
+
+        assert!(rendered.contains(commit_body));
+        assert_eq!(rendered.matches("gherrit-meta").count(), 1);
     }
 
     #[test]
     fn switches_to_sparse_history_only_above_the_size_limit() {
-        let empty = body("", None, 22, 4, "Gmiddle", Some("Groot"), Some("Gtip"));
+        let empty = body("", None, 22, 4, "Gmiddle", "Groot");
         let fixed_size = empty.rendered_len(HistoryTableFormat::Full);
         assert!(fixed_size < MAX_BODY_SIZE_BYTES);
 
         let exact_padding = "x".repeat(MAX_BODY_SIZE_BYTES - fixed_size);
-        let exact =
-            body(&exact_padding, None, 22, 4, "Gmiddle", Some("Groot"), Some("Gtip")).render();
+        let exact = body(&exact_padding, None, 22, 4, "Gmiddle", "Groot").render();
         let omitted_in_sparse = "/compare/gherrit/Gmiddle/v1..gherrit/Gmiddle/v3";
         assert_eq!(exact.len(), MAX_BODY_SIZE_BYTES);
         assert!(exact.contains(omitted_in_sparse));
 
         let over_padding = format!("{exact_padding}x");
-        let over =
-            body(&over_padding, None, 22, 4, "Gmiddle", Some("Groot"), Some("Gtip")).render();
+        let over = body(&over_padding, None, 22, 4, "Gmiddle", "Groot").render();
         assert!(!over.contains(omitted_in_sparse));
     }
 }
