@@ -1,8 +1,8 @@
 //! JSON decoding which retains duplicate object members as errors.
 //!
 //! `serde_json::Value` normally keeps only the final value for a duplicate
-//! object key. GraphQL aliases and receipt fields carry authority, so mutation
-//! responses cross this boundary before they can become ordinary values.
+//! object key. GraphQL aliases and receipt fields carry authority, so every
+//! response crosses this boundary before it can become an ordinary value.
 
 use std::fmt;
 
@@ -15,11 +15,15 @@ use serde_json::{Map, Number, Value};
 pub(crate) struct UniqueJson(Value);
 
 impl UniqueJson {
-    pub(crate) fn decode(bytes: &[u8]) -> serde_json::Result<Self> {
-        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    pub(crate) fn decode(response: &[u8]) -> serde_json::Result<Self> {
+        let mut deserializer = serde_json::Deserializer::from_slice(response);
         let value = Self::deserialize(&mut deserializer)?;
         deserializer.end()?;
         Ok(value)
+    }
+
+    pub(crate) fn as_value(&self) -> &Value {
+        &self.0
     }
 
     pub(crate) fn into_value(self) -> Value {
@@ -137,6 +141,31 @@ impl<'de> Deserialize<'de> for UniqueJson {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn generated_codec_json_requires_unique_decoded_keys_and_complete_input() {
+        for input in
+            [br#"{"a":1,"\u0061":2}"#.as_slice(), "{\"👍\":1,\"\\ud83d\\udc4d\":2}".as_bytes()]
+        {
+            assert!(UniqueJson::decode(input).is_err());
+        }
+        let seed = br#"{"a":[1,true,null]}"#;
+        assert!(UniqueJson::decode(seed).is_ok());
+        for byte in 0..=u8::MAX {
+            let mut trailing = seed.to_vec();
+            trailing.push(byte);
+            assert_eq!(
+                UniqueJson::decode(&trailing).is_ok(),
+                matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+            );
+            for position in 0..=seed.len() {
+                let mut input = seed.to_vec();
+                input.insert(position, byte);
+                let _ = UniqueJson::decode(&input);
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
