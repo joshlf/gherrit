@@ -104,13 +104,29 @@ fn check_and_apply_failure(
     Some(consumed)
 }
 
-/// Returns the subcommand from the command shape emitted by GHerrit.
-///
-/// The harness intentionally does not emulate Git's global-option grammar.
-/// Production calls put the subcommand immediately after the executable and
-/// the interceptor treats every subsequent argument as opaque.
+/// Recognizes only the global-option grammar emitted by production.
+/// Subcommand arguments remain opaque; this is not a general Git parser.
+fn subcommand_index(args: &[String]) -> Option<usize> {
+    let mut index = 1;
+    loop {
+        match args.get(index)?.as_str() {
+            "--no-replace-objects" => index += 1,
+            "-c" => {
+                let parameter = args.get(index + 1)?;
+                if parameter.split_once('=').is_none_or(|(key, _)| key.is_empty()) {
+                    return None;
+                }
+                index += 2;
+            }
+            argument if argument.starts_with("--config-env=") => index += 1,
+            subcommand if !subcommand.starts_with('-') => return Some(index),
+            _ => return None,
+        }
+    }
+}
+
 fn subcommand(args: &[String]) -> Option<&str> {
-    args.get(1).filter(|argument| !argument.starts_with('-')).map(String::as_str)
+    subcommand_index(args).map(|index| args[index].as_str())
 }
 
 async fn handle_git(
@@ -190,6 +206,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn typed_faults_recognize_configured_commands_without_a_graph_flag() {
+        assert_eq!(
+            subcommand(&args(&[
+                "git",
+                "-c",
+                "trailer.separators=:",
+                "-c",
+                "trailer.gherrit-pr-id.key=gherrit-pr-id",
+                "interpret-trailers",
+                "--parse",
+                "message"
+            ])),
+            Some("interpret-trailers")
+        );
+        assert_eq!(subcommand(&args(&["git", "-c"])), None);
+        assert_eq!(subcommand(&args(&["git", "--unknown", "interpret-trailers"])), None);
+    }
     #[test]
     fn recognizes_only_the_product_command_shape() {
         assert_eq!(subcommand(&args(&["git", "push", "origin"])), Some("push"));
