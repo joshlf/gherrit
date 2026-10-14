@@ -1,5 +1,48 @@
-use super::repository::get_repo_owner_name;
+use std::{ffi::OsStr, process::Command};
+
+use super::{command::command_invocation, repository::*};
 use crate::cmd;
+
+#[test]
+fn git_commands_use_the_literal_local_graph() {
+    let command = cmd("git", ["status"]);
+    let arguments = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(arguments, ["--no-replace-objects", "status"]);
+    let environment = command.get_envs().collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(environment[OsStr::new("GIT_NO_REPLACE_OBJECTS")], Some(OsStr::new("1")));
+    for variable in ["GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE", "GIT_SHALLOW_FILE"] {
+        assert_eq!(environment[OsStr::new(variable)], None);
+    }
+
+    for variable in ["GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"] {
+        assert!(!environment.contains_key(OsStr::new(variable)));
+    }
+
+    let command = cmd("gh", ["auth", "token"]);
+    assert_eq!(command.get_args().collect::<Vec<_>>(), [OsStr::new("auth"), OsStr::new("token")]);
+    assert!(command.get_envs().next().is_none());
+}
+
+#[test]
+fn command_diagnostics_render_only_program_and_arguments() {
+    let mut command = Command::new("git");
+    command.args(["status", "path with spaces"]);
+    command.env("VISIBLE_TO_CHILD_ONLY", "secret");
+    command.env_remove("REMOVED_FROM_CHILD");
+
+    assert_eq!(command_invocation(&command), r#""git" "status" "path with spaces""#);
+}
+
+#[test]
+fn literal_graph_open_options_deny_object_environment_at_every_trust_level() {
+    let options = literal_graph_open_options();
+    for trust in [gix::sec::Trust::Full, gix::sec::Trust::Reduced] {
+        assert_eq!(options.by_level(trust).permissions.env.objects, gix::sec::Permission::Deny);
+    }
+}
 
 #[test]
 #[should_panic(expected = "Command cannot be empty")]
