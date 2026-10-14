@@ -162,6 +162,16 @@ pub(super) struct PushDestination {
 }
 
 impl PushDestination {
+    pub(super) async fn observe_refs_from(
+        &self,
+        repository: &util::Repo,
+        ref_patterns: impl IntoIterator<Item = String>,
+    ) -> std::result::Result<subprocess::CommandOutput, subprocess::CommandError> {
+        let mut command = self.ls_remote(Vec::<String>::new(), ref_patterns);
+        command.current_dir(repository.workdir().unwrap_or(repository.path()));
+        subprocess::output(command, subprocess::REMOTE_GIT_EXECUTION_TIMEOUT).await
+    }
+
     /// Resolves the one exact destination Git would use for pushing.
     ///
     /// The configured remote is supplied by the caller so configuration is
