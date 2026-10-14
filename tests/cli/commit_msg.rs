@@ -293,6 +293,25 @@ fn interactive_message_comments_do_not_hide_the_inserted_identity() {
 }
 
 #[test]
+fn object_store_environment_is_refused_without_editing_the_message() {
+    let ctx = testutil::test_context!().with_initial_commit().build();
+    ctx.gherrit_cmd().arg("manage").assert().success();
+    let path = ctx.repo_path.join("MESSAGE");
+    let message = b"subject\n";
+    for variable in ["GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"] {
+        std::fs::write(&path, message).unwrap();
+        ctx.gherrit_cmd()
+            .args(["hook", "commit-msg"])
+            .arg(&path)
+            .env(variable, ctx.repo_path.join(".git/objects"))
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(format!("{variable} is unsupported")));
+        assert_eq!(std::fs::read(&path).unwrap(), message);
+    }
+}
+
+#[test]
 #[cfg(unix)]
 fn automatic_comments_preserve_native_git_decisions_for_ambiguous_hook_inputs() {
     use std::os::unix::fs::PermissionsExt as _;
