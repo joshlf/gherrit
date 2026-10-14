@@ -41,4 +41,12 @@ out another installer, or establish exclusive ownership of an external path.
 Git uses common-directory default hooks in linked worktrees; explicit relative
 hook paths are resolved from each worktree or the bare Git directory.
 
+Catchable Unix termination signals (HUP, INT, QUIT and TERM) are forwarded to
+registered child groups before GHerrit performs the signal's default
+termination. Spawn/registration and reap/removal share a mutex
+with the normal signal-delivery thread, preventing missed children and recycled
+identity signalling. Inherited ignored signals stay ignored. Child handlers may
+handle or ignore a forwarded signal, just as in the original caller group;
+uncatchable termination and escaped descendants have no cleanup guarantee.
+
 *Updated by an AI agent acting on joshlf's behalf.*

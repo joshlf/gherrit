@@ -15,7 +15,8 @@ pub(super) fn observe_managed_branches(
         let mut arguments = vec!["ls-remote".to_string(), repo.default_remote_name()];
         arguments.extend(chunk.iter().map(|id| format!("refs/heads/{id}")));
 
-        let output = util::cmd("git", arguments).checked_output()?;
+        let output = util::cmd("git", arguments)
+            .checked_output_with_timeout(crate::subprocess::REMOTE_GIT_EXECUTION_TIMEOUT)?;
 
         parse_managed_branches(&output.stdout, chunk)?.into_iter().try_for_each(
             |(id, object_id)| match states.entry(id) {
