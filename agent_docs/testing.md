@@ -89,7 +89,7 @@ Organize coverage around product risks rather than source files.
 | --- | --- |
 | Local intent is misunderstood | Pure stack and policy cases; focused real-Git discovery contracts |
 | The wrong refs are published | Pure publication decisions; real atomic-push and lease contracts |
-| GitHub differs from the desired projection | Pure projection and minimal-update cases; GraphQL codec contracts |
+| GitHub differs from the desired projection | Legacy minimal-patch reconciliation; complete owned-base title/body projection and receipt contracts |
 | A retry repeats or loses work | Interruption tests at every committed effect; idempotence invariants |
 | Two writers corrupt state | Deterministic stale-observation and interleaving schedules |
 | A hook does not enforce the workflow | Installed-hook success and blocking system tests |
@@ -151,7 +151,8 @@ The core model should distinguish at least:
 - stack visibility and base branch;
 - observed managed branches and version tags;
 - pull requests keyed by stable GHerrit ID, including lifecycle state;
-- desired pull request specifications and minimal update patches;
+- desired pull request specifications, legacy minimal patches, and complete
+  owned-base projection writes;
 - ref updates with explicit expected and desired object IDs; and
 - rejection and ambiguity reasons represented by dedicated Rust enum variants
   with structured fields, rather than booleans or formatted strings.
@@ -176,7 +177,7 @@ The GitHub boundary should support:
 
 - observing pull requests for a set of GHerrit IDs;
 - creating pull requests from complete specifications; and
-- applying minimal pull request updates.
+- applying legacy minimal patches or complete owned-base title/body updates.
 
 Production adapters use real Git and GitHub protocols. Application tests use a
 small in-memory world that applies only GHerrit's domain semantics and records
@@ -195,7 +196,7 @@ locks, ports, environment variables, or sleeps.
 They cover:
 
 - stack topology and policy;
-- pull request rendering and minimal updates;
+- pull request rendering, legacy minimal patches, and full owned-base updates;
 - publication and version decisions;
 - reconciliation ordering;
 - batching boundaries;
@@ -212,14 +213,16 @@ names and failures.
 
 Universal invariants include:
 
-- rejection produces no mutations;
-- GitHub writes never precede required Git publication;
+- admission/preflight rejection has no effects; a later failure can retain
+  earlier acknowledged stages;
+- acknowledged ready-to-draft departures precede Git publication; creates and
+  final PR projections follow their required Git publication;
 - a converged world produces `Done`;
 - applying a successful action makes measurable progress;
 - retrying from every committed prefix eventually converges;
 - version tags never move;
 - pull request bases refer to published branches; and
-- merged state is absorbing.
+- marker-bound merged state is absorbing.
 
 ### Adapter Contract Tests
 
@@ -424,6 +427,8 @@ parts compose, but they should not repeat the owner's full input matrix.
 | Branch-management transitions | Pure function | One hook per process boundary |
 | Pull request text and navigation | Pure renderer | One complete lifecycle snapshot |
 | Minimal pull request patches | Pure reconciliation | GraphQL encoding contracts |
+| Complete owned-base write planning | Pure reconciliation | Mutation preparation contracts |
+| Exact owned-base requests and receipts | Mutation/codec contracts | One publication recovery flow |
 | Version and publication decisions | Pure reconciliation | Bare-remote ref-state contracts |
 | GraphQL request and response shape | Codec contract | One complete system flow |
 | Batching boundaries and aliases | Pure batching | One multi-item codec contract |
@@ -485,8 +490,10 @@ new abstractions.
 14. Introduce typed outcomes for rejection, publication, PR creation, PR
     update, and convergence.
 15. Represent ref publication with explicit old-value expectations and desired
-    object IDs. Represent PR updates as minimal patches whose absent fields mean
-    no write.
+    object IDs. Legacy PR updates use minimal patches whose absent fields mean
+    no write. Owned-base projections resend and acknowledge complete title and
+    body fields, even when unchanged in the observation; base edits remain
+    conditional. Test these full-field wire requests and receipts explicitly.
 16. Convert adapter-specific values into validated domain observations at the
     edge. The reconciler must not accept HTTP JSON, GraphQL aliases, Git command
     output, or repository handles.
@@ -503,14 +510,17 @@ transport.
     returns either a typed rejection, the next semantic stage, or `Done`. Each
     stage contains independent effects that adapters may execute in bounded
     batches.
-19. Order stages so required Git publication precedes PR creation and PR
-    updates. Document every dependency in types or constructors rather than in
-    test setup.
+19. Acknowledge required ready-to-draft departures before Git publication.
+    Create PRs and apply final projections after their required Git publication.
+    Document every dependency in types or constructors rather than in test
+    setup.
 20. Apply any confirmed prefix of a stage's effects to an in-memory world and
     reconcile again.
 21. Enumerate bounded worlds of up to three commits and check universal
-    invariants: rejection has no effects, successful stages make progress,
-    tags never move, merged state is absorbing, and convergence is idempotent.
+    invariants: admission/preflight rejection has no effects; later failures
+    can retain earlier acknowledged effects. Successful stages make progress,
+    tags never move, marker-bound merged state is absorbing, and convergence
+    is idempotent.
 22. For every committed effect prefix, restart from observation alone and prove
     eventual convergence.
 23. Add deterministic stale-observation schedules and two-writer interleavings;
