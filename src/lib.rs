@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 mod commit_msg;
 mod install;
 mod manage;
@@ -94,7 +95,7 @@ enum HookCommands {
     /// Git commit-msg hook.
     CommitMsg {
         /// The file containing the commit message.
-        file: String,
+        file: PathBuf,
     },
 }
 
@@ -142,6 +143,24 @@ pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(unix)]
+    fn commit_message_filename_preserves_native_bytes() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+        let filename = OsString::from_vec(b"message-\xff".to_vec());
+        let cli = Cli::try_parse_from([
+            OsString::from("gherrit"),
+            OsString::from("hook"),
+            OsString::from("commit-msg"),
+            filename.clone(),
+        ])
+        .unwrap();
+        let Commands::Hook(HookCommands::CommitMsg { file }) = cli.command else {
+            panic!("expected commit-msg");
+        };
+        assert_eq!(file.into_os_string(), filename);
+    }
+
     use super::*;
 
     #[test]
