@@ -686,6 +686,24 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
     Ok(())
 }
 
+pub(crate) fn inspection(repo: &util::Repo, branch: &str) -> Result<serde_json::Value> {
+    let values = repo.local_branch_config(branch)?;
+    let state = State::from_values(&values.management)?;
+    let current = BranchConfig::from_values(&values);
+    let expected = expected_for_repo(repo, state, branch)?;
+    // Only managed states claim ownership of these branch fields.
+    let drift: Vec<_> = match state {
+        None | Some(State::Unmanaged) => Vec::new(),
+        Some(State::Private | State::Public) => current.changes_to(&expected).map(|(key, value, desired)| {
+            serde_json::json!({"field": key.suffix(), "observed": value.diagnostic(), "expected": desired})
+        }).collect(),
+    };
+    Ok(
+        serde_json::json!({"intent": state.map(|state| match state { State::Unmanaged => "false", State::Private => "managedPrivate", State::Public => "managedPublic" }),
+        "drift": drift, "scope": "local, no includes", "publication_authority": false}),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

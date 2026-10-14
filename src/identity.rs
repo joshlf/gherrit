@@ -7,6 +7,7 @@
 use std::{ops::Range, str};
 
 use eyre::{Result, bail};
+use gix::ObjectId;
 
 pub(crate) const MAX_GHERRIT_PR_ID_BYTES: usize = 128;
 
@@ -35,6 +36,22 @@ impl GherritPrId {
             bail!("invalid GHerrit change ID");
         }
         Ok(Self(str::from_utf8(value)?.to_owned()))
+    }
+
+    pub(crate) fn from_trailer(commit: ObjectId, value: &[u8]) -> Result<Self> {
+        if value.is_empty() {
+            bail!("Commit {commit} missing gherrit-pr-id trailer");
+        }
+        if value.len() > MAX_GHERRIT_PR_ID_BYTES {
+            bail!(
+                "Commit {commit} has a gherrit-pr-id trailer longer than the {MAX_GHERRIT_PR_ID_BYTES}-byte limit"
+            );
+        }
+        if !value.iter().all(u8::is_ascii_alphanumeric) {
+            bail!("Commit {commit} has invalid gherrit-pr-id trailer");
+        }
+
+        Self::from_ref_component(value)
     }
 
     pub(crate) fn as_str(&self) -> &str {
