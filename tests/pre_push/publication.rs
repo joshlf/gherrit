@@ -113,9 +113,10 @@ fn test_remote_default_ahead_of_local_tracking_ref_fails_before_publication() {
     ctx.run_git(&["checkout", "stale-default"]);
     let fixture_pushes = ctx.recorded_pushes();
 
-    ctx.hook_cmd("pre-push").assert().failure().stderr(predicates::str::contains(
-        "Local default branch 'main' does not match the push repository",
-    ));
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("does not descend from the observed push-destination default 'main' on its first-parent path"));
     assert!(ctx.github().requests().is_empty());
     assert_eq!(ctx.recorded_pushes(), fixture_pushes);
 }

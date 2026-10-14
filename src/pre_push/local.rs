@@ -144,16 +144,8 @@ impl LocalStack {
         head: ObjectId,
         default_branch: &DefaultBranch,
     ) -> Result<Self> {
-        let default_ref_name = default_branch.full_ref_name();
-        let default_ref = repo.rev_parse_single(default_ref_name.as_str()).wrap_err_with(|| {
-            format!("Local default branch '{}' is unavailable", default_branch.name())
-        })?;
-        if default_ref.detach() != default_branch.tip() {
-            bail!(
-                "Local default branch '{}' does not match the push repository",
-                default_branch.name()
-            );
-        }
+        let default_oid = default_branch.tip().to_string();
+        let default_ref = repo.rev_parse_single(default_oid.as_str())?;
         if head == default_ref.detach() {
             return Self::new(default_branch, Vec::new());
         }
@@ -165,9 +157,9 @@ impl LocalStack {
             util::FirstParentCommitsBetweenError::NotOnFirstParentPath => {
                 let default_branch = default_branch.name();
                 eyre!(
-                    "The branch '{branch_name}' does not descend from '{default_branch}' on its first-parent path.\n\
+                    "The branch '{branch_name}' does not descend from the observed push-destination default '{default_branch}' on its first-parent path.\n\
                      GHerrit defines stack order using first-parent ancestry.\n\
-                     Maybe you want to 'git rebase' on '{default_branch}' before pushing?"
+                     Fetch '{default_branch}' from the configured push destination, then rebase onto that fetched tip before pushing."
                 )
             }
             util::FirstParentCommitsBetweenError::Eyre(error) => error,
@@ -437,6 +429,26 @@ mod tests {
             title: String::new(),
             body: String::new(),
         }
+    }
+
+    #[test]
+    fn ancestry_guidance_does_not_depend_on_a_local_default_alias() {
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        let default_tip = ObjectId::from_hex(context.head_oid().as_bytes()).unwrap();
+        context.run_git(&["checkout", "--orphan", "unrelated"]);
+        context.commit_with_gherrit_id("Unrelated");
+        context.run_git(&["branch", "-D", "main"]);
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let error = LocalStack::collect_captured(
+            &repository,
+            "unrelated",
+            repository.head_id().unwrap().detach(),
+            &DefaultBranch::new("main".to_owned(), default_tip).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("configured push destination"));
+        assert!(error.to_string().contains("that fetched tip"));
+        assert!(!error.to_string().contains("'git rebase' on 'main'"));
     }
 
     #[test]
