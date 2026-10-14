@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     io::ErrorKind,
     path::{Path, PathBuf},
     str,
@@ -8,8 +10,8 @@ use std::{
 use eyre::{OptionExt, Result, WrapErr, bail, eyre};
 use gix::{Commit, Id, bstr::ByteSlice as _, state::InProgress};
 
-use super::{CommandExt as _, command::clear_git_repository_overrides};
-use crate::{cmd, manage::State, re};
+use super::{CommandExt as _, clear_git_repository_overrides};
+use crate::{cmd, manage::State};
 
 pub(super) const REMOTE_PROMISOR_CONFIG_PATTERN: &str =
     r"^remote\..*\.(promisor|partialclonefilter)$";
@@ -40,6 +42,21 @@ impl HeadState {
 pub struct Repo {
     pub(super) inner: gix::Repository,
     pub(super) current_branch: HeadState,
+    git_dir_identity: GitDirIdentity,
+}
+
+/// The canonical per-worktree Git directory selected by repository discovery.
+///
+/// Linked worktrees share objects and refs but have distinct Git directories.
+/// Keeping that distinction prevents an ambient recursion marker from one
+/// worktree from suppressing hooks in another.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct GitDirIdentity(PathBuf);
+
+impl GitDirIdentity {
+    pub(crate) fn as_os_str(&self) -> &OsStr {
+        self.0.as_os_str()
+    }
 }
 
 pub(super) fn literal_graph_open_options() -> gix::sec::trust::Mapping<gix::open::Options> {
@@ -62,6 +79,45 @@ pub(super) fn literal_graph_open_options() -> gix::sec::trust::Mapping<gix::open
     options
 }
 
+/// The configured Git remote whose push repository GHerrit publishes to.
+///
+/// Configuration decoding is fallible: an unreadable `gherrit.remote` never
+/// silently turns into `origin`. Control characters are rejected so the name
+/// remains safe to repeat in Git arguments and diagnostics.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RemoteName(String);
+
+impl RemoteName {
+    pub(crate) fn from_config(value: &[u8]) -> Result<Self> {
+        let value = std::str::from_utf8(value)
+            .wrap_err("The configured GHerrit remote is not valid UTF-8")?;
+        if value.is_empty() {
+            bail!("The configured GHerrit remote is empty");
+        }
+        if value.chars().any(char::is_control) {
+            bail!("The configured GHerrit remote contains a control character");
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+pub(super) fn default_remote_name_from_values<'a>(
+    values: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<RemoteName> {
+    let mut values = values.into_iter();
+    let Some(value) = values.next() else {
+        return Ok(RemoteName("origin".to_owned()));
+    };
+    if values.next().is_some() {
+        bail!("The GHerrit remote is configured more than once");
+    }
+    RemoteName::from_config(value)
+}
+
 impl Repo {
     pub fn open(path: &str) -> Result<Self> {
         // NOTE: `gix::discover` is used instead of `gix::open` so that
@@ -73,7 +129,15 @@ impl Repo {
         )?
         .to_thread_local();
         let current_branch = get_current_branch(&inner)?;
-        Ok(Self { inner, current_branch })
+        let git_dir_identity = GitDirIdentity(
+            fs::canonicalize(inner.path())
+                .wrap_err("Failed to identify the repository's Git directory")?,
+        );
+        Ok(Self { inner, current_branch, git_dir_identity })
+    }
+
+    pub(crate) fn git_dir_identity(&self) -> &GitDirIdentity {
+        &self.git_dir_identity
     }
 
     /// Rejects repository state which can rewrite or truncate publication
@@ -234,30 +298,21 @@ impl Repo {
         Ok(latest_log.is_some_and(|log| log.previous_oid.is_null()))
     }
 
-    pub fn default_remote_name(&self) -> String {
-        self.config_string("gherrit.remote")
-            .unwrap_or_default()
-            .unwrap_or_else(|| "origin".to_string())
+    pub fn default_remote_name(&self) -> Result<RemoteName> {
+        let snapshot = self.inner.config_snapshot();
+        let values = snapshot.strings("gherrit.remote").unwrap_or_default();
+        default_remote_name_from_values(values.iter().map(|value| value.as_ref().as_bytes()))
     }
 
-    pub fn default_remote(&self) -> Result<Remote> {
-        let remote_name = self.default_remote_name();
-        let remote_url = self
-            .config_string(&format!("remote.{}.url", remote_name))?
-            .ok_or_else(|| eyre!("Remote '{}' missing URL", remote_name))?;
-        let (owner, repo_name) = get_repo_owner_name(remote_url.as_str())?;
-        Ok(Remote { owner, repo_name })
-    }
-
-    fn find_default_branches(&self, remote_name: &str) -> Vec<String> {
+    fn find_default_branches(&self, remote_name: &RemoteName) -> Result<Vec<String>> {
         let mut branches = Vec::new();
 
         // Try to infer the default branch from the remote HEAD.
-        let remote_head_ref = format!("refs/remotes/{}/HEAD", remote_name);
+        let remote_head_ref = format!("refs/remotes/{}/HEAD", remote_name.as_str());
         if let Ok(head_ref) = self.inner.find_reference(&remote_head_ref) {
             let target_name = head_ref.target().try_name().map(|n| n.as_bstr().to_string());
             if let Some(target) = target_name {
-                let prefix = format!("refs/remotes/{}/", remote_name);
+                let prefix = format!("refs/remotes/{}/", remote_name.as_str());
                 if let Some(stripped) = target.strip_prefix(&prefix) {
                     branches.push(stripped.to_string());
                 }
@@ -266,8 +321,7 @@ impl Repo {
 
         // Check git config
         //
-        // Note that we swallow errors (e.g. invalid UTF-8) here.
-        if let Some(default_branch) = self.config_string("init.defaultBranch").ok().flatten() {
+        if let Some(default_branch) = self.config_string("init.defaultBranch")? {
             branches.push(default_branch);
         }
 
@@ -281,17 +335,13 @@ impl Repo {
         // Default fallback
         branches.push("main".to_string());
 
-        branches
+        Ok(branches)
     }
 
-    pub fn find_default_branch_on_default_remote(&self) -> String {
-        let branches = self.find_default_branches(&self.default_remote_name());
-        branches.first().cloned().unwrap_or_else(|| "main".to_string())
-    }
-
-    pub fn is_a_default_branch_on_default_remote(&self, branch_name: &str) -> bool {
-        let branches = self.find_default_branches(&self.default_remote_name());
-        branches.iter().any(|b| b == branch_name)
+    pub fn is_a_default_branch_on_default_remote(&self, branch_name: &str) -> Result<bool> {
+        let remote_name = self.default_remote_name()?;
+        let branches = self.find_default_branches(&remote_name)?;
+        Ok(branches.iter().any(|branch| branch == branch_name))
     }
 
     // Check whether the branch is managed by GHerrit.
@@ -417,6 +467,23 @@ pub(super) fn require_git_no_lazy_fetch(output: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn require_git_config_env() -> Result<()> {
+    let output = cmd("git", ["--version"])
+        .checked_output()
+        .wrap_err("Failed to determine the installed Git version")?;
+    require_git_config_env_output(&output.stdout)
+}
+
+pub(super) fn require_git_config_env_output(output: &[u8]) -> Result<()> {
+    let (major, minor) = parse_git_version(output)?;
+    if (major, minor) < (2, 31) {
+        bail!(
+            "GHerrit requires Git 2.31 or newer to bind the private publication destination without placing it in the top-level Git process arguments; found Git {major}.{minor}"
+        );
+    }
+    Ok(())
+}
+
 pub enum FirstParentCommitsBetweenError {
     NotOnFirstParentPath,
     Eyre(eyre::Error),
@@ -461,21 +528,6 @@ impl std::ops::Deref for Repo {
     }
 }
 
-pub struct Remote {
-    pub owner: String,
-    pub repo_name: String,
-}
-
-impl Remote {
-    pub fn pr_url(&self, pr_number: u64) -> String {
-        format!("https://github.com/{}/{}/pull/{}", self.owner, self.repo_name, pr_number)
-    }
-
-    pub fn repo_url_relative(&self) -> String {
-        format!("/{}/{}", self.owner, self.repo_name)
-    }
-}
-
 /// Determines the current HEAD state.
 pub(super) fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     if let Some(name) = repo.head()?.referent_name() {
@@ -506,23 +558,4 @@ pub(super) fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     }
 
     Ok(HeadState::Detached)
-}
-
-/// Parses the owner and repository name from a remote URL.
-///
-/// Supports the following formats:
-/// - https://github.com/owner/repo(.git)
-/// - git@github.com:owner/repo(.git)
-/// - http://localhost:port/owner/repo(.git)
-/// - /absolute/path/to/owner/repo(.git) (for tests)
-/// - owner/repo (for tests)
-pub(super) fn get_repo_owner_name(remote_url: &str) -> Result<(String, String)> {
-    let re = re!(r"^(?:.*[/:])?(?P<owner>[^/:]+)/(?P<repo>[^/]+?)(?:\.git)?$");
-
-    let caps = re
-        .captures(remote_url)
-        .ok_or_else(|| eyre!("Unsupported remote URL format: {remote_url}"))?;
-    let owner = caps.name("owner").unwrap().as_str().to_string();
-    let repo = caps.name("repo").unwrap().as_str().to_string();
-    Ok((owner, repo))
 }
