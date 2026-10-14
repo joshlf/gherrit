@@ -20,13 +20,14 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::{ObjectId, bstr::ByteSlice as _};
 
 use super::{INTERNAL_PRE_PUSH_GIT_DIR_ENV, INTERNAL_PRE_PUSH_REMOTE_ENV, subprocess};
-use crate::{util, util::CommandExt as _};
+use crate::{manage::PublicBranchName, util, util::CommandExt as _};
 
 const DESTINATION_ENV: &str = "GHERRIT_PRIVATE_PUSH_DESTINATION";
 const PROXY_ENV: &str = "GHERRIT_PRIVATE_REMOTE_PROXY";
 const PROXY_AUTH_METHOD_ENV: &str = "GHERRIT_PRIVATE_REMOTE_PROXY_AUTH_METHOD";
 const GIT_CONFIG_PARAMETERS_ENV: &str = "GIT_CONFIG_PARAMETERS";
 const DISABLE_HTTP_REDIRECTS: &str = "http.followRedirects=false";
+const DISABLE_BUNDLE_URI: &str = "fetch.bundleURI=";
 const DISABLE_FOLLOW_TAGS: &str = "push.followTags=false";
 const DISABLE_SUBMODULE_PUSHES: &str = "push.recurseSubmodules=no";
 const CLEAR_PUSH_OPTIONS: &str = "push.pushOption=";
@@ -45,7 +46,7 @@ struct ResolvedDestination {
     configured_remote: util::RemoteName,
     literal: String,
     coordinates: RepositoryCoordinates,
-    supports_production_github: bool,
+    production_github: bool,
     http_redirect_parameters: Option<OsString>,
 }
 
@@ -60,6 +61,75 @@ struct RemoteTransportSettings {
     proxy_auth_method: Option<String>,
 }
 
+/// The exact local repository context for every destination-bound Git child.
+///
+/// Git's repository-selection environment can override a command's current
+/// directory. Retaining the paths selected by `Repo::open` and applying them
+/// to every child prevents destination resolution, observation, acquisition,
+/// and publication from silently operating in another repository.
+///
+/// The canonical per-worktree Git directory defines repository identity. The
+/// remaining paths are spellings for Git child execution and do not affect
+/// equality.
+#[derive(Clone)]
+struct RepositoryBinding {
+    git_dir_identity: util::GitDirIdentity,
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    work_tree: Option<PathBuf>,
+    current_dir: PathBuf,
+}
+
+impl PartialEq for RepositoryBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.git_dir_identity == other.git_dir_identity
+    }
+}
+
+impl Eq for RepositoryBinding {}
+
+impl RepositoryBinding {
+    fn new(repository: &util::Repo) -> Result<Self> {
+        if repository.namespace().is_some() {
+            bail!("GHerrit does not support publishing from a namespaced Git repository");
+        }
+
+        let opened_from = std::path::absolute(repository.current_dir())
+            .wrap_err("Failed to make the Git repository's opening directory absolute")?;
+        let absolute = |path: &std::path::Path| {
+            Ok::<_, color_eyre::Report>(if path.is_absolute() {
+                path.to_owned()
+            } else {
+                opened_from.join(path)
+            })
+        };
+        // Rust's canonical Windows spelling can begin with `\\?\`, which Git
+        // for Windows does not accept as GIT_DIR. Keep gix's discovered path
+        // spelling for child execution and the canonical path only for stable
+        // repository identity and hook recursion suppression.
+        let git_dir_identity = repository.git_dir_identity().clone();
+        let git_dir = absolute(repository.path())?;
+        let common_dir = absolute(repository.common_dir())?;
+        let work_tree = repository.workdir().map(absolute).transpose()?;
+        let current_dir = work_tree.clone().unwrap_or_else(|| git_dir.clone());
+        Ok(Self { git_dir_identity, git_dir, common_dir, work_tree, current_dir })
+    }
+
+    fn bind(&self, command: &mut Command) {
+        // These values can select a different repository, worktree, common
+        // ref store, ref namespace, or local configuration even when
+        // `current_dir` is exact.
+        util::clear_git_repository_overrides(command);
+        command
+            .env("GIT_DIR", &self.git_dir)
+            .env("GIT_COMMON_DIR", &self.common_dir)
+            .current_dir(&self.current_dir);
+        if let Some(work_tree) = &self.work_tree {
+            command.env("GIT_WORK_TREE", work_tree);
+        }
+    }
+}
+
 /// A validated GitHub repository identity derived from the exact push
 /// destination.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,7 +138,38 @@ pub(super) struct RepositoryCoordinates {
     repository: String,
 }
 
+/// The exact local repository and remote Git destination represented by a
+/// publication client or executable action.
+///
+/// This value deliberately has no `Debug` implementation: its repository
+/// paths and destination literal may be private. Equality is used only to
+/// prevent evidence or effects prepared for one target from being relabelled
+/// as authority for another target with the same GitHub coordinates.
+#[derive(Clone, Eq, PartialEq)]
+pub(super) struct PublicationTarget {
+    repository: RepositoryBinding,
+    literal: String,
+    coordinates: RepositoryCoordinates,
+}
+
+impl PublicationTarget {
+    pub(super) fn coordinates(&self) -> &RepositoryCoordinates {
+        &self.coordinates
+    }
+}
+
 impl RepositoryCoordinates {
+    fn new(owner: String, repository: String) -> Option<Self> {
+        (valid_repository_component(&owner) && valid_repository_component(&repository))
+            .then_some(Self { owner, repository })
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(owner: &str, repository: &str) -> Self {
+        Self::new(owner.to_owned(), repository.to_owned())
+            .expect("test repository coordinates must be valid")
+    }
+
     pub(super) fn owner(&self) -> &str {
         &self.owner
     }
@@ -86,20 +187,123 @@ impl RepositoryCoordinates {
 /// destination to Git or use its derived repository identity, but must not log
 /// it.
 pub(super) struct PushDestination {
+    repository: RepositoryBinding,
     resolved: ResolvedDestination,
     internal_remote: String,
     transport: RemoteTransportSettings,
 }
 
+/// Exact state of the requested public branch projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RemoteBranchState {
+    Absent,
+    At(ObjectId),
+}
+
+/// The requested public branch and the exact state observed for that same
+/// branch.
+///
+/// Keeping the request identity with its evidence prevents a planner from
+/// accidentally pairing one branch name with another branch's remote state.
+#[derive(Debug)]
+pub(super) struct ObservedPublicBranch {
+    name: PublicBranchName,
+    state: RemoteBranchState,
+}
+
+impl ObservedPublicBranch {
+    pub(super) fn into_parts(self) -> (PublicBranchName, RemoteBranchState) {
+        (self.name, self.state)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(name: PublicBranchName, state: RemoteBranchState) -> Self {
+        Self { name, state }
+    }
+}
+
+/// The complete initial observation together with the exact destination
+/// capability which produced it.
+pub(super) struct InitialRemoteObservation {
+    destination: PushDestination,
+    refs: ParsedInitialRemoteObservation,
+}
+
+#[derive(Debug)]
+struct ParsedInitialRemoteObservation {
+    default_branch: DefaultBranch,
+    public_branch: Option<ObservedPublicBranch>,
+}
+
+impl InitialRemoteObservation {
+    pub(super) fn into_parts(
+        self,
+    ) -> (PushDestination, DefaultBranch, Option<ObservedPublicBranch>) {
+        let ParsedInitialRemoteObservation { default_branch, public_branch } = self.refs;
+        (self.destination, default_branch, public_branch)
+    }
+}
+
+impl ParsedInitialRemoteObservation {
+    #[cfg(test)]
+    fn into_parts(self) -> (DefaultBranch, Option<ObservedPublicBranch>) {
+        (self.default_branch, self.public_branch)
+    }
+}
+
+/// The one acquisition behavior selected from exact graph-load evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExactObjectFetchMode {
+    Negotiated,
+    Refetch,
+}
+
 impl PushDestination {
-    pub(super) async fn observe_refs_from(
+    pub(crate) fn materialize_version_object(
         &self,
-        repository: &util::Repo,
-        ref_patterns: impl IntoIterator<Item = String>,
-    ) -> std::result::Result<subprocess::CommandOutput, subprocess::CommandError> {
-        let mut command = self.ls_remote(Vec::<String>::new(), ref_patterns);
-        command.current_dir(repository.workdir().unwrap_or(repository.path()));
-        subprocess::output(command, subprocess::REMOTE_GIT_EXECUTION_TIMEOUT).await
+        expected: ObjectId,
+        bytes: &[u8],
+    ) -> Result<()> {
+        use gix::prelude::Write as _;
+        let repository =
+            gix::open_opts(&self.repository.git_dir, util::literal_graph_open_options().full)?;
+        let written = repository
+            .write_buf(gix::object::Kind::Tag, bytes)
+            .map_err(|e| eyre!("Failed to write publication annotation: {e}"))?;
+        if written != expected {
+            bail!("Publication object materialization disagrees with preflight");
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test() -> Self {
+        let repository = util::Repo::open(".").expect("tests run inside the GHerrit repository");
+        Self::for_test_in(&repository)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test_in(repository: &util::Repo) -> Self {
+        Self::for_test_url_in(repository, "https://github.com/owner/repo.git")
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test_url_in(repository: &util::Repo, url: &str) -> Self {
+        let configured_remote = util::RemoteName::from_config(b"origin").unwrap();
+        let repository = RepositoryBinding::new(repository)
+            .expect("test repositories use a supported repository context");
+        let resolved = ResolvedDestination::from_git_output(
+            configured_remote,
+            format!("{url}\n").as_bytes(),
+            &repository.current_dir,
+        )
+        .unwrap();
+        Self {
+            repository,
+            resolved,
+            internal_remote: INTERNAL_REMOTE_STEM.to_owned(),
+            transport: RemoteTransportSettings::default(),
+        }
     }
 
     /// Resolves the one exact destination Git would use for pushing.
@@ -108,18 +312,21 @@ impl PushDestination {
     /// decoded and validated exactly once per publication attempt. `--` is
     /// required because Git permits manually configured remote names beginning
     /// with a hyphen.
-    pub(super) fn resolve(configured_remote: util::RemoteName) -> Result<Self> {
+    pub(super) fn resolve(
+        repository: &util::Repo,
+        configured_remote: util::RemoteName,
+    ) -> Result<Self> {
         // The private adapter below depends on `--config-env`, introduced in
         // Git 2.31. Check explicitly instead of letting an older Git reject an
         // otherwise opaque internal command later in the attempt.
         util::require_git_config_env()?;
 
-        let current_dir = env::current_dir()
-            .wrap_err("Failed to resolve the Git repository's current directory")?;
+        let repository = RepositoryBinding::new(repository)?;
         let mut command = util::cmd(
             "git",
             ["remote", "get-url", "--push", "--all", "--", configured_remote.as_str()],
         );
+        repository.bind(&mut command);
         clear_git_transport_diagnostics(&mut command);
         let output = command.output().wrap_err_with(|| {
             format!(
@@ -135,8 +342,11 @@ impl PushDestination {
             );
         }
 
-        let resolved =
-            ResolvedDestination::from_git_output(configured_remote, &output.stdout, &current_dir)?;
+        let resolved = ResolvedDestination::from_git_output(
+            configured_remote,
+            &output.stdout,
+            &repository.current_dir,
+        )?;
 
         // First inspect the configuration which selected the configured
         // remote and its transport settings. Then add the private destination
@@ -147,19 +357,23 @@ impl PushDestination {
         // rejects remote URLs in files reached through that condition, so the
         // activated include set depends on the destination, not on which
         // absent probe name carries it.
-        let configuration = resolved.inspect_configuration()?;
+        let configuration = resolved.inspect_configuration(&repository)?;
         reject_unsupported_remote_transport_configuration(
             resolved.configured_remote.as_str(),
             &configuration,
         )?;
-        let transport = resolved.inspect_remote_transport_settings()?;
+        let transport = resolved.inspect_remote_transport_settings(&repository)?;
         let probe_remote = select_absent_remote(INTERNAL_REMOTE_PROBE_STEM, &configuration);
         let private_configuration =
-            resolved.inspect_private_configuration(&probe_remote, &transport)?;
-        resolved.ensure_private_configuration_preserves_context(&probe_remote, &transport)?;
+            resolved.inspect_private_configuration(&repository, &probe_remote, &transport)?;
+        resolved.ensure_private_configuration_preserves_context(
+            &repository,
+            &probe_remote,
+            &transport,
+        )?;
         let internal_remote = select_absent_remote(INTERNAL_REMOTE_STEM, &private_configuration);
 
-        let destination = Self { resolved, internal_remote, transport };
+        let destination = Self { repository, resolved, internal_remote, transport };
         destination.inspect_internal_remote_configuration()?;
         destination.ensure_rewrite_fixed_point()?;
         Ok(destination)
@@ -280,7 +494,12 @@ impl PushDestination {
     /// synthesized empty reset values or Git-version-dependent additive
     /// behavior participate.
     fn adapter_command(&self, arguments: impl IntoIterator<Item = String>) -> Command {
-        self.resolved.private_remote_command(&self.internal_remote, &self.transport, arguments)
+        self.resolved.private_remote_command(
+            &self.repository,
+            &self.internal_remote,
+            &self.transport,
+            arguments,
+        )
     }
 
     /// Constructs a destination-bearing Git command with redirects disabled.
@@ -310,11 +529,28 @@ impl PushDestination {
         self.remote_command("ls-remote", options, ref_patterns)
     }
 
+    /// Constructs the exact-local ref observation command.
+    ///
+    /// Git's positional patterns remain tail filters, so the decoder must
+    /// still accept only complete canonical names. The category options ask a
+    /// protocol-v2 server to advertise only branch and tag namespaces. They
+    /// are fixed here rather than supplied by the caller because all evidence
+    /// requested by the exact-local query plan is in one of those namespaces.
+    fn exact_ref_observation_command(
+        &self,
+        ref_patterns: impl IntoIterator<Item = String>,
+    ) -> Command {
+        self.ls_remote(
+            ["--quiet".to_owned(), "--heads".to_owned(), "--tags".to_owned()],
+            ref_patterns,
+        )
+    }
+
     /// Observes destination refs through the sole bounded execution path.
     ///
-    /// Keeping the raw `ls-remote` command private prevents an observation
-    /// caller from bypassing the execution deadline, output limit, descendant
-    /// cleanup, or asynchronous process supervision.
+    /// This compatibility entry point remains for the active legacy runtime.
+    /// The exact-local workflow uses [`Self::observe_refs_from`] so its
+    /// repository binding remains explicit while that workflow is dormant.
     pub(super) async fn observe_refs(
         &self,
         options: impl IntoIterator<Item = String>,
@@ -327,9 +563,63 @@ impl PushDestination {
         .await
     }
 
+    /// Observes refs from the exact repository bound to an acquisition plan.
+    ///
+    /// Keeping the raw `ls-remote` command private prevents callers from
+    /// bypassing the execution deadline, output limit, descendant cleanup, or
+    /// asynchronous process supervision. The repository supplies only the
+    /// command's working directory; the destination and every transport
+    /// setting still come from this validated value.
+    pub(super) async fn observe_refs_from(
+        &self,
+        repository: &util::Repo,
+        ref_patterns: impl IntoIterator<Item = String>,
+    ) -> std::result::Result<subprocess::CommandOutput, subprocess::CommandError> {
+        let mut command = self.exact_ref_observation_command(ref_patterns);
+        command.current_dir(repository.workdir().unwrap_or(repository.path()));
+        subprocess::output(command, subprocess::REMOTE_GIT_EXECUTION_TIMEOUT).await
+    }
+
+    /// Constructs the sole exact-object acquisition command.
+    ///
+    /// Source refs are accepted only through `fetch --stdin`, so no advertised
+    /// ref, object ID, or destination literal can enter the top-level Git
+    /// argument list. The empty refmap is load-bearing: without it, configured
+    /// fetch refspecs could update remote-tracking refs even for source-only
+    /// wants. An empty bundle URI prevents a configured secondary object
+    /// source and its creation-token state from participating in this one
+    /// fetch.
+    pub(super) fn exact_object_fetch(&self, mode: ExactObjectFetchMode) -> Command {
+        let fixed = [
+            "--quiet",
+            "--no-progress",
+            "--no-write-fetch-head",
+            "--no-tags",
+            "--no-prune",
+            "--no-prune-tags",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--no-write-commit-graph",
+            "--no-update-shallow",
+            "--no-filter",
+            "--refmap=",
+        ];
+        let mode = match mode {
+            ExactObjectFetchMode::Negotiated => None,
+            ExactObjectFetchMode::Refetch => Some("--refetch"),
+        };
+        let options = fixed.into_iter().chain(mode).chain(std::iter::once("--stdin"));
+        self.adapter_command(
+            ["-c", DISABLE_HTTP_REDIRECTS, "-c", DISABLE_BUNDLE_URI, "fetch"]
+                .into_iter()
+                .chain(options)
+                .chain(["--", self.internal_remote.as_str()])
+                .map(str::to_owned),
+        )
+    }
+
     pub(super) fn push(
         &self,
-        git_dir: &util::GitDirIdentity,
         options: impl IntoIterator<Item = String>,
         refspecs: impl IntoIterator<Item = String>,
     ) -> Command {
@@ -357,7 +647,7 @@ impl PushDestination {
         let mut command = self.adapter_command(arguments);
         command
             .env(INTERNAL_PRE_PUSH_REMOTE_ENV, &self.internal_remote)
-            .env(INTERNAL_PRE_PUSH_GIT_DIR_ENV, git_dir.as_os_str());
+            .env(INTERNAL_PRE_PUSH_GIT_DIR_ENV, self.repository.git_dir_identity.as_os_str());
         command
     }
 
@@ -365,12 +655,31 @@ impl PushDestination {
         self.resolved.configured_remote.as_str()
     }
 
-    pub(super) fn supports_production_github(&self) -> bool {
-        self.resolved.supports_production_github
-    }
-
     pub(super) fn coordinates(&self) -> &RepositoryCoordinates {
         &self.resolved.coordinates
+    }
+
+    pub(super) fn publication_target(&self) -> PublicationTarget {
+        PublicationTarget {
+            repository: self.repository.clone(),
+            literal: self.resolved.literal.clone(),
+            coordinates: self.resolved.coordinates.clone(),
+        }
+    }
+
+    /// Whether the Git destination belongs to the public GitHub forge used by
+    /// the production API endpoint.
+    ///
+    /// The publication entrypoint checks this before initial remote
+    /// observation. GitHub client construction repeats the check as defense in
+    /// depth. Test-driver runtimes may instead pair a fake or disabled endpoint
+    /// with a local Git remote.
+    pub(super) fn supports_production_github(&self) -> bool {
+        self.resolved.production_github
+    }
+
+    pub(super) fn belongs_to(&self, repository: &util::Repo) -> Result<bool> {
+        Ok(self.repository == RepositoryBinding::new(repository)?)
     }
 
     pub(super) fn pr_url(&self, pr_number: u64) -> String {
@@ -397,8 +706,30 @@ impl PushDestination {
         )
     }
 
-    /// Observes the symbolic default branch and its exact tip from this
-    /// destination. No local remote-tracking ref participates in the result.
+    /// Observes the symbolic default branch and optional exact public branch
+    /// through the shared bounded subprocess adapter. Public mode adds one ref
+    /// pattern without another network request. No local remote-tracking ref
+    /// participates in the result.
+    pub(super) async fn observe_initial(
+        self,
+        public_branch: Option<PublicBranchName>,
+    ) -> Result<InitialRemoteObservation> {
+        let command = self.initial_observation_command(public_branch.as_ref());
+        let refs = observe_initial_command(
+            command,
+            self.configured_remote(),
+            public_branch,
+            subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
+            subprocess::REMOTE_GIT_STDOUT_LIMIT,
+        )
+        .await?;
+        Ok(InitialRemoteObservation { destination: self, refs })
+    }
+
+    /// Observes only the symbolic default for the active legacy runtime.
+    ///
+    /// Keep this path independent from the dormant exact-local observation so
+    /// the preparatory public-branch model does not change active behavior.
     pub(super) async fn observe_default_branch(&self) -> Result<DefaultBranch> {
         observe_default_branch_command(
             self.ls_remote(["--symref".to_string()], ["HEAD".to_string()]),
@@ -407,6 +738,14 @@ impl PushDestination {
             subprocess::REMOTE_GIT_STDOUT_LIMIT,
         )
         .await
+    }
+
+    fn initial_observation_command(&self, public_branch: Option<&PublicBranchName>) -> Command {
+        self.ls_remote(
+            ["--symref".to_string()],
+            std::iter::once("HEAD".to_string())
+                .chain(public_branch.map(|branch| format!("refs/heads/{}", branch.as_str()))),
+        )
     }
 
     /// Returns bounded, redacted, terminal-safe context from a normally
@@ -548,17 +887,42 @@ async fn observe_default_branch_command(
     timeout: Duration,
     stdout_limit: usize,
 ) -> Result<DefaultBranch> {
+    let output = run_initial_observation(command, configured_remote, timeout, stdout_limit).await?;
+    parse_default_branch(output.stdout()).wrap_err_with(|| {
+        format!(
+            "GHerrit remote '{configured_remote}' did not report one valid symbolic default branch"
+        )
+    })
+}
+
+async fn observe_initial_command(
+    command: Command,
+    configured_remote: &str,
+    public_branch: Option<PublicBranchName>,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<ParsedInitialRemoteObservation> {
+    let output = run_initial_observation(command, configured_remote, timeout, stdout_limit).await?;
+    parse_initial_remote_observation(output.stdout(), public_branch).wrap_err_with(|| {
+        format!(
+            "GHerrit remote '{configured_remote}' did not report one valid initial ref observation"
+        )
+    })
+}
+
+async fn run_initial_observation(
+    command: Command,
+    configured_remote: &str,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<subprocess::CommandOutput> {
     let output = subprocess::output_with_stdout_limit(command, timeout, stdout_limit)
         .await
         .wrap_err_with(|| format!("Failed to observe GHerrit remote '{configured_remote}'"))?;
     if !output.status().success() {
         bail!("`git ls-remote --symref` failed for GHerrit remote '{configured_remote}'");
     }
-    parse_default_branch(output.stdout()).wrap_err_with(|| {
-        format!(
-            "GHerrit remote '{configured_remote}' did not report one valid symbolic default branch"
-        )
-    })
+    Ok(output)
 }
 
 fn local_destination_path(destination: &str) -> Option<PathBuf> {
@@ -629,8 +993,8 @@ impl ResolvedDestination {
             )
         })?;
         let parsed = parse_destination(&literal);
-        let supports_production_github = parsed.as_ref().is_some_and(targets_production_github);
-        let (owner, repository) = match parsed {
+        let production_github = parsed.as_ref().is_some_and(targets_production_github);
+        let coordinates = match parsed {
             Some(ParsedDestination::Local { path }) => {
                 let path = if path.is_absolute() { path } else { current_dir.join(path) };
                 let canonical = dunce::canonicalize(path).map_err(|_| {
@@ -688,7 +1052,6 @@ impl ResolvedDestination {
             )
         })?;
 
-        let coordinates = RepositoryCoordinates { owner, repository };
         let http_redirect_parameters = command_scope_http_redirect_parameters(
             &literal,
             env::var_os(GIT_CONFIG_PARAMETERS_ENV).as_deref(),
@@ -698,14 +1061,15 @@ impl ResolvedDestination {
             configured_remote,
             literal,
             coordinates,
-            supports_production_github,
+            production_github,
             http_redirect_parameters,
         })
     }
 
     /// Reads configuration which is active before GHerrit adds any remote.
-    fn inspect_configuration(&self) -> Result<Vec<Vec<u8>>> {
+    fn inspect_configuration(&self, repository: &RepositoryBinding) -> Result<Vec<Vec<u8>>> {
         let mut command = util::cmd("git", ["config", "--null", "--name-only", "--list"]);
+        repository.bind(&mut command);
         clear_git_transport_diagnostics(&mut command);
         let output = command.output().wrap_err_with(|| {
             format!(
@@ -723,11 +1087,13 @@ impl ResolvedDestination {
     /// argument list, exactly as it does for the final network commands.
     fn inspect_private_configuration(
         &self,
+        repository: &RepositoryBinding,
         probe_remote: &str,
         transport: &RemoteTransportSettings,
     ) -> Result<Vec<Vec<u8>>> {
         let output = self
             .private_remote_command(
+                repository,
                 probe_remote,
                 transport,
                 [
@@ -749,10 +1115,12 @@ impl ResolvedDestination {
 
     fn ensure_private_configuration_preserves_context(
         &self,
+        repository: &RepositoryBinding,
         probe: &str,
         transport: &RemoteTransportSettings,
     ) -> Result<()> {
         let mut baseline = util::cmd("git", ["config", "--null", "--list"]);
+        repository.bind(&mut baseline);
         clear_git_transport_diagnostics(&mut baseline);
         if let Some(parameters) = &self.http_redirect_parameters {
             baseline.env(GIT_CONFIG_PARAMETERS_ENV, parameters);
@@ -765,6 +1133,7 @@ impl ResolvedDestination {
         )?;
         let private = self
             .private_remote_command(
+                repository,
                 probe,
                 transport,
                 ["config".to_owned(), "--null".to_owned(), "--list".to_owned()],
@@ -805,17 +1174,26 @@ impl ResolvedDestination {
     /// configuration that can affect publication. `git config --get`
     /// deliberately selects Git's effective last value when a key occurs more
     /// than once.
-    fn inspect_remote_transport_settings(&self) -> Result<RemoteTransportSettings> {
+    fn inspect_remote_transport_settings(
+        &self,
+        repository: &RepositoryBinding,
+    ) -> Result<RemoteTransportSettings> {
         Ok(RemoteTransportSettings {
-            proxy: self.inspect_remote_transport_setting("proxy")?,
-            proxy_auth_method: self.inspect_remote_transport_setting("proxyAuthMethod")?,
+            proxy: self.inspect_remote_transport_setting(repository, "proxy")?,
+            proxy_auth_method: self
+                .inspect_remote_transport_setting(repository, "proxyAuthMethod")?,
         })
     }
 
-    fn inspect_remote_transport_setting(&self, key: &str) -> Result<Option<String>> {
+    fn inspect_remote_transport_setting(
+        &self,
+        repository: &RepositoryBinding,
+        key: &str,
+    ) -> Result<Option<String>> {
         let key = format!("remote.{}.{key}", self.configured_remote.as_str());
         let mut command =
             util::cmd("git", ["config".to_owned(), "--null".to_owned(), "--get".to_owned(), key]);
+        repository.bind(&mut command);
         clear_git_transport_diagnostics(&mut command);
         let output = command.output().wrap_err_with(|| {
             format!(
@@ -858,6 +1236,7 @@ impl ResolvedDestination {
     /// Adds the private URL and explicit transport inputs for an absent name.
     fn private_remote_command(
         &self,
+        repository: &RepositoryBinding,
         remote: &str,
         transport: &RemoteTransportSettings,
         arguments: impl IntoIterator<Item = String>,
@@ -881,6 +1260,7 @@ impl ResolvedDestination {
         .chain(transport_arguments.into_iter().flatten())
         .chain(arguments);
         let mut command = util::cmd("git", arguments);
+        repository.bind(&mut command);
         command.env(DESTINATION_ENV, &self.literal);
         match &transport.proxy {
             Some(proxy) => command.env(PROXY_ENV, proxy),
@@ -1144,7 +1524,7 @@ fn is_git_transport_diagnostic(name: &[u8]) -> bool {
 }
 
 /// One repository default branch, including the exact commit it names.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DefaultBranch {
     name: String,
     tip: ObjectId,
@@ -1294,7 +1674,7 @@ fn split_scp_destination(destination: &str) -> ScpDestination<'_> {
     }
 }
 
-fn slash_repository_identity(path: &str) -> Option<(String, String)> {
+fn slash_repository_identity(path: &str) -> Option<RepositoryCoordinates> {
     if path.ends_with('/') || path.contains('\\') {
         return None;
     }
@@ -1305,18 +1685,15 @@ fn slash_repository_identity(path: &str) -> Option<(String, String)> {
     repository_components(owner, repository)
 }
 
-fn local_repository_identity(path: &Path) -> Option<(String, String)> {
+fn local_repository_identity(path: &Path) -> Option<RepositoryCoordinates> {
     let repository = path.file_name()?.to_str()?;
     let owner = path.parent()?.file_name()?.to_str()?;
     repository_components(owner, repository)
 }
 
-fn repository_components(owner: &str, repository: &str) -> Option<(String, String)> {
+fn repository_components(owner: &str, repository: &str) -> Option<RepositoryCoordinates> {
     let repository = repository.strip_suffix(".git").unwrap_or(repository);
-    if !valid_repository_component(owner) || !valid_repository_component(repository) {
-        return None;
-    }
-    Some((owner.to_owned(), repository.to_owned()))
+    RepositoryCoordinates::new(owner.to_owned(), repository.to_owned())
 }
 
 // SSH preserves username case; DNS hostname matching does not.
@@ -1362,8 +1739,21 @@ fn valid_repository_component(component: &str) -> bool {
 }
 
 fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
+    let ParsedInitialRemoteObservation { default_branch, public_branch } =
+        parse_initial_remote_observation(output, None)?;
+    debug_assert!(public_branch.is_none());
+    Ok(default_branch)
+}
+
+fn parse_initial_remote_observation(
+    output: &[u8],
+    requested_public_branch: Option<PublicBranchName>,
+) -> Result<ParsedInitialRemoteObservation> {
     let mut symbolic_head = None;
     let mut direct_head = None;
+    let requested_public_ref =
+        requested_public_branch.as_ref().map(|branch| format!("refs/heads/{}", branch.as_str()));
+    let mut direct_public_branch = None;
 
     for record in git_output_records(output) {
         let mut fields = record.split(|byte| *byte == b'\t');
@@ -1377,6 +1767,9 @@ fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
             if name == b"HEAD" && symbolic_head.replace(target).is_some() {
                 bail!("duplicate symbolic HEAD");
             }
+            if requested_public_ref.as_deref().is_some_and(|expected| name == expected.as_bytes()) {
+                bail!("requested public branch is symbolic");
+            }
         } else {
             validate_direct_advertised_ref_name(name)?;
             let object_id =
@@ -1386,6 +1779,11 @@ fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
             }
             if name == b"HEAD" && direct_head.replace(object_id).is_some() {
                 bail!("duplicate direct HEAD");
+            }
+            if requested_public_ref.as_deref().is_some_and(|expected| name == expected.as_bytes())
+                && direct_public_branch.replace(object_id).is_some()
+            {
+                bail!("duplicate requested public branch");
             }
         }
     }
@@ -1400,7 +1798,18 @@ fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
         .strip_prefix(b"refs/heads/")
         .ok_or_else(|| eyre!("symbolic HEAD does not target a local branch"))?;
     let branch = str::from_utf8(branch).wrap_err("default branch name is not UTF-8")?.to_owned();
-    DefaultBranch::new(branch, direct_head)
+    let default_branch = DefaultBranch::new(branch, direct_head)?;
+    // Git output alone cannot distinguish these two states from a hidden or
+    // dangling symbolic ref on an arbitrary server. Production reaches this
+    // decoder only after selecting GitHub.com, whose ref contract makes
+    // absent-or-direct exhaustive. Custom test destinations promise the same
+    // fixture property. An explicitly advertised symbolic ref was rejected
+    // above as a defensive check.
+    let public_branch = requested_public_branch.map(|name| ObservedPublicBranch {
+        name,
+        state: direct_public_branch.map_or(RemoteBranchState::Absent, RemoteBranchState::At),
+    });
+    Ok(ParsedInitialRemoteObservation { default_branch, public_branch })
 }
 
 fn validate_advertised_ref_name(name: &[u8]) -> Result<()> {
