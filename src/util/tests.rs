@@ -1,4 +1,4 @@
-use std::{ffi::OsStr,process::Command};
+use std::{ffi::OsStr, process::Command};
 
 use super::{command::command_invocation, repository::*};
 use crate::cmd;
