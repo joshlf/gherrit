@@ -64,3 +64,7 @@ that your change is valid and follows the style guidelines.
   changes
 - [agent_docs/style.md](./agent_docs/style.md) for style and formatting
   guidelines for files and commit messages
+
+Before changing the new owned-base publication implementation, read [its
+contract](design/pre-push.md). The legacy runtime remains selected until its
+explicit activation review.
