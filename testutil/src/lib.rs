@@ -1,19 +1,22 @@
 pub mod git_model;
 use std::{
     any::Any,
+    cell::Cell,
     collections::HashMap,
     env,
     ffi::OsString,
-    fmt, fs, panic,
+    fmt, fs,
+    num::NonZeroU32,
+    panic,
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError},
-        Arc, LazyLock, RwLock,
+        Arc, LazyLock, OnceLock, RwLock,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use regex::Regex;
@@ -33,6 +36,8 @@ pub const MANAGED_PUBLIC: &str = "managedPublic";
 const FIRST_GIT_TIMESTAMP: u64 = 946_684_800;
 const MOCK_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MOCK_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const OBSERVATION_OVERLAP_TIMEOUT: Duration = Duration::from_secs(10);
+const PUBLICATION_OVERLAP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[macro_export]
 macro_rules! test_context {
@@ -49,6 +54,8 @@ pub struct TestContextBuilder {
     initial_commit: bool,
     mock_github: bool,
     git_interceptor: bool,
+    observation_overlap: Option<(String, String)>,
+    publication_overlap: bool,
     gherrit_bin: PathBuf,
 }
 
@@ -62,6 +69,8 @@ impl TestContextBuilder {
             initial_commit: false,
             mock_github: false,
             git_interceptor: false,
+            observation_overlap: None,
+            publication_overlap: false,
             gherrit_bin: gherrit_bin.into(),
         }
     }
@@ -103,6 +112,28 @@ impl TestContextBuilder {
         self
     }
 
+    /// Gates the expected ID's exact Git and local-ID GitHub observations.
+    ///
+    /// A test can require both requests to arrive before either is released,
+    /// proving that one publication attempt starts the requests concurrently.
+    #[must_use]
+    pub fn with_observation_overlap(mut self, id: &str, default_branch: &str) -> Self {
+        self.observation_overlap = Some((id.to_owned(), default_branch.to_owned()));
+        self.mock_github = true;
+        self.git_interceptor = true;
+        self
+    }
+
+    /// Installs deterministic gates around concurrent create and marker
+    /// boundaries. The controller remains outside mock state and its locks.
+    #[must_use]
+    pub fn with_publication_overlap(mut self) -> Self {
+        self.publication_overlap = true;
+        self.mock_github = true;
+        self.git_interceptor = true;
+        self
+    }
+
     pub fn build(self) -> TestContext {
         let dir = Arc::new(TempDir::new().unwrap());
         let system_git = SYSTEM_GIT.clone();
@@ -132,6 +163,20 @@ impl TestContextBuilder {
         }
 
         let mut mock_server_state = None;
+        let observation_overlap = self
+            .observation_overlap
+            .as_ref()
+            .map(|(id, default_branch)| ObservationOverlapSchedule::new(id, default_branch));
+        let (overlap_schedule, publication_overlap) = if self.publication_overlap {
+            let (schedule, controller) = PublicationOverlapSchedule::new();
+            (Some(schedule), Some(controller))
+        } else {
+            (None, None)
+        };
+        let schedules = MockSchedules {
+            observation_overlap: observation_overlap.clone(),
+            publication_overlap: overlap_schedule,
+        };
 
         let mock_server = (self.mock_github || self.git_interceptor).then(|| {
             let state = mock_server::MockState::new(self.owner.clone(), self.name.clone());
@@ -144,6 +189,7 @@ impl TestContextBuilder {
                 system_git.clone(),
                 test_environment.clone(),
                 dir.clone(),
+                schedules,
             )
         });
 
@@ -161,6 +207,8 @@ impl TestContextBuilder {
             next_gherrit_id: AtomicU64::new(1),
             mock_server,
             mock_server_state,
+            observation_overlap,
+            publication_overlap,
         };
 
         if self.installed_hooks {
@@ -192,6 +240,8 @@ pub struct TestContext {
     next_gherrit_id: AtomicU64,
     mock_server: Option<MockServerInfo>,
     mock_server_state: Option<Arc<RwLock<mock_server::MockState>>>,
+    observation_overlap: Option<Arc<ObservationOverlapSchedule>>,
+    publication_overlap: Option<PublicationOverlapController>,
 }
 
 #[derive(Clone)]
@@ -319,6 +369,13 @@ impl TestEnvironment {
         cmd.envs(self.variables.iter().cloned());
     }
 
+    fn variable(&self, name: &str) -> &OsString {
+        self.variables
+            .iter()
+            .find_map(|(key, value)| (key == name).then_some(value))
+            .unwrap_or_else(|| panic!("test environment does not define {name}"))
+    }
+
     fn command(&self, program: &Path) -> TestCommand {
         let mut cmd = TestCommand::new(program);
         self.apply_to_command(&mut cmd);
@@ -330,6 +387,12 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: &Path) {
     if !paths.iter().any(|existing| existing == path) {
         paths.push(path.to_path_buf());
     }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct MockSchedules {
+    pub observation_overlap: Option<Arc<ObservationOverlapSchedule>>,
+    pub publication_overlap: Option<Arc<PublicationOverlapSchedule>>,
 }
 
 pub struct MockServerInfo {
@@ -365,6 +428,7 @@ impl MockServerInfo {
         system_git: PathBuf,
         test_environment: TestEnvironment,
         fixture_dir: Arc<TempDir>,
+        schedules: MockSchedules,
     ) -> Self {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -386,6 +450,7 @@ impl MockServerInfo {
                         remote_path,
                         system_git,
                         test_environment,
+                        schedules,
                         ready_tx,
                         shutdown_rx,
                     ));
@@ -479,19 +544,290 @@ pub enum MalformedJson {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationPushStage {
+    Initial,
+    Marker,
+}
+
+struct ObservationArrival {
+    matches: AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+impl ObservationArrival {
+    fn new() -> Self {
+        Self { matches: AtomicUsize::new(0), notify: tokio::sync::Notify::new() }
+    }
+}
+
+/// A bounded rendezvous for the two observations in one publication attempt.
+///
+/// The first exact Git request and first local-ID GitHub request wait here
+/// before entering mutable fake state. A concurrent implementation releases
+/// both immediately. Sequential awaiting fails within a fixed deadline, and
+/// server shutdown can cancel either handler without a controller thread.
+pub struct ObservationOverlapSchedule {
+    exact_git: ObservationArrival,
+    local_github: ObservationArrival,
+    cancelled: AtomicBool,
+    deadline: OnceLock<tokio::time::Instant>,
+    expected_id: Box<str>,
+    expected_git_patterns: Box<[String]>,
+}
+
+impl ObservationOverlapSchedule {
+    fn new(id: &str, default_branch: &str) -> Arc<Self> {
+        let tag_root = format!("refs/tags/gherrit/{id}");
+        Arc::new(Self {
+            exact_git: ObservationArrival::new(),
+            local_github: ObservationArrival::new(),
+            cancelled: AtomicBool::new(false),
+            deadline: OnceLock::new(),
+            expected_id: id.into(),
+            expected_git_patterns: [
+                format!("refs/heads/{default_branch}"),
+                format!("refs/heads/{id}"),
+                format!("refs/heads/gherrit-bases/{id}"),
+                tag_root.clone(),
+                format!("{tag_root}/*"),
+            ]
+            .into(),
+        })
+    }
+
+    async fn arrive(&self, own: &ObservationArrival, peer: &ObservationArrival) -> bool {
+        if own.matches.fetch_add(1, Ordering::AcqRel) != 0 {
+            self.cancel();
+            return false;
+        }
+        own.notify.notify_one();
+        let deadline = *self
+            .deadline
+            .get_or_init(|| tokio::time::Instant::now() + OBSERVATION_OVERLAP_TIMEOUT);
+        loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return false;
+            }
+            if peer.matches.load(Ordering::Acquire) != 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, peer.notify.notified()).await.is_err() {
+                self.cancel();
+                return false;
+            }
+        }
+    }
+
+    pub(crate) async fn exact_git_arrived(&self) -> bool {
+        self.arrive(&self.exact_git, &self.local_github).await
+    }
+
+    pub(crate) async fn local_github_arrived(&self) -> bool {
+        self.arrive(&self.local_github, &self.exact_git).await
+    }
+
+    pub(crate) fn expected_id(&self) -> &str {
+        &self.expected_id
+    }
+
+    pub(crate) fn expected_git_patterns(&self) -> &[String] {
+        &self.expected_git_patterns
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.exact_git.notify.notify_one();
+        self.local_github.notify.notify_one();
+    }
+
+    pub fn assert_consumed(&self) {
+        assert!(!self.cancelled.load(Ordering::Acquire), "observation schedule was cancelled");
+        assert_eq!(self.exact_git.matches.load(Ordering::Acquire), 1, "exact Git request count");
+        assert_eq!(
+            self.local_github.matches.load(Ordering::Acquire),
+            1,
+            "local GitHub request count"
+        );
+    }
+}
+
+/// Server-side gates for one deliberately scheduled two-publisher overlap.
+///
+/// Semaphores retain releases even if teardown wins a race with a handler.
+/// Arrival channels let the synchronous test controller inspect durable state
+/// without sleeping or entering the server's state lock.
+pub(crate) struct PublicationOverlapSchedule {
+    cancelled: AtomicBool,
+    create_slots: AtomicUsize,
+    create_arrived: mpsc::Sender<()>,
+    create_application_release: Arc<tokio::sync::Semaphore>,
+    create_applied: mpsc::Sender<()>,
+    create_response_release: Arc<tokio::sync::Semaphore>,
+    marker_arrived: mpsc::Sender<()>,
+    marker_release: Arc<tokio::sync::Semaphore>,
+    marker_slots: AtomicUsize,
+}
+
+impl PublicationOverlapSchedule {
+    fn new() -> (Arc<Self>, PublicationOverlapController) {
+        let (create_arrived, create_arrivals) = mpsc::channel();
+        let (create_applied, create_applications) = mpsc::channel();
+        let (marker_arrived, marker_arrivals) = mpsc::channel();
+        let schedule = Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+            create_slots: AtomicUsize::new(2),
+            create_arrived,
+            create_application_release: Arc::new(tokio::sync::Semaphore::new(0)),
+            create_applied,
+            create_response_release: Arc::new(tokio::sync::Semaphore::new(0)),
+            marker_arrived,
+            marker_release: Arc::new(tokio::sync::Semaphore::new(0)),
+            marker_slots: AtomicUsize::new(2),
+        });
+        let controller = PublicationOverlapController {
+            schedule: schedule.clone(),
+            create_arrivals,
+            create_applications,
+            marker_arrivals,
+            deadline: Cell::new(None),
+        };
+        (schedule, controller)
+    }
+
+    fn claim(slot_count: &AtomicUsize) -> bool {
+        slot_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| remaining.checked_sub(1))
+            .is_ok()
+    }
+
+    pub(crate) fn claim_create(&self) -> bool {
+        Self::claim(&self.create_slots)
+    }
+
+    pub(crate) fn claim_marker(&self) -> bool {
+        Self::claim(&self.marker_slots)
+    }
+
+    async fn wait_for_release(&self, release: &tokio::sync::Semaphore) -> bool {
+        release.acquire().await.expect("overlap release semaphore remains open").forget();
+        !self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn before_create_application(&self) -> bool {
+        self.create_arrived.send(()).expect("overlap controller must receive create arrival");
+        self.wait_for_release(&self.create_application_release).await
+    }
+
+    pub(crate) async fn after_create_application(&self) -> bool {
+        self.create_applied.send(()).expect("overlap controller must receive applied create");
+        self.wait_for_release(&self.create_response_release).await
+    }
+
+    pub(crate) async fn before_marker_push(&self) -> bool {
+        self.marker_arrived.send(()).expect("overlap controller must receive marker arrival");
+        self.wait_for_release(&self.marker_release).await
+    }
+
+    fn release_all(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.create_application_release.add_permits(2);
+        self.create_response_release.add_permits(2);
+        self.marker_release.add_permits(2);
+    }
+}
+
+/// Synchronous control surface for the deterministic overlap schedule.
+pub struct PublicationOverlapController {
+    schedule: Arc<PublicationOverlapSchedule>,
+    create_arrivals: Receiver<()>,
+    create_applications: Receiver<()>,
+    marker_arrivals: Receiver<()>,
+    deadline: Cell<Option<Instant>>,
+}
+
+impl PublicationOverlapController {
+    fn deadline(&self) -> Instant {
+        self.deadline.get().expect("an overlap cancellation guard must be active")
+    }
+
+    fn wait_twice(&self, receiver: &Receiver<()>, boundary: &str) {
+        for publisher in 1..=2 {
+            let remaining = self.deadline().saturating_duration_since(Instant::now());
+            receiver.recv_timeout(remaining).unwrap_or_else(|error| {
+                panic!("publisher {publisher} did not reach {boundary}: {error}")
+            });
+        }
+    }
+
+    pub fn wait_for_create_arrivals(&self) {
+        self.wait_twice(&self.create_arrivals, "the create pre-application gate");
+    }
+
+    pub fn release_create_applications(&self) {
+        self.schedule.create_application_release.add_permits(2);
+    }
+
+    pub fn wait_for_create_applications(&self) {
+        self.wait_twice(&self.create_applications, "the create post-application gate");
+    }
+
+    pub fn release_create_responses(&self) {
+        self.schedule.create_response_release.add_permits(2);
+    }
+
+    pub fn wait_for_marker_arrivals(&self) {
+        self.wait_twice(&self.marker_arrivals, "the marker pre-push gate");
+    }
+
+    pub fn release_marker_pushes(&self) {
+        self.schedule.marker_release.add_permits(2);
+    }
+
+    /// Starts one bounded schedule and returns its unwind cancellation guard.
+    pub fn cancellation_guard(&self) -> PublicationOverlapCancellation<'_> {
+        assert!(self.deadline.get().is_none(), "overlap schedule starts exactly once");
+        self.deadline.set(Some(Instant::now() + PUBLICATION_OVERLAP_TIMEOUT));
+        PublicationOverlapCancellation { schedule: &self.schedule, armed: true }
+    }
+}
+
+/// Cancels blocked server handlers before scoped publisher threads are joined.
+pub struct PublicationOverlapCancellation<'schedule> {
+    schedule: &'schedule PublicationOverlapSchedule,
+    armed: bool,
+}
+
+impl PublicationOverlapCancellation<'_> {
+    pub fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PublicationOverlapCancellation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.schedule.release_all();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     GraphQl,
     QueryTransport,
     QueryHttp(RetryableHttpStatus),
-    RepositoryFactsHttp(RetryableHttpStatus),
     CreatePr,
+    CreatePrApplyThenDisconnect,
     CreatePrMalformedJson(MalformedJson),
     CreatePrHttp(RetryableHttpStatus),
-    SecondCreatePrHttp(RetryableHttpStatus),
     CreatePrRedirect(RedirectStatus),
+    ClosePr,
+    ClosePrApplyThenDisconnect,
     UpdatePr,
+    UpdatePrApplyThenDisconnect,
     UpdatePrMalformedJson(MalformedJson),
     UpdatePrConcurrentClose,
+    LosePublicationPushReceipt(PublicationPushStage),
     Git(GitOperation),
 }
 
@@ -499,6 +835,8 @@ pub enum FailureKind {
 pub enum GraphQlOperation {
     Query,
     CreatePr,
+    DraftPr,
+    ClosePr,
     UpdatePr,
 }
 
@@ -510,32 +848,45 @@ pub enum PullRequestState {
     Merged,
 }
 
-impl PullRequestState {
-    fn as_str(self) -> &'static str {
-        match self {
-            PullRequestState::Open => "OPEN",
-            PullRequestState::Closed => "CLOSED",
-            PullRequestState::Merged => "MERGED",
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestSeed {
+    number: NonZeroU32,
+    title: String,
+    body: String,
+    head: String,
+    base: String,
+    is_draft: bool,
+}
+
+impl PullRequestSeed {
+    pub fn new(
+        number: usize,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        head: impl Into<String>,
+        base: impl Into<String>,
+    ) -> Self {
+        let number = valid_pull_request_number(number)
+            .expect("a seeded pull request number must be in 1..=GraphQL Int::MAX");
+        Self {
+            number,
+            title: title.into(),
+            body: body.into(),
+            head: head.into(),
+            base: base.into(),
+            is_draft: false,
         }
     }
 
-    fn from_str(state: &str) -> Self {
-        match state {
-            "OPEN" => PullRequestState::Open,
-            "CLOSED" => PullRequestState::Closed,
-            "MERGED" => PullRequestState::Merged,
-            state => panic!("mock pull request has invalid state {state:?}"),
-        }
+    pub fn draft(mut self) -> Self {
+        self.is_draft = true;
+        self
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PullRequestSeed {
-    pub number: usize,
-    pub title: String,
-    pub body: String,
-    pub head: String,
-    pub base: String,
+fn valid_pull_request_number(number: usize) -> Option<NonZeroU32> {
+    let number = u32::try_from(number).ok().and_then(NonZeroU32::new)?;
+    (number.get() <= i32::MAX as u32).then_some(number)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -543,8 +894,9 @@ pub struct PullRequestSnapshot {
     pub number: usize,
     pub node_id: String,
     pub state: PullRequestState,
-    pub title: Option<String>,
-    pub body: Option<String>,
+    pub is_draft: bool,
+    pub title: String,
+    pub body: String,
     pub head: String,
     pub base: String,
 }
@@ -570,11 +922,12 @@ impl From<&mock_server::PrEntry> for PullRequestSnapshot {
         Self {
             number: pr.number,
             node_id: pr.node_id.clone(),
-            state: PullRequestState::from_str(&pr.state),
+            state: pr.state,
+            is_draft: pr.is_draft,
             title: pr.title.clone(),
             body: pr.body.clone(),
-            head: pr.head.ref_field.clone(),
-            base: pr.base.ref_field.clone(),
+            head: pr.head.name.clone(),
+            base: pr.base.name.clone(),
         }
     }
 }
@@ -594,7 +947,16 @@ impl MockGithub<'_> {
     }
 
     pub fn requests(&self) -> Vec<Vec<GraphQlOperation>> {
-        self.context.inspect_mock_state(|state| state.graphql_requests.clone())
+        self.context.inspect_mock_state(|state| {
+            state.graphql_requests.iter().map(|request| request.operations.clone()).collect()
+        })
+    }
+
+    /// Returns each validated physical GraphQL document in arrival order.
+    pub fn request_documents(&self) -> Vec<String> {
+        self.context.inspect_mock_state(|state| {
+            state.graphql_requests.iter().map(|request| request.document.clone()).collect()
+        })
     }
 
     pub fn redirect_trap_requests(&self) -> usize {
@@ -609,17 +971,107 @@ impl MockGithub<'_> {
     }
 
     pub fn seed_pull_request(&self, seed: PullRequestSeed) {
+        let PullRequestSeed { number, title, body, head, base, is_draft } = seed;
         self.context.mutate_mock_state(|state| {
-            let pr = mock_server::PrEntry::mock(mock_server::MockPrArgs {
-                id: u64::try_from(seed.number).expect("pull request number does not fit in u64"),
-                title: seed.title,
-                body: seed.body,
-                head: seed.head,
-                base: seed.base,
-                repo_owner: &state.repo_owner,
-                repo_name: &state.repo_name,
+            let mut pr = mock_server::PrEntry::mock(mock_server::MockPrArgs {
+                number: usize::try_from(number.get())
+                    .expect("the test target must represent GraphQL pull request numbers"),
+                title,
+                body,
+                head,
+                base,
             });
+            pr.is_draft = is_draft;
             state.add_pr(pr);
+        });
+    }
+
+    /// Inserts a pull request before the existing connection rows.
+    pub fn seed_earlier_pull_request(&self, seed: PullRequestSeed) {
+        let PullRequestSeed { number, title, body, head, base, is_draft } = seed;
+        self.context.mutate_mock_state(|state| {
+            let mut pr = mock_server::PrEntry::mock(mock_server::MockPrArgs {
+                number: usize::try_from(number.get())
+                    .expect("the test target must represent GraphQL pull request numbers"),
+                title,
+                body,
+                head,
+                base,
+            });
+            pr.is_draft = is_draft;
+            state.prs.insert(0, pr);
+        });
+    }
+
+    /// Seeds an intentionally malformed GraphQL identity for rejection tests.
+    pub fn seed_pull_request_with_invalid_number(
+        &self,
+        number: usize,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        head: impl Into<String>,
+        base: impl Into<String>,
+    ) {
+        assert!(
+            valid_pull_request_number(number).is_none(),
+            "ordinary pull request numbers must use seed_pull_request"
+        );
+        self.context.mutate_mock_state(|state| {
+            state.add_pr(mock_server::PrEntry::mock(mock_server::MockPrArgs {
+                number,
+                title: title.into(),
+                body: body.into(),
+                head: head.into(),
+                base: base.into(),
+            }));
+        });
+    }
+
+    pub fn seed_cross_repository_pull_request(
+        &self,
+        seed: PullRequestSeed,
+        head_oid: &str,
+        base_oid: &str,
+    ) {
+        for (kind, oid) in [("head", head_oid), ("base", base_oid)] {
+            assert!(
+                oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "cross-repository {kind} object ID must be 40 hexadecimal digits"
+            );
+        }
+        let PullRequestSeed { number, title, body, head, base, is_draft } = seed;
+        self.context.mutate_mock_state(|state| {
+            let number = usize::try_from(number.get())
+                .expect("the test target must represent GraphQL pull request numbers");
+            let mut pr = mock_server::PrEntry::mock(mock_server::MockPrArgs {
+                number,
+                title,
+                body,
+                head,
+                base,
+            });
+            pr.is_draft = is_draft;
+            pr.head.oid = head_oid.to_owned();
+            pr.base.oid = base_oid.to_owned();
+            state.add_pr(pr);
+            state.cross_repository_prs.insert(number);
+        });
+    }
+
+    pub fn set_pull_request_landing_automation(
+        &self,
+        number: usize,
+        auto_merge: bool,
+        in_merge_queue: bool,
+    ) {
+        self.context.mutate_mock_state(|state| {
+            let pr = state
+                .prs
+                .iter_mut()
+                .find(|pr| pr.number == number)
+                .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
+            pr.auto_merge = auto_merge;
+            pr.in_merge_queue = in_merge_queue;
         });
     }
 
@@ -630,7 +1082,18 @@ impl MockGithub<'_> {
                 .iter_mut()
                 .find(|pr| pr.number == number)
                 .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
-            pr.state = new_state.as_str().to_string();
+            pr.state = new_state;
+        });
+    }
+
+    pub fn set_pull_request_draft(&self, number: usize, is_draft: bool) {
+        self.context.mutate_mock_state(|state| {
+            let pr = state
+                .prs
+                .iter_mut()
+                .find(|pr| pr.number == number)
+                .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
+            pr.is_draft = is_draft;
         });
     }
 
@@ -641,15 +1104,22 @@ impl MockGithub<'_> {
                 .iter_mut()
                 .find(|pr| pr.number == number)
                 .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
-            pr.title = Some(new_title.to_string());
+            pr.title = new_title.to_owned();
         });
     }
 }
 
 impl Drop for TestContext {
     fn drop(&mut self) {
+        if let Some(overlap) = &self.observation_overlap {
+            overlap.cancel();
+        }
+        if let Some(overlap) = &self.publication_overlap {
+            overlap.schedule.release_all();
+        }
         // Stop the server before fixture directories and state are released.
         drop(self.mock_server.take());
+
         if let Some(state) = &self.mock_server_state {
             if let Ok(state) = state.read() {
                 if !state.protocol_violations.is_empty() {
@@ -666,17 +1136,21 @@ impl Drop for TestContext {
             }
         }
 
-        let (state_poisoned, pending_faults) = self
+        let (state_poisoned, pending_faults, pending_remote_ref_updates) = self
             .mock_server_state
             .as_ref()
             .map(|state| match state.read() {
-                Ok(state) => (false, state.faults.clone()),
-                Err(poisoned) => (true, poisoned.into_inner().faults.clone()),
+                Ok(state) => (false, state.faults.clone(), state.git.pending_remote_ref_updates()),
+                Err(poisoned) => {
+                    let state = poisoned.into_inner();
+                    (true, state.faults.clone(), state.git.pending_remote_ref_updates())
+                }
             })
             .unwrap_or_default();
         if state_poisoned {
             let message = format!(
-                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}"
+                "Test fixture mock state was poisoned; unconsumed faults: {pending_faults:?}; \
+                 unconsumed scheduled remote ref updates: {pending_remote_ref_updates}"
             );
             if thread::panicking() {
                 eprintln!("{message}");
@@ -685,11 +1159,17 @@ impl Drop for TestContext {
             }
             return;
         }
-        if !pending_faults.is_empty() {
+        if !pending_faults.is_empty() || pending_remote_ref_updates != 0 {
             if thread::panicking() {
-                eprintln!("Test fixture also has unconsumed faults: {pending_faults:?}");
+                eprintln!(
+                    "Test fixture also has unconsumed faults: {pending_faults:?}; \
+                     unconsumed scheduled remote ref updates: {pending_remote_ref_updates}"
+                );
             } else {
-                panic!("Test fixture has unconsumed faults: {pending_faults:?}");
+                panic!(
+                    "Test fixture has unconsumed faults: {pending_faults:?}; \
+                     unconsumed scheduled remote ref updates: {pending_remote_ref_updates}"
+                );
             }
         }
     }
@@ -698,7 +1178,10 @@ impl Drop for TestContext {
 impl TestContext {
     fn configure_test_env(&self, cmd: &mut TestCommand) {
         self.test_environment.apply_to_command(cmd);
+        self.configure_test_capabilities(cmd);
+    }
 
+    fn configure_test_capabilities(&self, cmd: &mut TestCommand) {
         // Give each command a deterministic, unique timestamp. In particular,
         // this ensures an otherwise-empty amend creates a distinct Git object.
         let timestamp = self.next_git_timestamp.fetch_add(1, Ordering::Relaxed);
@@ -709,6 +1192,10 @@ impl TestContext {
         if self.has_git_interceptor {
             cmd.env("SYSTEM_GIT_PATH", &self.system_git);
             cmd.env("GHERRIT_TEST_DRIVER", &self.gherrit_bin_path);
+            // Git prepends its own exec path while invoking hooks. Let the
+            // non-shipping test driver restore the hermetic PATH before
+            // production code starts any nested Git adapter.
+            cmd.env("GHERRIT_TEST_INTERCEPT_PATH", self.test_environment.variable("PATH"));
 
             if let Some(server) = &self.mock_server {
                 cmd.env("GHERRIT_MOCK_SERVER_URL", &server.url);
@@ -735,17 +1222,26 @@ impl TestContext {
         cmd
     }
 
+    /// Re-executes the current test binary through the bounded, hermetic
+    /// command harness for a single-process fixture.
     #[must_use = "command builders do nothing until executed"]
     pub fn reexec_test_cmd(&self) -> TestCommand {
         self.test_environment.command(&env::current_exe().expect("current test executable"))
     }
 
+    /// Executes a production-built command through the bounded, hermetic test
+    /// harness while preserving its explicit environment overrides.
+    #[must_use = "command builders do nothing until executed"]
     pub fn bounded_cmd(&self, command: Command) -> TestCommand {
-        let mut command = TestCommand::from_command(command);
-        let overrides = command.environment_overrides();
-        self.configure_test_env(&mut command);
-        command.apply_environment_overrides(overrides);
-        command
+        let mut cmd = TestCommand::from_command(command);
+        // `Command` records only explicit overrides. Capture them before
+        // replacing ambient inheritance, then restore them after fixture
+        // capabilities so production `env` and `env_remove` choices win.
+        let overrides = cmd.environment_overrides();
+        self.test_environment.apply_to_command(&mut cmd);
+        self.configure_test_capabilities(&mut cmd);
+        cmd.apply_environment_overrides(overrides);
+        cmd
     }
 
     #[must_use = "command builders do nothing until executed"]
@@ -796,7 +1292,7 @@ impl TestContext {
         id
     }
 
-    /// Creates a commit with a caller-supplied legacy or scenario identity.
+    /// Creates a commit with a caller-supplied scenario identity.
     pub fn commit_with_explicit_gherrit_id(&self, message: &str, id: &str) {
         assert!(
             !message.lines().any(|line| line.starts_with("gherrit-pr-id: ")),
@@ -884,7 +1380,7 @@ impl TestContext {
     }
 
     pub fn configure_managed_public(&self, branch_name: &str) {
-        self.configure_managed(branch_name, MANAGED_PUBLIC, "origin");
+        self.configure_managed(branch_name, MANAGED_PUBLIC, ".");
     }
 
     fn configure_managed(&self, branch_name: &str, state: &str, push_remote: &str) {
@@ -897,7 +1393,7 @@ impl TestContext {
 
     pub fn inject_failure(&self, kind: FailureKind) {
         match kind {
-            FailureKind::Git(_) => assert!(
+            FailureKind::LosePublicationPushReceipt(_) | FailureKind::Git(_) => assert!(
                 self.has_git_interceptor,
                 "missing test capability: .with_git_interceptor()"
             ),
@@ -908,6 +1404,16 @@ impl TestContext {
 
     pub fn expect_git_failure(&self, operation: GitOperation) {
         self.inject_failure(FailureKind::Git(operation));
+    }
+
+    /// Schedules one remote ref update after observation and immediately
+    /// before GHerrit's next publication push.
+    pub fn update_remote_ref_before_push(&self, ref_name: &str, target: &str) {
+        assert!(self.has_remote, "missing test capability: .with_remote()");
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        self.mutate_mock_state(|state| {
+            state.git.update_remote_ref_before_push(ref_name.to_owned(), target.to_owned());
+        });
     }
 
     fn enqueue_failure(&self, kind: FailureKind) {
@@ -973,6 +1479,23 @@ impl TestContext {
         })
     }
 
+    pub fn recorded_git_operations(&self) -> Vec<GitOperation> {
+        assert!(self.has_git_interceptor, "missing test capability: .with_git_interceptor()");
+        self.inspect_mock_state(|state| state.git.operations().to_vec())
+    }
+
+    pub fn observation_overlap(&self) -> &ObservationOverlapSchedule {
+        self.observation_overlap
+            .as_deref()
+            .expect("missing test capability: .with_observation_overlap()")
+    }
+
+    pub fn publication_overlap(&self) -> &PublicationOverlapController {
+        self.publication_overlap
+            .as_ref()
+            .expect("missing test capability: .with_publication_overlap()")
+    }
+
     pub fn formatted_github_state(&self) -> String {
         let state = self.github().pull_requests();
         let json = serde_json::to_string_pretty(&state).expect("Failed to serialize PRs");
@@ -990,6 +1513,11 @@ impl TestContext {
             Some(1) => None,
             code => panic!("git rev-parse failed with exit code {code:?}"),
         }
+    }
+
+    /// Peel an archive to its submitted commit; raw ref identity stays separate.
+    pub fn remote_commit_oid(&self, ref_name: &str) -> Option<String> {
+        self.remote_ref_oid(&format!("{ref_name}^{{commit}}"))
     }
 
     pub fn remote_refs(&self, prefix: &str) -> Vec<String> {
@@ -1043,6 +1571,18 @@ impl TestContext {
     pub fn hook_cmd(&self, name: &str) -> TestCommand {
         let mut cmd = self.gherrit_cmd();
         cmd.args(["hook", name]);
+        cmd
+    }
+
+    /// Runs one hook script installed in this fixture with the same hermetic
+    /// environment inherited from a fixture Git process.
+    #[must_use = "command builders do nothing until executed"]
+    pub fn installed_hook_cmd(&self, name: &str) -> TestCommand {
+        let hook = self.repo_path.join(".git/hooks").join(name);
+        assert!(hook.is_file(), "hook {name:?} is not installed");
+        let mut cmd = TestCommand::new(hook);
+        cmd.current_dir(&self.repo_path);
+        self.configure_test_env(&mut cmd);
         cmd
     }
 
@@ -1335,12 +1875,26 @@ fn install_git_interceptor(path: &Path, _gherrit_bin: &Path) {
 fn install_git_interceptor(path: &Path, gherrit_bin: &Path) {
     // `Command::new("git")` resolves native executables without consulting
     // PATHEXT, so a batch-file wrapper named `git.cmd` would be bypassed.
-    fs::copy(gherrit_bin, path.join("git.exe")).unwrap();
+    hard_link_or_copy(gherrit_bin, &path.join("git.exe"));
 }
 
 fn install_gherrit_binary(path: &Path, gherrit_bin: &Path) {
     let gherrit_dst = path.join(if cfg!(windows) { "gherrit.exe" } else { "gherrit" });
-    fs::copy(gherrit_bin, &gherrit_dst).unwrap();
+    hard_link_or_copy(gherrit_bin, &gherrit_dst);
+}
+
+/// Installs a test executable without copying a large Cargo artifact when the
+/// fixture and target directory share a filesystem.
+fn hard_link_or_copy(source: &Path, destination: &Path) {
+    if let Err(link_error) = fs::hard_link(source, destination) {
+        fs::copy(source, destination).unwrap_or_else(|copy_error| {
+            panic!(
+                "failed to install test executable {:?}: hard link failed ({link_error}); \
+                 copy fallback failed ({copy_error})",
+                destination
+            )
+        });
+    }
 }
 
 fn init_git_bare_repo(environment: &TestEnvironment, system_git: &Path, path: &Path) {
@@ -1371,19 +1925,63 @@ fn init_git_repo(
 }
 
 static SYSTEM_GIT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
-    let output = if cfg!(windows) {
-        Command::new("where").arg("git").output()
-    } else {
-        Command::new("which").arg("git").output()
-    };
-    let output = output.expect("Failed to find system git");
-    if !output.status.success() {
-        panic!("Failed to find git using 'which/where': {:?}", output);
-    }
-    let stdout = String::from_utf8(output.stdout).expect("Invalid utf8 from which git");
-    let path = stdout.lines().next().expect("No git path found").trim();
-    PathBuf::from(path)
+    let path = env::var_os("PATH").expect("PATH is required to find system Git");
+    find_system_git(&path, env::var_os("PATHEXT").as_deref())
+        .expect("Failed to find an executable system Git on PATH")
 });
+
+fn find_system_git(
+    path: &std::ffi::OsStr,
+    path_extensions: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let names = system_git_names(path_extensions);
+    env::split_paths(path).find_map(|directory| {
+        names.iter().find_map(|name| {
+            let candidate = directory.join(name);
+            if is_executable_file(&candidate) {
+                fs::canonicalize(candidate).ok()
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn system_git_names(_path_extensions: Option<&std::ffi::OsStr>) -> Vec<OsString> {
+    #[cfg(not(windows))]
+    {
+        vec![OsString::from("git")]
+    }
+    #[cfg(windows)]
+    {
+        let extensions =
+            _path_extensions.and_then(std::ffi::OsStr::to_str).unwrap_or(".COM;.EXE;.BAT;.CMD");
+        let mut names = vec![OsString::from("git.exe")];
+        for extension in extensions.split(';').filter(|extension| !extension.is_empty()) {
+            names.push(format!("git{extension}").into());
+        }
+        names
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1406,6 +2004,7 @@ mod tests {
         assert!(ctx.inspect_mock_state(|state| state.graphql_requests.is_empty()));
         ctx.expect_graphql_protocol_violations(1);
     }
+
     #[test]
     fn poisoned_mock_state_reports_unconsumed_faults() {
         let driver_dir = TempDir::new().unwrap();
@@ -1441,6 +2040,22 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_pull_request_seeds_match_the_graphql_number_domain() {
+        let seed = |number| PullRequestSeed::new(number, "title", "body", "head", "base");
+
+        assert_eq!(seed(1).number.get(), 1);
+        assert!(!seed(1).is_draft);
+        assert!(seed(1).draft().is_draft);
+        assert_eq!(seed(i32::MAX as usize).number.get(), i32::MAX as u32);
+        for invalid in [0, i32::MAX as usize + 1] {
+            assert!(
+                panic::catch_unwind(|| seed(invalid)).is_err(),
+                "accepted invalid pull request number {invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_management_helpers_write_complete_branch_state() {
         let ctx = TestContextBuilder::new("unused").with_initial_commit().build();
         let assert_state = |branch: &str, state: &str, push_remote: &str| {
@@ -1458,7 +2073,7 @@ mod tests {
 
         ctx.run_git(&["checkout", "main"]);
         ctx.checkout_managed_public("public-stack");
-        assert_state("public-stack", MANAGED_PUBLIC, "origin");
+        assert_state("public-stack", MANAGED_PUBLIC, ".");
     }
 
     #[test]
@@ -1478,6 +2093,28 @@ mod tests {
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .expect("fixture panic must have a string message");
         assert!(message.contains("Git(Var)"), "unexpected teardown panic: {message}");
+    }
+
+    #[test]
+    fn fixture_rejects_an_unconsumed_scheduled_remote_ref_update() {
+        let driver_dir = TempDir::new().unwrap();
+        let driver = driver_dir.path().join("gherrit-test-driver");
+        fs::write(&driver, "test driver placeholder").unwrap();
+
+        let panic = panic::catch_unwind(|| {
+            let ctx = TestContextBuilder::new(&driver).with_remote().with_git_interceptor().build();
+            ctx.update_remote_ref_before_push("refs/tags/race", &"1".repeat(40));
+        })
+        .expect_err("dropping the fixture must reject an unconsumed scheduled update");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("fixture panic must have a string message");
+        assert!(
+            message.contains("unconsumed scheduled remote ref updates: 1"),
+            "unexpected teardown panic: {message}"
+        );
     }
 
     #[test]
@@ -1642,6 +2279,54 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn bounded_command_preserves_overrides_after_context_capabilities() {
+        let context = TestContextBuilder::new("unused").build();
+        let mut raw = Command::new("/usr/bin/env");
+        raw.env("EXPLICIT_FIXTURE_VALUE", "present")
+            .env("GIT_AUTHOR_DATE", "explicit-author-date")
+            .env_remove("GIT_COMMITTER_DATE")
+            .env_remove("RUST_LOG");
+        let mut command = context.bounded_cmd(raw);
+
+        let output =
+            String::from_utf8(command.assert().success().get_output().stdout.clone()).unwrap();
+        assert!(output.lines().any(|line| line == "EXPLICIT_FIXTURE_VALUE=present"));
+        assert!(output.lines().any(|line| line == "GIT_AUTHOR_DATE=explicit-author-date"));
+        assert!(!output.lines().any(|line| line.starts_with("GIT_COMMITTER_DATE=")));
+        assert!(!output.lines().any(|line| line.starts_with("RUST_LOG=")));
+        assert!(output.lines().any(|line| line.starts_with("HOME=")));
+    }
+
+    #[test]
+    fn system_git_resolution_uses_path_order_and_executable_files() {
+        let root = TempDir::new().unwrap();
+        let skipped = root.path().join("skipped");
+        let selected = root.path().join("selected");
+        fs::create_dir(&skipped).unwrap();
+        fs::create_dir(&selected).unwrap();
+        #[cfg(windows)]
+        let name = "git.EXE";
+        #[cfg(not(windows))]
+        let name = "git";
+        let executable = selected.join(name);
+        fs::write(&executable, b"fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let non_executable = skipped.join(name);
+            fs::write(&non_executable, b"fixture").unwrap();
+        }
+        let path = env::join_paths([&skipped, &selected]).unwrap();
+
+        let resolved = find_system_git(&path, Some(std::ffi::OsStr::new(".EXE"))).unwrap();
+
+        assert_eq!(resolved, fs::canonicalize(executable).unwrap());
+    }
+
+    #[test]
     fn test_environment_provides_a_deterministic_git_identity() {
         let root = TempDir::new().unwrap();
         let environment = TestEnvironment::new(root.path(), SYSTEM_GIT.as_path());
@@ -1715,6 +2400,7 @@ mod tests {
             system_git,
             test_environment,
             test_dir,
+            MockSchedules::default(),
         );
 
         assert!(weak_state.upgrade().is_some());
