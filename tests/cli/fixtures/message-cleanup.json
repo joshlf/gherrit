@@ -1,0 +1,642 @@
+[
+  {
+    "character": "#",
+    "mode": "default",
+    "allow": false,
+    "message": "",
+    "success": false,
+    "stored": "initial\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "default",
+    "allow": true,
+    "message": "",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "default",
+    "allow": false,
+    "message": " \t\n\n",
+    "success": false,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "default",
+    "allow": true,
+    "message": " \t\n\n",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "default",
+    "allow": false,
+    "message": "# discarded\n",
+    "success": false,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "default",
+    "allow": true,
+    "message": "# discarded\n",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "default",
+    "allow": false,
+    "message": "# ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "ignored\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "default",
+    "allow": true,
+    "message": "# ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "ignored\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "strip",
+    "allow": false,
+    "message": "",
+    "success": false,
+    "stored": "ignored\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "strip",
+    "allow": true,
+    "message": "",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "strip",
+    "allow": false,
+    "message": " \t\n\n",
+    "success": false,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "strip",
+    "allow": true,
+    "message": " \t\n\n",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "strip",
+    "allow": false,
+    "message": "# discarded\n",
+    "success": false,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "strip",
+    "allow": true,
+    "message": "# discarded\n",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "strip",
+    "allow": false,
+    "message": "# ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "ignored\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "strip",
+    "allow": true,
+    "message": "# ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "ignored\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "whitespace",
+    "allow": false,
+    "message": "",
+    "success": false,
+    "stored": "ignored\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "whitespace",
+    "allow": true,
+    "message": "",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "whitespace",
+    "allow": false,
+    "message": " \t\n\n",
+    "success": false,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "whitespace",
+    "allow": true,
+    "message": " \t\n\n",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "whitespace",
+    "allow": false,
+    "message": "# discarded\n",
+    "success": true,
+    "stored": "# discarded\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "whitespace",
+    "allow": true,
+    "message": "# discarded\n",
+    "success": true,
+    "stored": "# discarded\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "whitespace",
+    "allow": false,
+    "message": "# ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "# ------------------------ >8 ------------------------\nignored\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "whitespace",
+    "allow": true,
+    "message": "# ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "# ------------------------ >8 ------------------------\nignored\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "verbatim",
+    "allow": false,
+    "message": "",
+    "success": false,
+    "stored": "# ------------------------ >8 ------------------------\nignored\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "verbatim",
+    "allow": true,
+    "message": "",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "verbatim",
+    "allow": false,
+    "message": " \t\n\n",
+    "success": true,
+    "stored": " \t\n\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "verbatim",
+    "allow": true,
+    "message": " \t\n\n",
+    "success": true,
+    "stored": " \t\n\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "verbatim",
+    "allow": false,
+    "message": "# discarded\n",
+    "success": true,
+    "stored": "# discarded\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "verbatim",
+    "allow": true,
+    "message": "# discarded\n",
+    "success": true,
+    "stored": "# discarded\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "verbatim",
+    "allow": false,
+    "message": "# ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "# ------------------------ >8 ------------------------\nignored\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "verbatim",
+    "allow": true,
+    "message": "# ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "# ------------------------ >8 ------------------------\nignored\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "scissors",
+    "allow": false,
+    "message": "",
+    "success": false,
+    "stored": "# ------------------------ >8 ------------------------\nignored\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "scissors",
+    "allow": true,
+    "message": "",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "scissors",
+    "allow": false,
+    "message": " \t\n\n",
+    "success": false,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "scissors",
+    "allow": true,
+    "message": " \t\n\n",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": "#",
+    "mode": "scissors",
+    "allow": false,
+    "message": "# discarded\n",
+    "success": true,
+    "stored": "# discarded\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "scissors",
+    "allow": true,
+    "message": "# discarded\n",
+    "success": true,
+    "stored": "# discarded\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "scissors",
+    "allow": false,
+    "message": "# ------------------------ >8 ------------------------\nignored\n",
+    "success": false,
+    "stored": "# discarded\n\n"
+  },
+  {
+    "character": "#",
+    "mode": "scissors",
+    "allow": true,
+    "message": "# ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "default",
+    "allow": false,
+    "message": "",
+    "success": false,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "default",
+    "allow": true,
+    "message": "",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "default",
+    "allow": false,
+    "message": " \t\n\n",
+    "success": false,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "default",
+    "allow": true,
+    "message": " \t\n\n",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "default",
+    "allow": false,
+    "message": "; discarded\n",
+    "success": false,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "default",
+    "allow": true,
+    "message": "; discarded\n",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "default",
+    "allow": false,
+    "message": "; ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "ignored\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "default",
+    "allow": true,
+    "message": "; ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "ignored\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "strip",
+    "allow": false,
+    "message": "",
+    "success": false,
+    "stored": "ignored\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "strip",
+    "allow": true,
+    "message": "",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "strip",
+    "allow": false,
+    "message": " \t\n\n",
+    "success": false,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "strip",
+    "allow": true,
+    "message": " \t\n\n",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "strip",
+    "allow": false,
+    "message": "; discarded\n",
+    "success": false,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "strip",
+    "allow": true,
+    "message": "; discarded\n",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "strip",
+    "allow": false,
+    "message": "; ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "ignored\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "strip",
+    "allow": true,
+    "message": "; ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "ignored\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "whitespace",
+    "allow": false,
+    "message": "",
+    "success": false,
+    "stored": "ignored\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "whitespace",
+    "allow": true,
+    "message": "",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "whitespace",
+    "allow": false,
+    "message": " \t\n\n",
+    "success": false,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "whitespace",
+    "allow": true,
+    "message": " \t\n\n",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "whitespace",
+    "allow": false,
+    "message": "; discarded\n",
+    "success": true,
+    "stored": "; discarded\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "whitespace",
+    "allow": true,
+    "message": "; discarded\n",
+    "success": true,
+    "stored": "; discarded\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "whitespace",
+    "allow": false,
+    "message": "; ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "; ------------------------ >8 ------------------------\nignored\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "whitespace",
+    "allow": true,
+    "message": "; ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "; ------------------------ >8 ------------------------\nignored\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "verbatim",
+    "allow": false,
+    "message": "",
+    "success": false,
+    "stored": "; ------------------------ >8 ------------------------\nignored\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "verbatim",
+    "allow": true,
+    "message": "",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "verbatim",
+    "allow": false,
+    "message": " \t\n\n",
+    "success": true,
+    "stored": " \t\n\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "verbatim",
+    "allow": true,
+    "message": " \t\n\n",
+    "success": true,
+    "stored": " \t\n\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "verbatim",
+    "allow": false,
+    "message": "; discarded\n",
+    "success": true,
+    "stored": "; discarded\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "verbatim",
+    "allow": true,
+    "message": "; discarded\n",
+    "success": true,
+    "stored": "; discarded\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "verbatim",
+    "allow": false,
+    "message": "; ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "; ------------------------ >8 ------------------------\nignored\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "verbatim",
+    "allow": true,
+    "message": "; ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "; ------------------------ >8 ------------------------\nignored\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "scissors",
+    "allow": false,
+    "message": "",
+    "success": false,
+    "stored": "; ------------------------ >8 ------------------------\nignored\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "scissors",
+    "allow": true,
+    "message": "",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "scissors",
+    "allow": false,
+    "message": " \t\n\n",
+    "success": false,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "scissors",
+    "allow": true,
+    "message": " \t\n\n",
+    "success": true,
+    "stored": "\n"
+  },
+  {
+    "character": ";",
+    "mode": "scissors",
+    "allow": false,
+    "message": "; discarded\n",
+    "success": true,
+    "stored": "; discarded\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "scissors",
+    "allow": true,
+    "message": "; discarded\n",
+    "success": true,
+    "stored": "; discarded\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "scissors",
+    "allow": false,
+    "message": "; ------------------------ >8 ------------------------\nignored\n",
+    "success": false,
+    "stored": "; discarded\n\n"
+  },
+  {
+    "character": ";",
+    "mode": "scissors",
+    "allow": true,
+    "message": "; ------------------------ >8 ------------------------\nignored\n",
+    "success": true,
+    "stored": "\n"
+  }
+]

@@ -42,3 +42,15 @@ Git uses common-directory default hooks in linked worktrees; explicit relative
 hook paths are resolved from each worktree or the bare Git directory.
 
 *Updated by an AI agent acting on joshlf's behalf.*
+
+## Ambiguous commit cleanup
+
+Git selects `core.commentChar=auto` before running prepare-commit-msg and the
+editor, and does not pass the selected character to commit-msg hooks. Identical
+hook inputs can therefore represent a valid `-F` subject or a message Git will
+strip to nothing. GHerrit conservatively leaves a comment-only message alone
+and warns when automatic selection makes the identity decision ambiguous. Use
+a fixed comment character which does not begin the intended message when an
+identity is required. The same conservative cancellation rule applies to
+comment-only verbatim input; the hook does not receive cleanup flags.
+
