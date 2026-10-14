@@ -1,3 +1,4 @@
+pub mod git_model;
 use std::{
     any::Any,
     collections::HashMap,
@@ -588,6 +589,21 @@ impl Drop for TestContext {
     fn drop(&mut self) {
         // Stop the server before fixture directories and state are released.
         drop(self.mock_server.take());
+        if let Some(state) = &self.mock_server_state {
+            if let Ok(state) = state.read() {
+                if !state.protocol_violations.is_empty() {
+                    let message = format!(
+                        "Unexpected HTTP protocol violations: {:?}",
+                        state.protocol_violations
+                    );
+                    if thread::panicking() {
+                        eprintln!("{message}");
+                    } else {
+                        panic!("{message}");
+                    }
+                }
+            }
+        }
 
         let (state_poisoned, pending_faults) = self
             .mock_server_state
@@ -656,6 +672,15 @@ impl TestContext {
         self.configure_test_env(&mut cmd);
 
         cmd
+    }
+
+    #[must_use = "command builders do nothing until executed"]
+    pub fn bounded_cmd(&self, command: Command) -> TestCommand {
+        let mut command = TestCommand::from_command(command);
+        let overrides = command.environment_overrides();
+        self.configure_test_env(&mut command);
+        command.apply_environment_overrides(overrides);
+        command
     }
 
     #[must_use = "command builders do nothing until executed"]
@@ -843,6 +868,19 @@ impl TestContext {
                 "Expected injected failures to be consumed, but {:?} remain",
                 state.faults
             );
+        });
+    }
+
+    /// Count arrivals even when JSON or GraphQL decoding rejected the request.
+    pub fn graphql_http_arrivals(&self) -> usize {
+        self.inspect_mock_state(|state| state.graphql_arrivals)
+    }
+
+    /// Negative protocol tests must explicitly account for every violation.
+    pub fn expect_graphql_protocol_violations(&self, count: usize) {
+        self.mutate_mock_state(|state| {
+            assert_eq!(state.protocol_violations.len(), count);
+            state.protocol_violations.clear();
         });
     }
 
@@ -1293,6 +1331,67 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn malformed_http_arrivals_are_recorded_before_protocol_decoding() {
+        use std::io::{Read as _, Write as _};
+        let ctx = TestContextBuilder::new("unused").with_mock_github().build();
+        let address = ctx.mock_server_url().strip_prefix("http://").unwrap();
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.write_all(b"POST /graphql HTTP/1.1\r\nHost: fixture\r\nContent-Type: application/json\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{").unwrap();
+        let mut response = Vec::new();
+        stream.take(4096).read_to_end(&mut response).unwrap();
+        assert_eq!(ctx.graphql_http_arrivals(), 1);
+        assert!(ctx.inspect_mock_state(|state| state.graphql_requests.is_empty()));
+        ctx.expect_graphql_protocol_violations(1);
+    }
+    #[test]
+    fn non_json_media_types_are_raw_arrivals_and_protocol_violations() {
+        use std::io::{Read as _, Write as _};
+        for header in ["", "Content-Type: text/plain\r\n"] {
+            let ctx = TestContextBuilder::new("unused").with_mock_github().build();
+            let address = ctx.mock_server_url().strip_prefix("http://").unwrap();
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let body =
+                r#"{"query":"query { repository(owner: \"owner\", name: \"repo\") { id } }"}"#;
+            assert!(serde_json::from_str::<serde_json::Value>(body).is_ok());
+            let request = format!("POST /graphql HTTP/1.1\r\nHost: fixture\r\n{header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut response = Vec::new();
+            stream.take(4096).read_to_end(&mut response).unwrap();
+            assert_eq!(ctx.graphql_http_arrivals(), 1);
+            assert!(ctx.inspect_mock_state(|state| state.graphql_requests.is_empty()));
+            assert!(ctx.inspect_mock_state(
+                |state| state.protocol_violations == ["Invalid GraphQL JSON or content type"]
+            ));
+            ctx.expect_graphql_protocol_violations(1);
+        }
+    }
+
+    #[test]
+    fn oversized_http_bodies_are_counted_and_recorded_as_protocol_violations() {
+        use std::io::{Read as _, Write as _};
+        let ctx = TestContextBuilder::new("unused").with_mock_github().build();
+        let address = ctx.mock_server_url().strip_prefix("http://").unwrap();
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let body = vec![b' '; 2 * 1024 * 1024 + 1];
+        let header = format!("POST /graphql HTTP/1.1\r\nHost: fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        stream.write_all(header.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+        let mut response = Vec::new();
+        stream.take(4096).read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 400"));
+        assert_eq!(ctx.graphql_http_arrivals(), 1);
+        assert!(ctx.inspect_mock_state(|state| state.graphql_requests.is_empty()
+            && state.protocol_violations == ["Invalid GraphQL request body"]));
+        ctx.expect_graphql_protocol_violations(1);
+    }
 
     #[test]
     fn poisoned_mock_state_reports_unconsumed_faults() {
