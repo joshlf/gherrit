@@ -12,6 +12,8 @@ default-run = "gherrit"
 # Builds the non-shipping process adapter used by integration tests. The
 # production binary never reads test endpoints or dispatches the Git shim.
 test-driver = []
+# Explicit disposable-repository probes; never dispatched by normal tests.
+hosted-contracts = []
 
 [profile.release]
 # Strip full debug info, but keep line tables for backtraces. This makes full
@@ -23,6 +25,7 @@ debug-assertions = true
 lto = true
 
 [dependencies]
+percent-encoding = "2.3.2"
 gix = { version = "0.75.0", features = ["blocking-network-client"] }
 regex = "1.12.2"
 serde = { version = "1.0.228", features = ["serde_derive"] }
@@ -103,3 +106,8 @@ required-features = ["test-driver"]
 
 [workspace]
 members = ["testutil"]
+
+[[bin]]
+name = "gherrit-hosted-contracts"
+path = "src/hosted_contracts_main.rs"
+required-features = ["hosted-contracts"]
