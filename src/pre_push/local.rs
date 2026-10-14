@@ -251,7 +251,92 @@ fn ensure_unique_change_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Resul
     Ok(())
 }
 
-pub(super) use crate::identity::{GherritIdTrailer, gherrit_id_trailers};
+/// One occurrence of the identity key in a raw trailer block.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum GherritIdTrailer {
+    /// An occurrence with GHerrit's exact `: ` separator.
+    Exact { value: Vec<u8>, line: Range<usize> },
+    /// An occurrence whose separator is not exactly `: `.
+    Malformed,
+}
+
+/// Reads identity-key occurrences from the final raw commit-message paragraph.
+///
+/// Git's trailer formatter normalizes inputs such as `key:value` into
+/// `key: value`. The raw bytes are therefore the only authority for GHerrit's
+/// exact `: ` separator. Same-key occurrences with other separators remain
+/// visible as malformed rather than disappearing. Other keys matter only for
+/// recognizing the final block. Continuations are unfolded so validation
+/// rejects a continued value rather than silently accepting its first line.
+pub(super) fn gherrit_id_trailers(message: &[u8]) -> Vec<GherritIdTrailer> {
+    let mut start = 0;
+    let mut lines = message
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(|terminated| {
+            let end = start + terminated.len();
+            let line = terminated.strip_suffix(b"\n").unwrap_or(terminated);
+            let raw_line = start..end;
+            start = end;
+            (raw_line, line.strip_suffix(b"\r").unwrap_or(line))
+        })
+        .collect::<Vec<_>>();
+    while lines.last().is_some_and(|(_, line)| line.iter().all(u8::is_ascii_whitespace)) {
+        lines.pop();
+    }
+    let block_start = lines
+        .iter()
+        .rposition(|(_, line)| line.iter().all(u8::is_ascii_whitespace))
+        .map_or(0, |index| index + 1);
+    let mut identities = Vec::<GherritIdTrailer>::new();
+    let mut has_entry = false;
+    let mut continued_identity: Option<usize> = None;
+
+    for (raw_line, line) in &lines[block_start..] {
+        if line.first().is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
+            if !has_entry {
+                return Vec::new();
+            }
+            if let Some(index) = continued_identity {
+                let GherritIdTrailer::Exact { value, .. } = &mut identities[index] else {
+                    unreachable!("only exact identity trailers have continuation indices")
+                };
+                value.push(b' ');
+                let value_start = line
+                    .iter()
+                    .position(|byte| !matches!(byte, b' ' | b'\t'))
+                    .unwrap_or(line.len());
+                value.extend_from_slice(&line[value_start..]);
+            }
+            continue;
+        }
+
+        let Some(separator) = line.iter().position(|byte| matches!(byte, b':' | b'=')) else {
+            return Vec::new();
+        };
+        let key = &line[..separator];
+        if key.is_empty()
+            || key.iter().any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        {
+            return Vec::new();
+        }
+
+        has_entry = true;
+        continued_identity = None;
+        if key.eq_ignore_ascii_case(b"gherrit-pr-id") {
+            if line.get(separator..separator + 2) == Some(b": ") {
+                identities.push(GherritIdTrailer::Exact {
+                    value: line[separator + 2..].to_vec(),
+                    line: raw_line.clone(),
+                });
+                continued_identity = Some(identities.len() - 1);
+            } else {
+                identities.push(GherritIdTrailer::Malformed);
+            }
+        }
+    }
+
+    identities
+}
 
 /// Requires each active change ID to identify exactly one reachable commit.
 ///
