@@ -120,16 +120,17 @@ impl LocalStack {
         head: ObjectId,
         default_branch: &DefaultBranch,
     ) -> Result<Self> {
-        let default_ref_name = default_branch.full_ref_name();
-        let default_ref = repo.rev_parse_single(default_ref_name.as_str()).wrap_err_with(|| {
-            format!("Local default branch '{}' is unavailable", default_branch.name())
-        })?;
-        if default_ref.detach() != default_branch.tip() {
+        if branch_name == default_branch.name() {
             bail!(
-                "Local default branch '{}' does not match the push repository",
-                default_branch.name()
+                "Cannot publish a managed stack from the repository default branch '{branch_name}'"
             );
         }
+
+        let default_oid = default_branch.tip().to_string();
+        let default_ref = repo.rev_parse_single(default_oid.as_str()).wrap_err_with(|| {
+            let name = default_branch.name();
+            format!("The observed push-destination default '{name}' is unavailable locally. Fetch '{name}' from the configured push destination, then rebase onto that fetched tip before pushing.")
+        })?;
         if head == default_ref.detach() {
             return Self::new(default_branch, Vec::new());
         }
@@ -141,9 +142,9 @@ impl LocalStack {
             util::FirstParentCommitsBetweenError::NotOnFirstParentPath => {
                 let default_branch = default_branch.name();
                 eyre!(
-                    "The branch '{branch_name}' does not descend from '{default_branch}' on its first-parent path.\n\
+                    "The branch '{branch_name}' does not descend from the observed push-destination default '{default_branch}' on its first-parent path.\n\
                      GHerrit defines stack order using first-parent ancestry.\n\
-                     Maybe you want to 'git rebase' on '{default_branch}' before pushing?"
+                     Fetch '{default_branch}' from the configured push destination, then rebase onto that fetched tip before pushing."
                 )
             }
             util::FirstParentCommitsBetweenError::Eyre(error) => error,
@@ -328,6 +329,39 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_destination_default_has_fetch_guidance() {
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        context.checkout_new("feature");
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let head = repository.rev_parse_single("HEAD").unwrap().detach();
+        let missing = ObjectId::from_hex(b"ffffffffffffffffffffffffffffffffffffffff").unwrap();
+        assert!(repository.try_find_object(missing).unwrap().is_none());
+        let default = DefaultBranch::new("main".to_owned(), missing).unwrap();
+        let error =
+            LocalStack::collect_captured(&repository, "feature", head, &default).unwrap_err();
+        assert!(error.to_string().contains("Fetch 'main' from the configured push destination"));
+    }
+    #[test]
+    fn ancestry_guidance_does_not_depend_on_a_local_default_alias() {
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        let default_tip = ObjectId::from_hex(context.head_oid().as_bytes()).unwrap();
+        context.run_git(&["checkout", "--orphan", "unrelated"]);
+        context.commit_with_gherrit_id("Unrelated");
+        context.run_git(&["branch", "-D", "main"]);
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let error = LocalStack::collect_captured(
+            &repository,
+            "unrelated",
+            repository.head_id().unwrap().detach(),
+            &DefaultBranch::new("main".to_owned(), default_tip).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("configured push destination"));
+        assert!(error.to_string().contains("that fetched tip"));
+        assert!(!error.to_string().contains("'git rebase' on 'main'"));
+    }
+
+    #[test]
     fn gherrit_pr_ids_require_bounded_nonempty_ascii_alphanumeric_values() {
         for id in [b"A".as_slice(), b"G123", b"abcDEF012"] {
             assert_eq!(
@@ -460,6 +494,7 @@ mod tests {
     #[test]
     fn empty_stack_does_not_require_publishable_history() {
         let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        context.checkout_new("feature");
         let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
         let default_tip = repository.rev_parse_single("refs/heads/main").unwrap().detach();
         let supplied_default = DefaultBranch::new("main".to_owned(), default_tip).unwrap();
@@ -472,7 +507,7 @@ mod tests {
 
         let head = repository.rev_parse_single("HEAD").unwrap().detach();
         let stack =
-            LocalStack::collect_captured(&repository, "main", head, &supplied_default).unwrap();
+            LocalStack::collect_captured(&repository, "feature", head, &supplied_default).unwrap();
 
         assert!(stack.is_empty());
     }
@@ -566,5 +601,33 @@ mod tests {
             strip_gherrit_id(body, line.clone()),
             "Summary\r\n\r\ngherrit-pr-id: Gexample\r\n\r\nNotes\r\n\r\n\r\n"
         );
+    }
+    #[test]
+    fn captured_default_branch_cannot_publish_a_managed_stack() {
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        let tip = ObjectId::from_hex(context.head_oid().as_bytes()).unwrap();
+        let default = DefaultBranch::new("main".to_owned(), tip).unwrap();
+        for ahead in [false, true] {
+            if ahead {
+                context.commit_with_gherrit_id("Ahead of remote default");
+            }
+            let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+            let head = repository.head_id().unwrap().detach();
+            let error =
+                LocalStack::collect_captured(&repository, "main", head, &default).unwrap_err();
+            assert!(error.to_string().contains(
+                "Cannot publish a managed stack from the repository default branch 'main'"
+            ));
+        }
+        context.checkout_new("feature");
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let stack = LocalStack::collect_captured(
+            &repository,
+            "feature",
+            repository.head_id().unwrap().detach(),
+            &default,
+        )
+        .unwrap();
+        assert_eq!(stack.len(), 1);
     }
 }
