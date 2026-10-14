@@ -1,6 +1,7 @@
 mod auth;
 mod command;
 mod config;
+pub(crate) use config::BranchConfigValues;
 mod layout;
 mod repository;
 pub use auth::get_github_token;
