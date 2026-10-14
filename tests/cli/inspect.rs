@@ -152,6 +152,23 @@ fn format_zero_backend_matches_native_git_not_an_unconditional_extension() {
 }
 
 #[test]
+fn remote_inspection_is_explicit_and_unsupported_destinations_are_unavailable() {
+    let context = testutil::test_context!().with_remote().with_initial_commit().build();
+    context.checkout_managed_private("status-remote");
+    context.commit_with_gherrit_id("Change");
+    let result = context
+        .gherrit_cmd()
+        .args(["status", "--json", "--remote", "--base", "main"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&result.get_output().stdout).unwrap();
+    assert_eq!(report["mode"], "remote");
+    assert_eq!(report["remote"]["state"], "unavailable");
+    assert!(report["remote"]["reason"].as_str().unwrap().contains("github.com"));
+    assert_eq!(report["stack"]["commits"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn stack_inspection_detects_ids_reused_from_the_selected_base() {
     let ctx = testutil::test_context!().with_initial_commit().build();
     let id = ctx.commit_with_gherrit_id("Base identity");
@@ -201,33 +218,32 @@ fn unmanaged_upstream_settings_are_not_management_drift() {
 
 #[test]
 fn inherited_repository_selectors_do_not_mix_inspection_repositories() {
-    let ctx = testutil::test_context!().with_initial_commit().build();
+    let ctx = testutil::test_context!().with_remote().with_initial_commit().build();
     ctx.checkout_managed_private("inspected");
     let other = testutil::test_context!().with_initial_commit().build();
     other.checkout_new("redirected");
-    let baseline = ctx
-        .gherrit_cmd()
-        .args(["status", "--json", "--base", "main"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let redirected = ctx
-        .gherrit_cmd()
-        .args(["status", "--json", "--base", "main"])
-        .env("GIT_DIR", other.repo_path.join(".git"))
-        .env("GIT_COMMON_DIR", other.repo_path.join(".git"))
-        .env("GIT_WORK_TREE", &other.repo_path)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    assert_eq!(
-        serde_json::from_slice::<Value>(&baseline).unwrap(),
-        serde_json::from_slice::<Value>(&redirected).unwrap()
-    );
+    for remote in [false, true] {
+        let mut args = vec!["status", "--json", "--base", "main"];
+        if remote {
+            args.push("--remote");
+        }
+        let baseline = ctx.gherrit_cmd().args(&args).assert().success().get_output().stdout.clone();
+        let redirected = ctx
+            .gherrit_cmd()
+            .args(&args)
+            .env("GIT_DIR", other.repo_path.join(".git"))
+            .env("GIT_COMMON_DIR", other.repo_path.join(".git"))
+            .env("GIT_WORK_TREE", &other.repo_path)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&baseline).unwrap(),
+            serde_json::from_slice::<Value>(&redirected).unwrap()
+        );
+    }
 }
 
 #[test]
