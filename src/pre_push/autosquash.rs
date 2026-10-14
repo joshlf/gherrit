@@ -10,7 +10,7 @@ fn is_pending(subject: &str) -> bool {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct PendingAutosquash {
-    default_ref: String,
+    default_tip: gix::ObjectId,
 }
 
 impl fmt::Display for PendingAutosquash {
@@ -22,7 +22,7 @@ impl fmt::Display for PendingAutosquash {
                 "Please squash your history before syncing:\n",
                 "    git rebase -i --autosquash {}",
             ),
-            self.default_ref,
+            self.default_tip,
         )
     }
 }
@@ -34,8 +34,8 @@ impl Error for PendingAutosquash {}
 /// This policy runs over the entire stack before commit metadata is validated.
 /// A temporary commit therefore takes precedence over errors that are only
 /// meaningful once the stack is ready to publish, such as a missing GHerrit
-/// ID. Guidance names the local ref whose tip was validated against the push
-/// repository; the configured remote name need not name that same history.
+/// ID. Guidance names the observed destination tip, independently of local
+/// aliases which may be missing or divergent.
 pub(super) fn ensure_publishable<'a>(
     subjects: impl IntoIterator<Item = &'a str>,
     default_branch: &DefaultBranch,
@@ -43,7 +43,7 @@ pub(super) fn ensure_publishable<'a>(
     subjects
         .into_iter()
         .any(is_pending)
-        .then(|| PendingAutosquash { default_ref: default_branch.full_ref_name() })
+        .then(|| PendingAutosquash { default_tip: default_branch.tip() })
         .map_or(Ok(()), Err)
 }
 
@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_the_validated_local_rebase_target() {
+    fn reports_the_observed_rebase_target() {
         ["main", "master", "release/trunk"].into_iter().for_each(|branch| {
             let error =
                 ensure_publishable(["fixup! subject"], &default_branch(branch)).unwrap_err();
@@ -125,9 +125,9 @@ mod tests {
                     concat!(
                         "Stack contains pending fixup/squash/amend commits.\n",
                         "Please squash your history before syncing:\n",
-                        "    git rebase -i --autosquash refs/heads/{}",
+                        "    git rebase -i --autosquash {}",
                     ),
-                    branch,
+                    default_branch(branch).tip(),
                 ),
             );
         });
