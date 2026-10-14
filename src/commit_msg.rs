@@ -18,13 +18,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fs, path::Path};
+use std::{fs, io::Write as _, path::Path};
 
 use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
 
 use crate::{
     cmd,
+    identity::has_normalized_id as has_gherrit_id,
     util::{self, CommandExt as _},
 };
 
@@ -35,8 +36,44 @@ fn is_temporary_squash(message: &str) -> bool {
     message.lines().next().is_some_and(|line| line.starts_with("squash! "))
 }
 
-fn has_gherrit_id(trailers: &str) -> bool {
-    trailers.lines().any(|line| line.starts_with("gherrit-pr-id: "))
+/// The hook does not receive `--cleanup` or `--allow-empty-message` flags.
+/// Conservatively leave messages empty under comment/scissors cleanup alone.
+/// Git then owns cancellation and explicit empty-message acceptance. Ambiguous
+/// comment-only verbatim messages are committed without a generated identity.
+fn may_cancel_commit(repo: &util::Repo, message: &str) -> Result<bool> {
+    let config = repo.config_snapshot();
+    let prefix = config
+        .string("core.commentString")
+        .map(|value| value.as_ref().to_vec())
+        .or_else(|| {
+            config.string("core.commentChar").map(|value| {
+                if value.as_ref() == b"auto" { b"#".to_vec() } else { value.as_ref().to_vec() }
+            })
+        })
+        .unwrap_or_else(|| b"#".to_vec());
+    let mut scissors = prefix;
+    scissors.extend_from_slice(b" ------------------------ >8 ------------------------");
+    let mut length = 0;
+    for line in message.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']).as_bytes() == scissors {
+            break;
+        }
+        length += line.len();
+    }
+    // Prepared private file input avoids a pipe producer or shell quoting.
+    let mut input = crate::subprocess::RegularFileStdinBuilder::new()
+        .wrap_err("Failed to prepare message cleanup")?;
+    input.write_all(&message.as_bytes()[..length])?;
+    let output = crate::subprocess::local_output(
+        &mut cmd!("git stripspace --strip-comments"),
+        Some(input.finish()?),
+        std::time::Duration::from_secs(60),
+        4 * 1024 * 1024,
+    )?;
+    if !output.status.success() {
+        bail!("Git message cleanup failed");
+    }
+    Ok(output.stdout.is_empty())
 }
 
 fn derive_gherrit_id(mut entropy: IdEntropy, object_hash: &[u8]) -> String {
@@ -70,10 +107,9 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
         return Ok(());
     }
 
-    // Skip temporary squash commits (e.g. from `git commit --squash`) to
-    // prevent creating "phantom" PRs for changes destined to be merged away.
-    // These commits are transient and shouldn't be part of the persistent
-    // managed stack.
+    // Skip temporary squash commits (e.g. from `git commit --squash`) so
+    // changes intended to be folded into another commit do not receive a
+    // persistent review identity or enter the managed stack.
     let msg_content = fs::read_to_string(msg_path).wrap_err("Failed to read msg file")?;
     if is_temporary_squash(&msg_content) {
         return Ok(());
@@ -87,8 +123,12 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
         return Ok(());
     }
 
-    // Calculate Change-ID
-    // Construct the input: "Ident\nRefHash\nMsgContent"
+    if may_cancel_commit(repo, &msg_content)? {
+        return Ok(());
+    }
+
+    // Construct the stable GHerrit ID input:
+    // "Ident\nRefHash\nMsgContent".
     let input_data = {
         let committer_ident = cmd!("git var GIT_COMMITTER_IDENT").checked_output()?;
         let committer_ident =
@@ -117,11 +157,17 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
     // --where start: puts it at the top of the trailer block
     // --if-exists doNothing: prevents duplicates
     cmd!(
-        "git interpret-trailers --in-place --where start --if-exists doNothing --trailer",
+        "git -c trailer.separators=: -c trailer.gherrit-pr-id.key=gherrit-pr-id interpret-trailers --in-place --where start --if-exists doNothing --trailer",
         "gherrit-pr-id: {gherrit_id}"
     )
     .arg(msg_file)
     .success()?;
+    let written = fs::read(msg_path).wrap_err("Failed to validate the written identity")?;
+    match crate::identity::gherrit_id_trailers(&written).as_slice() {
+        [crate::identity::GherritIdTrailer::Exact { value, .. }]
+            if crate::identity::GherritPrId::from_ref_component(value)?.as_str() == gherrit_id => {}
+        _ => bail!("Git trailer configuration did not produce one canonical GHerrit identity"),
+    }
     Ok(())
 }
 
