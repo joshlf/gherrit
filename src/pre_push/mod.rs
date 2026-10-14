@@ -1,6 +1,12 @@
 // Adapter entry points are compiled/tested before the separate runtime switch.
 #![allow(dead_code)]
-use std::{collections::HashMap, env, ffi::OsStr, time::Duration};
+use std::{
+    collections::HashMap,
+    env,
+    ffi::{OsStr, OsString},
+    io,
+    time::Duration,
+};
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
 use gix::reference::Category;
@@ -53,6 +59,83 @@ pub(crate) use crate::subprocess;
 
 const INDETERMINATE_GRAPHQL_MUTATION: &str = "GraphQL mutation acknowledgement is indeterminate; stop this publication attempt and retry the push to reobserve GitHub state";
 const MAX_GRAPHQL_MUTATION_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// The complete externally relevant shape of one hook invocation.
+///
+/// GHerrit's own nested pushes return before constructing this value. Direct
+/// invocation has no enclosing effect. For a managed Git invocation, one byte
+/// is enough to distinguish a no-op from a push which could mutate a ref after
+/// this hook returns. Unmanaged invocations never consume their input.
+#[allow(dead_code)]
+pub(crate) struct Invocation {
+    source: InvocationSource,
+}
+
+enum InvocationSource {
+    /// Direct invocation of the hidden hook command has no enclosing Git
+    /// process and therefore no later ref effect.
+    Direct,
+    Git {
+        remote_name: OsString,
+        remote_location: OsString,
+    },
+}
+
+#[allow(dead_code)]
+impl Invocation {
+    pub(crate) fn new(
+        remote_name: Option<OsString>,
+        remote_location: Option<OsString>,
+    ) -> Result<Self> {
+        let source = match (remote_name, remote_location) {
+            (None, None) => InvocationSource::Direct,
+            (Some(remote_name), Some(remote_location)) => {
+                InvocationSource::Git { remote_name, remote_location }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                bail!("Git pre-push hook arguments are incomplete")
+            }
+        };
+        Ok(Self { source })
+    }
+
+    fn input_has_ref_updates(input: &mut impl io::Read) -> Result<bool> {
+        let mut first = [0_u8; 1];
+        loop {
+            match input.read(&mut first) {
+                Ok(0) => return Ok(false),
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error).wrap_err("Failed to read Git pre-push input"),
+            }
+        }
+    }
+
+    /// Proves that no enclosing Git process can write a ref after GHerrit's
+    /// acknowledged publication finishes.
+    pub(super) fn require_managed_noop(self) -> Result<()> {
+        self.require_managed_noop_from(&mut io::stdin().lock())
+    }
+
+    fn require_managed_noop_from(self, input: &mut impl io::Read) -> Result<()> {
+        match self.source {
+            InvocationSource::Direct => Ok(()),
+            InvocationSource::Git { remote_name, remote_location }
+                if remote_name == OsStr::new(".") && remote_location == OsStr::new(".") =>
+            {
+                if Self::input_has_ref_updates(input)? {
+                    bail!(
+                        "A managed GHerrit push cannot include an enclosing Git ref update; run plain 'git push' with the branch configuration created by 'gherrit manage'"
+                    );
+                }
+                Ok(())
+            }
+            InvocationSource::Git { .. } => bail!(
+                "A managed GHerrit push must use the local no-op destination created by 'gherrit manage'; run plain 'git push'"
+            ),
+        }
+    }
+}
+
 const INTERNAL_PRE_PUSH_GIT_DIR_ENV: &str = "GHERRIT_INTERNAL_PRE_PUSH_GIT_DIR";
 const INTERNAL_PRE_PUSH_REMOTE_ENV: &str = "GHERRIT_INTERNAL_PRE_PUSH_REMOTE";
 
