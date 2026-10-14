@@ -392,7 +392,7 @@ fn test_default_branch_must_be_on_the_first_parent_stack_path() {
     ctx.hook_cmd("pre-push")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("does not descend from 'main' on its first-parent path"));
+        .stderr(predicate::str::contains("does not descend from the observed push-destination default 'main' on its first-parent path"));
 
     assert!(ctx.github().requests().is_empty());
     assert_eq!(ctx.recorded_pushes(), fixture_pushes);
