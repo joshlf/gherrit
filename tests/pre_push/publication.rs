@@ -45,6 +45,33 @@ fn test_full_stack_lifecycle_mocked() {
 }
 
 #[test]
+fn test_root_create_accepts_remote_default_ahead_of_local_tracking_ref() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    let initial = ctx.head_oid();
+    ctx.checkout_managed_private("stale-default");
+    ctx.commit_with_gherrit_id("Stack change");
+    let id = ctx.gherrit_id("HEAD").unwrap();
+
+    ctx.run_git(&["checkout", "main"]);
+    ctx.commit("Advance remote default");
+    ctx.run_git(&["push", "--quiet", "--no-verify", "origin", "main:main"]);
+    ctx.run_git(&["update-ref", "refs/heads/main", &initial]);
+    ctx.run_git(&["update-ref", "refs/remotes/origin/main", &initial]);
+    ctx.run_git(&["checkout", "stale-default"]);
+
+    ctx.hook_cmd("pre-push").assert().success();
+    let pull_requests = ctx.github().pull_requests();
+    assert_eq!(pull_requests.len(), 1);
+    assert_eq!(pull_requests[0].head, id);
+    assert_eq!(pull_requests[0].base, "main");
+}
+
+#[test]
 fn test_first_parent_stack_excludes_commits_reachable_only_through_a_merge() {
     let ctx = testutil::test_context!()
         .with_remote()
@@ -287,7 +314,7 @@ fn test_graphql_batch_backoff() {
         .with_git_interceptor()
         .build();
 
-    ctx.limit_graphql_operations_per_request(2);
+    ctx.limit_graphql_query_operations_per_request(2);
     ctx.checkout_managed_private("batch-backoff");
 
     for i in 1..=4 {
@@ -302,7 +329,15 @@ fn test_graphql_batch_backoff() {
         "GraphQL backoff must not alter the independent Git publication batch"
     );
     assert_eq!(ctx.github().pull_requests().len(), 4, "Expected every commit to have a PR");
-    insta::assert_debug_snapshot!("graphql_batch_backoff_trace", ctx.github().requests());
+    let requests = ctx.github().requests();
+    insta::assert_debug_snapshot!("graphql_batch_backoff_trace", requests);
+    assert!(
+        ctx.github()
+            .requests()
+            .iter()
+            .any(|request| { request == &vec![testutil::GraphQlOperation::CreatePr; 4] }),
+        "query backoff must not impose its learned limit on mutation batches"
+    );
 
     let v1_refs = ctx
         .remote_refs("refs/tags/gherrit")
