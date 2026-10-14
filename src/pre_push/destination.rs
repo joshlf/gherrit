@@ -647,7 +647,7 @@ impl ResolvedDestination {
                 Some(coordinates)
             }
             Some(ParsedDestination::Uri { scheme, authority, path }) => {
-                if authority.contains('@') {
+                if authority.contains('@') && !(scheme == "ssh" && authority.eq_ignore_ascii_case("git@github.com")) {
                     bail!(
                         "The push destination for GHerrit remote '{}' contains URI user information, which GHerrit does not support; use a Git credential helper or an SCP-style SSH destination instead",
                         configured_remote.as_str()
@@ -1319,7 +1319,8 @@ fn repository_components(owner: &str, repository: &str) -> Option<(String, Strin
 fn targets_production_github(destination: &ParsedDestination<'_>) -> bool {
     match destination {
         ParsedDestination::Uri { scheme, authority, .. } => {
-            ["https", "ssh"].contains(scheme) && authority.eq_ignore_ascii_case("github.com")
+            (["https", "ssh"].contains(scheme) && authority.eq_ignore_ascii_case("github.com"))
+                || (*scheme == "ssh" && authority.eq_ignore_ascii_case("git@github.com"))
         }
         ParsedDestination::Scp { authority, .. } => {
             authority.eq_ignore_ascii_case("git@github.com")
