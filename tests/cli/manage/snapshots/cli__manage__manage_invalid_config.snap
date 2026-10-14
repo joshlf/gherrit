@@ -8,4 +8,4 @@ STDOUT:
 (empty)
 
 STDERR:
-[gherrit] [ERROR] Invalid gherritManaged value: bad-value. Expected managedPublic, managedPrivate, or false.
+[gherrit] [ERROR] Invalid gherritManaged value. Expected managedPublic, managedPrivate, or false.

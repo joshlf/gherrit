@@ -916,7 +916,11 @@ fn rejects_ambiguous_or_malformed_destinations_without_disclosure() {
 
 #[test]
 fn rejects_uri_user_information_without_disclosure() {
-    assert!(resolved_result(b"ssh://git@github.com/owner/repo.git\n").unwrap().supports_production_github);
+    assert!(
+        resolved_result(b"ssh://git@github.com/owner/repo.git\n")
+            .unwrap()
+            .supports_production_github
+    );
     for destination in [
         "https://token-secret@github.com/owner/repo.git",
         "file://user:password-secret@localhost/tmp/owner/repo.git",
