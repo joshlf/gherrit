@@ -15,7 +15,6 @@ pub enum State {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PublicBranchName(String);
 
-#[allow(dead_code)] // Exercised as the protocol is assembled, before activation.
 impl PublicBranchName {
     pub(crate) fn new(value: String) -> Result<Self> {
         let full_name = format!("refs/heads/{value}");
@@ -310,28 +309,13 @@ fn config_reconciliation(ownership: BranchConfigOwnership, force: bool) -> Confi
     }
 }
 
-fn expected_for_repo(
-    repo: &util::Repo,
-    state: Option<State>,
-    branch: &str,
-) -> Result<BranchConfig> {
-    let mut desired = BranchConfig::expected(state, branch);
-    if state == Some(State::Public) {
-        desired.push_remote =
-            BranchConfigValue::One(repo.default_remote_name()?.as_str().to_owned());
-    }
-    Ok(desired)
-}
-
 fn classify_owned_branch_config(
     repo: &util::Repo,
     current_state: Option<State>,
     branch_name: &str,
     current: &BranchConfig,
 ) -> BranchConfigOwnership {
-    let Ok(expected) = expected_for_repo(repo, current_state, branch_name) else {
-        return BranchConfigOwnership::Drifted;
-    };
+    let expected = BranchConfig::expected(current_state, branch_name);
     match current_state {
         Some(State::Public) => {
             classify_public_branch_config(current, &expected, || repo.default_remote_name().ok())
@@ -476,8 +460,13 @@ fn set_state_impl(
         .to_owned();
     let values = repo.local_branch_config(&branch_name)?;
     let old_state = State::from_values(&values.management)?;
+    if new_state == State::Public {
+        PublicBranchName::new(branch_name.clone()).wrap_err(
+            "This branch cannot be managed as public. Rename it to a compatible branch name, or run `gherrit manage --private` to keep its stack private",
+        )?;
+    }
     if matches!(new_state, State::Private | State::Public) {
-        let desired = expected_for_repo(repo, Some(new_state), &branch_name)?;
+        let desired = BranchConfig::expected(Some(new_state), &branch_name);
         for field in BranchConfigKey::ALL {
             let key = format!("branch.{branch_name}.{}", field.suffix());
             let effective = repo.effective_config_values(&key)?;
@@ -508,8 +497,7 @@ fn set_state_impl(
             // requested state's configuration. Otherwise a transition could
             // silently adopt a user's custom value that happens to match the
             // new state, then treat that value as GHerrit-owned in the future.
-            let expected = expected_for_repo(repo, old_state, &branch_name)
-                .unwrap_or_else(|_| current.clone());
+            let expected = BranchConfig::expected(old_state, &branch_name);
             // `--force` is explicit authority to replace any non-current
             // owned configuration. It must remain usable even when unrelated
             // destination configuration is malformed; exact legacy
@@ -553,7 +541,7 @@ fn set_state_impl(
         }
     };
 
-    let desired = expected_for_repo(repo, Some(new_state), &branch_name)?;
+    let desired = BranchConfig::expected(Some(new_state), &branch_name);
     let plan =
         ManagementPlan::from_desired(&branch_name, new_state, current.as_ref(), desired.clone());
     if matches!(new_state, State::Private | State::Public) {
@@ -711,11 +699,12 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
     Ok(())
 }
 
+/// Uses the exact ownership decoder without config repair or publication.
 pub(crate) fn inspection(repo: &util::Repo, branch: &str) -> Result<serde_json::Value> {
     let values = repo.local_branch_config(branch)?;
     let state = State::from_values(&values.management)?;
     let current = BranchConfig::from_values(&values);
-    let expected = expected_for_repo(repo, state, branch)?;
+    let expected = BranchConfig::expected(state, branch);
     // Only managed states claim ownership of these branch fields.
     let drift: Vec<_> = match state {
         None | Some(State::Unmanaged) => Vec::new(),
@@ -732,16 +721,47 @@ pub(crate) fn inspection(repo: &util::Repo, branch: &str) -> Result<serde_json::
 #[cfg(test)]
 mod tests {
     #[test]
-    fn complete_real_config_reads_preserve_current_public_routing() {
-        let ctx = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
-        ctx.checkout_new("config-route");
-        let repo = util::Repo::open(ctx.repo_path.to_str().unwrap()).unwrap();
-        for state in [State::Private, State::Public, State::Public, State::Private] {
-            set_state(&repo, state, false).unwrap();
-            assert_eq!(
-                BranchConfig::read_from(&repo, "config-route").unwrap(),
-                expected_for_repo(&repo, Some(state), "config-route").unwrap()
-            );
+    fn next_management_invocation_preserves_partial_drift_until_forced() {
+        for state in [State::Private, State::Public, State::Unmanaged] {
+            for prefix in 0..=4 {
+                let context =
+                    testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+                context.checkout_new("feature-work");
+                let old = if state == State::Unmanaged { State::Private } else { State::Unmanaged };
+                let current = BranchConfig::expected(Some(old), "feature-work");
+                let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+                for (key, _, value) in BranchConfig::default().changes_to(&current) {
+                    repository
+                        .replace_local_config(
+                            &format!("branch.feature-work.{}", key.suffix()),
+                            value.unwrap(),
+                        )
+                        .unwrap();
+                }
+                repository
+                    .replace_local_config("branch.feature-work.gherritManaged", old.config_value())
+                    .unwrap();
+                let plan = ManagementPlan::new("feature-work", state, Some(&current));
+                for edit in
+                    plan.branch_edits.iter().chain(std::iter::once(&plan.marker)).take(prefix)
+                {
+                    edit.apply(&repository).unwrap();
+                }
+                let file = repository.layout().common_git_dir.join("config");
+                let before = std::fs::read(&file).unwrap();
+                let result = set_state(&repository, state, false);
+                assert_eq!(result.is_err(), (1..=3).contains(&prefix));
+                if (1..=3).contains(&prefix) {
+                    assert_eq!(std::fs::read(&file).unwrap(), before, "partial config was adopted");
+                    assert_eq!(State::read_from(&repository, "feature-work").unwrap(), Some(old));
+                }
+                set_state(&repository, state, true).unwrap();
+                assert_eq!(State::read_from(&repository, "feature-work").unwrap(), Some(state));
+                assert_eq!(
+                    BranchConfig::read_from(&repository, "feature-work").unwrap(),
+                    BranchConfig::expected(Some(state), "feature-work")
+                );
+            }
         }
     }
 
@@ -866,6 +886,25 @@ mod tests {
             .args(["config", "--local", "--get", "branch.selected-repository.gherritManaged"])
             .assert()
             .code(1);
+    }
+
+    #[test]
+    fn public_branches_are_disjoint_from_every_owned_ref() {
+        for branch in ["feature-/one", "feature-one", "feature.one", "café", "gherrit-bases-other"]
+        {
+            assert_eq!(PublicBranchName::new(branch.to_owned()).unwrap().as_str(), branch);
+        }
+
+        for branch in [
+            "Gchange",
+            "Gchange/child",
+            "feature",
+            "feature/one",
+            "gherrit-bases",
+            "gherrit-bases/Gchange",
+        ] {
+            assert!(PublicBranchName::new(branch.to_owned()).is_err(), "branch={branch:?}");
+        }
     }
 
     const BRANCH: &str = "feature";

@@ -116,14 +116,11 @@ impl LocalChange {
         self.first_parent
     }
 
+    #[cfg(test)]
     pub(super) fn title(&self) -> &str {
         self.title.as_str()
     }
 
-    pub(super) fn body(&self) -> &str {
-        &self.body
-    }
-    #[allow(dead_code)]
     pub(super) fn into_pull_request_content(self) -> (PullRequestTitle, String) {
         (self.title, self.body)
     }
