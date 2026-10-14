@@ -81,10 +81,39 @@ git push
 
 ### 3\. Updating the Stack
 
-To modify a commit in the middle of the stack, use interactive rebase:
+Fetch the default tip from the same push destination GHerrit uses before
+rebasing. These examples use a destination whose default branch is `main`:
+
+Define this Bash helper once in the terminal where you work on the stack. It
+fetches the push destination and carries the selected remote's proxy settings
+into that URL's native Git context. It leaves persistent configuration alone.
 
 ```bash
-git rebase -i main
+gherrit_fetch_default() (
+    set -eo pipefail
+    unset GIT_CONFIG
+    gherrit_remote="$(git config --default origin --get gherrit.remote)"
+    gherrit_destination="$(git remote get-url --push -- "$gherrit_remote")"
+    transport_args=()
+    for setting in proxy proxyAuthMethod; do
+        if value="$(git config --get "remote.$gherrit_remote.$setting")"; then
+            config_env="GHERRIT_FETCH_$setting"
+            export "$config_env=$value"
+            transport_args+=("--config-env=remote.$gherrit_destination.$setting=$config_env")
+        elif [ "$?" -ne 1 ]; then
+            return 1
+        fi
+    done
+    git "${transport_args[@]}" fetch --no-tags --refmap= -- \
+        "$gherrit_destination" "$1"
+    git rev-parse --verify FETCH_HEAD
+)
+```
+
+```bash
+set -eo pipefail
+default_tip="$(gherrit_fetch_default refs/heads/main)"
+git rebase -i "$default_tip"
 # (Edit, squash, or reword commits)
 ```
 
@@ -107,26 +136,24 @@ another name) before landing with this version. GHerrit no longer provides the
 PR merge. The manual steps below replace its automatic cascade.
 
 Merge only the root PR, whose base is the repository's default branch. After it
-lands, advance your local default branch from the same repository that GHerrit
-publishes to. Remove the merged local root from the remaining stack, and
-publish again. For a repository whose default branch is `main`:
+lands, fetch its destination default tip again. Remove the merged local root
+from the remaining stack, and publish again. For a repository whose default
+branch is `main`, using the fetch helper defined above:
 
 ```bash
-git switch main
-gherrit_remote="$(git config --default origin --get gherrit.remote)"
-gherrit_destination="$(git remote get-url --push -- "$gherrit_remote")"
-git pull --ff-only -- "$gherrit_destination" main
-git switch -
-git rebase --onto main <merged-root-commit>
+set -eo pipefail
+default_tip="$(gherrit_fetch_default refs/heads/main)"
+git rebase --onto "$default_tip" <merged-root-commit>
 git push
 ```
 
 Replace `<merged-root-commit>` with the commit ID of the local root which just
-landed. The two assignments select the same push destination that GHerrit uses:
+landed. The helper selects the same push destination that GHerrit uses:
 `gherrit.remote` when configured and `origin` otherwise. Naming both that
 destination and `main` prevents the local branch's upstream or the remote's
-fetch URL from selecting a different repository. Repeat from the new root until
-the stack is landed.
+fetch URL from selecting a different repository. Rebase against the captured
+OID; a local `main` alias may be absent or divergent. Refresh this tip before
+each rebase. Repeat from the new root until the stack is landed.
 
 ## Configuration
 
