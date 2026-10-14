@@ -236,9 +236,7 @@ fn edit_identity(
     // Recognition retains configured legacy separators. Put ':' first so
     // Git formats every recognized key consistently, while insertion below
     // still writes only GHerrit's canonical separator.
-    let configured = cmd!("git config --null --get trailer.separators")
-        .env_remove("GIT_CONFIG")
-        .bounded_output()?;
+    let configured = cmd!("git config --null --get trailer.separators").bounded_output()?;
     let mut separators = "trailer.separators=:".to_owned();
     match configured.status.code() {
         Some(0) => {
