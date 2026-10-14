@@ -93,3 +93,14 @@ identities use canonical `: ` syntax. An existing recognized identity keeps its
 original bytes and value during amendment. Recognition does not broaden the raw
 publication grammar; convert an unsupported legacy separator explicitly while
 retaining its ID instead of generating a replacement review identity.
+
+## Enclosing public pushes from promisor repositories
+
+The legacy public route still allows the original Git process to push after
+this hook returns. Set a true `GIT_NO_LAZY_FETCH` value before starting that
+Git process; setting it only in a pre-push wrapper cannot change its parent.
+GHerrit checks its inherited value with Git's boolean parser before observing
+or publishing a managed public stack. Child-only environment changes cannot
+constrain the enclosing pack generation. Private loopback pushes need no such
+setting. The later loopback activation removes the enclosing ref effect and
+this legacy-specific requirement.

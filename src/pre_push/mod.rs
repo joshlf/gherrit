@@ -90,6 +90,8 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
         true => log::info!("Branch {} is MANAGED. Syncing stack...", branch_name.yellow()),
     }
 
+    require_enclosing_no_lazy_fetch(repo, branch_name)?;
+
     let commits = LocalStack::collect(repo).wrap_err("Failed to collect commits")?;
 
     if commits.is_empty() {
@@ -855,6 +857,33 @@ where
         batches.accept();
     }
     Ok(outputs)
+}
+
+/// Child environment edits cannot constrain the Git process running this hook.
+/// Legacy public pushes still transmit their projection after the hook returns.
+fn require_enclosing_no_lazy_fetch(repo: &util::Repo, branch: &str) -> Result<()> {
+    use crate::util::CommandExt as _;
+    if is_private_stack(repo, branch) || !repo.has_promisor_remote()? {
+        return Ok(());
+    }
+    if let Some(value) = std::env::var_os("GIT_NO_LAZY_FETCH") {
+        // Git's config and environment booleans share its native parser. Keep
+        // alternate true spellings without maintaining a second parser.
+        let mut setting = std::ffi::OsString::from("gherrit.enclosingNoLazyFetch=");
+        setting.push(value);
+        let output = util::cmd("git", ["-c"])
+            .arg(setting)
+            .env_remove("GIT_CONFIG")
+            .args(["config", "--type=bool", "--get", "gherrit.enclosingNoLazyFetch"])
+            .bounded_output()
+            .wrap_err("Failed to inspect the enclosing push's lazy-fetch setting")?;
+        if output.status.success() && output.stdout == b"true\n" {
+            return Ok(());
+        }
+    }
+    bail!(
+        "A public push from a promisor repository requires GIT_NO_LAZY_FETCH=1 on the enclosing Git process; run 'GIT_NO_LAZY_FETCH=1 git push'"
+    )
 }
 
 #[cfg(test)]
