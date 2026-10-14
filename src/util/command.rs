@@ -59,25 +59,12 @@ macro_rules! cmd {
 }
 pub(crate) use cmd as cmd_macro;
 
-macro_rules! re {
-    ($name:ident, $re:literal) => {
-        fn $name() -> &'static regex::Regex {
-            $crate::re!(@inner $re)
-        }
-    };
-    ($re:literal) => {
-        $crate::re!(@inner $re)
-    };
-    (@inner $re:literal) => {{
-        static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new($re).unwrap());
-        &*RE
-    }};
-}
-pub(crate) use re as re_macro;
-
 pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Command {
     let mut c = Command::new(name);
     if name == "git" {
+        // The config builtin alone treats GIT_CONFIG as a file override.
+        // Every query must see the same configuration as ordinary Git.
+        c.env_remove("GIT_CONFIG");
         // Replacement objects and implicit promisor fetches can make Git
         // subprocesses observe a different graph from the one sent to the
         // remote. Keep every production Git invocation on the literal local
