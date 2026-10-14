@@ -48,6 +48,36 @@ fn promisor_configuration_process_fixture() {
 }
 
 #[test]
+fn remote_names_are_decoded_and_validated_without_fallback() {
+    for value in [b"origin".as_slice(), b"-publish", "rémote".as_bytes()] {
+        assert_eq!(RemoteName::from_config(value).unwrap().as_str().as_bytes(), value);
+    }
+
+    for value in [b"".as_slice(), b"bad\nname", b"bad\rname", b"bad\0name", b"\xff"] {
+        assert!(RemoteName::from_config(value).is_err(), "value: {value:?}");
+    }
+}
+
+#[test]
+fn the_default_remote_requires_at_most_one_configured_value() {
+    assert_eq!(default_remote_name_from_values(std::iter::empty()).unwrap().as_str(), "origin");
+    assert_eq!(
+        default_remote_name_from_values([b"publish".as_slice()]).unwrap().as_str(),
+        "publish"
+    );
+
+    for values in [
+        [b"origin".as_slice(), b"origin".as_slice()],
+        [b"origin".as_slice(), b"publish".as_slice()],
+    ] {
+        let error = default_remote_name_from_values(values)
+            .err()
+            .expect("repeated values must be rejected");
+        assert_eq!(error.to_string(), "The GHerrit remote is configured more than once");
+    }
+}
+
+#[test]
 fn git_commands_use_the_literal_local_graph_without_lazy_fetches() {
     let command = cmd("git", ["status"]);
     let arguments = command
@@ -109,6 +139,26 @@ fn literal_graph_open_options_deny_object_environment_at_every_trust_level() {
     for trust in [gix::sec::Trust::Full, gix::sec::Trust::Reduced] {
         assert_eq!(options.by_level(trust).permissions.env.objects, gix::sec::Permission::Deny);
     }
+}
+
+#[test]
+fn git_directory_identity_is_stable_and_worktree_specific() {
+    let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+    let linked = context.dir.path().join("linked-identity");
+    context
+        .git_cmd()
+        .args(["worktree", "add", "--detach"])
+        .arg(&linked)
+        .arg("HEAD")
+        .assert()
+        .success();
+
+    let main = Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+    let reopened = Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+    let linked = Repo::open(linked.to_str().unwrap()).unwrap();
+
+    assert!(main.git_dir_identity() == reopened.git_dir_identity());
+    assert!(main.git_dir_identity() != linked.git_dir_identity());
 }
 
 #[test]
@@ -264,6 +314,17 @@ fn promisor_configuration_uses_direct_common_config_and_bound_repository() {
 }
 
 #[test]
+fn config_env_support_requires_git_2_31() {
+    let error = require_git_config_env_output(b"git version 2.30.9\n").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "GHerrit requires Git 2.31 or newer to bind the private publication destination without placing it in the top-level Git process arguments; found Git 2.30.9"
+    );
+    require_git_config_env_output(b"git version 2.31.0\n").unwrap();
+    require_git_config_env_output(b"git version 3.0.0\n").unwrap();
+}
+
+#[test]
 #[should_panic(expected = "Command cannot be empty")]
 fn test_cmd_macro_empty_panic() {
     cmd!("");
@@ -273,33 +334,6 @@ fn test_cmd_macro_empty_panic() {
 #[should_panic(expected = "Command cannot be empty")]
 fn test_cmd_macro_whitespace_panic() {
     cmd!("   ");
-}
-
-#[test]
-fn test_get_repo_owner_name() {
-    for (url, (owner, repo)) in [
-        ("https://github.com/owner/repo.git", ("owner", "repo")),
-        ("https://github.com/owner/repo", ("owner", "repo")),
-        ("git@github.com:owner/repo.git", ("owner", "repo")),
-        ("git@github.com:owner/repo", ("owner", "repo")),
-        ("alias:owner/repo.git", ("owner", "repo")),
-        ("alias:owner/repo", ("owner", "repo")),
-        ("http://localhost:3000/owner/repo.git", ("owner", "repo")),
-        ("http://my-gh.com/owner/repo", ("owner", "repo")),
-        ("/tmp/test/owner/repo.git", ("owner", "repo")),
-        ("/tmp/owner/repo", ("owner", "repo")),
-        ("owner/repo", ("owner", "repo")),
-        ("https://github.com/user-name/repo", ("user-name", "repo")),
-        ("https://github.com/user_name/repo", ("user_name", "repo")),
-        ("https://github.com/user.name/repo", ("user.name", "repo")),
-        ("https://github.com/user/repo-name", ("user", "repo-name")),
-        ("https://github.com/user/repo_name", ("user", "repo_name")),
-        ("https://github.com/user/repo.name", ("user", "repo.name")),
-        ("https://github.com/user/repo.name.git", ("user", "repo.name")),
-    ] {
-        let expect = (owner.to_string(), repo.to_string());
-        assert_eq!(get_repo_owner_name(url).unwrap(), expect);
-    }
 }
 
 #[test]
