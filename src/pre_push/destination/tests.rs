@@ -916,9 +916,17 @@ fn rejects_ambiguous_or_malformed_destinations_without_disclosure() {
 
 #[test]
 fn rejects_uri_user_information_without_disclosure() {
+    assert!(
+        resolved_result(b"ssh://git@github.com/owner/repo.git\n")
+            .unwrap()
+            .supports_production_github
+    );
     for destination in [
+        "ssh://GIT@github.com/owner/repo.git",
+        "ssh://Git@GITHUB.COM/owner/repo.git",
+        "SSH://git@github.com/owner/repo.git",
+        "SsH://git@github.com/owner/repo.git",
         "https://token-secret@github.com/owner/repo.git",
-        "ssh://git@github.com/owner/repo.git",
         "file://user:password-secret@localhost/tmp/owner/repo.git",
     ] {
         let error = resolved_result(format!("{destination}\n").as_bytes())
@@ -930,6 +938,17 @@ fn rejects_uri_user_information_without_disclosure() {
     }
 
     assert!(resolved_result(b"git@github.com:owner/repo.git\n").is_ok());
+    assert!(
+        resolved_result(b"ssh://git@GITHUB.COM/owner/repo.git\n")
+            .unwrap()
+            .supports_production_github
+    );
+    assert!(
+        resolved_result(b"git@GITHUB.COM:owner/repo.git\n").unwrap().supports_production_github
+    );
+    assert!(
+        !resolved_result(b"GIT@github.com:owner/repo.git\n").unwrap().supports_production_github
+    );
 }
 
 #[test]
