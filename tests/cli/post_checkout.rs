@@ -28,3 +28,21 @@ fn installed_hook_classifies_new_and_shared_branches() {
     );
     ctx.assert_config("branch.collab-feature.gherritManaged", Some("false"));
 }
+
+#[test]
+fn installed_hook_keeps_a_foreign_remote_default_branch_shared() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_installed_hooks()
+        .build();
+    ctx.run_git(&["remote", "add", "other", "https://github.com/other/repo"]);
+    ctx.run_git(&["update-ref", "refs/remotes/other/main", "HEAD"]);
+    ctx.git_cmd()
+        .args(["checkout", "-b", "foreign-main", "--track", "other/main"])
+        .assert()
+        .success();
+    ctx.assert_config("branch.foreign-main.gherritManaged", Some("false"));
+    ctx.assert_config("branch.foreign-main.remote", Some("other"));
+    ctx.assert_config("branch.foreign-main.merge", Some("refs/heads/main"));
+}
