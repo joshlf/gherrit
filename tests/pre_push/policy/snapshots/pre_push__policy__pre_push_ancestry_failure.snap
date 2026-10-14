@@ -9,6 +9,6 @@ STDOUT:
 
 STDERR:
 [gherrit] Branch lonely-branch is MANAGED. Syncing stack...
-[gherrit] [ERROR] Failed to collect commits: The branch 'lonely-branch' does not descend from 'main' on its first-parent path.
+[gherrit] [ERROR] Failed to collect commits: The branch 'lonely-branch' does not descend from the observed push-destination default 'main' on its first-parent path.
 [gherrit] [ERROR] GHerrit defines stack order using first-parent ancestry.
-[gherrit] [ERROR] Maybe you want to 'git rebase' on 'main' before pushing?
+[gherrit] [ERROR] Fetch 'main' from the configured push destination, then rebase onto that fetched tip before pushing.
