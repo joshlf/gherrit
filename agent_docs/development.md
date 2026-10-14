@@ -9,8 +9,8 @@ change. They match the checks run in CI, including the required test-build
 configuration.
 
 Use [testing.md](./testing.md) when choosing a test layer or extending the test
-infrastructure. It defines the product-risk model and the target architecture
-for the ongoing migration away from broad system fixtures.
+infrastructure. It defines the product-risk model and the implemented
+architecture for pure, adapter-contract, semantic-recovery, and system tests.
 
 - `cargo build`: Builds the project.
 
@@ -41,13 +41,14 @@ out another installer, or establish exclusive ownership of an external path.
 Git uses common-directory default hooks in linked worktrees; explicit relative
 hook paths are resolved from each worktree or the bare Git directory.
 
-Catchable Unix termination signals (HUP, INT, QUIT and TERM) are forwarded to
-registered child groups before GHerrit performs the signal's default
-termination. Spawn/registration and reap/removal share a mutex
-with the normal signal-delivery thread, preventing missed children and recycled
-identity signalling. Inherited ignored signals stay ignored. Child handlers may
-handle or ignore a forwarded signal, just as in the original caller group;
-uncatchable termination and escaped descendants have no cleanup guarantee.
+## Management edits
+
+Management classifies existing local ownership before constructing a complete
+ordered edit plan. The final management marker follows every branch edit.
+Separate Git config writes are not transactional: an interruption can leave
+partial drift. An unforced invocation preserves that drift rather than adopting
+it; an explicit forced invocation can repair it. Restoring pre-management user
+values remains a separate persistence policy.
 
 *Updated by an AI agent acting on joshlf's behalf.*
 
@@ -70,6 +71,7 @@ refuses those overrides explicitly before opening its repository, rather than
 silently reading or writing a different object store. On-disk
 `objects/info/alternates` remains supported. Object location is independent of
 replacement objects and grafts, which must not rewrite publication ancestry.
+
 
 ## Scissors cleanup
 
