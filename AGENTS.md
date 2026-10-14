@@ -104,6 +104,9 @@ that your change is valid and follows the style guidelines.
 - [agent_docs/style.md](./agent_docs/style.md) for style and formatting
   guidelines for files and commit messages
 
+The [review-order index](design/review-order.md) separates shared foundations
+from the owned-base protocol decision.
+
 The [architecture and test map](design/architecture.md) locates invariant owners.
 [Issue/PR provenance](agent_docs/issue-provenance.md) preserves the surveyed
 historical counterexamples and distinguishes the survey baseline from these
