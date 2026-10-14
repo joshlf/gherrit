@@ -27,24 +27,8 @@ expression: state.graphql_requests
         CreatePr,
     ],
     [
-        CreatePr,
-        CreatePr,
-    ],
-    [
-        CreatePr,
-        CreatePr,
-    ],
-    [
         UpdatePr,
         UpdatePr,
-        UpdatePr,
-        UpdatePr,
-    ],
-    [
-        UpdatePr,
-        UpdatePr,
-    ],
-    [
         UpdatePr,
         UpdatePr,
     ],
