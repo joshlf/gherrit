@@ -6,7 +6,7 @@ use std::{
 };
 
 use apollo_compiler::{ast, executable, validation::Valid, ExecutableDocument, Name, Node};
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{body::Bytes, extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
@@ -28,6 +28,8 @@ pub struct MockState {
     pub(super) cross_repository_prs: HashSet<usize>,
     pub(super) git: git_interceptor::State,
     pub graphql_requests: Vec<Vec<GraphQlOperation>>,
+    pub(super) graphql_arrivals: usize,
+    pub(super) protocol_violations: Vec<String>,
     pub max_graphql_operations_per_request: Option<usize>,
     pub repo_owner: String,
     pub repo_name: String,
@@ -539,16 +541,42 @@ fn validate_supported_document(
     Ok(())
 }
 
+fn graphql_protocol_error(
+    state: &AppState,
+    message: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    state.state.write().unwrap().protocol_violations.push(message.to_owned());
+    graphql_http_error(message)
+}
+
 async fn graphql(
     State(app_state): State<AppState>,
-    Json(payload): Json<serde_json::Value>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    app_state.state.write().unwrap().graphql_arrivals += 1;
+    // Reuse Axum's JSON/media-type contract after counting the raw arrival.
+    let mut request = axum::http::Request::new(axum::body::Body::from(body));
+    *request.headers_mut() = headers;
+    let payload: serde_json::Value = match <Json<serde_json::Value> as axum::extract::FromRequest<
+        (),
+    >>::from_request(request, &())
+    .await
+    {
+        Ok(Json(payload)) => payload,
+        Err(_) => {
+            return graphql_protocol_error(&app_state, "Invalid GraphQL JSON or content type")
+        }
+    };
     let Some(query) = payload.get("query").and_then(|value| value.as_str()) else {
-        return graphql_http_error("Invalid GraphQL payload: missing string field `query`");
+        return graphql_protocol_error(
+            &app_state,
+            "Invalid GraphQL payload: missing string field `query`",
+        );
     };
     let variables = match graphql_variables(&payload) {
         Ok(variables) => variables,
-        Err(message) => return graphql_http_error(&message),
+        Err(message) => return graphql_protocol_error(&app_state, &message),
     };
 
     let document =
@@ -556,11 +584,14 @@ async fn graphql(
             Ok(doc) => doc,
             Err(e) => {
                 eprintln!("DEBUG: GraphQL validation errors: {:?}", e.errors);
-                return graphql_http_error("GraphQL request failed schema validation");
+                return graphql_protocol_error(
+                    &app_state,
+                    "GraphQL request failed schema validation",
+                );
             }
         };
     if let Err(message) = validate_supported_document(&document, &variables) {
-        return graphql_http_error(&message);
+        return graphql_protocol_error(&app_state, &message);
     }
 
     let operations = graphql_operations(&document);
