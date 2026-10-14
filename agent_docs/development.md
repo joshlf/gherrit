@@ -94,6 +94,18 @@ original bytes and value during amendment. Recognition does not broaden the raw
 publication grammar; convert an unsupported legacy separator explicitly while
 retaining its ID instead of generating a replacement review identity.
 
+## Enclosing pushes from promisor repositories
+
+The legacy route still allows the original Git process to push after this hook
+returns. Neither an inherited lazy-fetch flag nor the version of Git found
+through PATH proves that the enclosing executable supports that flag. GHerrit
+therefore requires a direct hook invocation or an actual `.`/`.` destination
+with no ref update when the repository has a promisor remote. Use private
+management and plain `git push` for the latter route. Explicit remote, URL or
+refspec overrides cannot bypass this requirement, even with the flag set.
+Bound child commands enforce their own executable capability separately. The
+later loopback activation requires the same no-op proof for all repositories.
+
 ## Trailer aliases
 
 Identity retention requires the literal full gherrit-pr-id key in the source

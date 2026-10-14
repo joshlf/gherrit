@@ -1,4 +1,10 @@
-use std::{collections::HashMap, process::Stdio, time::Duration};
+use std::{
+    collections::HashMap,
+    ffi::{OsStr, OsString},
+    io,
+    process::Stdio,
+    time::Duration,
+};
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
 use gix::{reference::Category, refs::transaction::PreviousValue};
@@ -43,6 +49,81 @@ use remote::observe_managed_branches;
 const INDETERMINATE_GRAPHQL_MUTATION: &str = "GraphQL mutation acknowledgement is indeterminate; stop this publication attempt and retry the push to reobserve GitHub state";
 const MAX_GRAPHQL_MUTATION_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
+/// The complete externally relevant shape of one hook invocation.
+///
+/// GHerrit's own nested pushes return before constructing this value. Direct
+/// invocation has no enclosing effect. For a managed Git invocation, one byte
+/// is enough to distinguish a no-op from a push which could mutate a ref after
+/// this hook returns. Unmanaged invocations never consume their input.
+pub(crate) struct Invocation {
+    source: InvocationSource,
+}
+
+enum InvocationSource {
+    /// Direct invocation of the hidden hook command has no enclosing Git
+    /// process and therefore no later ref effect.
+    Direct,
+    Git {
+        remote_name: OsString,
+        remote_location: OsString,
+    },
+}
+
+impl Invocation {
+    pub(crate) fn new(
+        remote_name: Option<OsString>,
+        remote_location: Option<OsString>,
+    ) -> Result<Self> {
+        let source = match (remote_name, remote_location) {
+            (None, None) => InvocationSource::Direct,
+            (Some(remote_name), Some(remote_location)) => {
+                InvocationSource::Git { remote_name, remote_location }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                bail!("Git pre-push hook arguments are incomplete")
+            }
+        };
+        Ok(Self { source })
+    }
+
+    fn input_has_ref_updates(input: &mut impl io::Read) -> Result<bool> {
+        let mut first = [0_u8; 1];
+        loop {
+            match input.read(&mut first) {
+                Ok(0) => return Ok(false),
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error).wrap_err("Failed to read Git pre-push input"),
+            }
+        }
+    }
+
+    /// Proves that no enclosing Git process can write a ref after GHerrit's
+    /// acknowledged publication finishes.
+    pub(super) fn require_managed_noop(self) -> Result<()> {
+        self.require_managed_noop_from(&mut io::stdin().lock())
+    }
+
+    fn require_managed_noop_from(self, input: &mut impl io::Read) -> Result<()> {
+        match self.source {
+            InvocationSource::Direct => Ok(()),
+            InvocationSource::Git { remote_name, remote_location }
+                if remote_name == OsStr::new(".") && remote_location == OsStr::new(".") =>
+            {
+                if Self::input_has_ref_updates(input)? {
+                    bail!(
+                        "A managed GHerrit push cannot include an enclosing Git ref update; run plain 'git push' with the branch configuration created by 'gherrit manage'"
+                    );
+                }
+                Ok(())
+            }
+            InvocationSource::Git { .. } => bail!(
+                "A managed GHerrit push must use the local no-op destination created by 'gherrit manage'; run plain 'git push'"
+            ),
+        }
+    }
+}
+
 #[derive(Eq, PartialEq)]
 pub(crate) enum GithubEndpoint {
     Production,
@@ -73,7 +154,11 @@ impl GithubEndpoint {
     }
 }
 
-pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<()> {
+pub async fn run(
+    repo: &util::Repo,
+    github_endpoint: &GithubEndpoint,
+    invocation: Invocation,
+) -> Result<()> {
     let branch_name = repo.current_branch();
     let branch_name = match branch_name {
         HeadState::Attached(bn) | HeadState::Pending(bn) => bn,
@@ -88,6 +173,10 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
             return Ok(());
         }
         true => log::info!("Branch {} is MANAGED. Syncing stack...", branch_name.yellow()),
+    }
+
+    if repo.has_promisor_remote()? {
+        invocation.require_managed_noop().wrap_err("Legacy publication from a promisor repository requires a local no-op enclosing push; use 'gherrit manage --private' and plain 'git push', or invoke the hook directly. An inherited flag cannot establish the enclosing Git executable's capability")?;
     }
 
     let commits = LocalStack::collect(repo).wrap_err("Failed to collect commits")?;
