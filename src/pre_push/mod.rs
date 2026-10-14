@@ -1366,7 +1366,10 @@ mod tests {
 
         let error = result.expect_err("an oversized response must end the attempt");
         assert!(error.to_string().contains("indeterminate"), "error={error:?}");
-        assert!(format!("{error:?}").contains("GraphQL response exceeded its body limit"), "error={error:?}");
+        assert!(
+            format!("{error:?}").contains("GraphQL response exceeded its body limit"),
+            "error={error:?}"
+        );
         assert_eq!(ids, [0], "the mutation must be transmitted exactly once");
     }
 

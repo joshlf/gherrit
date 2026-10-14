@@ -78,11 +78,13 @@ pub(crate) use re as re_macro;
 pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Command {
     let mut c = Command::new(name);
     if name == "git" {
-        // Replacement objects can make Git subprocesses observe a different
-        // graph from the one sent to the remote. Keep every production Git
-        // invocation on the literal local graph.
+        // Replacement objects and implicit promisor fetches can make Git
+        // subprocesses observe a different graph from the one sent to the
+        // remote. Keep every production Git invocation on the literal local
+        // graph.
         c.arg("--no-replace-objects");
         c.env("GIT_NO_REPLACE_OBJECTS", "1");
+        c.env("GIT_NO_LAZY_FETCH", "1");
         for variable in [
             "GIT_ALTERNATE_OBJECT_DIRECTORIES",
             "GIT_GRAFT_FILE",
@@ -148,4 +150,19 @@ pub(crate) fn local_output(command: &mut Command) -> Result<std::process::Output
         std::time::Duration::from_secs(60),
         4 * 1024 * 1024,
     )?)
+}
+
+pub(crate) fn clear_git_repository_overrides(command: &mut Command) {
+    for variable in [
+        "GIT_CONFIG",
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ] {
+        command.env_remove(variable);
+    }
 }
