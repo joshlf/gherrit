@@ -11,5 +11,5 @@ STDERR:
 Switched to a new branch 'feature-stack'
 [gherrit] Detected feature-stack as a new branch.
 [gherrit] Branch feature-stack is now managed by GHerrit in private mode.
-[gherrit]   - 'git push' will sync PRs only, but will not push feature-stack itself.
+[gherrit]   - 'git push' will publish the stack without projecting feature-stack to the push destination.
 [gherrit] To opt-out, run: gherrit unmanage
