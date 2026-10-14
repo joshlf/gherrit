@@ -1,0 +1,312 @@
+//! Read-only facts. Cached local refs and reports are never publication authority.
+
+use std::collections::HashSet;
+
+use eyre::{Result, WrapErr, bail};
+use serde_json::{Value, json};
+
+use crate::{
+    identity::{self, GherritIdTrailer, GherritPrId},
+    manage,
+    util::{self, CommandExt as _},
+};
+
+const MAX_INSPECT_COMMITS: usize = 1000;
+
+/// Lossless byte representation, including non-UTF-8 paths and names.
+fn bytes(value: &[u8]) -> Value {
+    json!({"utf8": std::str::from_utf8(value).ok(), "hex": value.iter().map(|byte| format!("{byte:02x}")).collect::<String>()})
+}
+
+/// Keep human output valid JSON while escaping every non-ASCII scalar,
+/// including C1, bidirectional formatting, and non-BMP characters.
+fn terminal_json(value: &Value) -> Result<String> {
+    use std::fmt::Write as _;
+    let encoded = serde_json::to_string(value)?;
+    let mut output = String::with_capacity(encoded.len());
+    for character in encoded.chars() {
+        if character.is_ascii() && !character.is_ascii_control() {
+            output.push(character);
+        } else {
+            for unit in character.encode_utf16(&mut [0; 2]) {
+                write!(&mut output, "\\u{unit:04x}")?;
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn git(args: &[&str]) -> Result<Option<Vec<u8>>> {
+    let mut command = util::cmd("git", args);
+    util::clear_git_repository_overrides(&mut command);
+    let output = command.bounded_output()?;
+    match output.status.code() {
+        Some(0) => Ok(Some(output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout).to_owned())),
+        Some(1) if output.stdout.is_empty() => Ok(None),
+        _ => bail!("Local Git inspection failed for {:?}", args),
+    }
+}
+
+fn fact(args: &[&str]) -> Value {
+    match git(args) {
+        Ok(Some(value)) => json!({"state": "observed", "value": bytes(&value)}),
+        Ok(None) => json!({"state": "absent"}),
+        Err(_) => json!({"state": "unavailable"}),
+    }
+}
+
+/// Namespace diagnostics use witnessed local remote-HEAD names, never a
+/// guessed main/master name. These cached facts may still be stale.
+fn cached_default_branch(repo: &util::Repo) -> Result<String> {
+    let remote = repo.default_remote_name()?;
+    let prefix = format!("refs/remotes/{}/", remote.as_str());
+    let head = repo.find_reference(&format!("{prefix}HEAD"))?;
+    let target = head.target();
+    let name =
+        target.try_name().ok_or_else(|| eyre::eyre!("Cached remote HEAD is not symbolic"))?;
+    let name = std::str::from_utf8(name.as_bstr())?;
+    name.strip_prefix(&prefix)
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| eyre::eyre!("Cached remote HEAD targets another namespace"))
+}
+
+fn commit_fact(
+    commit: gix::Commit<'_>,
+    seen: &mut HashSet<GherritPrId>,
+    default: Option<&str>,
+) -> Result<Value> {
+    let message = commit.message_raw()?;
+    let parsed = commit.message()?;
+    let identity_source = parsed.body.map(AsRef::as_ref).unwrap_or(message.as_ref());
+    let occurrences = identity::gherrit_id_trailers(identity_source);
+    let mut problems = Vec::new();
+    let id = match occurrences.as_slice() {
+        [] => {
+            problems.push("missing identity");
+            None
+        }
+        [GherritIdTrailer::Exact { value, .. }] => {
+            match GherritPrId::from_trailer(commit.id, value) {
+                Ok(id) => Some(id),
+                Err(_) => {
+                    problems.push("invalid identity");
+                    None
+                }
+            }
+        }
+        [GherritIdTrailer::Malformed] => {
+            problems.push("malformed identity syntax");
+            None
+        }
+        _ => {
+            problems.push("multiple identities");
+            None
+        }
+    };
+    if id.as_ref().is_some_and(|id| !seen.insert(id.clone())) {
+        problems.push("repeated identity");
+    }
+    if id
+        .as_ref()
+        .is_some_and(|id| default.is_some_and(|default| id.head_conflicts_with_branch(default)))
+    {
+        problems.push("identity conflicts with default branch");
+    }
+    if std::str::from_utf8(message.as_ref()).is_err() {
+        problems.push("non-UTF-8 message");
+    }
+    let title = message.split(|byte| *byte == b'\n').next().unwrap_or_default();
+    if [b"fixup!".as_slice(), b"squash!", b"amend!"].iter().any(|prefix| title.starts_with(prefix))
+    {
+        problems.push("pending autosquash");
+    }
+    if title.is_empty() {
+        problems.push("empty title");
+    }
+    if std::str::from_utf8(title).is_ok_and(|title| title.chars().count() > 256) {
+        problems.push("oversized title");
+    }
+    Ok(
+        json!({"oid": commit.id.to_string(), "id": id.as_ref().map(GherritPrId::as_str), "title": bytes(title), "problems": problems}),
+    )
+}
+
+fn inspect_identity_ancestry(
+    repo: &util::Repo,
+    head: gix::ObjectId,
+    commits: &mut [Value],
+) -> Value {
+    const MAX_ANCESTRY_COMMITS: usize = 10_000;
+    let expected = commits
+        .iter()
+        .filter_map(|commit| {
+            Some((commit["id"].as_str()?.to_owned(), commit["oid"].as_str()?.to_owned()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    if expected.is_empty() {
+        return json!({"state":"not_needed"});
+    }
+    let mut repeated = HashSet::new();
+    let scan = (|| -> Result<Value> {
+        let shallow = repo.shallow_commits()?.is_some();
+        let mut inspected = 0;
+        for commit in repo.rev_walk([head]).all()? {
+            if inspected == MAX_ANCESTRY_COMMITS {
+                return Ok(
+                    json!({"state":"incomplete","reason":"HEAD ancestry exceeds the 10000-commit inspection budget"}),
+                );
+            }
+            let commit = commit?.object()?;
+            inspected += 1;
+            for trailer in identity::gherrit_id_trailers(commit.message_raw()?.as_ref()) {
+                let GherritIdTrailer::Exact { value, .. } = trailer else {
+                    continue;
+                };
+                let Ok(id) = std::str::from_utf8(&value) else {
+                    continue;
+                };
+                if expected.get(id).is_some_and(|target| *target != commit.id.to_string()) {
+                    repeated.insert(id.to_owned());
+                }
+            }
+        }
+        if shallow {
+            Ok(
+                json!({"state":"incomplete","commits":inspected,"reason":"Shallow boundaries may omit older HEAD ancestry"}),
+            )
+        } else {
+            Ok(json!({"state":"observed","commits":inspected}))
+        }
+    })();
+    for commit in commits {
+        if commit["id"].as_str().is_some_and(|id| repeated.contains(id)) {
+            let problems =
+                commit["problems"].as_array_mut().expect("commit facts have problem arrays");
+            if !problems.iter().any(|problem| problem == "repeated identity") {
+                problems.push(json!("repeated identity"));
+            }
+        }
+    }
+    scan.unwrap_or_else(|error| json!({"state":"unavailable","reason":error.to_string()}))
+}
+
+fn stack(repo: &util::Repo, base: &str) -> Result<Value> {
+    let base_oid = repo.rev_parse_single(base)?.object()?.peel_to_commit()?.id;
+    let head = repo.head_id()?.detach();
+    // Traverse lazily with an inspection budget. Missing objects stay errors;
+    // literal open options and GIT_NO_LAZY_FETCH prevent acquisition.
+    let mut commits = Vec::new();
+    let mut reached = false;
+    for commit in repo.rev_walk([head]).first_parent_only().all()? {
+        let commit = commit?;
+        if commit.id == base_oid {
+            reached = true;
+            break;
+        }
+        if commits.len() == MAX_INSPECT_COMMITS {
+            bail!("Inspection exceeds 1000 commits");
+        }
+        commits.push(commit.object()?);
+    }
+    if !reached {
+        bail!("Inspection base is not on HEAD's first-parent path");
+    }
+    commits.reverse();
+    let default = cached_default_branch(repo);
+    let default_name = default.as_deref().ok();
+    let mut seen = HashSet::new();
+    let mut commits = commits
+        .into_iter()
+        .map(|commit| commit_fact(commit, &mut seen, default_name))
+        .collect::<Result<Vec<_>>>()?;
+    let identity_ancestry = inspect_identity_ancestry(repo, head, &mut commits);
+    let identity_namespace = match default {
+        Ok(name) => json!({"state":"observed","cached_default_branch":name}),
+        Err(_) => {
+            json!({"state":"unavailable","reason":"No exact cached publication-default name; remote HEAD may be absent or malformed"})
+        }
+    };
+    Ok(
+        json!({"identity_ancestry":identity_ancestry,"identity_namespace":identity_namespace,"state": "observed", "base_ref": base, "base_oid": base_oid.to_string(), "head_oid": head.to_string(),
+        "basis": "local refs only; may be stale", "commits": commits, "publication_authority": false}),
+    )
+}
+
+pub(crate) fn report(base: Option<&str>) -> Result<Value> {
+    // A real Git discovery makes status useful even when gix cannot open the
+    // ref backend. Ordinary commands still require gix's supported format.
+    git(&["rev-parse", "--git-dir"])?.ok_or_else(|| eyre::eyre!("No repository"))?;
+    let mut report = json!({"schema_version": 1, "mode": "local", "binary_version": env!("CARGO_PKG_VERSION"),
+        "formats": {"report": 1, "publication": "legacy commit-head publication", "canonical_pr_marker": null, "persistent_binary_marker": null},
+        "git_version": fact(&["--version"]),
+        "paths": {
+            "worktree_git_dir": fact(&["rev-parse", "--absolute-git-dir"]),
+            "common_git_dir": fact(&["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+            "workdir": fact(&["rev-parse", "--show-toplevel"]),
+            "effective_hooks_dir": fact(&["rev-parse", "--path-format=absolute", "--git-path", "hooks"])},
+        "capabilities": {
+            "object_format": fact(&["rev-parse", "--show-object-format"]),
+            "ref_backend": fact(&["rev-parse", "--show-ref-format"]),
+            "ref_storage_config": fact(&["config", "--local", "--no-includes", "--get", "extensions.refStorage"]),
+            "shallow": fact(&["rev-parse", "--is-shallow-repository"])},
+        "head": {"branch": fact(&["symbolic-ref", "--quiet", "--short", "HEAD"]), "oid": fact(&["rev-parse", "--verify", "HEAD"])},
+        "remote": {"state": "not_requested"}, "stack": {"state": "unavailable"}});
+    if report["capabilities"]["ref_backend"]["value"]["utf8"] == "--show-ref-format" {
+        report["capabilities"]["ref_backend"] =
+            json!({"state": "unavailable", "reason": "Git does not report its ref backend"});
+    }
+    match util::Repo::open(".") {
+        Ok(repo) => {
+            report["capabilities"]["gix"] = json!({"state": "supported"});
+            report["capabilities"]["publication_history"] = match repo.ensure_publishable_history()
+            {
+                Ok(()) => json!({"state": "admissible", "publication_authority": false}),
+                Err(error) => json!({"state": "unsupported", "reason": format!("{error}")}),
+            };
+            report["management"] = match repo.current_branch().name() {
+                Some(branch) => match manage::inspection(&repo, branch) {
+                    Ok(value) => json!({"state": "observed", "branch": branch, "value": value}),
+                    Err(error) => json!({"state": "unavailable", "reason": format!("{error}")}),
+                },
+                None if matches!(repo.current_branch(), util::HeadState::UnsupportedName) => {
+                    json!({"state":"unavailable","reason":"Management requires a UTF-8 logical branch name"})
+                }
+                None => json!({"state": "not_on_branch"}),
+            };
+            let inferred = repo
+                .default_remote_name()
+                .ok()
+                .map(|remote| format!("refs/remotes/{}/HEAD", remote.as_str()));
+            let base = base.or(inferred.as_deref());
+            if let Some(base) = base {
+                report["stack"] = match stack(&repo, base) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        json!({"state": "unavailable", "base_ref": base, "reason": "Base or literal first-parent objects are unavailable; specify --base with a local ref"})
+                    }
+                };
+            }
+        }
+        Err(_) => {
+            report["capabilities"]["gix"] = json!({"state": "unsupported", "reason": "GHerrit's repository backend could not open this repository; inspect object/ref format and Git configuration"});
+            report["management"] = json!({"state": "unavailable"});
+        }
+    }
+    Ok(report)
+}
+
+pub(crate) fn run(json_output: bool, base: Option<&str>) -> Result<()> {
+    let report = report(base).wrap_err("Failed to inspect repository")?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("GHerrit repository inspection (local; schema 1)");
+        println!("Management: {}", terminal_json(&report["management"])?);
+        println!("Paths: {}", terminal_json(&report["paths"])?);
+        println!("Capabilities: {}", terminal_json(&report["capabilities"])?);
+        println!("Stack: {}", terminal_json(&report["stack"])?);
+        println!("Remote: not requested");
+    }
+    Ok(())
+}
