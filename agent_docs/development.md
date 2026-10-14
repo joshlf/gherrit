@@ -62,6 +62,14 @@ a fixed comment character which does not begin the intended message when an
 identity is required. The same conservative cancellation rule applies to
 comment-only verbatim input; the hook does not receive cleanup flags.
 
+## Object store locations
+
+The gix 0.75 backend does not implement native Git's
+`GIT_OBJECT_DIRECTORY` or `GIT_ALTERNATE_OBJECT_DIRECTORIES` lookup. GHerrit
+refuses those overrides explicitly before opening its repository, rather than
+silently reading or writing a different object store. On-disk
+`objects/info/alternates` remains supported. Object location is independent of
+replacement objects and grafts, which must not rewrite publication ancestry.
 
 ## Scissors cleanup
 
