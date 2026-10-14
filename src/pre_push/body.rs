@@ -1,5 +1,7 @@
 use std::fmt::{self, Write};
 
+use color_eyre::eyre::{Result, bail};
+
 // Per https://github.com/orgs/community/discussions/27190#discussioncomment-3254953,
 // GitHub stores PR bodies in a `mediumblob` with a 262,144-byte limit. Use half
 // of that limit as a safety factor.
@@ -8,6 +10,7 @@ pub(super) const MAX_BODY_SIZE_BYTES: usize = 131_072;
 pub(super) struct PrBody<'a> {
     pub commit_body: &'a str,
     pub repo_url: &'a str,
+    pub repo_fetch_url: &'a str,
     pub public_branch: Option<&'a str>,
     pub stack_pr_numbers: &'a [u64],
     pub current_pr_number: u64,
@@ -23,20 +26,30 @@ enum HistoryTableFormat {
 }
 
 impl PrBody<'_> {
-    pub fn render(&self) -> String {
-        let format = if self.rendered_len(HistoryTableFormat::Full) > MAX_BODY_SIZE_BYTES {
-            HistoryTableFormat::Sparse
-        } else {
-            HistoryTableFormat::Full
-        };
-
-        self.render_with_history(format)
+    pub fn render(&self) -> Result<String> {
+        Ok(self.render_with_history(self.selected_history_format()?))
     }
 
-    fn rendered_len(&self, format: HistoryTableFormat) -> usize {
+    pub fn check_budget(&self) -> Result<()> {
+        self.selected_history_format().map(|_| ())
+    }
+
+    fn selected_history_format(&self) -> Result<HistoryTableFormat> {
+        if self.fits_size_limit(HistoryTableFormat::Full) {
+            return Ok(HistoryTableFormat::Full);
+        }
+        if self.fits_size_limit(HistoryTableFormat::Sparse) {
+            return Ok(HistoryTableFormat::Sparse);
+        }
+        bail!(
+            "Legacy pull request body for '{}' exceeds the {MAX_BODY_SIZE_BYTES}-byte limit even with sparse history",
+            self.gherrit_id
+        )
+    }
+
+    fn fits_size_limit(&self, format: HistoryTableFormat) -> bool {
         let mut size = ByteCounter(0);
-        self.write(&mut size, format).expect("counting rendered PR body bytes cannot fail");
-        size.0
+        self.write(&mut size, format).is_ok()
     }
 
     fn render_with_history(&self, format: HistoryTableFormat) -> String {
@@ -157,12 +170,13 @@ impl PrBody<'_> {
         // the full `refs/heads/` syntax to avoid ambiguity with tags of the
         // same name.
         let id = self.gherrit_id;
-        let fetch = format!("git fetch origin refs/heads/{id}");
+        let repository = self.repo_fetch_url;
+        let fetch = format!("git fetch {repository} refs/heads/{id}");
         let commands = [
             ("Branch", format!("{fetch} && git checkout -b pr-{id} FETCH_HEAD")),
             ("Checkout", format!("{fetch} && git checkout FETCH_HEAD")),
             ("Cherry Pick", format!("{fetch} && git cherry-pick FETCH_HEAD")),
-            ("Pull", format!("git pull origin refs/heads/{id}")),
+            ("Pull", format!("git pull {repository} refs/heads/{id}")),
         ];
 
         commands.into_iter().try_for_each(|(title, command)| {
@@ -177,8 +191,8 @@ struct ByteCounter(usize);
 
 impl Write for ByteCounter {
     fn write_str(&mut self, value: &str) -> fmt::Result {
-        self.0 += value.len();
-        Ok(())
+        self.0 = self.0.checked_add(value.len()).ok_or(fmt::Error)?;
+        if self.0 > MAX_BODY_SIZE_BYTES { Err(fmt::Error) } else { Ok(()) }
     }
 }
 
@@ -199,6 +213,7 @@ mod tests {
         PrBody {
             commit_body,
             repo_url: "/octo/widgets",
+            repo_fetch_url: "https://github.com/octo/widgets.git",
             public_branch,
             stack_pr_numbers: STACK,
             current_pr_number,
@@ -220,6 +235,7 @@ mod tests {
                 "main",
             )
             .render()
+            .unwrap()
         );
     }
 
@@ -233,13 +249,13 @@ mod tests {
             "Gmiddle",
             "Groot",
         )
-        .render());
+        .render().unwrap());
     }
 
     #[test]
     fn renders_full_patch_history() {
         insta::assert_snapshot!(
-            body("Finish the stack\n\n", None, 33, 4, "Gtip", "Gmiddle").render()
+            body("Finish the stack\n\n", None, 33, 4, "Gtip", "Gmiddle").render().unwrap()
         );
     }
 
@@ -252,7 +268,7 @@ mod tests {
     #[test]
     fn metadata_like_text_is_ordinary_commit_body_content() {
         let commit_body = "Keep <!-- gherrit-meta: ordinary commit text --> exactly.";
-        let rendered = body(commit_body, None, 22, 1, "Gmiddle", "Groot").render();
+        let rendered = body(commit_body, None, 22, 1, "Gmiddle", "Groot").render().unwrap();
 
         assert!(rendered.contains(commit_body));
         assert_eq!(rendered.matches("gherrit-meta").count(), 1);
@@ -261,17 +277,33 @@ mod tests {
     #[test]
     fn switches_to_sparse_history_only_above_the_size_limit() {
         let empty = body("", None, 22, 4, "Gmiddle", "Groot");
-        let fixed_size = empty.rendered_len(HistoryTableFormat::Full);
+        let fixed_size = empty.render_with_history(HistoryTableFormat::Full).len();
         assert!(fixed_size < MAX_BODY_SIZE_BYTES);
 
         let exact_padding = "x".repeat(MAX_BODY_SIZE_BYTES - fixed_size);
-        let exact = body(&exact_padding, None, 22, 4, "Gmiddle", "Groot").render();
+        let exact = body(&exact_padding, None, 22, 4, "Gmiddle", "Groot").render().unwrap();
         let omitted_in_sparse = "/compare/gherrit/Gmiddle/v1..gherrit/Gmiddle/v3";
         assert_eq!(exact.len(), MAX_BODY_SIZE_BYTES);
         assert!(exact.contains(omitted_in_sparse));
 
         let over_padding = format!("{exact_padding}x");
-        let over = body(&over_padding, None, 22, 4, "Gmiddle", "Groot").render();
+        let over = body(&over_padding, None, 22, 4, "Gmiddle", "Groot").render().unwrap();
         assert!(!over.contains(omitted_in_sparse));
+    }
+    #[test]
+    fn full_history_count_stops_at_the_body_limit() {
+        let huge = body("", None, 22, usize::MAX, "Gmiddle", "Groot");
+        assert!(!huge.fits_size_limit(HistoryTableFormat::Full));
+        let mut counter = ByteCounter(MAX_BODY_SIZE_BYTES);
+        assert!(counter.write_str("x").is_err());
+    }
+    #[test]
+    fn sparse_history_must_fit_the_same_complete_body_limit() {
+        let oversized = body("", None, 22, 512, "Gmiddle", "Groot");
+        assert!(!oversized.fits_size_limit(HistoryTableFormat::Full));
+        assert!(!oversized.fits_size_limit(HistoryTableFormat::Sparse));
+        assert!(oversized.render().is_err());
+        let padding = "x".repeat(MAX_BODY_SIZE_BYTES + 1);
+        assert!(body(&padding, None, 22, 1, "Gmiddle", "Groot").render().is_err());
     }
 }
