@@ -1,0 +1,70 @@
+# Production subprocess inventory
+
+All production child spawning belongs to `subprocess/{unix,windows}`. The
+borrowed synchronous entry and async remote entry share spawn ownership,
+foreground terminal leasing, finite concurrent pipe draining, cleanup, and
+leader reaping. Unit fixtures own any raw child they deliberately launch.
+
+| Caller | Input | Stdout cap | Execution | Interaction / authority |
+| --- | --- | --- | --- | --- |
+| Remote advertisement, fetch, atomic push | null or prepared read-only regular file (64 MiB) | 64 MiB | 120 seconds | inherited terminal; exact destination; sealed output |
+| Local config, repository checks, URL resolution | null | 4 MiB | 60 seconds | no network commands; selected Git context |
+| Commit-message parsing, hash, insertion | null; cleanup uses prepared file bounded by its accepted input | input-scaled parsing/cleanup; otherwise 4 MiB | 60 seconds | Git remains message formatter |
+| `gh auth token` | null | 64 KiB | 30 seconds | inherited credential environment; output never logged |
+
+Message cleanup allows its input length plus one final newline. Trailer parsing
+allows the larger of 4 MiB and twice the accepted message length plus one.
+Configured key expansion remains subject to that finite parsing allowance.
+
+The Git command builder removes the historical `GIT_CONFIG` file override so
+config probes observe ordinary Git's repository context. Explicit `--file`
+queries and command-scope settings remain available to their callers.
+
+Stderr retains its final 16 KiB and drains/counts all preceding bytes. Remote
+output remains sealed behind destination redaction and terminal escaping. Local
+config preserves exact stdout bytes; stderr retains its bounded tail. Local
+checked-command errors escape terminal control bytes. Local status-entry output
+is forwarded after complete capture; checked output remains caller-owned.
+Production local commands have no progress stream. Forwarding preserves their
+existing output contract, bounded to the retained bytes; unlike publication
+diagnostics it is not evidence of remote effects.
+
+These new local/auth deadlines and caps are observable hardening: oversized or
+stalled commands now stop. They are separate from the HTTP observation deadline;
+credential lookup completes before that deadline starts. Each execution has the
+existing additional five-second cleanup bound. A cleanup failure is reported,
+never treated as proof that children are gone. Unix descendants escaping the
+owned process group are outside the guarantee; Windows uses the existing private
+kill-on-close job. Synchronous callers do not gain async cancellation, but
+retain deadline cleanup and unwind guards.
+
+Tests cover binary bytes/status, stdout overflow, no spawn at zero timeout,
+prepared stdin, descendant termination, terminal restoration, and platform fault
+paths. The 80 real Git message-cleanup witnesses remain independent of the hook
+and exercise the new finite input path.
+
+Audit with `rg -n '\.output\(|\.status\(|\.spawn\(' src`. Distinguish test-only
+witnesses and status accessors from child execution. A new child must choose
+this lifecycle boundary and an explicit finite policy; do not replace it with
+`std::process::Command::output` in production.
+
+Execution records only normal completion or its exact command error. Cleanup
+always runs first and can supersede that error when ownership remains unproven.
+A complete stdout value fails at its byte bound; a diagnostic stderr tail keeps
+draining and records truncation. Each capture policy binds retention and
+overflow semantics, so those settings cannot disagree.
+
+Leader reaping and process-boundary emptiness remain separate evidence. Unix
+numeric identities can be reused after reaping, while Windows job handles retain
+identity across it. A cleanup timeout can coexist with a successfully reaped
+leader; it must not leave numeric signal-on-drop authority armed.
+
+Catchable Unix termination signals (HUP, INT, QUIT and TERM) are forwarded to
+registered child groups before GHerrit performs the signal's default
+termination. Spawn/registration and reap/removal share a mutex
+with the normal signal-delivery thread, preventing missed children and recycled
+identity signalling. Inherited ignored signals stay ignored. Child handlers may
+handle or ignore a forwarded signal, just as in the original caller group;
+uncatchable termination and escaped descendants have no cleanup guarantee.
+
+*Updated by an AI agent acting on joshlf's behalf.*
