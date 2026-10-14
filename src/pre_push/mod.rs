@@ -26,7 +26,7 @@ use batching::{
     BatchPlan, INITIAL_GRAPHQL_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
     classify_response, query_exceeds_limit,
 };
-use body::{PrBody, gherrit_pr_id_re};
+use body::PrBody;
 use github::{
     BatchedOperation, CreatePullRequest, CreatedPullRequest, FindPullRequest,
     PullRequest as PrState, RepositoryIdQuery, UpdatePullRequest, batch_document,
@@ -155,52 +155,15 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
         &default_branch,
     )?;
 
-    let trailers = read_commit_trailers(&commits)?;
+    let separators = legacy_trailer_separators_in(repo.workdir().unwrap_or(repo.path()))?;
+    let trailers = read_commit_trailers(&commits, &separators)?;
     let commits = commits
         .into_iter()
         .zip(trailers)
-        .map(|((commit, _), trailers)| Commit::from_git(commit, &trailers))
+        .map(|((commit, _), trailers)| Commit::from_git(commit, &trailers, separators.as_bytes()))
         .collect::<Result<Vec<_>>>()?;
     ensure_unique_gherrit_ids(commits.iter().map(|commit| commit.gherrit_id.as_str()))?;
     Ok(commits)
-}
-
-fn read_commit_trailers(commits: &[(gix::Commit<'_>, String)]) -> Result<Vec<Vec<u8>>> {
-    const QUERY_BATCH_LEN: usize = 120;
-    const FORMAT: &str = "--format=tformat:%H%x00%(trailers:only,unfold)";
-
-    commits.chunks(QUERY_BATCH_LEN).try_fold(
-        Vec::with_capacity(commits.len()),
-        |mut parsed, chunk| {
-            let arguments = ["log", "--no-walk=unsorted", "-z", FORMAT]
-                .into_iter()
-                .map(ToString::to_string)
-                .chain(chunk.iter().map(|(commit, _)| commit.id.to_string()));
-            let output = util::cmd("git", arguments)
-                .checked_output()
-                .wrap_err("Failed to parse commit trailers")?;
-            let mut fields = output.stdout.split(|byte| *byte == 0);
-
-            chunk.iter().try_for_each(|(commit, _)| {
-                let object_id = fields
-                    .next()
-                    .ok_or_else(|| eyre!("Git omitted trailer data for commit {}", commit.id))?;
-                if object_id != commit.id.to_string().as_bytes() {
-                    bail!("Git returned commit trailers out of order");
-                }
-                let trailers = fields
-                    .next()
-                    .ok_or_else(|| eyre!("Git omitted trailer data for commit {}", commit.id))?;
-                parsed.push(trailers.to_vec());
-                Ok(())
-            })?;
-
-            if fields.next() != Some(&[][..]) || fields.next().is_some() {
-                bail!("Git returned malformed commit trailer data");
-            }
-            Ok(parsed)
-        },
-    )
 }
 
 fn ensure_unique_gherrit_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Result<()> {
@@ -519,53 +482,70 @@ struct Commit {
 }
 
 impl Commit {
-    fn from_git(c: gix::Commit<'_>, trailers: &[u8]) -> Result<Self> {
+    fn from_git(c: gix::Commit<'_>, trailers: &[u8], separators: &[u8]) -> Result<Self> {
         let message = c.message()?;
         let message_title = core::str::from_utf8(message.title)?.to_string();
         let message_body =
             message.body.map(|body| core::str::from_utf8(body).unwrap()).unwrap_or("").to_string();
-        let mut gherrit_ids = trailers
+        let native = trailers
             .split(|byte| *byte == b'\n')
-            .filter_map(|line| line.strip_prefix(b"gherrit-pr-id: "));
-        let gherrit_id = gherrit_ids
-            .next()
-            .ok_or_else(|| eyre!("Commit {} missing gherrit-pr-id trailer", c.id))?;
-        if gherrit_ids.next().is_some() {
-            bail!("Commit {} has multiple gherrit-pr-id trailers", c.id);
-        }
+            .filter_map(|line| {
+                let (key, suffix) = line.split_at_checked(b"gherrit-pr-id".len())?;
+                key.eq_ignore_ascii_case(b"gherrit-pr-id").then(|| suffix.strip_prefix(b": "))?
+            })
+            .collect::<Vec<_>>();
+        let gherrit_id = match native.as_slice() {
+            [value] => value.to_vec(),
+            [] => {
+                let occurrences = crate::identity::gherrit_id_trailers(c.message_raw()?.as_ref());
+                match occurrences.as_slice() {
+                    [] => bail!("Commit {} missing gherrit-pr-id trailer", c.id),
+                    [crate::identity::GherritIdTrailer::Exact { value, .. }] => value.clone(),
+                    [crate::identity::GherritIdTrailer::Malformed] => {
+                        bail!("Commit {} has invalid gherrit-pr-id trailer syntax", c.id)
+                    }
+                    _ => bail!("Commit {} has multiple gherrit-pr-id trailers", c.id),
+                }
+            }
+            _ => bail!("Commit {} has multiple gherrit-pr-id trailers", c.id),
+        };
         if gherrit_id.is_empty() {
             bail!("Commit {} missing gherrit-pr-id trailer", c.id);
         }
         if !gherrit_id.iter().all(u8::is_ascii_alphanumeric) {
             bail!("Commit {} has invalid gherrit-pr-id trailer", c.id);
         }
-        let gherrit_id = str::from_utf8(gherrit_id)?.to_string();
-        let message_body = strip_gherrit_id(&message_body, &gherrit_id);
+        let gherrit_id = str::from_utf8(&gherrit_id)?.to_string();
+        let message_body = strip_gherrit_id(&message_body, &gherrit_id, separators);
 
         Ok(Commit { id: c.id, gherrit_id, message_title, message_body })
     }
 }
 
-fn strip_gherrit_id(body: &str, id: &str) -> String {
-    let trailer_start = body
-        .rfind("\n\n")
-        .map(|position| position + 2)
-        .into_iter()
-        .chain(body.rfind("\r\n\r\n").map(|position| position + 4))
-        .max()
-        .unwrap_or(0);
-    let matching_trailer = gherrit_pr_id_re()
-        .captures_iter(&body[trailer_start..])
-        .filter(|captures| captures.get(1).is_some_and(|value| value.as_str() == id))
-        .filter_map(|captures| captures.get(0))
+fn strip_gherrit_id(body: &str, id: &str, separators: &[u8]) -> String {
+    let matching = crate::identity::trailer_sections(body.as_bytes())
+        .flat_map(|(offset, section)| crate::identity::footer_lines(section, offset))
+        .filter_map(|(range, line)| {
+            // Indented lines continue the preceding trailer, not a new key.
+            if line.first().is_some_and(u8::is_ascii_whitespace) {
+                return None;
+            }
+            let (key, suffix) = line.split_at_checked(b"gherrit-pr-id".len())?;
+            let (&separator, value) = suffix.trim_ascii_start().split_first()?;
+            (key.eq_ignore_ascii_case(b"gherrit-pr-id")
+                && separators.contains(&separator)
+                && value.trim_ascii() == id.as_bytes())
+            .then_some(range)
+        })
         .last();
-    let Some(trailer) = matching_trailer else {
-        return body.to_string();
-    };
-
-    let mut body = body.to_string();
-    let range = trailer.range();
-    body.replace_range(trailer_start + range.start..trailer_start + range.end, "");
+    let mut body = body.to_owned();
+    if let Some(mut line) = matching {
+        // Preserve the legacy body's line terminator at this presentation edge.
+        if body.as_bytes().get(line.end - 1) == Some(&b'\n') {
+            line.end -= 1;
+        }
+        body.replace_range(line, "");
+    }
     body
 }
 
@@ -746,4 +726,114 @@ where
         batches.accept();
     }
     Ok(outputs)
+}
+
+fn read_commit_trailers(
+    commits: &[(gix::Commit<'_>, String)],
+    separators: &str,
+) -> Result<Vec<Vec<u8>>> {
+    const QUERY_BATCH_LEN: usize = 120;
+    const FORMAT: &str = "--format=tformat:%H%x00%(trailers:only,unfold)";
+
+    commits.chunks(QUERY_BATCH_LEN).try_fold(
+        Vec::with_capacity(commits.len()),
+        |mut parsed, chunk| {
+            let separator_config = format!("trailer.separators={separators}");
+            let arguments = ["-c", &separator_config, "log", "--no-walk=unsorted", "-z", FORMAT]
+                .into_iter()
+                .map(ToString::to_string)
+                .chain(chunk.iter().map(|(commit, _)| commit.id.to_string()));
+            let output = util::cmd("git", arguments)
+                .checked_output()
+                .wrap_err("Failed to parse commit trailers")?;
+            let mut fields = output.stdout.split(|byte| *byte == 0);
+
+            chunk.iter().try_for_each(|(commit, _)| {
+                let object_id = fields
+                    .next()
+                    .ok_or_else(|| eyre!("Git omitted trailer data for commit {}", commit.id))?;
+                if object_id != commit.id.to_string().as_bytes() {
+                    bail!("Git returned commit trailers out of order");
+                }
+                let trailers = fields
+                    .next()
+                    .ok_or_else(|| eyre!("Git omitted trailer data for commit {}", commit.id))?;
+                parsed.push(trailers.to_vec());
+                Ok(())
+            })?;
+
+            if fields.next() != Some(&[][..]) || fields.next().is_some() {
+                bail!("Git returned malformed commit trailer data");
+            }
+            Ok(parsed)
+        },
+    )
+}
+
+fn legacy_trailer_separators_in(directory: &std::path::Path) -> Result<String> {
+    let output = util::cmd("git", ["config", "--null", "--get", "trailer.separators"])
+        .env_remove("GIT_CONFIG")
+        .current_dir(directory)
+        .bounded_output()?;
+    let mut separators = ":".to_owned();
+    match output.status.code() {
+        Some(0) => separators.push_str(str::from_utf8(
+            output
+                .stdout
+                .strip_suffix(b"\0")
+                .ok_or_else(|| eyre!("Malformed Git trailer separator configuration"))?,
+        )?),
+        Some(1) if output.stdout.is_empty() => {}
+        _ => bail!("Failed to read Git trailer separator configuration"),
+    }
+    Ok(separators)
+}
+
+#[cfg(test)]
+mod identity_presentation_tests {
+    use super::*;
+    #[test]
+    fn legacy_native_footer_selection_preserves_body_mentions_and_removes_identity() {
+        for (configured, separator) in [(":=", "="), ("=:%", "%"), ("%=$", "$"), ("r", ": ")] {
+            let ctx = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+            ctx.run_git(&["config", "trailer.separators", configured]);
+            let body = format!(
+                "Body mentions gherrit-pr-id{separator}Gone\n\nReviewed-by: Person\nGhErRiT-pR-Id{separator}Gone\nNote: text\n gherrit-pr-id{separator}Gone\n"
+            );
+            let message = format!("Subject\n\n{body}");
+            ctx.run_git(&[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--allow-empty",
+                "--cleanup=verbatim",
+                "-m",
+                &message,
+            ]);
+            let repo = gix::open(&ctx.repo_path).unwrap();
+            let commit = repo.head_commit().unwrap();
+            let separators = legacy_trailer_separators_in(ctx.repo_path.as_path()).unwrap();
+            let raw = util::cmd(
+                "git",
+                [
+                    "-c",
+                    &format!("trailer.separators={separators}"),
+                    "log",
+                    "-1",
+                    "--format=%(trailers:only,unfold)",
+                ],
+            )
+            .current_dir(&ctx.repo_path)
+            .checked_output()
+            .unwrap();
+            let parsed = Commit::from_git(commit, &raw.stdout, separators.as_bytes()).unwrap();
+            assert_eq!(parsed.gherrit_id, "Gone");
+            assert_eq!(
+                parsed.message_body,
+                format!(
+                    "Body mentions gherrit-pr-id{separator}Gone\n\nReviewed-by: Person\n\nNote: text\n gherrit-pr-id{separator}Gone\n"
+                )
+            );
+        }
+    }
 }
