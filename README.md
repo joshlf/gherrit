@@ -81,10 +81,16 @@ git push
 
 ### 3\. Updating the Stack
 
-To modify a commit in the middle of the stack, use interactive rebase:
+Fetch the default tip from the same push destination GHerrit uses before
+rebasing. These examples use a destination whose default branch is `main`:
 
 ```bash
-git rebase -i main
+set -eo pipefail
+gherrit_remote="$(git config --default origin --get gherrit.remote)"
+gherrit_destination="$(git remote get-url --push -- "$gherrit_remote")"
+git fetch --no-tags -- "$gherrit_destination" refs/heads/main
+default_tip="$(git rev-parse --verify FETCH_HEAD)"
+git rebase -i "$default_tip"
 # (Edit, squash, or reword commits)
 ```
 
@@ -107,17 +113,17 @@ another name) before landing with this version. GHerrit no longer provides the
 PR merge. The manual steps below replace its automatic cascade.
 
 Merge only the root PR, whose base is the repository's default branch. After it
-lands, advance your local default branch from the same repository that GHerrit
-publishes to. Remove the merged local root from the remaining stack, and
-publish again. For a repository whose default branch is `main`:
+lands, fetch its destination default tip again. Remove the merged local root
+from the remaining stack, and publish again. For a repository whose default
+branch is `main`:
 
 ```bash
-git switch main
+set -eo pipefail
 gherrit_remote="$(git config --default origin --get gherrit.remote)"
 gherrit_destination="$(git remote get-url --push -- "$gherrit_remote")"
-git pull --ff-only -- "$gherrit_destination" main
-git switch -
-git rebase --onto main <merged-root-commit>
+git fetch --no-tags -- "$gherrit_destination" refs/heads/main
+default_tip="$(git rev-parse --verify FETCH_HEAD)"
+git rebase --onto "$default_tip" <merged-root-commit>
 git push
 ```
 
@@ -125,8 +131,9 @@ Replace `<merged-root-commit>` with the commit ID of the local root which just
 landed. The two assignments select the same push destination that GHerrit uses:
 `gherrit.remote` when configured and `origin` otherwise. Naming both that
 destination and `main` prevents the local branch's upstream or the remote's
-fetch URL from selecting a different repository. Repeat from the new root until
-the stack is landed.
+fetch URL from selecting a different repository. Rebase against the captured
+OID; a local `main` alias may be absent or divergent. Refresh this tip before
+each rebase. Repeat from the new root until the stack is landed.
 
 ## Configuration
 
