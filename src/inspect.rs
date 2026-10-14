@@ -171,17 +171,43 @@ pub(crate) fn report(base: Option<&str>) -> Result<Value> {
     Ok(report)
 }
 
-pub(crate) fn run(json_output: bool, base: Option<&str>) -> Result<()> {
-    let report = report(base).wrap_err("Failed to inspect repository")?;
+pub(crate) async fn run(json_output: bool, base: Option<&str>, remote: bool) -> Result<()> {
+    let mut report = report(base).wrap_err("Failed to inspect repository")?;
+    if remote {
+        report["mode"] = json!("remote");
+        let observed = async {
+            let commits = report["stack"]["commits"].as_array().ok_or_else(|| {
+                eyre::eyre!("A complete local stack basis is required for remote inspection")
+            })?;
+            let mut ids = Vec::new();
+            let mut seen = HashSet::new();
+            for commit in commits {
+                if let Some(id) = commit["id"].as_str()
+                    && seen.insert(id.to_owned())
+                {
+                    ids.push(GherritPrId::from_ref_component(id.as_bytes())?);
+                }
+            }
+            crate::pre_push::inspect_remote(&util::Repo::open(".")?, &ids).await
+        }
+        .await;
+        report["remote"] = match observed {
+            Ok(value) => value,
+            Err(error) => json!({"state":"unavailable","reason":error.to_string()}),
+        };
+    }
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("GHerrit repository inspection (local; schema 1)");
+        println!(
+            "GHerrit repository inspection ({}; schema 1)",
+            if remote { "remote" } else { "local" }
+        );
         println!("Management: {}", serde_json::to_string(&report["management"])?);
         println!("Paths: {}", serde_json::to_string(&report["paths"])?);
         println!("Capabilities: {}", serde_json::to_string(&report["capabilities"])?);
         println!("Stack: {}", serde_json::to_string(&report["stack"])?);
-        println!("Remote: not requested");
+        println!("Remote: {}", serde_json::to_string(&report["remote"])?);
     }
     Ok(())
 }

@@ -147,3 +147,20 @@ fn format_zero_backend_matches_native_git_not_an_unconditional_extension() {
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     }
 }
+
+#[test]
+fn remote_inspection_is_explicit_and_unsupported_destinations_are_unavailable() {
+    let context = testutil::test_context!().with_remote().with_initial_commit().build();
+    context.checkout_managed_private("status-remote");
+    context.commit_with_gherrit_id("Change");
+    let result = context
+        .gherrit_cmd()
+        .args(["status", "--json", "--remote", "--base", "main"])
+        .assert()
+        .success();
+    let report: Value = serde_json::from_slice(&result.get_output().stdout).unwrap();
+    assert_eq!(report["mode"], "remote");
+    assert_eq!(report["remote"]["state"], "unavailable");
+    assert!(report["remote"]["reason"].as_str().unwrap().contains("github.com"));
+    assert_eq!(report["stack"]["commits"].as_array().unwrap().len(), 1);
+}
