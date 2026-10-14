@@ -53,8 +53,8 @@ fn derive_gherrit_id(mut entropy: IdEntropy, object_hash: &[u8]) -> String {
     format!("G{}", data_encoding::BASE32.encode(&entropy).to_ascii_lowercase())
 }
 
-pub fn run(repo: &util::Repo, msg_file: &str, acquire_entropy: fn() -> IdEntropy) -> Result<()> {
-    let msg_path = Path::new(msg_file);
+pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntropy) -> Result<()> {
+    let msg_path = msg_file;
     if !msg_path.try_exists().wrap_err("Failed to check file existence")? {
         bail!("File does not exist: {}", msg_path.display().red().bold());
     }
@@ -76,6 +76,14 @@ pub fn run(repo: &util::Repo, msg_file: &str, acquire_entropy: fn() -> IdEntropy
     // managed stack.
     let msg_content = fs::read_to_string(msg_path).wrap_err("Failed to read msg file")?;
     if is_temporary_squash(&msg_content) {
+        return Ok(());
+    }
+
+    // Check if trailer exists
+    let output = cmd!("git interpret-trailers --parse").arg(msg_file).checked_output()?;
+    let trailers = String::from_utf8_lossy(&output.stdout);
+
+    if has_gherrit_id(&trailers) {
         return Ok(());
     }
 
@@ -105,22 +113,14 @@ pub fn run(repo: &util::Repo, msg_file: &str, acquire_entropy: fn() -> IdEntropy
     .wrap_err("Failed to compute hash")?;
     let gherrit_id = derive_gherrit_id(acquire_entropy(), object_id.as_bytes());
 
-    // Check if trailer exists
-    let output = cmd!("git interpret-trailers --parse", msg_file).checked_output()?;
-    let trailers = String::from_utf8_lossy(&output.stdout);
-
-    if has_gherrit_id(&trailers) {
-        return Ok(());
-    }
-
     // Insert trailer
     // --where start: puts it at the top of the trailer block
     // --if-exists doNothing: prevents duplicates
     cmd!(
         "git interpret-trailers --in-place --where start --if-exists doNothing --trailer",
-        "gherrit-pr-id: {gherrit_id}",
-        msg_file
+        "gherrit-pr-id: {gherrit_id}"
     )
+    .arg(msg_file)
     .success()?;
     Ok(())
 }
