@@ -1,12 +1,11 @@
-use std::path::PathBuf;
 mod commit_msg;
 mod github_http;
+mod hosted;
 #[cfg(feature = "hosted-contracts")]
 mod hosted_contracts;
 #[cfg(feature = "hosted-contracts")]
 #[doc(hidden)]
 pub use hosted_contracts::main as hosted_contracts_main;
-mod hosted;
 mod identity;
 mod inspect;
 mod install;
@@ -14,6 +13,8 @@ mod manage;
 mod pre_push;
 mod subprocess;
 mod util;
+
+use std::{ffi::OsString, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use eyre::{Result, WrapErr};
@@ -58,14 +59,16 @@ enum Commands {
     /// Inspect local management, paths, capabilities, and commit identities.
     #[command(visible_alias = "inspect")]
     Status {
+        /// Emit a report with an explicit schema version.
         #[arg(long)]
         json: bool,
+        /// Local base ref; otherwise use the cached remote HEAD (never fetch).
         #[arg(long)]
         base: Option<String>,
+        /// Explicitly inspect GitHub refs, PR lifecycle, and native membership.
         #[arg(long)]
         remote: bool,
     },
-
     /// Git hooks integration (internal use only).
     #[command(subcommand, hide = true)]
     Hook(HookCommands),
@@ -75,11 +78,16 @@ enum Commands {
         #[arg(long, short)]
         force: bool,
 
-        /// Configure the branch to be public (`git push` syncs PRs *and* pushes the branch itself).
+        /// Configure the branch to be public.
+        ///
+        /// `git push` publishes PRs and projects the captured tip to a
+        /// same-named remote branch.
         #[arg(long, group = "visibility")]
         public: bool,
 
-        /// Configure the branch to be private (`git push` syncs PRs *only*; does not push the branch itself).
+        /// Configure the branch to be private.
+        ///
+        /// `git push` publishes PRs without a same-named remote projection.
         #[arg(long, group = "visibility")]
         private: bool,
     },
@@ -106,10 +114,10 @@ enum HookCommands {
     PrePush {
         /// Name of the remote being pushed to.
         #[arg(requires = "remote_location")]
-        remote_name: Option<String>,
+        remote_name: Option<OsString>,
         /// Location of the remote being pushed to.
         #[arg(requires = "remote_name")]
-        remote_location: Option<String>,
+        remote_location: Option<OsString>,
     },
     /// Git post-checkout hook.
     PostCheckout { prev: String, new: String, flag: String },
@@ -125,7 +133,9 @@ enum HookCommands {
 ///
 /// This boundary is asynchronous and fallible: it does not install process
 /// hooks, parse process arguments, terminate the process, or create a nested
-/// async runtime. Standalone binaries own those policies.
+/// async runtime. Standalone binaries own those policies. A managed pre-push
+/// invocation from Git reads enough hook input to prove the enclosing push has
+/// no ref update.
 pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
     if let Commands::Status { json, base, remote } = &cli.command {
         return inspect::run(*json, base.as_deref(), *remote).await;
@@ -145,10 +155,7 @@ pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
     match cli.command {
         Commands::Hook(cmd) => match cmd {
             HookCommands::PrePush { remote_name, remote_location } => {
-                let invocation = pre_push::Invocation::new(
-                    remote_name.map(Into::into),
-                    remote_location.map(Into::into),
-                )?;
+                let invocation = pre_push::Invocation::new(remote_name, remote_location)?;
                 pre_push::run(&repo, &runtime.github_endpoint, invocation).await?;
             }
             HookCommands::PostCheckout { prev, new, flag } => {
