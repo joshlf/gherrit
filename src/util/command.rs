@@ -80,6 +80,29 @@ pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Co
     c
 }
 
+/// Removes inherited variables which can select a different repository or
+/// replace its local configuration with another file.
+///
+/// `GIT_CONFIG_PARAMETERS` and the numbered `GIT_CONFIG_*` variables remain
+/// intact: an enclosing `git -c` invocation deliberately passes those command
+/// scope settings into hooks and GHerrit's bound children must preserve them.
+// `GIT_CONFIG` affects only `git config`, unlike ordinary Git commands.
+// Clearing it makes configuration queries match the bound operation.
+pub(crate) fn clear_git_repository_overrides(command: &mut Command) {
+    for variable in [
+        "GIT_CONFIG",
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ] {
+        command.env_remove(variable);
+    }
+}
+
 pub trait CommandExt {
     fn bounded_output(&mut self) -> Result<std::process::Output>;
     fn success(&mut self) -> Result<()>;
@@ -148,27 +171,10 @@ impl CommandExt for Command {
 /// Local commands never consult a remote: one minute and four MiB of stdout.
 /// Stderr retains the supervisor's final 16 KiB.
 pub(crate) fn local_output(command: &mut Command) -> Result<std::process::Output> {
-    Ok(crate::subprocess::local_output(
+    Ok(crate::pre_push::subprocess::local_output(
         command,
         None,
         std::time::Duration::from_secs(60),
         4 * 1024 * 1024,
     )?)
-}
-
-// `GIT_CONFIG` affects only `git config`, unlike ordinary Git commands.
-// Clearing it makes configuration queries match the bound operation.
-pub(crate) fn clear_git_repository_overrides(command: &mut Command) {
-    for variable in [
-        "GIT_CONFIG",
-        "GIT_DIR",
-        "GIT_COMMON_DIR",
-        "GIT_WORK_TREE",
-        "GIT_IMPLICIT_WORK_TREE",
-        "GIT_NAMESPACE",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    ] {
-        command.env_remove(variable);
-    }
 }

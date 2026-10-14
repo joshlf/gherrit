@@ -20,7 +20,10 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::{ObjectId, bstr::ByteSlice as _};
 
 use super::{INTERNAL_PRE_PUSH_GIT_DIR_ENV, INTERNAL_PRE_PUSH_REMOTE_ENV, subprocess};
-use crate::{manage::PublicBranchName, util, util::CommandExt as _};
+use crate::{
+    manage::PublicBranchName,
+    util::{self, CommandExt as _},
+};
 
 const DESTINATION_ENV: &str = "GHERRIT_PRIVATE_PUSH_DESTINATION";
 const PROXY_ENV: &str = "GHERRIT_PRIVATE_REMOTE_PROXY";
@@ -31,8 +34,8 @@ const DISABLE_BUNDLE_URI: &str = "fetch.bundleURI=";
 const DISABLE_FOLLOW_TAGS: &str = "push.followTags=false";
 const DISABLE_SUBMODULE_PUSHES: &str = "push.recurseSubmodules=no";
 const CLEAR_PUSH_OPTIONS: &str = "push.pushOption=";
-const INTERNAL_REMOTE_STEM: &str = "gherrit-publication";
 const INTERNAL_REMOTE_PROBE_STEM: &str = "gherrit-publication-probe";
+const INTERNAL_REMOTE_STEM: &str = "gherrit-publication";
 const PRIVATE_DESTINATION_REDACTION: &str = "<private-destination-redacted>";
 const PRIVATE_TRANSPORT_REDACTION: &str = "<private-transport-redacted>";
 const PATH_OR_URL_REDACTION: &str = "<path-or-URL-redacted>";
@@ -258,7 +261,14 @@ pub(super) enum ExactObjectFetchMode {
     Refetch,
 }
 
+impl crate::subprocess::DiagnosticRenderer for PushDestination {
+    fn render(&self, stderr: &[u8], total_bytes: u64) -> Option<String> {
+        self.render_child_diagnostic(stderr, total_bytes)
+    }
+}
+
 impl PushDestination {
+    /// Write only a preflighted annotation to this exact bound local ODB.
     pub(crate) fn materialize_version_object(
         &self,
         expected: ObjectId,
@@ -348,15 +358,9 @@ impl PushDestination {
             &repository.current_dir,
         )?;
 
-        // First inspect the configuration which selected the configured
-        // remote and its transport settings. Then add the private destination
-        // under a throwaway absent name and inspect again before choosing the
-        // name used for network commands. A command-scoped remote URL may
-        // participate in `includeIf.hasconfig:remote.*.url`; the second
-        // observation materializes any configuration it activates. Git
-        // rejects remote URLs in files reached through that condition, so the
-        // activated include set depends on the destination, not on which
-        // absent probe name carries it.
+        // Inspect URL-activated names before choosing the private alias, and
+        // reject any additional active context beyond known unused-remote
+        // settings. Pushurl lookup must remain the authority for transport.
         let configuration = resolved.inspect_configuration(&repository)?;
         reject_unsupported_remote_transport_configuration(
             resolved.configured_remote.as_str(),
@@ -381,8 +385,8 @@ impl PushDestination {
 
     /// Inspects the exact configuration context used by network commands.
     ///
-    /// The internal name was absent from the complete configuration observed
-    /// with the private destination already present under a throwaway name.
+    /// The internal name was absent after materializing the URL's complete
+    /// name context, and the context's transport inputs were checked.
     /// This final inspection defends that choice directly: every planned key
     /// must occur once, carry the exact private value, and be the only key for
     /// the internal remote.
@@ -546,23 +550,6 @@ impl PushDestination {
         )
     }
 
-    /// Observes destination refs through the sole bounded execution path.
-    ///
-    /// This compatibility entry point remains for the active legacy runtime.
-    /// The exact-local workflow uses [`Self::observe_refs_from`] so its
-    /// repository binding remains explicit while that workflow is dormant.
-    pub(super) async fn observe_refs(
-        &self,
-        options: impl IntoIterator<Item = String>,
-        ref_patterns: impl IntoIterator<Item = String>,
-    ) -> std::result::Result<subprocess::CommandOutput, subprocess::CommandError> {
-        subprocess::output(
-            self.ls_remote(options, ref_patterns),
-            subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
-        )
-        .await
-    }
-
     /// Observes refs from the exact repository bound to an acquisition plan.
     ///
     /// Keeping the raw `ls-remote` command private prevents callers from
@@ -682,13 +669,6 @@ impl PushDestination {
         Ok(self.repository == RepositoryBinding::new(repository)?)
     }
 
-    pub(super) fn pr_url(&self, pr_number: u64) -> String {
-        format!(
-            "https://github.com/{}/{}/pull/{pr_number}",
-            self.resolved.coordinates.owner, self.resolved.coordinates.repository
-        )
-    }
-
     pub(super) fn repo_url_relative(&self) -> String {
         format!("/{}/{}", self.resolved.coordinates.owner, self.resolved.coordinates.repository)
     }
@@ -724,20 +704,6 @@ impl PushDestination {
         )
         .await?;
         Ok(InitialRemoteObservation { destination: self, refs })
-    }
-
-    /// Observes only the symbolic default for the active legacy runtime.
-    ///
-    /// Keep this path independent from the dormant exact-local observation so
-    /// the preparatory public-branch model does not change active behavior.
-    pub(super) async fn observe_default_branch(&self) -> Result<DefaultBranch> {
-        observe_default_branch_command(
-            self.ls_remote(["--symref".to_string()], ["HEAD".to_string()]),
-            self.configured_remote(),
-            subprocess::REMOTE_GIT_EXECUTION_TIMEOUT,
-            subprocess::REMOTE_GIT_STDOUT_LIMIT,
-        )
-        .await
     }
 
     fn initial_observation_command(&self, public_branch: Option<&PublicBranchName>) -> Command {
@@ -879,20 +845,6 @@ impl PushDestination {
         spellings.dedup();
         spellings
     }
-}
-
-async fn observe_default_branch_command(
-    command: Command,
-    configured_remote: &str,
-    timeout: Duration,
-    stdout_limit: usize,
-) -> Result<DefaultBranch> {
-    let output = run_initial_observation(command, configured_remote, timeout, stdout_limit).await?;
-    parse_default_branch(output.stdout()).wrap_err_with(|| {
-        format!(
-            "GHerrit remote '{configured_remote}' did not report one valid symbolic default branch"
-        )
-    })
 }
 
 async fn observe_initial_command(
@@ -1080,11 +1032,8 @@ impl ResolvedDestination {
         decode_config_names(&output, self.configured_remote.as_str(), "Git configuration")
     }
 
-    /// Reads the configuration active after the private destination exists.
-    ///
-    /// The probe is used only by `git config`; no transport consults it. The
-    /// private destination remains in the child environment rather than its
-    /// argument list, exactly as it does for the final network commands.
+    /// Inspect names activated by the URL before choosing the real private
+    /// alias. Known remote-specific values can safely make names unavailable.
     fn inspect_private_configuration(
         &self,
         repository: &RepositoryBinding,
@@ -1113,6 +1062,9 @@ impl ResolvedDestination {
         decode_config_names(&output, self.configured_remote.as_str(), "private Git configuration")
     }
 
+    /// A temporary remote URL can activate hasconfig includes which ordinary
+    /// pushurl lookup did not load. Apart from checked unused-remote settings,
+    /// reject changed context instead of blacklisting transport settings.
     fn ensure_private_configuration_preserves_context(
         &self,
         repository: &RepositoryBinding,
@@ -1738,6 +1690,7 @@ fn valid_repository_component(component: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+#[cfg(test)]
 fn parse_default_branch(output: &[u8]) -> Result<DefaultBranch> {
     let ParsedInitialRemoteObservation { default_branch, public_branch } =
         parse_initial_remote_observation(output, None)?;
@@ -1855,10 +1808,5 @@ pub(super) fn git_output_records(output: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 #[cfg(test)]
+#[path = "destination/tests.rs"]
 mod tests;
-
-impl crate::subprocess::DiagnosticRenderer for PushDestination {
-    fn render(&self, stderr: &[u8], total_bytes: u64) -> Option<String> {
-        self.render_child_diagnostic(stderr, total_bytes)
-    }
-}
