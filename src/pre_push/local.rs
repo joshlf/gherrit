@@ -403,7 +403,7 @@ mod tests {
         assert!(repository.try_find_object(missing).unwrap().is_none());
         let default = DefaultBranch::new("main".to_owned(), missing).unwrap();
         let error =
-            LocalStack::collect_captured(&repository, "feature", head, &default).unwrap_err();
+            LocalStack::collect_captured(&repository, "feature", head, default).unwrap_err();
         assert!(error.to_string().contains("Fetch 'main' from the configured push destination"));
     }
     #[test]
@@ -661,7 +661,7 @@ mod tests {
 
         let head = repository.rev_parse_single("HEAD").unwrap().detach();
         let stack =
-            LocalStack::collect_captured(&repository, "feature", head, &supplied_default).unwrap();
+            LocalStack::collect_captured(&repository, "feature", head, supplied_default).unwrap();
 
         assert!(stack.is_empty());
     }
@@ -771,8 +771,8 @@ mod tests {
             }
             let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
             let head = repository.head_id().unwrap().detach();
-            let error =
-                LocalStack::collect_captured(&repository, "main", head, &default).unwrap_err();
+            let error = LocalStack::collect_captured(&repository, "main", head, default.clone())
+                .unwrap_err();
             assert!(error.to_string().contains(
                 "Cannot publish a managed stack from the repository default branch 'main'"
             ));
@@ -783,7 +783,7 @@ mod tests {
             &repository,
             "feature",
             repository.head_id().unwrap().detach(),
-            &default,
+            default,
         )
         .unwrap();
         assert_eq!(stack.len(), 1);
