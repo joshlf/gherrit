@@ -89,6 +89,11 @@ pub trait CommandExt {
         &mut self,
         timeout: std::time::Duration,
     ) -> Result<std::process::Output>;
+    fn checked_output_with_limits(
+        &mut self,
+        timeout: std::time::Duration,
+        stdout_limit: usize,
+    ) -> Result<std::process::Output>;
 }
 
 pub(super) fn command_invocation(command: &Command) -> String {
@@ -123,7 +128,15 @@ impl CommandExt for Command {
         &mut self,
         timeout: std::time::Duration,
     ) -> Result<std::process::Output> {
-        let output = crate::subprocess::local_output(self, None, timeout, 4 * 1024 * 1024)?;
+        self.checked_output_with_limits(timeout, 4 * 1024 * 1024)
+    }
+
+    fn checked_output_with_limits(
+        &mut self,
+        timeout: std::time::Duration,
+        stdout_limit: usize,
+    ) -> Result<std::process::Output> {
+        let output = crate::subprocess::local_output(self, None, timeout, stdout_limit)?;
         if !output.status.success() {
             let stderr = output.stderr.escape_ascii().to_string();
             let invocation = command_invocation(self);

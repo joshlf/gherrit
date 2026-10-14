@@ -45,11 +45,12 @@ const SUPERVISOR_GRACE: Duration = Duration::from_secs(1);
 /// adversarial remote. Observing the first byte beyond this cap stops execution
 /// and enters bounded cleanup immediately.
 pub(super) const REMOTE_GIT_STDOUT_LIMIT: usize = 64 * 1024 * 1024;
-/// Maximum input accepted for one command.
+/// Default maximum input accepted for one command.
 ///
-/// Input and retained stdout have the same finite budget. The regular file is
-/// fully prepared before execution, so neither its producer nor pipe capacity
-/// can extend the command lifetime.
+/// Remote callers use the same finite input and retained-stdout budget.
+/// Local callers with already accepted input may select its exact length.
+/// The regular file is fully prepared before execution, so neither a producer
+/// nor pipe capacity can extend the command lifetime.
 pub(super) const REGULAR_FILE_STDIN_LIMIT: u64 = 64 * 1024 * 1024;
 /// Maximum stderr retained for a diagnostic after normal process completion.
 ///
@@ -124,7 +125,7 @@ impl RegularFileStdinBuilder {
         Self::with_limit(REGULAR_FILE_STDIN_LIMIT)
     }
 
-    fn with_limit(limit: u64) -> Result<Self, CommandError> {
+    pub(crate) fn with_limit(limit: u64) -> Result<Self, CommandError> {
         let file = tempfile::NamedTempFile::new()
             .map_err(|error| io_error(IoStage::PrepareInput, &error))?;
         Ok(Self { file, written: 0, limit })
