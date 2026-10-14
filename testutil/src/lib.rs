@@ -736,6 +736,10 @@ impl TestContext {
     }
 
     #[must_use = "command builders do nothing until executed"]
+    pub fn reexec_test_cmd(&self) -> TestCommand {
+        self.test_environment.command(&env::current_exe().expect("current test executable"))
+    }
+
     pub fn bounded_cmd(&self, command: Command) -> TestCommand {
         let mut command = TestCommand::from_command(command);
         let overrides = command.environment_overrides();

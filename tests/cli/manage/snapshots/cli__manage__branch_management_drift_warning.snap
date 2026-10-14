@@ -2,7 +2,7 @@
 source: tests/cli/manage/mod.rs
 expression: content
 ---
-EXIT_CODE: 0
+EXIT_CODE: 1
 
 STDOUT:
 (empty)
@@ -12,3 +12,4 @@ STDERR:
 [gherrit] [WARN] The current git configuration does not match the expected state for an unmanaged branch.
 [gherrit] [WARN]   - pushRemote: current='origin', expected='<unset>'
 [gherrit] [WARN] Use --force to overwrite manual changes.
+[gherrit] [ERROR] Branch management was not changed; use --force to replace local drift
