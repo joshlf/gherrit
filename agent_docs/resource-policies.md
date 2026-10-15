@@ -14,6 +14,9 @@ outstanding work.
 | `src/pre_push/batching.rs` | 262,144 bytes of query text | Local heuristic; equality is accepted and larger queries back off |
 | `src/pre_push/github.rs` | 100 PR candidates per ID and lifecycle query | A remaining page rejects the observation instead of silently choosing from a prefix |
 | `src/pre_push/body.rs` | 131,072 rendered UTF-8 bytes | Switches full history to sparse history above this boundary; it is not a final body truncation limit |
+| `testutil/src/scripted_http.rs` | 1,048,576 request-body bytes | Literal HTTP fixture acquisition; malformed bodies still record an arrival |
+| `testutil/src/scripted_http.rs` | 10 seconds each for startup/shutdown | Separate readiness and completion waits for scripted HTTP fixtures |
+| `tests/pre_push/failures/mod.rs` | 5 seconds per raw socket operation | Native invalid-JSON arrival witness only |
 | `src/test_git.rs` | 10 seconds per socket read/write operation | Test-driver Git-interceptor transport only |
 | `testutil/src/command.rs` | 60 seconds by default, override per command | Test command execution deadline |
 | `testutil/src/command.rs` | 5 seconds for cleanup waits | Descendant termination and output collection have their existing separate waits |

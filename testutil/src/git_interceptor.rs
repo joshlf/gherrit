@@ -61,10 +61,17 @@ struct GitCompletion {
     exit_code: i32,
 }
 
+const REQUEST_PATH: &str = "/_internal/git";
+const COMPLETION_PATH: &str = "/_internal/git/complete";
+
+pub(super) fn is_control_path(path: &str) -> bool {
+    matches!(path, REQUEST_PATH | COMPLETION_PATH)
+}
+
 pub(super) fn routes(shared: Arc<RwLock<MockState>>) -> Router {
     Router::new()
-        .route("/_internal/git", post(handle_git))
-        .route("/_internal/git/complete", post(complete_git))
+        .route(REQUEST_PATH, post(handle_git))
+        .route(COMPLETION_PATH, post(complete_git))
         .with_state(HandlerState { shared })
 }
 

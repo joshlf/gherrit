@@ -636,4 +636,14 @@ before submission. Navigation checks only establish that these references still
 exist. They cannot establish GitHub behavior, concurrent-writer safety or the
 adequacy of a test's assertions.
 
+
+The literal HTTP fixture in `testutil/src/scripted_http.rs` compares method,
+path and raw request bytes, serves explicit status/body pairs, and rejects
+unexpected or unused exchanges. The batched-mutation contract in
+`src/pre_push/mod.rs` exercises the actual Octocrab adapter. Stateful GitHub
+fixtures separately count HTTP arrivals before routing, JSON extraction and
+schema validation, excluding only declared Git-interceptor control paths.
+Unknown paths and wrong methods remain arrivals; decoded operation records are
+a distinct observation.
+
 *Updated by an AI agent acting on joshlf's behalf.*

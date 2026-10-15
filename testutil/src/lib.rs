@@ -37,6 +37,7 @@ use server::{wait_for_server_completion, MockServerStopError};
 mod command;
 mod git_interceptor;
 mod mock_server;
+pub mod scripted_http;
 
 pub use command::TestCommand;
 
