@@ -243,17 +243,25 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
     // Fetch remote branch states to ensure we don't act on stale information.
     let remote_branch_states = observe_managed_branches(repo, &gherrit_ids)?;
 
-    let mut next_versions = HashMap::new();
+    // One local observation for the entire attempt. Failed reads and counter
+    // exhaustion must be discovered before any publication batch is pushed.
+    let local_versions = get_local_versions(repo, &gherrit_ids)
+        .wrap_err("Failed to read local version refs; no publication batch was pushed")?;
+    let next_versions = gherrit_ids
+        .iter()
+        .map(|id| {
+            let next = local_versions[id].checked_add(1).ok_or_else(|| {
+                eyre!("Local version counter exhausted for '{id}'; no publication batch was pushed")
+            })?;
+            Ok((id.clone(), next))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
 
     for chunk in push_batches(commits) {
         let mut targets = Vec::with_capacity(chunk.len());
 
         for c in chunk {
-            // Determine the next version based on local tags (Optimistic
-            // Locking).
-            let local_max = get_local_version(repo, &c.gherrit_id).unwrap_or(0);
-            let next_ver = local_max + 1;
-            next_versions.insert(c.gherrit_id.clone(), next_ver);
+            let next_ver = next_versions[&c.gherrit_id];
 
             // Lease the branch to ensure it hasn't changed since our fetch.
             // If we know the remote SHA, we expect it. If we don't (None), we
@@ -318,13 +326,24 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
             );
         }
 
-        // Persist the local tags now that the push succeeded.
+        // The remote batch has already committed. Try every local ref and
+        // distinguish local persistence failure from an unapplied push.
+        let mut persistence_errors = Vec::new();
         for tag in plan.persisted_tags {
-            let _ = repo.reference(
-                refs::version_tag(&tag.gherrit_id, tag.version),
+            let name = refs::version_tag(&tag.gherrit_id, tag.version);
+            if let Err(error) = repo.reference(
+                name.clone(),
                 tag.object_id,
                 PreviousValue::Any,
                 "gherrit: persist local version state",
+            ) {
+                persistence_errors.push(format!("{name}: {error}"));
+            }
+        }
+        if !persistence_errors.is_empty() {
+            bail!(
+                "Remote publication batch succeeded, but local version refs were not all persisted: {}. Remote changes are already applied; inspect and fetch version refs before retrying.",
+                persistence_errors.join("; ")
             );
         }
     }
@@ -336,29 +355,28 @@ fn without_pr_invitation(block: &str) -> std::borrow::Cow<'_, str> {
     re!(r"(?m)\n?^remote:\s*\nremote: Create a pull request for '.*' on GitHub by visiting:\s*\nremote:\s*https://github\.com/.*\nremote:\s*$").replace(block, "")
 }
 
-fn get_local_version(repo: &util::Repo, gherrit_id: &str) -> Result<usize> {
-    let prefix = refs::version_tag_prefix(gherrit_id);
-    let mut max_ver = 0;
+fn local_version_entry(name: &str) -> Option<(&str, usize)> {
+    let tail = name.strip_prefix("refs/tags/gherrit/")?;
+    let (id, version) = tail.split_once("/v")?;
+    // Preserve the legacy last-'v' numeric suffix, including noncanonical
+    // spellings. Changing archive admission is a separate policy decision.
+    let version = version.rsplit('v').next()?.parse().ok()?;
+    Some((id, version))
+}
 
-    // Use .all() and manual filtering to avoid `prefixed` API type issues.
-    let references = repo.references().map_err(|e| eyre!(e))?;
-
-    for reference in references.all().map_err(|e| eyre!(e))? {
-        let reference = reference.map_err(|e| eyre!(e))?;
+fn get_local_versions(repo: &util::Repo, ids: &[String]) -> Result<HashMap<String, usize>> {
+    let mut versions = ids.iter().map(|id| (id.clone(), 0)).collect::<HashMap<_, _>>();
+    let references = repo.references().map_err(|error| eyre!(error))?;
+    for reference in references.all().map_err(|error| eyre!(error))? {
+        let reference = reference.map_err(|error| eyre!(error))?;
         let name = reference.name().as_bstr().to_string();
-
-        if name.starts_with(&prefix) {
-            // Parse "refs/tags/gherrit/<id>/v<ver>"
-            if let Some(ver_str) = name.rsplit('v').next()
-                && let Ok(ver) = ver_str.parse::<usize>()
-                && ver > max_ver
-            {
-                max_ver = ver;
-            }
+        if let Some((id, version)) = local_version_entry(&name)
+            && let Some(current) = versions.get_mut(id)
+        {
+            *current = (*current).max(version);
         }
     }
-
-    Ok(max_ver)
+    Ok(versions)
 }
 
 fn pull_requests_by_head(prs: &[PrState]) -> HashMap<&str, &PrState> {
@@ -780,6 +798,17 @@ mod tests {
             base_branch: "main".to_string(),
             head_branch: head.to_string(),
             state: reconcile::PullRequestState::Open,
+        }
+    }
+
+    #[test]
+    fn local_version_index_retains_legacy_numeric_suffixes() {
+        for (name, version) in [("v2", 2), ("v0002", 2), ("v+2", 2), ("vjunkv3", 3)] {
+            let full = format!("refs/tags/gherrit/Gcase/{name}");
+            assert_eq!(local_version_entry(&full), Some(("Gcase", version)));
+        }
+        for name in ["refs/heads/Gcase", "refs/tags/gherrit/Gcase/vno", "refs/tags/other/v2"] {
+            assert!(local_version_entry(name).is_none());
         }
     }
 
