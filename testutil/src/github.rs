@@ -17,6 +17,11 @@ impl MockGithub<'_> {
             .inspect_mock_state(|state| state.prs.iter().map(PullRequestSnapshot::from).collect())
     }
 
+    /// HTTP arrivals counted before JSON extraction or schema validation.
+    pub fn http_arrivals(&self) -> usize {
+        self.context.inspect_mock_state(|state| state.http_arrivals)
+    }
+
     pub fn requests(&self) -> Vec<Vec<GraphQlOperation>> {
         self.context.inspect_mock_state(|state| state.graphql_requests.clone())
     }

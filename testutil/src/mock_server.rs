@@ -33,6 +33,7 @@ pub struct MockState {
     pub prs: Vec<PrEntry>,
     pub(super) cross_repository_prs: HashSet<usize>,
     pub(super) git: git_interceptor::State,
+    pub http_arrivals: usize,
     pub graphql_requests: Vec<Vec<GraphQlOperation>>,
     pub max_graphql_operations_per_request: Option<usize>,
     pub repo_owner: String,
@@ -115,8 +116,10 @@ pub(super) async fn run_mock_server(
     let git_routes = git_interceptor::routes(state.clone());
     let app_state = AppState { state, remote_path, system_git, test_environment };
 
+    let graphql_route = post(graphql)
+        .layer(axum::middleware::from_fn_with_state(app_state.state.clone(), record_http_arrival));
     let app =
-        Router::new().route("/graphql", post(graphql)).with_state(app_state).merge(git_routes);
+        Router::new().route("/graphql", graphql_route).with_state(app_state).merge(git_routes);
 
     ready_tx.send(url).expect("Failed to send mock server URL");
 
@@ -126,6 +129,15 @@ pub(super) async fn run_mock_server(
         result = &mut server => result.unwrap(),
         _ = shutdown_rx => {}
     }
+}
+
+async fn record_http_arrival(
+    State(state): State<Arc<RwLock<MockState>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    state.write().unwrap().http_arrivals += 1;
+    next.run(request).await
 }
 
 fn check_and_apply_graphql_failure(

@@ -784,6 +784,46 @@ mod tests {
     }
 
     #[test]
+    fn batched_mutation_http_contracts_use_literal_requests_and_raw_responses() {
+        use testutil::scripted_http::{Exchange, HttpRequest, ScriptedHttp};
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _entered = runtime.enter();
+        for (status, response, success) in [
+            (200, br#"{"data":{"op0":{"clientMutationId":null}}}"#.as_slice(), true),
+            (200, b"not JSON".as_slice(), false),
+            (200, br#"{"data":{}}"#.as_slice(), false),
+            (
+                400,
+                br#"{"message":"Bad request","documentation_url":"https://example.invalid/docs"}"#
+                    .as_slice(),
+                false,
+            ),
+        ] {
+            let server = ScriptedHttp::start([Exchange {
+                request: HttpRequest { method: "POST".to_string(), path: "/graphql".to_string(),
+                    body: br#"{"query":"mutation { op0: updatePullRequest(input: { pullRequestId: \"PR_1\" }) { clientMutationId } }"}"#.to_vec() },
+                status, response: response.to_vec(),
+            }]);
+            let client = Octocrab::builder()
+                .personal_token("fixture-token".to_string())
+                .base_uri(&server.url)
+                .unwrap()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(run_batched_graphql(
+                &client,
+                [UpdatePullRequest::new("PR_1".to_string(), None, None, None)],
+            ));
+            assert_eq!(result.is_ok(), success, "status={status}, result={result:?}");
+            assert_eq!(
+                server.arrivals().len(),
+                1,
+                "a malformed acknowledgement must not be replayed"
+            );
+        }
+    }
+
+    #[test]
     fn transient_pr_index_preserves_first_match() {
         let prs = [observed_pr(1, "Ga"), observed_pr(2, "Gb"), observed_pr(3, "Ga")];
         let index = pull_requests_by_head(&prs);
