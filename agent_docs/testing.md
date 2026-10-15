@@ -117,6 +117,12 @@ their measurement method. Tuple and marker budgets describe this implementation,
 not a neutral requirement for every future protocol. Exact process counts are
 workload-specific and are not elapsed-time benchmarks.
 
+PTY readiness, transcript progress, foreground ownership and exact child exit
+are separate observations in `src/subprocess/tests/terminal.rs`. That private
+fixture owns the PTY supervisor cleanup and preserves real bounded polling.
+Overlap-gate deadlines and the harness command-group runner have different
+lifetimes; they deliberately retain their own waits and cleanup policies.
+
 ## High-risk regression navigation
 
 These are implemented witnesses, not exhaustive guarantees. `navigation`
