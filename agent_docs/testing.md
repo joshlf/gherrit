@@ -91,6 +91,8 @@ changes, default movement or interruptible adoption. Keep provider assumptions
 visible rather than repairing a failing model by preventing an external action
 that the service can actually perform.
 
+See [resource policies](resource-policies.md) for budget owners and units.
+
 ## Snapshot and cost checks
 
 Before accepting a snapshot, inspect its owning state/effect oracle and the
