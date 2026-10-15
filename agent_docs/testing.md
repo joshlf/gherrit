@@ -104,6 +104,27 @@ their measurement method. Tuple and marker budgets describe this implementation,
 not a neutral requirement for every future protocol. Exact process counts are
 workload-specific and are not elapsed-time benchmarks.
 
+## High-risk regression navigation
+
+These are implemented witnesses, not exhaustive guarantees. `navigation`
+checks the explicit source/function references below. The evidence kinds are
+separate: model schedules do not establish provider or OS behavior.
+
+- Raw JSON: unit codec,
+  `src/json.rs::rejects_duplicate_members_at_every_depth_and_trailing_values`.
+- Git acknowledgement: literal adapter codec,
+  `src/pre_push/publication_attempt/refs.rs::receipt_decoder_rejects_bad_framing_records_and_coverage`.
+- Cross-batch create identity: HTTP adapter,
+  `src/pre_push/publication_attempt/github/transport/tests.rs::a_cross_batch_create_collision_withholds_receipts_and_later_batches`.
+- Competing canonical markers: installed hooks and native Git,
+  `tests/hooks.rs::installed_hooks_converge_two_publishers_after_one_marker_lease_wins`.
+- Commit cancellation and retention: native Git cleanup matrix,
+  `tests/cli/commit_msg.rs::test_commit_msg_hook` plus its neighboring cases.
+
+Between-alias competing requests and non-orphaned shell-job stop/continue need
+additional witnesses. Existing whole-request schedules and isolated PTY tests
+must not be cited as those missing witnesses.
+
 ## Hosted probes
 
 The [provider tool](hosted-contracts.md) requires an explicit disposable target,

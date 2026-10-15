@@ -26,9 +26,14 @@ The formatter still uses nightly. The Windows job retains its native test
 invocation.
 
 For focused feedback, select `production`, `profiles`, `fmt`, `lint`, `unit`, `semantic`,
-`adapters`, `hooks`, `cli`, `doc`, or `markers`. `unit` includes all library
+`adapters`, `hooks`, `cli`, `doc`, `markers`, or `navigation`. `unit` includes all library
 tests; `semantic` selects the durable recovery model; `adapters` selects the
 pre-push integration target; `hooks` and `cli` select complete process tests.
+Focused test selectors list tests first and reject an empty selection.
+`navigation` requires Python 3 and checks local Markdown destinations, explicit
+source paths and source-function references in the agent/design maps. These
+checks establish navigation, not coverage or correctness.
+
 These commands do not replace the full validation required for submission.
 
 
