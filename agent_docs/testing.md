@@ -644,4 +644,14 @@ unexpected or unused exchanges. The batched-mutation contract in
 fixtures separately count HTTP arrivals before JSON extraction/schema
 validation; decoded operation records remain a distinct observation.
 
+`tests/pre_push/native_messages.rs` runs literal whole messages through the
+native hook and committed-message collector, with separate preservation and
+admission expectations. Its corpus covers CRLF, paragraphs, aliases/case,
+continuations, comment prefixes and cleanup. A test-only disabled API endpoint
+marks successful collection without publishing; it does not mean that a PR
+was created. This complements the supplied-trailer corpus. Configured separator
+formatting differs across Git versions. That case maps each supported literal
+native trailer output to its expected admission; unrecognized output fails
+rather than selecting a permissive expectation.
+
 *Updated by an AI agent acting on joshlf's behalf.*
