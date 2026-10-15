@@ -52,4 +52,20 @@ same-repository PR with that exact head name. Missing, multiple, fork or
 mismatched observations stop before checkout or mutation. The shell contracts
 in `ci/test_rebase_stack_child.sh` cover those refusal paths.
 
+## Local execution context
+
+Run `python3 ci/execution_context.py --directory /path/to/worktree` to inspect
+which binary is on PATH, its version, worktree and common Git directories,
+effective hooks, selected remote, and default-branch candidates with local and
+tracking OIDs. Use `--binary /path/to/gherrit` to query an explicit executable.
+The helper makes local observations only. It does not fetch or write config,
+and it labels remote freshness unknown. Missing configuration and failed
+commands are distinct; an unavailable fact does not authorize a fallback.
+Each subprocess has a ten-second timeout. Remote URL user information, queries
+and fragments are removed, and failed commands do not print arbitrary stderr.
+This is a developer diagnostic, not a stable product status or admission API.
+
+`ci/validate.sh devtools` exercises redaction and a native linked-worktree
+contract, including relative hooks and unchanged configuration and refs.
+
 *Updated by an AI agent acting on joshlf's behalf.*
