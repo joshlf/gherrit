@@ -35,6 +35,9 @@ jobs:
       - name: Check production configuration
         run: ci/validate.sh production
 
+      - name: Check feature profiles
+        run: ci/validate.sh profiles
+
       - name: Check Formatting
         run: |
           set -eo pipefail
