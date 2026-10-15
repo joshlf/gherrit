@@ -298,36 +298,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
             .spawn()
             .wrap_err("Failed to run `git push`")?;
 
-        // Filter output logic (elided for brevity, same as before)
-        {
-            use std::io::{BufRead, BufReader};
-            let stderr = child.stderr.take().unwrap();
-            let reader = BufReader::new(stderr);
-            let mut remote_buffer: Vec<String> = Vec::new();
-            let flush_buffer = |buf: &mut Vec<String>| {
-                if buf.is_empty() {
-                    return;
-                }
-                let block = buf.join("\n");
-                let cleaned = without_pr_invitation(&block);
-                if !cleaned.is_empty() {
-                    eprintln!("{}", cleaned);
-                }
-                buf.clear();
-            };
-            for line in reader.lines() {
-                let line = line.unwrap();
-                if line.trim_start().starts_with("remote:") {
-                    remote_buffer.push(line);
-                } else {
-                    flush_buffer(&mut remote_buffer);
-                    eprintln!("{}", line);
-                }
-            }
-            flush_buffer(&mut remote_buffer);
-        }
-
-        let status = child.wait().unwrap();
+        let status = finish_push(&mut child, std::io::stderr().lock())?;
         if !status.success() {
             // If the push failed, it's likely due to a lease failure
             // (concurrent modification). If failed, it might be due to the tag
@@ -365,6 +336,84 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
 
 fn without_pr_invitation(block: &str) -> std::borrow::Cow<'_, str> {
     re!(r"(?m)\n?^remote:\s*\nremote: Create a pull request for '.*' on GitHub by visiting:\s*\nremote:\s*https://github\.com/.*\nremote:\s*$").replace(block, "")
+}
+
+/// Own the pipe until it is consumed or dropped, then reap even if relaying
+/// diagnostics failed. Once dispatched, an I/O error cannot prove no effect.
+fn finish_push(
+    child: &mut std::process::Child,
+    output: impl std::io::Write,
+) -> Result<std::process::ExitStatus> {
+    let diagnostics = match child.stderr.take() {
+        Some(stderr) => relay_push_diagnostics(std::io::BufReader::new(stderr), output),
+        None => Err(std::io::Error::other("Git push stderr pipe is unavailable")),
+    };
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            // Best-effort cleanup after wait itself failed. The remote outcome
+            // is unknown even if termination and the second wait succeed.
+            let termination = child.kill();
+            let reaping = child.wait();
+            bail!(
+                "Failed to wait for git push: {error}; termination: {termination:?}; reaping: {reaping:?}. Remote changes may have applied; inspect remote refs before retrying."
+            );
+        }
+    };
+    diagnostics.wrap_err_with(|| format!("Failed to relay git push diagnostics (child status {status}). Remote changes may have applied; inspect remote refs before retrying."))?;
+    Ok(status)
+}
+
+fn relay_push_diagnostics(
+    mut reader: impl std::io::BufRead,
+    mut output: impl std::io::Write,
+) -> std::io::Result<()> {
+    fn flush(buffer: &mut Vec<String>, output: &mut impl std::io::Write) -> std::io::Result<()> {
+        if !buffer.is_empty() {
+            let block = buffer.join("\n");
+            let cleaned = without_pr_invitation(&block);
+            if !cleaned.is_empty() {
+                writeln!(output, "{cleaned}")?;
+            }
+            buffer.clear();
+        }
+        Ok(())
+    }
+    let result = (|| {
+        let mut buffer = Vec::new();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            // Match BufRead::lines for valid text, including CRLF and a final
+            // unterminated line. Non-UTF-8 diagnostics are relayed as bytes.
+            if line.last() == Some(&b'\n') {
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+            }
+            match std::str::from_utf8(&line) {
+                Ok(text) if text.trim_start().starts_with("remote:") => {
+                    buffer.push(text.to_owned())
+                }
+                _ => {
+                    flush(&mut buffer, &mut output)?;
+                    output.write_all(&line)?;
+                    output.write_all(b"\n")?;
+                }
+            }
+        }
+        flush(&mut buffer, &mut output)
+    })();
+    if result.is_err() {
+        // A broken output stream must not leave Git blocked on its stderr
+        // pipe. If reading also fails, dropping the owned pipe closes it.
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    }
+    result
 }
 
 fn local_version_entry(name: &str) -> Option<(&str, usize)> {
@@ -805,6 +854,78 @@ mod tests {
             head_branch: head.to_string(),
             state: reconcile::PullRequestState::Open,
         }
+    }
+
+    #[test]
+    fn push_relay_preserves_text_and_non_utf8_diagnostics() {
+        let input = b"remote: server warning\r\nlocal diagnostic\r\nremote: \xff\nlast";
+        let mut output = Vec::new();
+        relay_push_diagnostics(std::io::Cursor::new(input), &mut output).unwrap();
+        assert_eq!(output, b"remote: server warning\nlocal diagnostic\nremote: \xff\nlast\n");
+    }
+
+    struct FailedOutput;
+    impl std::io::Write for FailedOutput {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn push_relay_drains_after_output_or_read_failure() {
+        let mut reader = std::io::Cursor::new(b"first\nsecond\nlast\n");
+        assert!(relay_push_diagnostics(&mut reader, FailedOutput).is_err());
+        assert_eq!(reader.position(), reader.get_ref().len() as u64);
+
+        struct ReadFailure {
+            reader: std::io::Cursor<Vec<u8>>,
+            fail: bool,
+        }
+        impl std::io::Read for ReadFailure {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.reader.read(bytes)
+            }
+        }
+        impl std::io::BufRead for ReadFailure {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                if std::mem::take(&mut self.fail) {
+                    return Err(std::io::Error::other("fixture read failure"));
+                }
+                self.reader.fill_buf()
+            }
+            fn consume(&mut self, n: usize) {
+                self.reader.consume(n);
+            }
+        }
+        let mut reader =
+            ReadFailure { reader: std::io::Cursor::new(b"remaining bytes".to_vec()), fail: true };
+        let error = relay_push_diagnostics(&mut reader, Vec::new()).unwrap_err();
+        assert_eq!(error.to_string(), "fixture read failure");
+        assert_eq!(reader.reader.position(), reader.reader.get_ref().len() as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_child_is_drained_and_reaped_after_output_failure() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "i=0; while [ $i -lt 10000 ]; do echo diagnostic >&2; i=$((i+1)); done"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let error = finish_push(&mut child, FailedOutput).unwrap_err();
+        assert!(format!("{error:#}").contains("Remote changes may have applied"));
+        assert!(child.try_wait().unwrap().unwrap().success());
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert_eq!(finish_push(&mut child, Vec::new()).unwrap().code(), Some(3));
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[test]
