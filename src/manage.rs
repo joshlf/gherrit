@@ -209,7 +209,7 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
         }
         TransitionKind::RecordUnmanaged => {}
         TransitionKind::ReconcileConfig => {
-            let default_remote = repo.default_remote_name();
+            let default_remote = repo.default_remote_name()?;
             let current = BranchConfig::read_from(repo, &branch_name)?;
             // Compare against the old state's expected configuration, not the
             // requested state's configuration. Otherwise a transition could
@@ -341,14 +341,17 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         let upstream_merge = repo
             .config_string(&format!("branch.{branch_name}.merge"))
             .wrap_err("Failed to read config")?;
-        let upstream_merge_target = upstream_merge.as_deref().map(|merge| {
-            let merge_branch_name = merge.strip_prefix("refs/heads/").unwrap_or(merge);
-            if repo.is_a_default_branch_on_default_remote(merge_branch_name) {
-                PostCheckoutMergeTarget::DefaultBranch
-            } else {
-                PostCheckoutMergeTarget::OtherBranch
-            }
-        });
+        let upstream_merge_target = upstream_merge
+            .as_deref()
+            .map(|merge| -> Result<_> {
+                let merge_branch_name = merge.strip_prefix("refs/heads/").unwrap_or(merge);
+                if repo.is_a_default_branch_on_default_remote(merge_branch_name)? {
+                    Ok(PostCheckoutMergeTarget::DefaultBranch)
+                } else {
+                    Ok(PostCheckoutMergeTarget::OtherBranch)
+                }
+            })
+            .transpose()?;
 
         PostCheckoutBranchObservation::NewlyCreated {
             has_upstream_remote: upstream_remote.is_some(),

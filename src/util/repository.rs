@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use eyre::{OptionExt, Result, bail, eyre};
+use eyre::{Context as _, OptionExt, Result, bail, eyre};
 use gix::{Commit, Id, state::InProgress};
 
 use crate::{manage::State, re};
@@ -47,14 +47,10 @@ impl Repo {
     }
 
     pub fn is_newly_created_branch(&self, branch_name: &str) -> Result<bool> {
-        let reference = match self.inner.find_reference(branch_name) {
-            Ok(r) => r,
-            // If the branch reference doesn't exist yet, it's an "unborn branch".
-            // This happens, for example, during `git checkout --orphan <name>`:
-            // HEAD points to `refs/heads/<name>`, but the ref itself isn't
-            // created until the first commit. In this case, it is definitionally
-            // a newly created branch.
-            Err(_) => return Ok(true),
+        let Some(reference) = self.inner.try_find_reference(branch_name)? else {
+            // Only a missing ref establishes an unborn branch. Malformed or
+            // unreadable references must not select that policy.
+            return Ok(true);
         };
 
         // Get the most recent reflog entry
@@ -69,14 +65,12 @@ impl Repo {
         Ok(latest_log.is_some_and(|log| log.previous_oid.is_null()))
     }
 
-    pub fn default_remote_name(&self) -> String {
-        self.config_string("gherrit.remote")
-            .unwrap_or_default()
-            .unwrap_or_else(|| "origin".to_string())
+    pub fn default_remote_name(&self) -> Result<String> {
+        Ok(self.config_string("gherrit.remote")?.unwrap_or_else(|| "origin".to_string()))
     }
 
     pub fn default_remote(&self) -> Result<Remote> {
-        let remote_name = self.default_remote_name();
+        let remote_name = self.default_remote_name()?;
         let remote_url = self
             .config_string(&format!("remote.{}.url", remote_name))?
             .ok_or_else(|| eyre!("Remote '{}' missing URL", remote_name))?;
@@ -84,12 +78,12 @@ impl Repo {
         Ok(Remote { owner, repo_name })
     }
 
-    fn find_default_branches(&self, remote_name: &str) -> Vec<String> {
+    fn find_default_branches(&self, remote_name: &str) -> Result<Vec<String>> {
         let mut branches = Vec::new();
 
         // Try to infer the default branch from the remote HEAD.
         let remote_head_ref = format!("refs/remotes/{}/HEAD", remote_name);
-        if let Ok(head_ref) = self.inner.find_reference(&remote_head_ref) {
+        if let Some(head_ref) = self.inner.try_find_reference(&remote_head_ref)? {
             let target_name = head_ref.target().try_name().map(|n| n.as_bstr().to_string());
             if let Some(target) = target_name {
                 let prefix = format!("refs/remotes/{}/", remote_name);
@@ -99,34 +93,32 @@ impl Repo {
             }
         }
 
-        // Check git config
-        //
-        // Note that we swallow errors (e.g. invalid UTF-8) here.
-        if let Some(default_branch) = self.config_string("init.defaultBranch").ok().flatten() {
+        // An absent setting allows the usual fallback; a failed read does not.
+        if let Some(default_branch) = self.config_string("init.defaultBranch")? {
             branches.push(default_branch);
         }
 
         // Check for common local branch names
-        let locals = ["main", "master", "trunk"]
-            .into_iter()
-            .filter(|b| self.find_reference(&format!("refs/heads/{b}")).is_ok())
-            .map(String::from);
-        branches.extend(locals);
+        for branch in ["main", "master", "trunk"] {
+            if self.inner.try_find_reference(&format!("refs/heads/{branch}"))?.is_some() {
+                branches.push(branch.to_string());
+            }
+        }
 
         // Default fallback
         branches.push("main".to_string());
 
-        branches
+        Ok(branches)
     }
 
-    pub fn find_default_branch_on_default_remote(&self) -> String {
-        let branches = self.find_default_branches(&self.default_remote_name());
-        branches.first().cloned().unwrap_or_else(|| "main".to_string())
+    pub fn find_default_branch_on_default_remote(&self) -> Result<String> {
+        let branches = self.find_default_branches(&self.default_remote_name()?)?;
+        Ok(branches.first().cloned().unwrap_or_else(|| "main".to_string()))
     }
 
-    pub fn is_a_default_branch_on_default_remote(&self, branch_name: &str) -> bool {
-        let branches = self.find_default_branches(&self.default_remote_name());
-        branches.iter().any(|b| b == branch_name)
+    pub fn is_a_default_branch_on_default_remote(&self, branch_name: &str) -> Result<bool> {
+        let branches = self.find_default_branches(&self.default_remote_name()?)?;
+        Ok(branches.iter().any(|b| b == branch_name))
     }
 
     // Check whether the branch is managed by GHerrit.
@@ -170,13 +162,30 @@ impl Repo {
         ancestor: Id<'_>,
         descendant: Id<'_>,
     ) -> Result<Vec<Commit<'_>>, CommitsBetweenError> {
-        // If there is no common ancestor (e.g., an orphan branch), `merge_base`
-        // returns an error. We treat this as "not an ancestor".
-        let is_ancestor = self
-            .inner
-            .merge_base(ancestor, descendant)
-            .map(|merge_base| merge_base.detach() == ancestor)
-            .unwrap_or(false);
+        // The graph API can report no base for missing endpoints. Establish
+        // that both requested objects are commits before interpreting absence.
+        for id in [ancestor, descendant] {
+            id.object()
+                .map_err(|error| CommitsBetweenError::Eyre(error.into()))?
+                .try_into_commit()
+                .map_err(|error| CommitsBetweenError::Eyre(error.into()))?;
+        }
+        let is_ancestor = match self.inner.merge_base(ancestor, descendant) {
+            Ok(merge_base) => merge_base.detach() == ancestor,
+            Err(gix::repository::merge_base::Error::NotFound { .. }) => {
+                // Missing parents may also be skipped by merge-base. Only
+                // classify unrelated history after a complete readable walk.
+                for entry in self
+                    .rev_walk([ancestor, descendant])
+                    .all()
+                    .map_err(|error| CommitsBetweenError::Eyre(error.into()))?
+                {
+                    entry.map_err(|error| CommitsBetweenError::Eyre(error.into()))?;
+                }
+                false
+            }
+            Err(error) => return Err(CommitsBetweenError::Eyre(error.into())),
+        };
         if !is_ancestor {
             return Err(CommitsBetweenError::NotAncestor);
         }
@@ -231,17 +240,27 @@ fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
     // are states in which we don't have any branch name at all.
     if let Some(InProgress::Rebase) | Some(InProgress::RebaseInteractive) = repo.state() {
         let git_dir = repo.path();
-        let try_read_ref = |path: PathBuf| -> Option<String> {
-            std::fs::read_to_string(path).ok().map(|content| {
-                content.trim().strip_prefix("refs/heads/").unwrap_or(content.trim()).to_string()
-            })
+        let try_read_ref = |path: PathBuf| -> Result<Option<String>> {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => Ok(Some(
+                    content
+                        .trim()
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(content.trim())
+                        .to_string(),
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error).wrap_err_with(|| {
+                    format!("Failed to read rebase branch metadata {}", path.display())
+                }),
+            }
         };
 
-        if let Some(name) = try_read_ref(git_dir.join("rebase-merge/head-name")) {
+        if let Some(name) = try_read_ref(git_dir.join("rebase-merge/head-name"))? {
             return Ok(HeadState::Pending(name));
         }
 
-        if let Some(name) = try_read_ref(git_dir.join("rebase-apply/head-name")) {
+        if let Some(name) = try_read_ref(git_dir.join("rebase-apply/head-name"))? {
             return Ok(HeadState::Pending(name));
         }
     }
@@ -266,4 +285,103 @@ pub(super) fn get_repo_owner_name(remote_url: &str) -> Result<(String, String)> 
     let owner = caps.name("owner").unwrap().as_str().to_string();
     let repo = caps.name("repo").unwrap().as_str().to_string();
     Ok((owner, repo))
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use gix::prelude::ObjectIdExt as _;
+
+    use super::*;
+
+    fn fixture() -> testutil::TestContext {
+        testutil::TestContextBuilder::new(std::env::current_exe().unwrap())
+            .with_initial_commit()
+            .build()
+    }
+
+    #[test]
+    fn absent_refs_allow_fallback_but_malformed_refs_do_not() {
+        let ctx = fixture();
+        let repo = Repo::open(ctx.repo_path.to_str().unwrap()).unwrap();
+        assert!(repo.is_newly_created_branch("refs/heads/missing").unwrap());
+        assert_eq!(repo.default_remote_name().unwrap(), "origin");
+        assert_eq!(repo.find_default_branch_on_default_remote().unwrap(), "main");
+        let path = ctx.repo_path.join(".git/refs/heads/broken");
+        std::fs::write(path, "not an object ID\n").unwrap();
+        assert!(repo.is_newly_created_branch("refs/heads/broken").is_err());
+        let path = ctx.repo_path.join(".git/refs/remotes/origin/HEAD");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "broken remote HEAD\n").unwrap();
+        assert!(repo.find_default_branch_on_default_remote().is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_config_does_not_select_fallback() {
+        use std::io::Write as _;
+        for section in ["[gherrit]\nremote", "[init]\ndefaultBranch"] {
+            let ctx = fixture();
+            let mut config = std::fs::OpenOptions::new()
+                .append(true)
+                .open(ctx.repo_path.join(".git/config"))
+                .unwrap();
+            config.write_all(format!("\n{section} = ").as_bytes()).unwrap();
+            config.write_all(b"\xff\n").unwrap();
+            let repo = Repo::open(ctx.repo_path.to_str().unwrap()).unwrap();
+            assert!(repo.find_default_branch_on_default_remote().is_err());
+        }
+    }
+
+    #[test]
+    fn missing_object_is_not_unrelated_history() {
+        let ctx = fixture();
+        let first = ctx.head_oid();
+        ctx.run_git(&["checkout", "--orphan", "unrelated"]);
+        ctx.run_git(&["commit", "--allow-empty", "--no-verify", "-m", "Other root"]);
+        let repo = Repo::open(ctx.repo_path.to_str().unwrap()).unwrap();
+        let first = gix::ObjectId::from_hex(first.as_bytes()).unwrap().attach(&repo.inner);
+        let head = repo.rev_parse_single("HEAD").unwrap();
+        assert!(matches!(repo.commits_between(first, head), Err(CommitsBetweenError::NotAncestor)));
+        let missing = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")
+            .unwrap()
+            .attach(&repo.inner);
+        assert!(matches!(repo.commits_between(missing, head), Err(CommitsBetweenError::Eyre(_))));
+    }
+
+    #[test]
+    fn missing_parent_is_not_unrelated_history() {
+        let ctx = fixture();
+        let tree = ctx.git_cmd().args(["show", "-s", "--format=%T", "HEAD"]).output().unwrap();
+        let raw = format!(
+            "tree {}\nparent 1111111111111111111111111111111111111111\nauthor Fixture <fixture@example.com> 0 +0000\ncommitter Fixture <fixture@example.com> 0 +0000\n\nMissing parent\n",
+            String::from_utf8(tree.stdout).unwrap().trim()
+        );
+        let path = ctx.repo_path.join("missing-parent-commit");
+        std::fs::write(&path, raw).unwrap();
+        let output =
+            ctx.git_cmd().args(["hash-object", "-w", "-t", "commit"]).arg(path).output().unwrap();
+        assert!(output.status.success());
+        let repo = Repo::open(ctx.repo_path.to_str().unwrap()).unwrap();
+        let first = repo.rev_parse_single("HEAD").unwrap();
+        let broken =
+            gix::ObjectId::from_hex(String::from_utf8(output.stdout).unwrap().trim().as_bytes())
+                .unwrap()
+                .attach(&repo.inner);
+        assert!(matches!(repo.commits_between(first, broken), Err(CommitsBetweenError::Eyre(_))));
+    }
+
+    #[test]
+    fn failed_rebase_metadata_read_is_not_detached_head() {
+        let ctx = fixture();
+        ctx.run_git(&["checkout", "--detach"]);
+        let path = ctx.repo_path.join(".git/rebase-merge/head-name");
+        std::fs::create_dir_all(&path).unwrap();
+        let error = Repo::open(ctx.repo_path.to_str().unwrap()).err().unwrap();
+        assert!(format!("{error:#}").contains("Failed to read rebase branch metadata"));
+        std::fs::remove_dir(&path).unwrap();
+        // Missing metadata retains the old detached fallback.
+        assert_eq!(
+            Repo::open(ctx.repo_path.to_str().unwrap()).unwrap().current_branch(),
+            &HeadState::Detached
+        );
+    }
 }
