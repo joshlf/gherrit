@@ -26,7 +26,7 @@ pub(super) fn handle_update_pr(
     let Some(pr) = mock_state.prs.iter_mut().find(|pr| pr.node_id == node_id) else {
         return Err(format!("Pull request node `{node_id}` does not exist"));
     };
-    if base.as_deref() == Some(pr.head.ref_field.as_str()) {
+    if base.as_deref() == Some(pr.head.as_str()) {
         return Err("Pull request head and base branches must differ".to_string());
     }
     if let Some(title) = title {
@@ -36,7 +36,7 @@ pub(super) fn handle_update_pr(
         pr.body = Some(body.clone());
     }
     if let Some(base) = base {
-        pr.base.ref_field = base;
+        pr.base = base;
     }
 
     let mut response = serde_json::Map::new();
@@ -78,7 +78,7 @@ pub(super) fn handle_create_pr(
     }
     if mock_state.prs.iter().any(|pr| {
         pr.state == "OPEN"
-            && pr.head.ref_field == head
+            && pr.head == head
             && !mock_state.cross_repository_prs.contains(&pr.number)
     }) {
         return Err(format!("An open pull request already exists for head branch `{head}`"));

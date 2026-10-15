@@ -300,8 +300,8 @@ impl From<&mock_server::PrEntry> for PullRequestSnapshot {
             state: PullRequestState::from_str(&pr.state),
             title: pr.title.clone(),
             body: pr.body.clone(),
-            head: pr.head.ref_field.clone(),
-            base: pr.base.ref_field.clone(),
+            head: pr.head.clone(),
+            base: pr.base.clone(),
         }
     }
 }

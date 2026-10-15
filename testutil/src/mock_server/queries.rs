@@ -47,7 +47,7 @@ pub(super) fn handle_repository_query(
                 let matching_prs = mock_state
                     .prs
                     .iter()
-                    .filter(|pr| pr.head.ref_field == head && states.contains(pr.state.as_str()))
+                    .filter(|pr| pr.head == head && states.contains(pr.state.as_str()))
                     .collect::<Vec<_>>();
                 let has_next_page = matching_prs.len() > MAX_PULL_REQUEST_CANDIDATES;
 
@@ -119,7 +119,7 @@ fn project_pr_node(
             "id" => serde_json::json!(pr.node_id),
             "title" => serde_json::json!(pr.title),
             "body" => serde_json::json!(pr.body),
-            "baseRefName" => serde_json::json!(pr.base.ref_field),
+            "baseRefName" => serde_json::json!(pr.base),
             "state" => serde_json::json!(pr.state),
             "isCrossRepository" => serde_json::json!(is_cross_repository),
             _ => unreachable!("request was checked by validate_pull_requests_field"),
