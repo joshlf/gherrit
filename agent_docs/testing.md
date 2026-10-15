@@ -32,6 +32,13 @@ capability builders only when the scenario needs them. Production and the
 feature-gated test driver are separate executables: production does not read
 test endpoints or dispatch fixture interception, including all-feature builds.
 
+Fixture roles live in private `testutil/src/environment.rs`,
+`testutil/src/server.rs`, `testutil/src/overlap.rs`,
+`testutil/src/failures.rs`, `testutil/src/github.rs`,
+`testutil/src/git_fixture.rs` and `testutil/src/normalization.rs` children.
+The root retains builder setup and TestContext teardown order; existing public
+fixture types are reexported from the root.
+
 The HTTP fake counts every arrival before JSON or GraphQL validation. Decoded
 operation traces are a separate observation. Unexpected protocol violations fail
 teardown; a negative test must explicitly consume the expected violation count.
