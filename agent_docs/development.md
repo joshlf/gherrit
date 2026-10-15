@@ -68,4 +68,36 @@ This is a developer diagnostic, not a stable product status or admission API.
 `ci/validate.sh devtools` exercises redaction and a native linked-worktree
 contract, including relative hooks and unchanged configuration and refs.
 
+## Current-head PR observations
+
+Run `python3 ci/pr_readiness.py --repo owner/repository 123` for a read-only
+report of head and base commits, head-commit checks, workflow runs, and formal
+review decisions. It distinguishes no run, approval required, running, failed,
+successful and unknown. It summarizes the latest check/app and workflow/event,
+retains attempts as evidence, and marks whether each formal decision names the
+current head. Ordinary review comments, bot messages and emoji reactions do
+not become formal approvals. It reads the PR again after observation; a changed
+head or base invalidates the summaries.
+
+The report is not permission to merge. It omits rulesets, required-check
+selection, merge-commit checks, commit status contexts and comment/reaction
+approvals. Head checks alone do not prove validation against the recorded base.
+Missing API access fails rather than indicating green CI. Each request has a
+30-second timeout. Reviews/checks are bounded at 100 pages of 100 records;
+filtered workflow searches are bounded at ten pages because GitHub caps them
+at 1,000 results. A full bound is explicitly incomplete and summarizes unknown.
+See GitHub's [workflow run API](https://docs.github.com/en/rest/actions/workflow-runs),
+[check API](https://docs.github.com/en/rest/checks/runs), and
+[review API](https://docs.github.com/en/rest/pulls/reviews).
+
+To approve existing workflow runs deliberately, add `--approve-workflows
+--expect-head FULL_OID --expect-base FULL_OID`. The helper rechecks the PR and
+each run before the POST, requiring an approval-required pull-request run
+whose PR record names both expected commits. An absent binding refuses the
+operation. A later failure may leave earlier approvals applied; errors report
+that prefix. A failed POST has an uncertain outcome. These observations cannot
+fence a concurrent edit. Approval starts execution; run the read-only helper
+again for fresh results. The helper never dispatches a new workflow or changes
+credentials. Its scripted API contracts run with `ci/validate.sh devtools`.
+
 *Updated by an AI agent acting on joshlf's behalf.*
