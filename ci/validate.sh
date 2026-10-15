@@ -31,7 +31,7 @@ check() {
     tests) cargo test --workspace --all-targets --all-features --locked ;;
     doc) selected_tests --workspace --doc --all-features --locked ;;
     markers) ci/check_todo.sh ;;
-    devtools) python3 ci/test_execution_context.py ;;
+    devtools) python3 ci/test_execution_context.py; python3 ci/test_pr_readiness.py ;;
     action) bash ci/test_extract_stack_child.sh; bash ci/test_rebase_stack_child.sh ;;
     navigation)
       python3 ci/test_check_navigation.py
