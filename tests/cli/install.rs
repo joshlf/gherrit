@@ -1,3 +1,23 @@
+fn assert_installed_hooks(directory: &std::path::Path) {
+    // Keep the expected shim independent of the production template.
+    for hook in ["pre-push", "commit-msg", "post-checkout"] {
+        let expected = format!(
+            "#!/bin/sh\n\
+             # gherrit-installer: managed\n\
+             # This hook is managed by GHerrit.\n\
+             # Any manual changes to this file may be overwritten by 'gherrit install'.\n\n\
+             gherrit hook {hook} \"$@\"\n"
+        );
+        let path = directory.join(hook);
+        assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes(), "{hook}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
+        }
+    }
+}
+
 #[test]
 fn test_install_command_edge_cases() {
     let ctx = testutil::test_context!().build();
@@ -25,7 +45,7 @@ fn test_install_command_edge_cases() {
     );
 
     let content = std::fs::read_to_string(&pre_push).unwrap();
-    assert!(content.contains("# gherrit-installer: managed"));
+    assert_installed_hooks(&hooks_dir);
 
     // Scenario C: Idempotency (Safe to run again)
     testutil::assert_success_snapshot!(
@@ -44,10 +64,8 @@ fn test_install_command_edge_cases() {
         "install_edge_cases_upgrade"
     );
 
-    // Content should be reset to standard shim (losing custom comment, which is expected behavior for managed hooks)
-    let reset_content = std::fs::read_to_string(&pre_push).unwrap();
-    assert!(reset_content.contains("# gherrit-installer: managed"));
-    assert!(!reset_content.contains("# Some custom comment"));
+    // An upgrade restores the complete managed shim for every hook.
+    assert_installed_hooks(&hooks_dir);
 }
 
 #[test]
@@ -67,7 +85,7 @@ fn test_install_configuration_and_security() {
         ctx.gherrit_cmd().args(["install"]),
         "install_security_default"
     );
-    assert!(default_hooks.join("pre-push").exists(), "Should create directory and install hook");
+    assert_installed_hooks(&default_hooks);
 
     // Scenario B: Custom core.hooksPath (Internal)
     // --------------------------------------------
@@ -79,7 +97,7 @@ fn test_install_configuration_and_security() {
         ctx.gherrit_cmd().args(["install"]),
         "install_security_custom_internal"
     );
-    assert!(custom_internal.join("pre-push").exists(), "Should respect core.hooksPath within repo");
+    assert_installed_hooks(&custom_internal);
 
     // Scenario C: Custom core.hooksPath (External/Global) - Security Block
     // --------------------------------------------------------------------
@@ -110,10 +128,7 @@ fn test_install_configuration_and_security() {
         &[(ext_path, "[EXTERNAL_HOOKS_PATH]")],
     );
 
-    assert!(
-        external_dir.path().join("pre-push").exists(),
-        "Should install to external path with --allow-global"
-    );
+    assert_installed_hooks(external_dir.path());
 }
 
 #[test]
