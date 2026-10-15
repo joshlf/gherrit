@@ -21,6 +21,9 @@ outstanding work.
 | `testutil/src/command.rs` | 60 seconds by default, override per command | Test command execution deadline |
 | `testutil/src/command.rs` | 5 seconds for cleanup waits | Descendant termination and output collection have their existing separate waits |
 | `testutil/src/server.rs` | 10 seconds each for server startup/shutdown | Fixture readiness and completion are separate observations |
+| `ci/execution_context.py` | 10 seconds per local command | Read-only developer context acquisition |
+| `ci/pr_readiness.py` | 30 seconds per GitHub request | Developer observations and explicit workflow approval requests |
+| `ci/pr_readiness.py` | 100 pages of 100 checks/reviews; 10 pages of 100 filtered runs | A full page bound is incomplete and reports unknown |
 | `.github/workflows/ci.yml` | 15 minutes on Ubuntu; 25 minutes on Windows | Outer validation job deadlines |
 
 The production command adapter in `src/util/command.rs` uses native process
