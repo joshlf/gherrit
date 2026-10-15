@@ -418,3 +418,22 @@ fn inspection_reports_a_managed_default_branch_without_guessing_unknown_cache() 
         assert_eq!(report["stack"]["publication_authority"], false);
     }
 }
+
+#[test]
+fn inspection_uses_literal_committed_message_corpus() {
+    let cases: Value =
+        serde_json::from_str(include_str!("../fixtures/committed-messages.json")).unwrap();
+    let context = testutil::test_context!().with_initial_commit().build();
+    let base = context.head_oid();
+    context.checkout_new("corpus");
+    for case in cases.as_array().unwrap() {
+        context.run_git(&["reset", "--hard", &base]);
+        context.commit_raw_message(case["message"].as_str().unwrap().as_bytes());
+        let result =
+            context.gherrit_cmd().args(["status", "--json", "--base", "main"]).assert().success();
+        let report: Value = serde_json::from_slice(&result.get_output().stdout).unwrap();
+        let fact = &report["stack"]["commits"][0];
+        assert_eq!(fact["id"], case["inspection"]["id"], "{}", case["name"]);
+        assert_eq!(fact["problems"], case["inspection"]["problems"], "{}", case["name"]);
+    }
+}

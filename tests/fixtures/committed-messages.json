@@ -1,0 +1,162 @@
+[
+  {
+    "name": "ordinary",
+    "message": "Subject\n\nBody\n\ngherrit-pr-id: Gone\n",
+    "publication": {
+      "id": "Gone",
+      "error": null
+    },
+    "inspection": {
+      "id": "Gone",
+      "problems": []
+    }
+  },
+  {
+    "name": "before_body",
+    "message": "gherrit-pr-id: Gsubject\n\n# ------------------------ >8 ------------------------\nBody\n",
+    "publication": {
+      "id": "Gsubject",
+      "error": null
+    },
+    "inspection": {
+      "id": "Gsubject",
+      "problems": []
+    }
+  },
+  {
+    "name": "before_body_and_body",
+    "message": "gherrit-pr-id: Gsubject\n\n# ------------------------ >8 ------------------------\nBody\n\ngherrit-pr-id: Gbody\n",
+    "publication": {
+      "id": null,
+      "error": "multiple gherrit-pr-id trailers"
+    },
+    "inspection": {
+      "id": null,
+      "problems": [
+        "multiple identities"
+      ]
+    }
+  },
+  {
+    "name": "multiple_sections",
+    "message": "Subject\n\ngherrit-pr-id: Gone\n# ------------------------ >8 ------------------------\nBody\n\ngherrit-pr-id: Gtwo\n",
+    "publication": {
+      "id": null,
+      "error": "multiple gherrit-pr-id trailers"
+    },
+    "inspection": {
+      "id": null,
+      "problems": [
+        "multiple identities"
+      ]
+    }
+  },
+  {
+    "name": "alias_key",
+    "message": "Subject\n\ngid: Gone\n",
+    "publication": {
+      "id": null,
+      "error": "missing gherrit-pr-id trailer"
+    },
+    "inspection": {
+      "id": null,
+      "problems": [
+        "missing identity"
+      ]
+    }
+  },
+  {
+    "name": "crlf",
+    "message": "Subject\r\n\r\ngherrit-pr-id: Gone\r\n",
+    "publication": {
+      "id": "Gone",
+      "error": null
+    },
+    "inspection": {
+      "id": "Gone",
+      "problems": []
+    }
+  },
+  {
+    "name": "git_blank_padding",
+    "message": "Subject\n\ngherrit-pr-id: \tGone\t\r\n \t\r\n",
+    "publication": {
+      "id": "Gone",
+      "error": null
+    },
+    "inspection": {
+      "id": "Gone",
+      "problems": []
+    }
+  },
+  {
+    "name": "vertical_tab",
+    "message": "Subject\n\ngherrit-pr-id: \u000bGone\u000b\n",
+    "publication": {
+      "id": null,
+      "error": "invalid gherrit-pr-id trailer"
+    },
+    "inspection": {
+      "id": null,
+      "problems": [
+        "invalid identity"
+      ]
+    }
+  },
+  {
+    "name": "form_feed",
+    "message": "Subject\n\ngherrit-pr-id: \fGone\f\n",
+    "publication": {
+      "id": null,
+      "error": "invalid gherrit-pr-id trailer"
+    },
+    "inspection": {
+      "id": null,
+      "problems": [
+        "invalid identity"
+      ]
+    }
+  },
+  {
+    "name": "ambiguous_footer",
+    "message": "Subject\n\ngherrit-pr-id: Gone\n\nFinal prose.\n",
+    "publication": {
+      "id": null,
+      "error": "missing gherrit-pr-id trailer"
+    },
+    "inspection": {
+      "id": null,
+      "problems": [
+        "missing identity"
+      ]
+    }
+  },
+  {
+    "name": "malformed_separator",
+    "message": "Subject\n\ngherrit-pr-id=Gone\n",
+    "publication": {
+      "id": null,
+      "error": "invalid gherrit-pr-id trailer syntax"
+    },
+    "inspection": {
+      "id": null,
+      "problems": [
+        "malformed identity syntax"
+      ]
+    }
+  },
+  {
+    "name": "temporary_subject",
+    "message": "fixup! Subject\n\ngherrit-pr-id: Gone\n",
+    "publication": {
+      "id": null,
+      "error": "Stack contains pending fixup/squash/amend commits"
+    },
+    "inspection": {
+      "id": "Gone",
+      "problems": [
+        "pending autosquash"
+      ]
+    }
+  }
+]

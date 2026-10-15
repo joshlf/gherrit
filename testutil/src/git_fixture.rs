@@ -84,3 +84,27 @@ pub(super) fn init_git_repo(
         run(&["remote", "add", "origin", &remote_url]);
     }
 }
+
+impl TestContext {
+    /// Store exact committed-message bytes without hook or Git cleanup.
+    /// This is a commit-object fixture, not evidence about commit-msg behavior.
+    pub fn commit_raw_message(&self, message: &[u8]) -> String {
+        let tree = self.git_cmd().args(["rev-parse", "HEAD^{tree}"]).output().unwrap();
+        assert!(tree.status.success());
+        let tree = String::from_utf8(tree.stdout).unwrap();
+        let parent = self.head_oid();
+        let mut object = format!(
+            "tree {}\nparent {parent}\nauthor Fixture <fixture@example.invalid> 946684800 +0000\ncommitter Fixture <fixture@example.invalid> 946684800 +0000\n\n",
+            tree.trim()
+        ).into_bytes();
+        object.extend_from_slice(message);
+        let path = self.dir.path().join("raw-commit-object");
+        fs::write(&path, object).unwrap();
+        let output =
+            self.git_cmd().args(["hash-object", "-t", "commit", "-w"]).arg(path).output().unwrap();
+        assert!(output.status.success());
+        let oid = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        self.run_git(&["update-ref", "HEAD", &oid]);
+        oid
+    }
+}

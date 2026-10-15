@@ -366,6 +366,49 @@ mod tests {
     use super::*;
     use crate::identity::MAX_GHERRIT_PR_ID_BYTES;
 
+    #[test]
+    fn publication_uses_literal_committed_message_corpus() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/committed-messages.json"))
+                .unwrap();
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        let base = context.head_oid();
+        context.checkout_new("corpus");
+        for case in cases.as_array().unwrap() {
+            context.run_git(&["reset", "--hard", &base]);
+            let raw = case["message"].as_str().unwrap().as_bytes();
+            let head = context.commit_raw_message(raw);
+            let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+            let head = ObjectId::from_hex(head.as_bytes()).unwrap();
+            let commit = repository.find_commit(head).unwrap();
+            let stored: &[u8] = commit.message_raw().unwrap().as_ref();
+            assert_eq!(stored, raw);
+            let result = LocalStack::collect_captured(
+                &repository,
+                "corpus",
+                head,
+                DefaultBranch::new("main".into(), ObjectId::from_hex(base.as_bytes()).unwrap())
+                    .unwrap(),
+            );
+            if let Some(expected) = case["publication"]["id"].as_str() {
+                let stack = result.unwrap();
+                assert_eq!(
+                    stack.iter().next().unwrap().id().as_str(),
+                    expected,
+                    "{}",
+                    case["name"]
+                );
+            } else {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(
+                    error.contains(case["publication"]["error"].as_str().unwrap()),
+                    "{}: {error}",
+                    case["name"]
+                );
+            }
+        }
+    }
+
     fn identity_values(message: &[u8]) -> Vec<Option<Vec<u8>>> {
         gherrit_id_trailers(message)
             .into_iter()

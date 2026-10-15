@@ -55,6 +55,12 @@ with unhooked Git across cleanup modes and comment/trailer configuration. Its
 existing-identity fast path must leave messages byte-exact and avoid unnecessary
 committer/entropy work.
 
+Publication and inspection independently assert outcomes for the same literal
+`tests/fixtures/committed-messages.json` inputs: pre-body identities, raw body,
+sections, aliases, CRLF, Git blank bytes, VT/FF and ambiguous footers. The raw
+commit-object fixture bypasses hooks and cleanup and verifies stored bytes.
+The native hook cleanup matrix remains a separate context and evidence source.
+
 ## External storage and concurrency
 
 `testutil::git_model::RefStore` stores literal refs. Advertisement-time equal-OID
