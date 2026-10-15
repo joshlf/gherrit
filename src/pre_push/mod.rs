@@ -525,26 +525,28 @@ impl Commit {
         let message_title = core::str::from_utf8(message.title)?.to_string();
         let message_body =
             message.body.map(|body| core::str::from_utf8(body).unwrap()).unwrap_or("").to_string();
-        let mut gherrit_ids = trailers
-            .split(|byte| *byte == b'\n')
-            .filter_map(|line| line.strip_prefix(b"gherrit-pr-id: "));
-        let gherrit_id = gherrit_ids
-            .next()
-            .ok_or_else(|| eyre!("Commit {} missing gherrit-pr-id trailer", c.id))?;
-        if gherrit_ids.next().is_some() {
-            bail!("Commit {} has multiple gherrit-pr-id trailers", c.id);
-        }
-        if gherrit_id.is_empty() {
-            bail!("Commit {} missing gherrit-pr-id trailer", c.id);
-        }
-        if !gherrit_id.iter().all(u8::is_ascii_alphanumeric) {
-            bail!("Commit {} has invalid gherrit-pr-id trailer", c.id);
-        }
-        let gherrit_id = str::from_utf8(gherrit_id)?.to_string();
+        let gherrit_id = committed_gherrit_id(trailers, c.id)?;
         let message_body = strip_gherrit_id(&message_body, &gherrit_id);
 
         Ok(Commit { id: c.id, gherrit_id, message_title, message_body })
     }
+}
+
+fn committed_gherrit_id(trailers: &[u8], object_id: ObjectId) -> Result<String> {
+    let mut gherrit_ids = crate::commit_message::gherrit_id_values(trailers);
+    let gherrit_id = gherrit_ids
+        .next()
+        .ok_or_else(|| eyre!("Commit {} missing gherrit-pr-id trailer", object_id))?;
+    if gherrit_ids.next().is_some() {
+        bail!("Commit {} has multiple gherrit-pr-id trailers", object_id);
+    }
+    if gherrit_id.is_empty() {
+        bail!("Commit {} missing gherrit-pr-id trailer", object_id);
+    }
+    if !gherrit_id.iter().all(u8::is_ascii_alphanumeric) {
+        bail!("Commit {} has invalid gherrit-pr-id trailer", object_id);
+    }
+    Ok(str::from_utf8(gherrit_id)?.to_string())
 }
 
 fn strip_gherrit_id(body: &str, id: &str) -> String {

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+mod commit_message;
 mod commit_msg;
 mod install;
 mod manage;
