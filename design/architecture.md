@@ -18,6 +18,7 @@ tests without restating that contract.
 | Exact push repository | `pre_push/destination.rs` | Real fetch/push URL, rewrite, environment, and destination-redaction fixtures |
 | Local intent | `pre_push/local.rs`, `pre_push/autosquash.rs` | Captured HEAD, first-parent path, trailer/title/body and autosquash cases |
 | Git facts and immutable history admission | `publication_attempt/{remote,history,marker,version}.rs` | Literal OIDs/ref sets, graph adversaries, canonical marker/version codec cases |
+| Literal history graph | `src/pre_push/publication_attempt/history/graph.rs` | Mixed missing-root/ancestor provenance, all-parent reachability and promisor witnesses |
 | Strict OPEN PR admission | `publication_attempt/github/observation.rs` | Complete exact-head cursors, identity registry, bounded row/page counterexamples |
 | Bound production effect execution | `src/pre_push/publication_attempt/plan/execution.rs` | Existing consuming stage and failure-prefix tests |
 | Pure decisions and consuming stages | `publication_attempt/plan/` | Independent typed effects and durable semantic-world transitions |
