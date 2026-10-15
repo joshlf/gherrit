@@ -63,6 +63,12 @@ checks on transmitted commands. A native bare-Git differential scenario compares
 success and every raw ref for lightweight A→B→A and distinct-annotation control
 schedules. Keep raw annotation identity distinct from the peeled commit.
 
+A separate native ref-transaction witness retains only transmitted commands
+across competing writes and optional old-OID restoration. It compares all raw
+refs after each step and shows that an omitted equal-desired ref is outside the
+retained receive transaction. This checks native old-OID transactions, rather
+than claiming a paused receive-pack or another fresh advertisement.
+
 The semantic world stores raw current refs independently from its history
 ledger. It must not authorize version creation using ledger length: Git has no
 such namespace-wide condition. Production prepared annotation OIDs reach that

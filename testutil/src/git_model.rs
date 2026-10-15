@@ -317,4 +317,92 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn native_ref_transactions_agree_after_retaining_only_transmitted_commands() {
+        for restore_old in [false, true] {
+            let ctx = crate::TestContextBuilder::new("unused").with_initial_commit().build();
+            let a = ctx.head_oid();
+            ctx.commit("B");
+            let b = ctx.head_oid();
+            ctx.commit("C");
+            let c = ctx.head_oid();
+            let target = "refs/heads/Gretained";
+            let omitted = "refs/heads/GalreadyDesired";
+            for name in [target, omitted] {
+                ctx.run_git(&["update-ref", name, &a]);
+            }
+            let native_refs = || {
+                let output = ctx
+                    .git_cmd()
+                    .args(["for-each-ref", "--format=%(refname) %(objectname)"])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .map(|line| {
+                        let (name, oid) = line.split_once(' ').unwrap();
+                        (name.to_owned(), oid.to_owned())
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            };
+            let mut model = RefStore(BTreeMap::from([
+                ("refs/heads/main".into(), c.clone()),
+                (target.into(), a.clone()),
+                (omitted.into(), a.clone()),
+            ]));
+            assert_eq!(native_refs(), model.0);
+            let requested = [
+                Update { name: target.into(), expected: Some(a.clone()), desired: b.clone() },
+                Update { name: omitted.into(), expected: None, desired: a.clone() },
+            ];
+            let retained = model.advertise(&requested).unwrap();
+            assert_eq!(
+                retained,
+                [requested[0].clone()],
+                "equal desired wins before the absence lease"
+            );
+            // A different writer changes both refs after advertisement. The
+            // omitted ref never participates in the retained receive request.
+            for (name, desired) in [(target, &c), (omitted, &b)] {
+                ctx.run_git(&["update-ref", name, desired]);
+                model.0.insert(name.into(), desired.clone());
+                assert_eq!(native_refs(), model.0);
+            }
+            if restore_old {
+                ctx.run_git(&["update-ref", target, &a]);
+                model.0.insert(target.into(), a.clone());
+                assert_eq!(native_refs(), model.0);
+            }
+            let modeled = model.receive(&retained).is_ok();
+            assert_eq!(modeled, restore_old);
+            let input_path = ctx.dir.path().join("retained-transaction");
+            // This exercises native atomic old-OID transactions, not a fresh
+            // push advertisement. The requested-but-omitted ref stays absent.
+            std::fs::write(
+                &input_path,
+                format!("start\nupdate {target} {b} {a}\nprepare\ncommit\n"),
+            )
+            .unwrap();
+            let actual = ctx
+                .git_cmd()
+                .args([
+                    "-c",
+                    "alias.transaction=!git update-ref --stdin < \"$GHERRIT_REF_INPUT\"",
+                    "transaction",
+                ])
+                .env("GHERRIT_REF_INPUT", &input_path)
+                .output()
+                .unwrap();
+            assert_eq!(
+                actual.status.success(),
+                modeled,
+                "restore_old={restore_old}: {}",
+                String::from_utf8_lossy(&actual.stderr)
+            );
+            assert_eq!(native_refs(), model.0);
+            assert_eq!(model.0[omitted], b);
+        }
+    }
 }
