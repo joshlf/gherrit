@@ -357,6 +357,15 @@ fn get_local_version(repo: &util::Repo, gherrit_id: &str) -> Result<usize> {
     Ok(max_ver)
 }
 
+fn pull_requests_by_head(prs: &[PrState]) -> HashMap<&str, &PrState> {
+    let mut by_head = HashMap::with_capacity(prs.len());
+    for pr in prs {
+        // Preserve the previous linear search's first-match behavior.
+        by_head.entry(pr.head_branch.as_str()).or_insert(pr);
+    }
+    by_head
+}
+
 /// Syncs the local stack of commits with GitHub Pull Requests.
 ///
 /// This function:
@@ -381,13 +390,15 @@ async fn sync_prs(
         ToCreate(BatchCreate),
     }
 
+    let prs_by_head = pull_requests_by_head(&prs);
+
     // 1. Identify existing PRs or queue for creation
     let resolutions: Vec<_> = commits
         .iter()
         .map(|entry| {
             let c = &entry.item;
 
-            if let Some(pr) = prs.iter().find(|pr| pr.head_branch == c.gherrit_id) {
+            if let Some(&pr) = prs_by_head.get(c.gherrit_id.as_str()) {
                 log::debug!("Found existing PR #{} for {}", pr.number.green().bold(), c.gherrit_id);
                 PrResolution::Existing(pr.clone())
             } else {
@@ -755,6 +766,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn observed_pr(number: u64, head: &str) -> PrState {
+        PrState {
+            number,
+            node_id: format!("PR_{number}"),
+            title: None,
+            body: None,
+            base_branch: "main".to_string(),
+            head_branch: head.to_string(),
+            state: reconcile::PullRequestState::Open,
+        }
+    }
+
+    #[test]
+    fn transient_pr_index_preserves_first_match() {
+        let prs = [observed_pr(1, "Ga"), observed_pr(2, "Gb"), observed_pr(3, "Ga")];
+        let index = pull_requests_by_head(&prs);
+        assert_eq!(index["Ga"].number, 1);
+        assert_eq!(index["Gb"].number, 2);
+        assert!(!index.contains_key("Gc"));
+    }
 
     #[test]
     fn push_diagnostics_only_remove_the_complete_github_invitation() {
