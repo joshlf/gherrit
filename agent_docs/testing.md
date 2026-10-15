@@ -39,6 +39,10 @@ Fixture roles live in private `testutil/src/environment.rs`,
 The root retains builder setup and TestContext teardown order; existing public
 fixture types are reexported from the root.
 
+The independent HTTP fake keeps document validation, HTTP arrivals, failure
+injection, query projection and mutation handlers in private children of
+`testutil/src/mock_server.rs`.
+
 The HTTP fake counts every arrival before JSON or GraphQL validation. Decoded
 operation traces are a separate observation. Unexpected protocol violations fail
 teardown; a negative test must explicitly consume the expected violation count.
