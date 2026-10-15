@@ -12,7 +12,7 @@ pub(super) fn observe_managed_branches(
     gherrit_ids: &[String],
 ) -> Result<HashMap<String, String>> {
     remote_query_batches(gherrit_ids).try_fold(HashMap::new(), |mut states, chunk| {
-        let mut arguments = vec!["ls-remote".to_string(), repo.default_remote_name()];
+        let mut arguments = vec!["ls-remote".to_string(), repo.default_remote_name()?];
         arguments.extend(chunk.iter().map(|id| refs::head(id)));
 
         let output = util::cmd("git", arguments).checked_output()?;
