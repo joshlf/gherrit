@@ -26,11 +26,18 @@ The formatter still uses nightly. The Windows job retains its native test
 invocation.
 
 For focused feedback, select `production`, `profiles`, `fmt`, `lint`, `unit`,
-`adapters`, `hooks`, `cli`, `doc`, or `markers`. `unit` includes all library
-tests; `adapters` selects the
-pre-push integration target; `hooks` and `cli` select complete process tests.
+`adapters`, `hooks`, `cli`, `doc`, `markers`, `navigation`, or `action`.
+`unit` includes all library tests; `adapters` selects the pre-push integration
+target; `hooks` and `cli` select complete process tests.
 These commands do not replace the full validation required for submission.
 
+Focused test selections must contain at least one test. `navigation` checks
+simple inline documentation links, including optional titles, and explicit
+source/function references in the agent maps. It first runs negative and
+positive fixture checks in `ci/test_check_navigation.py`. This small checker
+does not parse reference-style links or the full Markdown grammar; a valid
+destination establishes navigation, rather than proving test coverage.
+`action` runs the stack-extraction and rebase shell contracts.
 
 `profiles` separately compiles the shipping library/binary without optional
 features and the test driver with only its required feature. These checks
