@@ -143,8 +143,7 @@ fn commit_fact(
     default: Option<&str>,
 ) -> Result<CommitFact> {
     let message = commit.message_raw()?;
-    let parsed = commit.message()?;
-    let identity_source = parsed.body.map(AsRef::as_ref).unwrap_or(message.as_ref());
+    let identity_source = message.as_ref();
     let mut problems = Vec::new();
     let id = match message::identity(identity_source) {
         Ok(raw) => match GherritPrId::from_trailer(commit.id, &raw.value) {

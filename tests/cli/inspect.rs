@@ -326,11 +326,16 @@ fn local_identity_namespace_diagnostics_use_only_the_exact_cached_default() {
 
 #[test]
 fn inspection_admits_identities_from_the_same_region_as_publication() {
-    for (body, expected) in [
-        ("# ------------------------ >8 ------------------------\nBody text", None),
+    for (body, expected, problems) in [
+        (
+            "# ------------------------ >8 ------------------------\nBody text",
+            Some("Gsubject"),
+            json!([]),
+        ),
         (
             "# ------------------------ >8 ------------------------\nBody text\n\ngherrit-pr-id: Gbody",
-            Some("Gbody"),
+            None,
+            json!(["multiple identities"]),
         ),
     ] {
         let ctx = testutil::test_context!().with_initial_commit().build();
@@ -340,10 +345,7 @@ fn inspection_admits_identities_from_the_same_region_as_publication() {
             ctx.gherrit_cmd().args(["status", "--json", "--base", "main"]).assert().success();
         let report: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
         assert_eq!(report["stack"]["commits"][0]["id"], json!(expected));
-        assert_eq!(
-            report["stack"]["commits"][0]["problems"],
-            if expected.is_none() { json!(["missing identity"]) } else { json!([]) }
-        );
+        assert_eq!(report["stack"]["commits"][0]["problems"], problems);
     }
 }
 
