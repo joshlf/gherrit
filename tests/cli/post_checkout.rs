@@ -60,3 +60,39 @@ fn installed_checkout_hook_keeps_drift_refusal_nonfatal() {
     ctx.assert_config("branch.tracking-topic.remote", Some("origin"));
     ctx.assert_config("branch.tracking-topic.merge", Some("refs/heads/main"));
 }
+
+#[test]
+fn failed_default_branch_observation_preserves_branch_settings() {
+    use predicates::prelude::*;
+    let ctx = testutil::test_context!().with_initial_commit().build();
+    ctx.checkout_new("topic");
+    ctx.run_git(&["config", "branch.topic.remote", "origin"]);
+    ctx.run_git(&["config", "branch.topic.merge", "refs/heads/main"]);
+    let path = ctx.repo_path.join(".git/refs/remotes/origin/HEAD");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, "malformed ref\n").unwrap();
+    let before = std::fs::read(ctx.repo_path.join(".git/config")).unwrap();
+    ctx.hook_cmd("post-checkout")
+        .args(["old", "new", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("[ERROR]"));
+    assert_eq!(std::fs::read(ctx.repo_path.join(".git/config")).unwrap(), before);
+}
+
+#[test]
+fn failed_remote_setting_read_preserves_management_settings() {
+    use std::io::Write as _;
+    let ctx = testutil::test_context!().with_initial_commit().build();
+    ctx.checkout_new("topic");
+    let path = ctx.repo_path.join(".git/config");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"\n[gherrit]\n remote = \xff\n")
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    ctx.gherrit_cmd().args(["manage", "--force", "--public"]).assert().failure();
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
