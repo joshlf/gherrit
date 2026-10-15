@@ -30,6 +30,8 @@ tests without restating that contract.
 | Shared bounded HTTP body and diagnostic primitives | `github_http.rs`, `diagnostic.rs` | Body-limit and safe-text transport contracts |
 | Child ownership | `subprocess/{mod,unix,windows}.rs` | Platform process-group/job lifetime, terminal, cancellation, bounded cleanup fixtures |
 | Factual lifecycle/native reads and inspection | `hosted.rs`, `inspect.rs`, `pre_push/inspection.rs` | Wrong-scope and incomplete-page cases, terminal facts, local read-only CLI/reftable witnesses |
+| Factual decoding/transport boundaries | `src/hosted/graphql.rs`, `src/hosted/native.rs`, `src/hosted/read_api.rs` | Existing complete-resource, identity and budget cases |
+| Probe journal and receipts | `src/hosted_contracts/journal.rs`, `src/hosted_contracts/receipts.rs` | Durable redaction and exact ownership receipt cases |
 | Live provider behavior | `hosted_contracts.rs` (explicit feature/tool) | Disposable target receipts; never normal Cargo test side effects |
 
 `publication_attempt/semantic_oracle/` is a private test tree: durable world,
