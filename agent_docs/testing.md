@@ -606,3 +606,24 @@ moving lower.
 The target is not the fewest tests. It is the smallest set of independent,
 high-information tests that makes unsafe behavior difficult to introduce and
 failures cheap to understand.
+
+## Regression navigation on main
+
+These are implemented witnesses for the current branch-chain protocol. The
+future state-machine architecture above remains a target, rather than evidence
+that its proposed oracle already exists.
+
+| Risk | Existing witness | Boundary |
+| --- | --- | --- |
+| Incorrect atomic refspecs or leases | `src/pre_push/publication.rs::plans_atomic_branch_and_tag_leases` | Pure argument plan |
+| Malformed or duplicate remote refs | `src/pre_push/remote.rs::rejects_every_untrusted_output_shape` | Byte decoder |
+| Identity failure before external effects | `tests/pre_push/failures/mod.rs::test_empty_stack_id_fails_before_external_io` | Process and adapter composition |
+| Partial GraphQL data replay | `src/pre_push/batching.rs::treats_partial_or_mixed_errors_as_fatal` | Pure response classification |
+| Oversized patch-history rendering | `src/pre_push/body.rs::switches_to_sparse_history_only_above_the_size_limit` | Exact byte boundary |
+
+Use the owning target for focused feedback and the full validation command
+before submission. Navigation checks only establish that these references still
+exist. They cannot establish GitHub behavior, concurrent-writer safety or the
+adequacy of a test's assertions.
+
+*Updated by an AI agent acting on joshlf's behalf.*
