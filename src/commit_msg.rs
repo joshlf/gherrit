@@ -36,7 +36,7 @@ fn is_temporary_squash(message: &str) -> bool {
 }
 
 fn has_gherrit_id(trailers: &str) -> bool {
-    trailers.lines().any(|line| line.starts_with("gherrit-pr-id: "))
+    crate::commit_message::gherrit_id_values(trailers.as_bytes()).next().is_some()
 }
 
 fn derive_gherrit_id(mut entropy: IdEntropy, object_hash: &[u8]) -> String {
