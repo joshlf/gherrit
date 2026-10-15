@@ -1,8 +1,9 @@
 //! Validated local input for one pre-push publication attempt.
 //!
 //! A local stack is the ordered first-parent path from the default branch to
-//! `HEAD`. Its order is the source of parent, child, and root relationships.
-//! Those relationships are deliberately not stored alongside each change.
+//! the `HEAD` object captured for one publication attempt. Its order is the
+//! source of parent, child, and root relationships. Those relationships are
+//! deliberately not stored alongside each change.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -14,10 +15,32 @@ use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use gix::ObjectId;
 
 use super::{autosquash, destination::DefaultBranch};
-pub(super) use crate::identity::GherritPrId;
-#[cfg(test)]
-use crate::identity::MAX_GHERRIT_PR_ID_BYTES;
+pub(super) use crate::identity::{GherritIdTrailer, GherritPrId, gherrit_id_trailers};
 use crate::util;
+
+const MAX_TITLE_SCALARS: usize = 256;
+
+/// A nonempty title of at most 256 Unicode scalar values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PullRequestTitle(String);
+
+impl PullRequestTitle {
+    fn new(value: String) -> Result<Self> {
+        if value.is_empty() {
+            bail!("A pull request title must not be empty");
+        }
+        if value.chars().nth(MAX_TITLE_SCALARS).is_some() {
+            bail!(
+                "A pull request title must contain at most {MAX_TITLE_SCALARS} Unicode scalar values"
+            );
+        }
+        Ok(Self(value))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// One local commit which GHerrit can publish.
 ///
@@ -29,11 +52,23 @@ pub(super) struct LocalChange {
     id: GherritPrId,
     head: ObjectId,
     first_parent: ObjectId,
-    title: String,
+    title: PullRequestTitle,
     body: String,
 }
 
 impl LocalChange {
+    #[cfg(test)]
+    /// Constructs trusted synthetic content for body-renderer unit tests.
+    pub(super) fn for_body_test(
+        id: GherritPrId,
+        head: ObjectId,
+        first_parent: ObjectId,
+        title: String,
+        body: String,
+    ) -> Result<Self> {
+        Ok(Self { id, head, first_parent, title: PullRequestTitle::new(title)?, body })
+    }
+
     fn from_commit(commit: gix::Commit<'_>, title: String) -> Result<Self> {
         let message = commit.message()?;
         let raw_body = message.body.map(AsRef::as_ref);
@@ -62,6 +97,8 @@ impl LocalChange {
             .next()
             .ok_or_else(|| eyre!("Commit {} has no first parent", commit.id))?
             .detach();
+        let title = PullRequestTitle::new(title)
+            .wrap_err_with(|| format!("Commit {} has an invalid pull request title", commit.id))?;
         // gix's body is the unmodified suffix after its title separator.
         // Translate the selected raw range instead of parsing a second scope.
         let body = raw_body.map_or_else(String::new, |raw_body| {
@@ -88,37 +125,34 @@ impl LocalChange {
     }
 
     pub(super) fn title(&self) -> &str {
-        &self.title
+        self.title.as_str()
     }
 
     pub(super) fn body(&self) -> &str {
         &self.body
     }
+    #[allow(dead_code)]
+    pub(super) fn into_pull_request_content(self) -> (PullRequestTitle, String) {
+        (self.title, self.body)
+    }
 }
 
-/// An ordered, validated first-parent path from the default branch to `HEAD`.
+/// An ordered, validated first-parent path from the default branch to one
+/// captured `HEAD` object.
 #[derive(Debug)]
 pub(super) struct LocalStack {
+    default_branch: DefaultBranch,
     changes: Vec<LocalChange>,
 }
 
 impl LocalStack {
-    /// Reads and validates the local managed stack without performing network
-    /// writes.
-    #[allow(dead_code)]
-    pub(super) fn collect(repo: &util::Repo, default_branch: &DefaultBranch) -> Result<Self> {
-        let head = repo.rev_parse_single("HEAD")?.detach();
-        let branch_name = repo.current_branch().name().unwrap_or("current branch");
-        Self::collect_captured(repo, branch_name, head, default_branch)
-    }
-
     /// Reads and validates one captured local managed stack without re-reading
     /// its branch identity or `HEAD` target.
     pub(super) fn collect_captured(
         repo: &util::Repo,
         branch_name: &str,
         head: ObjectId,
-        default_branch: &DefaultBranch,
+        default_branch: DefaultBranch,
     ) -> Result<Self> {
         if branch_name == default_branch.name() {
             bail!(
@@ -126,19 +160,13 @@ impl LocalStack {
             );
         }
 
-        let default_oid = default_branch.tip().to_string();
-        let default_ref = repo.rev_parse_single(default_oid.as_str()).wrap_err_with(|| {
-            let name = default_branch.name();
-            format!("The observed push-destination default '{name}' is unavailable locally. Fetch '{name}' from the configured push destination, then rebase onto that fetched tip before pushing.")
-        })?;
-        if head == default_ref.detach() {
+        let default_ref = default_branch.tip();
+        if head == default_ref {
             return Self::new(default_branch, Vec::new());
         }
 
         repo.ensure_publishable_history()?;
-        let captured_head_hex = head.to_string();
-        let captured_head = repo.rev_parse_single(captured_head_hex.as_str())?;
-        let commits = repo.first_parent_commits_between(default_ref, captured_head).map_err(|err| match err {
+        let commits = repo.first_parent_commits_between(default_ref, head).map_err(|err| match err {
             util::FirstParentCommitsBetweenError::NotOnFirstParentPath => {
                 let default_branch = default_branch.name();
                 eyre!(
@@ -162,7 +190,7 @@ impl LocalStack {
 
         autosquash::ensure_publishable(
             commits.iter().map(|(_, title)| title.as_str()),
-            default_branch,
+            &default_branch,
         )?;
 
         let changes = commits
@@ -175,7 +203,7 @@ impl LocalStack {
         Ok(stack)
     }
 
-    fn new(default_branch: &DefaultBranch, changes: Vec<LocalChange>) -> Result<Self> {
+    fn new(default_branch: DefaultBranch, changes: Vec<LocalChange>) -> Result<Self> {
         let ids = changes.iter().map(|change| change.id.as_str());
         ensure_unique_change_ids(ids)?;
         let default_ref = default_branch.full_ref_name();
@@ -202,7 +230,49 @@ impl LocalStack {
             expected_parent = change.head;
         }
 
-        Ok(Self { changes })
+        Ok(Self { default_branch, changes })
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_history_test(
+        default_branch: DefaultBranch,
+        changes: impl IntoIterator<Item = (GherritPrId, ObjectId, ObjectId)>,
+    ) -> Self {
+        Self::for_plan_test(
+            default_branch,
+            changes.into_iter().map(|(id, head, first_parent)| {
+                (id, head, first_parent, "Test change".to_owned(), String::new())
+            }),
+        )
+    }
+
+    /// Constructs a synthetic stack with distinct presentation content after
+    /// local collection and validation have been tested at their own boundary.
+    #[cfg(test)]
+    pub(super) fn for_plan_test(
+        default_branch: DefaultBranch,
+        changes: impl IntoIterator<Item = (GherritPrId, ObjectId, ObjectId, String, String)>,
+    ) -> Self {
+        let changes = changes
+            .into_iter()
+            .map(|(id, head, first_parent, title, body)| LocalChange {
+                id,
+                head,
+                first_parent,
+                title: PullRequestTitle::new(title).expect("plan-test title is valid"),
+                body,
+            })
+            .collect();
+        Self::new(default_branch, changes).expect("valid plan-test local stack")
+    }
+
+    pub(super) fn default_branch(&self) -> &DefaultBranch {
+        &self.default_branch
+    }
+
+    /// The exact stack tip represented by this validated local input.
+    pub(super) fn tip(&self) -> ObjectId {
+        self.changes.last().map_or(self.default_branch.tip(), LocalChange::head)
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -216,6 +286,10 @@ impl LocalStack {
     pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = &LocalChange> {
         self.changes.iter()
     }
+
+    pub(super) fn into_changes(self) -> Vec<LocalChange> {
+        self.changes
+    }
 }
 
 fn ensure_unique_change_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Result<()> {
@@ -227,8 +301,6 @@ fn ensure_unique_change_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Resul
     })?;
     Ok(())
 }
-
-pub(super) use crate::identity::{GherritIdTrailer, gherrit_id_trailers};
 
 /// Requires each active change ID to identify exactly one reachable commit.
 ///
@@ -295,6 +367,7 @@ fn strip_gherrit_id(body: &str, line: Range<usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::MAX_GHERRIT_PR_ID_BYTES;
 
     fn identity_values(message: &[u8]) -> Vec<Option<Vec<u8>>> {
         gherrit_id_trailers(message)
@@ -323,7 +396,7 @@ mod tests {
             id: GherritPrId::from_trailer(object_id(head), id.as_bytes()).unwrap(),
             head: object_id(head),
             first_parent: object_id(first_parent),
-            title: String::new(),
+            title: PullRequestTitle::new("Test change".to_owned()).unwrap(),
             body: String::new(),
         }
     }
@@ -338,7 +411,7 @@ mod tests {
         assert!(repository.try_find_object(missing).unwrap().is_none());
         let default = DefaultBranch::new("main".to_owned(), missing).unwrap();
         let error =
-            LocalStack::collect_captured(&repository, "feature", head, &default).unwrap_err();
+            LocalStack::collect_captured(&repository, "feature", head, default).unwrap_err();
         assert!(error.to_string().contains("Fetch 'main' from the configured push destination"));
     }
     #[test]
@@ -353,7 +426,7 @@ mod tests {
             &repository,
             "unrelated",
             repository.head_id().unwrap().detach(),
-            &DefaultBranch::new("main".to_owned(), default_tip).unwrap(),
+            DefaultBranch::new("main".to_owned(), default_tip).unwrap(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("configured push destination"));
@@ -379,10 +452,12 @@ mod tests {
             GherritPrId::from_trailer(object_id(1), maximum.as_bytes()).unwrap().as_str(),
             maximum
         );
+        assert!(GherritPrId::from_ref_component(maximum.as_bytes()).is_ok());
 
         let too_long = "G".repeat(MAX_GHERRIT_PR_ID_BYTES + 1);
         let error = GherritPrId::from_trailer(object_id(1), too_long.as_bytes()).unwrap_err();
         assert!(error.to_string().contains("longer than the 128-byte limit"));
+        assert!(GherritPrId::from_ref_component(too_long.as_bytes()).is_err());
     }
 
     #[test]
@@ -454,10 +529,97 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_titles_use_unicode_scalar_limits() {
+        assert!(PullRequestTitle::new(String::new()).is_err());
+        assert_eq!(PullRequestTitle::new("雪".to_owned()).unwrap().as_str(), "雪");
+
+        let ascii_256 = "x".repeat(256);
+        assert_eq!(PullRequestTitle::new(ascii_256.clone()).unwrap().as_str(), ascii_256);
+        assert!(PullRequestTitle::new("x".repeat(257)).is_err());
+
+        let multibyte_256 = "雪".repeat(256);
+        assert!(multibyte_256.len() > 256);
+        assert!(PullRequestTitle::new(multibyte_256).is_ok());
+
+        let combining_256 = "e\u{301}".repeat(128);
+        assert_eq!(combining_256.chars().count(), 256);
+        assert!(PullRequestTitle::new(combining_256).is_ok());
+        assert!(PullRequestTitle::new(format!("{}x", "e\u{301}".repeat(128))).is_err());
+    }
+
+    #[test]
+    fn collected_titles_enforce_the_unicode_scalar_limit() {
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let default_tip = repository.rev_parse_single("refs/heads/main").unwrap().detach();
+        let supplied_default = DefaultBranch::new("main".to_owned(), default_tip).unwrap();
+        context.run_git(&["checkout", "-b", "feature"]);
+
+        let collect = || {
+            let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+            let head = repository.rev_parse_single("HEAD").unwrap().detach();
+            LocalStack::collect_captured(&repository, "feature", head, supplied_default.clone())
+        };
+
+        let accepted = "雪".repeat(MAX_TITLE_SCALARS);
+        context.commit_with_gherrit_id(&accepted);
+        let stack = collect().unwrap();
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack.iter().next().unwrap().title(), accepted);
+
+        let rejected = format!("{accepted}雪");
+        context.commit_with_gherrit_id(&rejected);
+        let rejected_head = util::Repo::open(context.repo_path.to_str().unwrap())
+            .unwrap()
+            .rev_parse_single("HEAD")
+            .unwrap()
+            .detach();
+        let error = collect().unwrap_err();
+        assert_eq!(
+            error.chain().map(ToString::to_string).collect::<Vec<_>>(),
+            [
+                format!("Commit {rejected_head} has an invalid pull request title"),
+                format!(
+                    "A pull request title must contain at most {MAX_TITLE_SCALARS} Unicode scalar values"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn captured_collection_uses_the_captured_branch_and_head_after_checkout_moves() {
+        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
+        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
+        let default_tip = repository.rev_parse_single("refs/heads/main").unwrap().detach();
+        let default = DefaultBranch::new("main".to_owned(), default_tip).unwrap();
+
+        context.run_git(&["checkout", "-b", "feature-a"]);
+        let id_a = context.commit_with_gherrit_id("Feature A");
+        let snapshot = repository.branch_head_snapshot().unwrap().unwrap();
+        let (captured_branch, captured_head) = snapshot.into_parts();
+        let captured_head = captured_head.unwrap();
+        assert_eq!(captured_branch, "feature-a");
+
+        context.run_git(&["checkout", "main"]);
+        context.run_git(&["checkout", "-b", "feature-b"]);
+        context.commit_with_gherrit_id("Feature B");
+
+        let captured = LocalStack::collect_captured(
+            &repository,
+            &captured_branch,
+            captured_head,
+            default.clone(),
+        )
+        .unwrap();
+        assert_eq!(captured.iter().map(|change| change.id().as_str()).collect::<Vec<_>>(), [id_a]);
+        assert_eq!(captured.iter().next().unwrap().head(), captured_head);
+    }
+
+    #[test]
     fn stacks_require_unique_change_ids() {
         let error = LocalStack::new(
-            &default_branch("main", 0),
-            vec![change("Gsame", 1, 0), change("Gsame", 2, 1)],
+            default_branch("main", 10),
+            vec![change("Gsame", 1, 10), change("Gsame", 2, 1)],
         )
         .unwrap_err();
 
@@ -467,8 +629,8 @@ mod tests {
     #[test]
     fn stacks_require_one_contiguous_first_parent_path() {
         let stack = LocalStack::new(
-            &default_branch("main", 0),
-            vec![change("Gone", 1, 0), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
+            default_branch("main", 10),
+            vec![change("Gone", 1, 10), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
         )
         .unwrap();
 
@@ -478,8 +640,8 @@ mod tests {
         );
 
         let error = LocalStack::new(
-            &default_branch("main", 0),
-            vec![change("Gone", 1, 0), change("Gtwo", 2, 0)],
+            default_branch("main", 10),
+            vec![change("Gone", 1, 10), change("Gtwo", 2, 10)],
         )
         .unwrap_err();
         assert_eq!(
@@ -507,7 +669,7 @@ mod tests {
 
         let head = repository.rev_parse_single("HEAD").unwrap().detach();
         let stack =
-            LocalStack::collect_captured(&repository, "feature", head, &supplied_default).unwrap();
+            LocalStack::collect_captured(&repository, "feature", head, supplied_default).unwrap();
 
         assert!(stack.is_empty());
     }
@@ -515,8 +677,8 @@ mod tests {
     #[test]
     fn stack_order_derives_root_parent_and_child_positions() {
         let stack = LocalStack::new(
-            &default_branch("main", 0),
-            vec![change("Gone", 1, 0), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
+            default_branch("main", 10),
+            vec![change("Gone", 1, 10), change("Gtwo", 2, 1), change("Gthree", 3, 2)],
         )
         .unwrap();
         let ids = stack.iter().map(|change| change.id().as_str()).collect::<Vec<_>>();
@@ -535,8 +697,8 @@ mod tests {
             .into_iter()
             .for_each(|(id, default)| {
                 let error = LocalStack::new(
-                    &default_branch(default, 0),
-                    vec![change(id, 1, 0)],
+                    default_branch(default, 10),
+                    vec![change(id, 1, 10)],
                 )
                 .unwrap_err();
 
@@ -563,29 +725,18 @@ mod tests {
         ]
         .into_iter()
         .for_each(|(id, default)| {
-            LocalStack::new(&default_branch(default, 0), vec![change(id, 1, 0)]).unwrap();
+            LocalStack::new(default_branch(default, 10), vec![change(id, 1, 10)]).unwrap();
         });
     }
 
     #[test]
-    fn captured_collection_uses_the_captured_branch_and_head_after_checkout_moves() {
-        let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
-        let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
-        let default_tip = repository.rev_parse_single("refs/heads/main").unwrap().detach();
-        let default = DefaultBranch::new("main".to_owned(), default_tip).unwrap();
+    fn stacks_retain_the_exact_default_path_origin() {
+        let default = default_branch("trunk", 10);
+        let stack = LocalStack::new(default.clone(), vec![change("Gone", 1, 10)]).unwrap();
 
-        context.run_git(&["checkout", "-b", "feature-a"]);
-        let id_a = context.commit_with_gherrit_id("Feature A");
-        let captured_head = repository.rev_parse_single("HEAD").unwrap().detach();
-        context.run_git(&["checkout", "main"]);
-        context.run_git(&["checkout", "-b", "feature-b"]);
-        context.commit_with_gherrit_id("Feature B");
-
-        let captured =
-            LocalStack::collect_captured(&repository, "feature-a", captured_head, &default)
-                .unwrap();
-        assert_eq!(captured.iter().map(|change| change.id().as_str()).collect::<Vec<_>>(), [id_a]);
-        assert_eq!(captured.iter().next().unwrap().head(), captured_head);
+        assert_eq!(stack.default_branch(), &default);
+        assert_eq!(stack.iter().next().unwrap().head(), object_id(1));
+        assert_eq!(stack.iter().next().unwrap().first_parent(), default.tip());
     }
 
     #[test]
@@ -602,6 +753,21 @@ mod tests {
             "Summary\r\n\r\ngherrit-pr-id: Gexample\r\n\r\nNotes\r\n\r\n\r\n"
         );
     }
+
+    #[test]
+    fn former_metadata_prefix_is_ordinary_commit_text() {
+        let body = "Keep <!-- gherrit-meta: arbitrary text --> exactly.\n\n\
+                    gherrit-pr-id: Greal\n";
+        let trailers = gherrit_id_trailers(body.as_bytes());
+        let [GherritIdTrailer::Exact { line, .. }] = trailers.as_slice() else {
+            panic!("expected one exact identity trailer")
+        };
+
+        assert_eq!(
+            strip_gherrit_id(body, line.clone()),
+            "Keep <!-- gherrit-meta: arbitrary text --> exactly.\n\n"
+        );
+    }
     #[test]
     fn captured_default_branch_cannot_publish_a_managed_stack() {
         let context = testutil::TestContextBuilder::new("unused").with_initial_commit().build();
@@ -613,8 +779,8 @@ mod tests {
             }
             let repository = util::Repo::open(context.repo_path.to_str().unwrap()).unwrap();
             let head = repository.head_id().unwrap().detach();
-            let error =
-                LocalStack::collect_captured(&repository, "main", head, &default).unwrap_err();
+            let error = LocalStack::collect_captured(&repository, "main", head, default.clone())
+                .unwrap_err();
             assert!(error.to_string().contains(
                 "Cannot publish a managed stack from the repository default branch 'main'"
             ));
@@ -625,7 +791,7 @@ mod tests {
             &repository,
             "feature",
             repository.head_id().unwrap().detach(),
-            &default,
+            default,
         )
         .unwrap();
         assert_eq!(stack.len(), 1);
