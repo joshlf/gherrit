@@ -58,6 +58,9 @@ jobs:
       - name: Check documentation navigation
         run: ci/validate.sh navigation
 
+      - name: Test developer helpers
+        run: ci/validate.sh devtools
+
       - name: Check task markers
         run: ci/validate.sh markers
 
