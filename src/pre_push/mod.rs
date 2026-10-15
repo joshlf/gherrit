@@ -750,3 +750,27 @@ where
     }
     Ok(outputs)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn committed_identity_corpus_preserves_admission_and_error_order() {
+        let object_id = ObjectId::from_bytes_or_panic(&[0x11; 20]);
+        for case in crate::commit_message::trailer_cases() {
+            let actual = committed_gherrit_id(case.trailers.as_bytes(), object_id);
+            if let Some(expected_id) = case.publication.strip_prefix("ok:") {
+                assert_eq!(actual.unwrap(), expected_id, "{}", case.name);
+            } else {
+                let expected = case.publication.strip_prefix("error:").unwrap();
+                assert_eq!(
+                    actual.unwrap_err().to_string(),
+                    format!("Commit {object_id} {expected}"),
+                    "{}",
+                    case.name
+                );
+            }
+        }
+    }
+}

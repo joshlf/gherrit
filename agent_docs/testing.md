@@ -607,6 +607,16 @@ The target is not the fewest tests. It is the smallest set of independent,
 high-information tests that makes unsafe behavior difficult to introduce and
 failures cheap to understand.
 
+## Trailer classifier corpus
+
+`tests/fixtures/trailer-classification.json` supplies literal input bytes and
+separate expected answers for the hook's preservation check and publication's
+committed-ID admission. Empty, duplicate and malformed values deliberately have
+different answers under those two policies. This corpus exercises their supplied
+trailer inputs, including non-normalized forms, rather than simulating native
+Git's selection of trailer paragraphs. The existing hook and pre-push process
+contracts retain responsibility for that native boundary.
+
 ## Regression navigation on main
 
 These are implemented witnesses for the current branch-chain protocol. The
