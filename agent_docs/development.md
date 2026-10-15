@@ -44,4 +44,12 @@ out another installer, or establish exclusive ownership of an external path.
 Git uses common-directory default hooks in linked worktrees; explicit relative
 hook paths are resolved from each worktree or the bare Git directory.
 
+## Stack action
+
+`ci/rebase_stack_child.sh` uses the workflow's `GITHUB_REPOSITORY` for lookup,
+checkout and PR editing. A nonempty child ID must identify exactly one open
+same-repository PR with that exact head name. Missing, multiple, fork or
+mismatched observations stop before checkout or mutation. The shell contracts
+in `ci/test_rebase_stack_child.sh` cover those refusal paths.
+
 *Updated by an AI agent acting on joshlf's behalf.*
