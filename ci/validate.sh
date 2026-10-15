@@ -31,6 +31,7 @@ check() {
     tests) cargo test --workspace --all-targets --all-features --locked ;;
     doc) selected_tests --workspace --doc --all-features --locked ;;
     markers) ci/check_todo.sh ;;
+    devtools) python3 ci/test_execution_context.py ;;
     action) bash ci/test_extract_stack_child.sh; bash ci/test_rebase_stack_child.sh ;;
     navigation)
       python3 ci/test_check_navigation.py
@@ -41,10 +42,10 @@ check() {
     hooks) selected_tests --test hooks --all-features --locked ;;
     cli) selected_tests --test cli --all-features --locked ;;
     all)
-      for step in production profiles fmt lint tests doc markers navigation action; do check "$step"; done
+      for step in production profiles fmt lint tests doc markers navigation action devtools; do check "$step"; done
       ;;
     *)
-      echo "Usage: ci/validate.sh [all|production|profiles|fmt|lint|tests|doc|markers|navigation|unit|adapters|hooks|cli|action]" >&2
+      echo "Usage: ci/validate.sh [all|production|profiles|fmt|lint|tests|doc|markers|navigation|unit|adapters|hooks|cli|action|devtools]" >&2
       return 2
       ;;
   esac
