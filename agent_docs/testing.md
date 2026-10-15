@@ -72,6 +72,11 @@ unadmitted legacy cutover. Lower history tests separately cover marker-seeded
 legacy admission and rejection of unmarked lightweight prefixes. Coherence is asserted after storage effects and independently
 checked before observed facts become publication authority.
 
+Semantic scenarios are grouped in private namespace, lifecycle, recovery and
+competition modules. Outcome failures include the existing reached effect
+trace; draft-safety failures also show the literal world. Explicit snapshot
+identities remain unchanged by these module paths.
+
 Scenarios include retained plans, repeated revisions, partial/lost receipts,
 canonical marker contenders, arbitrary complete mutation-alias subsets,
 duplicate repair and stable-intent recovery. The three-retained-attempt ABA case

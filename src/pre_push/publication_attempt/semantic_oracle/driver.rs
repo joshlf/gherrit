@@ -75,7 +75,9 @@ impl<'world> WorldDriver<'world> {
         if let ExternalTarget::Change(id) = target {
             assert!(
                 self.world.local_open_rows_are_draft_safe(&id),
-                "each reached local effect prefix must retain draft safety"
+                "each reached local effect prefix must retain draft safety; trace={:#?}; world={:#?}",
+                self.trace,
+                self.world
             );
         }
     }

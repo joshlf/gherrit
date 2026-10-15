@@ -55,7 +55,7 @@ const REPOSITORY_ID: &str = "REPOSITORY_NODE";
 macro_rules! assert_model_snapshot {
     ($name:literal, $value:expr $(,)?) => {
         insta::with_settings!({
-            snapshot_path => "../snapshots",
+            snapshot_path => concat!(env!("CARGO_MANIFEST_DIR"), "/src/pre_push/publication_attempt/snapshots"),
             prepend_module_to_snapshot => false,
         }, {
             insta::assert_yaml_snapshot!(
