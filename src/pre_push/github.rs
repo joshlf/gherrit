@@ -365,6 +365,17 @@ impl BatchedOperation for UpdatePullRequest {
                 self.node_id
             );
         }
+        let acknowledgement = response.as_object().ok_or_else(|| eyre!(
+            "Unusable update acknowledgement for PR '{}': expected an object; the mutation may have applied", self.node_id))?;
+        let mutation_id = acknowledgement.get("clientMutationId").ok_or_else(|| eyre!(
+            "Unusable update acknowledgement for PR '{}': missing clientMutationId; the mutation may have applied", self.node_id))?;
+        if !mutation_id.is_null() && !mutation_id.is_string() {
+            bail!(
+                "Unusable update acknowledgement for PR '{}': invalid clientMutationId; the mutation may have applied",
+                self.node_id
+            );
+        }
+
         Ok(())
     }
 }
@@ -729,6 +740,25 @@ mod tests {
             error.to_string(),
             "The batched GraphQL mutation failed to update PR with node ID 'PR_1'. The response for this operation was null."
         );
+    }
+
+    #[test]
+    fn update_acknowledgements_require_the_requested_object_shape() {
+        let update = UpdatePullRequest::new("PR_1".to_string(), None, None, None);
+        for response in [
+            json!(true),
+            json!(1),
+            json!("ok"),
+            json!([]),
+            json!({}),
+            json!({"clientMutationId": 1}),
+            json!({"clientMutationId": []}),
+        ] {
+            assert!(update.decode(response).unwrap_err().to_string().contains("may have applied"));
+        }
+        for response in [json!({"clientMutationId": null}), json!({"clientMutationId": "token"})] {
+            update.decode(response).unwrap();
+        }
     }
 
     #[test]
