@@ -9,7 +9,7 @@ fn test_branch_management() {
     ctx.run_git(&["config", "branch.feature-A.pushRemote", "origin"]);
 
     // Attempt manage - should fail (drift)
-    testutil::assert_success_snapshot!(ctx, ctx.manage_cmd(), "branch_management_drift_warning"); // Logs warning, no change
+    testutil::assert_failure_snapshot!(ctx, ctx.manage_cmd(), "branch_management_drift_warning");
     // Assert still unmanaged (missing key)
     ctx.assert_config("branch.feature-A.gherritManaged", None);
 
@@ -94,7 +94,7 @@ fn test_unmanage_preserves_drift_unless_forced() {
     ctx.run_git(&["config", "branch.feature-cleanup.remote", "."]);
     ctx.run_git(&["config", "branch.feature-cleanup.merge", "refs/heads/feature-cleanup"]);
 
-    testutil::assert_success_snapshot!(ctx, ctx.unmanage_cmd(), "unmanage_preserve_drift",);
+    testutil::assert_failure_snapshot!(ctx, ctx.unmanage_cmd(), "unmanage_preserve_drift",);
 
     ctx.assert_config("branch.feature-cleanup.gherritManaged", Some(testutil::MANAGED_PRIVATE));
     ctx.assert_config("branch.feature-cleanup.pushRemote", Some("drifted-remote"));
@@ -127,8 +127,8 @@ fn test_manage_drift_detection() {
     ctx.run_git(&["config", "branch.drift-feature.pushRemote", "origin"]);
 
     // 3. Attempt Switch to Public (without force)
-    // The command should exit with 0 but log a warning and NOT apply changes.
-    testutil::assert_success_snapshot!(
+    // Refusal must fail and preserve the existing configuration.
+    testutil::assert_failure_snapshot!(
         ctx,
         ctx.gherrit_cmd().args(["manage", "--public"]),
         "manage_drift_attempt_switch"

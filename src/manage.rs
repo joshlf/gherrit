@@ -225,8 +225,9 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
                     // configuration so it can be restored during a subsequent
                     // `gherrit unmanage`.
                     log_configuration_drift(&branch_name, old_state, &current, &expected);
-                    log::warn!("Use --force to overwrite manual changes.");
-                    return Ok(());
+                    bail!(
+                        "Branch configuration was not changed. Use --force to overwrite manual changes."
+                    );
                 }
                 DriftDecision::Overwrite => {
                     log_configuration_drift(&branch_name, old_state, &current, &expected);
