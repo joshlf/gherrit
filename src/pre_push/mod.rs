@@ -198,28 +198,32 @@ fn read_commit_trailers(commits: &[(gix::Commit<'_>, String)]) -> Result<Vec<Vec
             let output = util::cmd("git", arguments)
                 .checked_output()
                 .wrap_err("Failed to parse commit trailers")?;
-            let mut fields = output.stdout.split(|byte| *byte == 0);
-
-            chunk.iter().try_for_each(|(commit, _)| {
-                let object_id = fields
-                    .next()
-                    .ok_or_else(|| eyre!("Git omitted trailer data for commit {}", commit.id))?;
-                if object_id != commit.id.to_string().as_bytes() {
-                    bail!("Git returned commit trailers out of order");
-                }
-                let trailers = fields
-                    .next()
-                    .ok_or_else(|| eyre!("Git omitted trailer data for commit {}", commit.id))?;
-                parsed.push(trailers.to_vec());
-                Ok(())
-            })?;
-
-            if fields.next() != Some(&[][..]) || fields.next().is_some() {
-                bail!("Git returned malformed commit trailer data");
-            }
+            let object_ids = chunk.iter().map(|(commit, _)| commit.id).collect::<Vec<_>>();
+            parsed.extend(decode_commit_trailers(&output.stdout, &object_ids)?);
             Ok(parsed)
         },
     )
+}
+
+fn decode_commit_trailers(output: &[u8], object_ids: &[ObjectId]) -> Result<Vec<Vec<u8>>> {
+    let mut parsed = Vec::with_capacity(object_ids.len());
+    let mut fields = output.split(|byte| *byte == 0);
+    for object_id in object_ids {
+        let returned_id = fields
+            .next()
+            .ok_or_else(|| eyre!("Git omitted trailer data for commit {object_id}"))?;
+        if returned_id != object_id.to_string().as_bytes() {
+            bail!("Git returned commit trailers out of order");
+        }
+        let trailers = fields
+            .next()
+            .ok_or_else(|| eyre!("Git omitted trailer data for commit {object_id}"))?;
+        parsed.push(trailers.to_vec());
+    }
+    if fields.next() != Some(&[][..]) || fields.next().is_some() {
+        bail!("Git returned malformed commit trailer data");
+    }
+    Ok(parsed)
 }
 
 fn ensure_unique_gherrit_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Result<()> {
@@ -820,5 +824,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn native_trailer_records_require_exact_ids_order_and_terminator() {
+        let a = ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+        let b = ObjectId::from_hex(b"2222222222222222222222222222222222222222").unwrap();
+        let valid = format!("{a}\0gherrit-pr-id: GA\n\0{b}\0\0");
+        assert_eq!(
+            decode_commit_trailers(valid.as_bytes(), &[a, b]).unwrap(),
+            vec![b"gherrit-pr-id: GA\n".to_vec(), vec![]]
+        );
+        for malformed in [
+            format!("{a}\0"),
+            format!("{a}\0value"),
+            format!("{b}\0value\0"),
+            format!("{a}\0value\0extra\0"),
+        ] {
+            assert!(decode_commit_trailers(malformed.as_bytes(), &[a]).is_err(), "{malformed:?}");
+        }
+        assert!(decode_commit_trailers(valid.as_bytes(), &[b, a]).is_err());
     }
 }
