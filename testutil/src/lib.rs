@@ -1,22 +1,38 @@
 use std::{
-    any::Any,
-    collections::HashMap,
-    env,
-    ffi::OsString,
-    fmt, fs, panic,
+    fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError},
         Arc, LazyLock, RwLock,
     },
     thread,
-    time::Duration,
 };
 
 use regex::Regex;
 use tempfile::TempDir;
+
+mod environment;
+mod git_fixture;
+mod github;
+mod normalization;
+mod server;
+use environment::{TestEnvironment, SYSTEM_GIT};
+use git_fixture::{
+    deterministic_gherrit_id, init_git_bare_repo, init_git_repo, install_gherrit_binary,
+    install_git_interceptor,
+};
+pub use github::MockGithub;
+#[cfg(test)]
+use normalization::normalize_git_diagnostic_separators;
+use normalization::{
+    apply_literal_redactions, expand_literal_redactions, normalize_command_output,
+    redact_identities,
+};
+#[cfg(any(test, windows))]
+use normalization::{normalize_windows_redacted_paths, normalize_windows_stderr};
+pub use server::MockServerInfo;
+#[cfg(test)]
+use server::{wait_for_server_completion, MockServerStopError};
 
 mod command;
 mod git_interceptor;
@@ -30,8 +46,6 @@ pub const MANAGED_PRIVATE: &str = "managedPrivate";
 pub const MANAGED_PUBLIC: &str = "managedPublic";
 
 const FIRST_GIT_TIMESTAMP: u64 = 946_684_800;
-const MOCK_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-const MOCK_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[macro_export]
 macro_rules! test_context {
@@ -193,253 +207,6 @@ pub struct TestContext {
     mock_server_state: Option<Arc<RwLock<mock_server::MockState>>>,
 }
 
-#[derive(Clone)]
-struct TestEnvironment {
-    variables: Vec<(OsString, OsString)>,
-}
-
-impl TestEnvironment {
-    fn new(root: &Path, system_git: &Path) -> Self {
-        let home = root.join("home");
-        let temporary_directory = root.join("tmp");
-        fs::create_dir_all(&home).unwrap();
-        fs::create_dir_all(&temporary_directory).unwrap();
-
-        let git_config = home.join("gitconfig");
-        fs::write(
-            &git_config,
-            "[color]\n\tui = false\n[commit]\n\tgpgSign = false\n[tag]\n\tgpgSign = false\n",
-        )
-        .unwrap();
-
-        let mut paths = vec![root.to_path_buf()];
-        if let Some(parent) = system_git.parent() {
-            push_unique_path(&mut paths, parent);
-        }
-
-        #[cfg(unix)]
-        for path in ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
-            push_unique_path(&mut paths, Path::new(path));
-        }
-
-        let mut variables = vec![
-            (OsString::from("HOME"), home.clone().into_os_string()),
-            (OsString::from("XDG_CONFIG_HOME"), home.join(".config").into_os_string()),
-            (OsString::from("TMPDIR"), temporary_directory.clone().into_os_string()),
-            (OsString::from("TMP"), temporary_directory.clone().into_os_string()),
-            (OsString::from("TEMP"), temporary_directory.into_os_string()),
-            (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
-            (OsString::from("GIT_CONFIG_GLOBAL"), git_config.into_os_string()),
-            (OsString::from("GIT_ATTR_NOSYSTEM"), OsString::from("1")),
-            (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
-            (OsString::from("GCM_INTERACTIVE"), OsString::from("never")),
-            (OsString::from("GIT_PAGER"), OsString::from("cat")),
-            (OsString::from("PAGER"), OsString::from("cat")),
-            (OsString::from("GIT_EDITOR"), OsString::from("true")),
-            (OsString::from("GIT_SEQUENCE_EDITOR"), OsString::from("true")),
-            (OsString::from("LANG"), OsString::from("C")),
-            (OsString::from("LC_ALL"), OsString::from("C")),
-            (OsString::from("TZ"), OsString::from("UTC")),
-            (OsString::from("TERM"), OsString::from("dumb")),
-            (OsString::from("NO_COLOR"), OsString::from("1")),
-            (OsString::from("RUST_LOG"), OsString::from("info")),
-            (OsString::from("RUST_BACKTRACE"), OsString::from("0")),
-            (OsString::from("NO_PROXY"), OsString::from("127.0.0.1,localhost")),
-            (OsString::from("no_proxy"), OsString::from("127.0.0.1,localhost")),
-        ];
-
-        // Preserve only process-instrumentation settings needed to run the
-        // already-built test binaries. These do not provide developer or CI
-        // configuration to GHerrit, but dropping them would make coverage and
-        // sanitizer runs silently incomplete or unable to start.
-        for name in [
-            "LLVM_PROFILE_FILE",
-            "ASAN_OPTIONS",
-            "LSAN_OPTIONS",
-            "MSAN_OPTIONS",
-            "TSAN_OPTIONS",
-            "UBSAN_OPTIONS",
-        ] {
-            if let Some(value) = env::var_os(name) {
-                variables.push((OsString::from(name), value));
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        if let Some(value) = env::var_os("LD_LIBRARY_PATH") {
-            variables.push((OsString::from("LD_LIBRARY_PATH"), value));
-        }
-
-        #[cfg(target_os = "macos")]
-        for name in ["DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"] {
-            if let Some(value) = env::var_os(name) {
-                variables.push((OsString::from(name), value));
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            if let Some(system_root) = env::var_os("SystemRoot") {
-                let system_root = PathBuf::from(system_root);
-                push_unique_path(&mut paths, &system_root.join("System32"));
-                variables
-                    .push((OsString::from("SystemRoot"), system_root.clone().into_os_string()));
-                variables.push((OsString::from("WINDIR"), system_root.clone().into_os_string()));
-                let command_processor = env::var_os("COMSPEC")
-                    .unwrap_or_else(|| system_root.join("System32/cmd.exe").into_os_string());
-                variables.push((OsString::from("COMSPEC"), command_processor));
-            }
-
-            if let Some(git_root) = system_git.parent().and_then(Path::parent) {
-                push_unique_path(&mut paths, &git_root.join("mingw64/bin"));
-                push_unique_path(&mut paths, &git_root.join("usr/bin"));
-            }
-            variables.push((OsString::from("PATHEXT"), OsString::from(".COM;.EXE;.BAT;.CMD")));
-        }
-
-        variables.push((OsString::from("PATH"), env::join_paths(paths).unwrap()));
-        Self { variables }
-    }
-
-    fn apply_to_command(&self, cmd: &mut TestCommand) {
-        cmd.env_clear();
-        cmd.envs(self.variables.iter().cloned());
-    }
-
-    fn command(&self, program: &Path) -> TestCommand {
-        let mut cmd = TestCommand::new(program);
-        self.apply_to_command(&mut cmd);
-        cmd
-    }
-}
-
-fn push_unique_path(paths: &mut Vec<PathBuf>, path: &Path) {
-    if !paths.iter().any(|existing| existing == path) {
-        paths.push(path.to_path_buf());
-    }
-}
-
-pub struct MockServerInfo {
-    pub url: String,
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    completion_rx: Option<Receiver<thread::Result<()>>>,
-}
-
-enum MockServerStopError {
-    Panicked(Box<dyn Any + Send + 'static>),
-    TimedOut(Duration),
-    Disconnected,
-}
-
-impl fmt::Display for MockServerStopError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Panicked(_) => formatter.write_str("mock server thread panicked"),
-            Self::TimedOut(timeout) => {
-                write!(formatter, "mock server did not stop within {timeout:?}")
-            }
-            Self::Disconnected => {
-                formatter.write_str("mock server thread exited without reporting its result")
-            }
-        }
-    }
-}
-
-impl MockServerInfo {
-    fn start(
-        state: Arc<RwLock<mock_server::MockState>>,
-        remote_path: PathBuf,
-        system_git: PathBuf,
-        test_environment: TestEnvironment,
-        fixture_dir: Arc<TempDir>,
-    ) -> Self {
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let (completion_tx, completion_rx) = mpsc::channel();
-
-        thread::Builder::new()
-            .name("gherrit-mock-server".to_string())
-            .spawn(move || {
-                let result = panic::catch_unwind(panic::AssertUnwindSafe(move || {
-                    // Keep the fixture directory alive if this thread must be
-                    // detached after a pathological shutdown timeout.
-                    let _fixture_dir = fixture_dir;
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("Failed to build mock server runtime");
-                    runtime.block_on(mock_server::run_mock_server(
-                        state,
-                        remote_path,
-                        system_git,
-                        test_environment,
-                        ready_tx,
-                        shutdown_rx,
-                    ));
-                }));
-                let _ = completion_tx.send(result);
-            })
-            .expect("Failed to spawn mock server thread");
-
-        let url = match ready_rx.recv_timeout(MOCK_SERVER_STARTUP_TIMEOUT) {
-            Ok(url) => url,
-            Err(startup_error) => match Self::stop(Some(shutdown_tx), &completion_rx) {
-                Ok(()) => panic!(
-                    "Mock server did not become ready within \
-                     {MOCK_SERVER_STARTUP_TIMEOUT:?}: {startup_error}"
-                ),
-                Err(MockServerStopError::Panicked(server_panic)) => {
-                    panic::resume_unwind(server_panic)
-                }
-                Err(stop_error) => panic!(
-                    "Mock server did not become ready within \
-                     {MOCK_SERVER_STARTUP_TIMEOUT:?}: {startup_error}; {stop_error}"
-                ),
-            },
-        };
-
-        Self { url, shutdown_tx: Some(shutdown_tx), completion_rx: Some(completion_rx) }
-    }
-
-    fn stop(
-        shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-        completion_rx: &Receiver<thread::Result<()>>,
-    ) -> Result<(), MockServerStopError> {
-        if let Some(shutdown_tx) = shutdown_tx {
-            let _ = shutdown_tx.send(());
-        }
-
-        wait_for_server_completion(completion_rx, MOCK_SERVER_SHUTDOWN_TIMEOUT)
-    }
-}
-
-fn wait_for_server_completion(
-    completion_rx: &Receiver<thread::Result<()>>,
-    timeout: Duration,
-) -> Result<(), MockServerStopError> {
-    match completion_rx.recv_timeout(timeout) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(server_panic)) => Err(MockServerStopError::Panicked(server_panic)),
-        Err(RecvTimeoutError::Timeout) => Err(MockServerStopError::TimedOut(timeout)),
-        Err(RecvTimeoutError::Disconnected) => Err(MockServerStopError::Disconnected),
-    }
-}
-
-impl Drop for MockServerInfo {
-    fn drop(&mut self) {
-        let completion_rx = self.completion_rx.take().expect("mock server completion receiver");
-        if let Err(error) = Self::stop(self.shutdown_tx.take(), &completion_rx) {
-            if thread::panicking() {
-                eprintln!("Mock server teardown also failed: {error}");
-            } else if let MockServerStopError::Panicked(server_panic) = error {
-                panic::resume_unwind(server_panic);
-            } else {
-                panic!("Mock server teardown failed: {error}");
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitOperation {
     Var,
@@ -536,51 +303,6 @@ impl From<&mock_server::PrEntry> for PullRequestSnapshot {
             head: pr.head.ref_field.clone(),
             base: pr.base.ref_field.clone(),
         }
-    }
-}
-
-pub struct MockGithub<'a> {
-    context: &'a TestContext,
-}
-
-impl MockGithub<'_> {
-    pub fn repository(&self) -> (String, String) {
-        self.context.inspect_mock_state(|state| (state.repo_owner.clone(), state.repo_name.clone()))
-    }
-
-    pub fn pull_requests(&self) -> Vec<PullRequestSnapshot> {
-        self.context
-            .inspect_mock_state(|state| state.prs.iter().map(PullRequestSnapshot::from).collect())
-    }
-
-    pub fn requests(&self) -> Vec<Vec<GraphQlOperation>> {
-        self.context.inspect_mock_state(|state| state.graphql_requests.clone())
-    }
-
-    pub fn seed_pull_request(&self, seed: PullRequestSeed) {
-        self.context.mutate_mock_state(|state| {
-            let pr = mock_server::PrEntry::mock(mock_server::MockPrArgs {
-                id: u64::try_from(seed.number).expect("pull request number does not fit in u64"),
-                title: seed.title,
-                body: seed.body,
-                head: seed.head,
-                base: seed.base,
-                repo_owner: &state.repo_owner,
-                repo_name: &state.repo_name,
-            });
-            state.add_pr(pr);
-        });
-    }
-
-    pub fn set_pull_request_state(&self, number: usize, new_state: PullRequestState) {
-        self.context.mutate_mock_state(|state| {
-            let pr = state
-                .prs
-                .iter_mut()
-                .find(|pr| pr.number == number)
-                .unwrap_or_else(|| panic!("pull request #{number} does not exist"));
-            pr.state = new_state.as_str().to_string();
-        });
     }
 }
 
@@ -1007,60 +729,6 @@ impl TestContext {
     }
 }
 
-fn normalize_command_output(output: &str) -> String {
-    // This Git error message only appears on some platforms/versions.
-    let output = output.replace("fatal: the remote end hung up unexpectedly\n", "");
-    normalize_git_diagnostic_separators(&output)
-}
-
-#[cfg(any(test, windows))]
-fn normalize_windows_stderr(stderr: &str) -> String {
-    static CLAP_USAGE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?m)^Usage: gherrit\.exe(?P<suffix>[ \t\r]|$)").expect("Invalid regex")
-    });
-    static COMMAND_STATUS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"(?m)^(?P<prefix>\[gherrit\](?: \[[A-Z]+\])? [^\r\n]*\bCommand(?: [^\r\n]*)? failed with status: )exit code: ",
-        )
-        .expect("Invalid regex")
-    });
-    static MISSING_TMP_WARNING_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"(?m)^(?P<prefix>\[gherrit\](?: \[[A-Z]+\])? [^\r\n]*\bStderr: )?bash\.exe: warning: could not find /tmp, please create!(?:\r?\n|$)",
-        )
-        .expect("Invalid regex")
-    });
-
-    let stderr = MISSING_TMP_WARNING_REGEX.replace_all(stderr, "${prefix}");
-    let stderr = CLAP_USAGE_REGEX.replace_all(&stderr, "Usage: gherrit${suffix}");
-    COMMAND_STATUS_REGEX.replace_all(&stderr, "${prefix}exit status: ").into_owned()
-}
-
-#[cfg(any(test, windows))]
-fn normalize_windows_redacted_paths(output: &str) -> String {
-    static REDACTED_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"\[(?:REPO_PATH|REMOTE_PATH|EXTERNAL_HOOKS_PATH)\](?:\\+[^\\\s"']+)*"#)
-            .expect("Invalid regex")
-    });
-    static WINDOWS_SEPARATOR_REGEX: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\\+").expect("Invalid regex"));
-
-    REDACTED_PATH_REGEX
-        .replace_all(output, |path: &regex::Captures<'_>| {
-            WINDOWS_SEPARATOR_REGEX.replace_all(&path[0], "/").into_owned()
-        })
-        .into_owned()
-}
-
-fn normalize_git_diagnostic_separators(output: &str) -> String {
-    static ATOMIC_PUSH_SEPARATOR_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?m)^(error: atomic push failed[^\r\n]*\r?\n)(?:\r?\n)+(To )")
-            .expect("Invalid regex")
-    });
-
-    ATOMIC_PUSH_SEPARATOR_REGEX.replace_all(output, "${1}${2}").into_owned()
-}
-
 pub trait IntoCommandRef {
     fn as_command_mut(&mut self) -> &mut TestCommand;
 }
@@ -1123,63 +791,6 @@ pub enum ExpectedExit {
     Failure,
 }
 
-fn redact_identities(output: &str, regex: &Regex, namespace: &str) -> String {
-    let mut identities = HashMap::new();
-    regex
-        .replace_all(output, |captures: &regex::Captures<'_>| {
-            let next_index = identities.len() + 1;
-            let index = identities.entry(captures[0].to_string()).or_insert(next_index);
-            format!("[{namespace}_{index}]")
-        })
-        .into_owned()
-}
-
-fn apply_literal_redactions<'a>(
-    output: &str,
-    redactions: impl IntoIterator<Item = (&'a str, &'a str)>,
-) -> String {
-    redactions.into_iter().fold(output.to_string(), |output, (target, replacement)| {
-        output.replace(target, replacement)
-    })
-}
-
-fn expand_literal_redactions<'a>(
-    redactions: impl IntoIterator<Item = (&'a str, &'a str)>,
-) -> Vec<(String, String)> {
-    let mut redactions = redactions
-        .into_iter()
-        .flat_map(|(target, replacement)| {
-            let mut targets = vec![target.to_string()];
-            let debug = format!("{target:?}");
-            let debug =
-                debug.strip_prefix('"').and_then(|debug| debug.strip_suffix('"')).unwrap_or(&debug);
-            targets.push(debug.to_string());
-            if let Ok(canonical) = fs::canonicalize(target) {
-                targets.push(canonical.to_string_lossy().into_owned());
-
-                let debug = format!("{canonical:?}");
-                let debug = debug
-                    .strip_prefix('"')
-                    .and_then(|debug| debug.strip_suffix('"'))
-                    .unwrap_or(&debug);
-                targets.push(debug.to_string());
-            }
-            let forward_slash_targets = targets
-                .iter()
-                .filter(|target| target.contains('\\'))
-                .map(|target| target.replace('\\', "/"))
-                .collect::<Vec<_>>();
-            targets.extend(forward_slash_targets);
-            targets.sort();
-            targets.dedup();
-            targets.sort_by_key(|target| std::cmp::Reverse(target.len()));
-            targets.into_iter().map(move |target| (target, replacement.to_string()))
-        })
-        .collect::<Vec<_>>();
-    redactions.sort_by_key(|(target, _)| std::cmp::Reverse(target.len()));
-    redactions
-}
-
 #[macro_export]
 macro_rules! assert_success_snapshot {
     ($ctx:expr, $cmd:expr, $name:expr $(,)?) => {
@@ -1209,88 +820,13 @@ macro_rules! assert_pr_snapshot {
     };
 }
 
-fn deterministic_gherrit_id(mut sequence: u64) -> String {
-    const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let mut encoded = [BASE32[0]; 32];
-    encoded.iter_mut().rev().for_each(|digit| {
-        *digit = BASE32[(sequence % BASE32.len() as u64) as usize];
-        sequence /= BASE32.len() as u64;
-    });
-    assert_eq!(sequence, 0, "GHerrit ID sequence exceeds its 32-digit encoding");
-
-    format!("G{}", core::str::from_utf8(&encoded).expect("base32 alphabet is UTF-8"))
-}
-
-fn run_git_cmd(environment: &TestEnvironment, system_git: &Path, path: &Path, args: &[&str]) {
-    environment.command(system_git).current_dir(path).args(args).assert().success();
-}
-
-#[cfg(unix)]
-fn install_git_interceptor(path: &Path, _gherrit_bin: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let git = path.join("git");
-    fs::write(&git, "#!/bin/sh\nexec \"$GHERRIT_TEST_DRIVER\" __test-git \"$@\"\n").unwrap();
-    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-#[cfg(windows)]
-fn install_git_interceptor(path: &Path, gherrit_bin: &Path) {
-    // `Command::new("git")` resolves native executables without consulting
-    // PATHEXT, so a batch-file wrapper named `git.cmd` would be bypassed.
-    fs::copy(gherrit_bin, path.join("git.exe")).unwrap();
-}
-
-fn install_gherrit_binary(path: &Path, gherrit_bin: &Path) {
-    let gherrit_dst = path.join(if cfg!(windows) { "gherrit.exe" } else { "gherrit" });
-    fs::copy(gherrit_bin, &gherrit_dst).unwrap();
-}
-
-fn init_git_bare_repo(environment: &TestEnvironment, system_git: &Path, path: &Path) {
-    fs::create_dir(path).unwrap();
-    run_git_cmd(environment, system_git, path, &["init", "--bare"]);
-}
-
-fn init_git_repo(
-    environment: &TestEnvironment,
-    system_git: &Path,
-    path: &Path,
-    remote_path: Option<&Path>,
-) {
-    let run = |args| run_git_cmd(environment, system_git, path, args);
-    run(&["init"]);
-    run(&["config", "core.hooksPath", ".git/hooks"]);
-    // Must config user identity for commits to work
-    run(&["config", "user.email", "test@example.com"]);
-    run(&["config", "user.name", "Test User"]);
-    // Ensure default branch is main
-    run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
-    // Explicitly unmanage main to satisfy strict config checks
-    run(&["config", "branch.main.gherritManaged", "false"]);
-    if let Some(remote_path) = remote_path {
-        let remote_url = remote_path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
-        run(&["remote", "add", "origin", &remote_url]);
-    }
-}
-
-static SYSTEM_GIT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
-    let output = if cfg!(windows) {
-        Command::new("where").arg("git").output()
-    } else {
-        Command::new("which").arg("git").output()
-    };
-    let output = output.expect("Failed to find system git");
-    if !output.status.success() {
-        panic!("Failed to find git using 'which/where': {:?}", output);
-    }
-    let stdout = String::from_utf8(output.stdout).expect("Invalid utf8 from which git");
-    let path = stdout.lines().next().expect("No git path found").trim();
-    PathBuf::from(path)
-});
-
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{
+        panic,
+        sync::mpsc::{self, Receiver},
+        time::{Duration, Instant},
+    };
 
     use super::*;
 
