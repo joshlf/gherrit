@@ -57,9 +57,9 @@ pub struct PrEntry {
     pub state: String,
     pub user: User,
     #[serde(rename = "title")]
-    pub title: Option<String>,
+    pub title: String,
     #[serde(rename = "body")]
-    pub body: Option<String>,
+    pub body: String,
     #[serde(rename = "head")]
     pub head: RefInfo,
     #[serde(rename = "base")]
@@ -115,8 +115,8 @@ impl PrEntry {
                 type_field: "User".to_string(),
                 site_admin: false,
             },
-            title: Some(title),
-            body: Some(body),
+            title,
+            body,
             head: RefInfo { ref_field: head, sha: "".to_string() },
             base: RefInfo { ref_field: base, sha: "".to_string() },
             created_at: "2023-01-01T00:00:00Z".to_string(),
@@ -482,7 +482,7 @@ fn validate_create_field(field: &executable::Field) -> Result<(), String> {
             "pullRequest" => validate_scalar_fields(
                 &field.selection_set,
                 "createPullRequest.pullRequest",
-                &["number", "url", "id"],
+                &["number", "id", "title", "body", "baseRefName", "state"],
             )?,
             _ => {
                 return Err(format!(
@@ -715,10 +715,10 @@ fn handle_update_pr(
         return Err("Pull request head and base branches must differ".to_string());
     }
     if let Some(title) = title {
-        pr.title = Some(title);
+        pr.title = title;
     }
     if let Some(body) = &body {
-        pr.body = Some(body.clone());
+        pr.body.clone_from(body);
     }
     if let Some(base) = base {
         pr.base.ref_field = base;
@@ -781,9 +781,8 @@ fn handle_create_pr(
         repo_owner: &owner,
         repo_name: &repo,
     });
-    let node_id = entry.node_id.clone();
-    let html_url = entry.html_url.clone();
     mock_state.prs.push(entry);
+    let entry = mock_state.prs.last().expect("the created PR was just appended");
 
     let mut response = serde_json::Map::new();
     for field in selected_fields(&field.selection_set, PATH)? {
@@ -796,9 +795,12 @@ fn handle_create_pr(
                 for field in selected_fields(&field.selection_set, "createPullRequest.pullRequest")?
                 {
                     let value = match field.name.as_str() {
-                        "number" => serde_json::json!(number),
-                        "url" => serde_json::json!(html_url),
-                        "id" => serde_json::json!(node_id),
+                        "number" => serde_json::json!(entry.number),
+                        "id" => serde_json::json!(entry.node_id),
+                        "title" => serde_json::json!(entry.title),
+                        "body" => serde_json::json!(entry.body),
+                        "baseRefName" => serde_json::json!(entry.base.ref_field),
+                        "state" => serde_json::json!(entry.state),
                         _ => unreachable!("request was checked by validate_create_field"),
                     };
                     pull_request.insert(response_key(field), value);
@@ -1011,7 +1013,8 @@ mod tests {
         let create = parse_document(
             "mutation { op0: createPullRequest(input: { repositoryId: \
              \"REPO_NODE_ID\", baseRefName: \"main\", headRefName: \"Ghead\", \
-             title: \"Title\", body: \"Body\" }) { pullRequest { number, url, id } } }",
+             title: \"Title\", body: \"Body\" }) { pullRequest { number, id, \
+             title, body, baseRefName, state } } }",
         );
         validate_supported_document(&create, &None).unwrap();
 
