@@ -20,6 +20,7 @@ tests without restating that contract.
 | Git facts and immutable history admission | `publication_attempt/{remote,history,marker,version}.rs` | Literal OIDs/ref sets, graph adversaries, canonical marker/version codec cases |
 | Strict OPEN PR admission | `publication_attempt/github/observation.rs` | Complete exact-head cursors, identity registry, bounded row/page counterexamples |
 | Pure decisions and consuming stages | `publication_attempt/plan/` | Independent typed effects and durable semantic-world transitions |
+| Production ref spellings | `managed_refs.rs` | Literal wire assertions; independent native/model refs |
 | Exact atomic Git acknowledgements | `publication_attempt/refs.rs` | Literal porcelain receipts, atomic rollback, exact leases and malformed/lost output |
 | Single-send GitHub effects | `publication_attempt/github/{mutation,transport}.rs` | Literal provider receipts, null/missing/partial effects, no mutation replay |
 | Failure classification and safe context | `publication_attempt/failure.rs` | Typed known/indeterminate outcomes, stage/target escaping and bounded display |

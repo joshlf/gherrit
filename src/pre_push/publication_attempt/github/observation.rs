@@ -18,6 +18,7 @@ use super::{
 };
 use crate::{
     json::UniqueJson,
+    managed_refs::owned_base_name,
     pre_push::{
         destination::{DefaultBranch, PushDestination, RepositoryCoordinates},
         local::{GherritPrId, LocalStack},
@@ -466,10 +467,6 @@ impl CompleteLocalPullRequests {
             identities,
         })
     }
-}
-
-fn owned_base_name(id: &GherritPrId) -> String {
-    format!("gherrit-bases/{}", id.as_str())
 }
 
 /// One exact local-ID connection and the page it requests next.

@@ -317,12 +317,12 @@ impl AtomicUnit {
     }
 
     fn tuple(transition: &TupleTransition) -> Self {
-        let id = transition.id().as_str();
+        let id = transition.id();
         let desired = transition.desired();
         let expected_revision = transition.expected();
-        let head = format!("refs/heads/{id}");
-        let base = format!("refs/heads/gherrit-bases/{id}");
-        let tag = format!("refs/tags/gherrit/{id}/v{}", transition.version());
+        let head = crate::managed_refs::head(id);
+        let base = crate::managed_refs::owned_base(id);
+        let tag = crate::managed_refs::version(id, transition.version().get());
         let head_expectation = expected_revision
             .map_or(LeaseExpectation::Absent, |revision| LeaseExpectation::At(revision.head));
         let base_expectation = expected_revision
@@ -368,7 +368,7 @@ impl AtomicUnit {
     }
 
     fn marker(transition: &MarkerTransition) -> Self {
-        let destination = format!("refs/tags/gherrit/{}/pr", transition.id.as_str());
+        let destination = crate::managed_refs::marker(&transition.id);
         let option = format!("--force-with-lease={destination}:");
         let refspec = format!("{}:{destination}", transition.target);
         let expected = (

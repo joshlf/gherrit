@@ -98,10 +98,10 @@ fn ref_queries(ids: &[GherritPrId], budget: usize) -> Result<Vec<Vec<String>>> {
     let mut used = 0;
     for id in ids {
         let patterns = [
-            format!("refs/heads/{}", id.as_str()),
-            format!("refs/heads/gherrit-bases/{}", id.as_str()),
-            format!("refs/tags/gherrit/{}", id.as_str()),
-            format!("refs/tags/gherrit/{}/*", id.as_str()),
+            crate::managed_refs::head(id),
+            crate::managed_refs::owned_base(id),
+            crate::managed_refs::tag_root(id),
+            format!("{}/*", crate::managed_refs::tag_root(id)),
         ];
         let bytes: usize = patterns.iter().map(|pattern| pattern.len() + 1).sum();
         if bytes > budget {

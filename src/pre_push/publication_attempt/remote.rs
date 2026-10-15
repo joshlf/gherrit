@@ -677,10 +677,10 @@ fn plan_queries(ids: &[GherritPrId], budget: usize) -> Result<Vec<Query>> {
 }
 
 fn local_patterns(id: &GherritPrId) -> [String; 4] {
-    let tag_root = format!("refs/tags/gherrit/{}", id.as_str());
+    let tag_root = crate::managed_refs::tag_root(id);
     [
-        format!("refs/heads/{}", id.as_str()),
-        format!("refs/heads/gherrit-bases/{}", id.as_str()),
+        crate::managed_refs::head(id),
+        crate::managed_refs::owned_base(id),
         tag_root.clone(),
         format!("{tag_root}/*"),
     ]
@@ -837,7 +837,7 @@ fn parse_query<'id>(
                 (Some(tag), Some(v1)) => Some(RawPullRequestMarker {
                     tag,
                     v1,
-                    source_ref: format!("refs/tags/gherrit/{}/pr", id.as_str()).into(),
+                    source_ref: crate::managed_refs::marker(id).into(),
                 }),
                 (Some(_), None) => bail!(
                     "remote pull-request marker for GHerrit change '{}' is lightweight or omitted its peeled v1 commit",
@@ -858,7 +858,7 @@ fn parse_query<'id>(
                         version,
                         object_id: evidence.v1.unwrap_or(tag),
                         annotation: evidence.v1.map(|_| tag),
-                        source_ref: format!("refs/tags/gherrit/{}/v{version}", id.as_str()).into(),
+                        source_ref: crate::managed_refs::version(id, version.get()).into(),
                     })
                 }).collect::<Result<_>>()?,
                 pull_request_marker,

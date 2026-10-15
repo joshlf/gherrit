@@ -1183,7 +1183,7 @@ fn desired_base(index: usize) -> BaseKind {
 fn desired_base_name(kind: BaseKind, default_branch: &str, id: &GherritPrId) -> String {
     match kind {
         BaseKind::Default => default_branch.to_owned(),
-        BaseKind::Owned => format!("gherrit-bases/{}", id.as_str()),
+        BaseKind::Owned => crate::managed_refs::owned_base_name(id),
     }
 }
 

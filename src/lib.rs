@@ -12,6 +12,7 @@ mod inspect;
 mod install;
 mod json;
 mod manage;
+mod managed_refs;
 mod pre_push;
 mod subprocess;
 mod util;

@@ -20,15 +20,12 @@ use super::{
 };
 use crate::{
     json::UniqueJson,
+    managed_refs::owned_base_name,
     pre_push::{
         destination::DefaultBranch,
         local::{GherritPrId, PullRequestTitle},
     },
 };
-
-fn owned_base_name(id: &GherritPrId) -> String {
-    format!("gherrit-bases/{}", id.as_str())
-}
 
 fn create_client_mutation_id(id: &GherritPrId) -> String {
     format!("gherrit:create:{}", id.as_str())

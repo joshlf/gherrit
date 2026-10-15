@@ -208,7 +208,7 @@ impl LocalStack {
             .iter()
             .find(|change| change.id.head_conflicts_with_branch(default_branch.name()))
         {
-            let managed_ref = format!("refs/heads/{}", change.id.as_str());
+            let managed_ref = crate::managed_refs::head(&change.id);
             bail!(
                 "Commit {} has gherrit-pr-id '{}', whose managed branch '{managed_ref}' conflicts with repository default branch '{default_ref}'",
                 change.head,
