@@ -27,6 +27,15 @@ their units and their owning operations. It does not change their values.
 This project uses the stable Rust toolchain and the 2024 edition. Ensure your
 code compiles and passes tests on the stable channel.
 
+## Management refusal
+
+Explicit `manage` and `unmanage` requests return failure when configuration drift
+blocks the requested change. Automatic post-checkout management remains
+advisory: a known drift refusal warns and preserves configuration without making
+Git report a failed checkout. Failed observations and writes still return errors.
+The installed-hook regression covers tracking the default branch and contrasts
+its successful checkout with a failing explicit management request.
+
 ## Hook installation
 
 The installer inspects all destination bytes and constructs the complete plan
