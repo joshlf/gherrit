@@ -153,21 +153,9 @@ mod tests {
 
     #[test]
     fn existing_id_classification() {
-        [
-            ("", false),
-            ("other-trailer: value", false),
-            ("gherrit-pr-id: Gabc", true),
-            ("gherrit-pr-id: ", true),
-            ("other-trailer: value\ngherrit-pr-id: Gabc", true),
-            ("gherrit-pr-id:Gabc", false),
-            ("Gherrit-pr-id: Gabc", false),
-            (" gherrit-pr-id: Gabc", false),
-            ("not-gherrit-pr-id: Gabc", false),
-        ]
-        .into_iter()
-        .for_each(|(trailers, expected)| {
-            assert_eq!(has_gherrit_id(trailers), expected, "trailers: {trailers:?}");
-        });
+        for case in crate::commit_message::trailer_cases() {
+            assert_eq!(has_gherrit_id(&case.trailers), case.hook_preserves, "{}", case.name);
+        }
     }
 
     #[test]
