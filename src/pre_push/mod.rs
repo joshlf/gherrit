@@ -132,6 +132,9 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
         return Ok(());
     }
 
+    let public_branch =
+        public_branch_name(repo, branch_name).wrap_err("Failed to read stack visibility")?;
+
     if github_endpoint.is_disabled() {
         bail!("The GHerrit test driver cannot sync PRs without a configured GitHub endpoint");
     }
@@ -156,10 +159,19 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     ensure_pull_requests_open(prs.iter().map(|pr| (pr.number, pr.state)))?;
 
     let latest_versions = push_to_origin(repo, &commits)?;
-    let default_branch = repo.find_default_branch_on_default_remote();
+    let default_branch = repo.find_default_branch_on_default_remote()?;
 
     let num_commits = commits.len();
-    sync_prs(repo, &octocrab, branch_name, &default_branch, commits, latest_versions, prs).await?;
+    sync_prs(
+        repo,
+        &octocrab,
+        public_branch.as_deref(),
+        &default_branch,
+        commits,
+        latest_versions,
+        prs,
+    )
+    .await?;
 
     log::info!("Successfully synced {num_commits} commits.");
     Ok(())
@@ -170,7 +182,7 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
     // the remote tip. The user must update or rebase local history when that
     // ref no longer names the intended publication base.
     let head = repo.rev_parse_single("HEAD")?;
-    let default_branch = repo.find_default_branch_on_default_remote();
+    let default_branch = repo.find_default_branch_on_default_remote()?;
     let default_ref = repo.rev_parse_single(format!("refs/heads/{}", default_branch).as_str())?;
 
     let commits = repo.commits_between(default_ref, head).map_err(|err| match err {
@@ -195,7 +207,7 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
 
     autosquash::ensure_publishable(
         commits.iter().map(|(_, title)| title.as_str()),
-        &repo.default_remote_name(),
+        &repo.default_remote_name()?,
         &default_branch,
     )?;
 
@@ -316,7 +328,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
             });
         }
 
-        let plan = plan_push(&repo.default_remote_name(), &targets);
+        let plan = plan_push(&repo.default_remote_name()?, &targets);
 
         log::info!("Pushing chunk to remote...");
         let mut child = util::cmd("git", plan.arguments)
@@ -360,7 +372,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
         if !status.success() {
             // A lease failure is a likely cause: another writer may have
             // changed the branch or version tag.
-            let r = repo.default_remote_name();
+            let r = repo.default_remote_name()?;
             bail!(
                 "`git push` failed. The remote might be ahead or changed. Run `git fetch {r}` to sync."
             );
@@ -446,7 +458,7 @@ fn pull_requests_by_head(prs: &[PrState]) -> HashMap<&str, &PrState> {
 async fn sync_prs(
     repo: &util::Repo,
     octocrab: &Octocrab,
-    branch_name: &str,
+    public_branch: Option<&str>,
     base_branch: &str,
     commits: Vec<Commit>,
     latest_versions: HashMap<String, usize>,
@@ -544,14 +556,6 @@ async fn sync_prs(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let public_branch = (!is_private_stack(repo, branch_name))
-        .then(|| {
-            let head_ref = repo.head().ok()?.try_into_referent()?;
-            let (cat, short_name) = head_ref.inner.name.category_and_short_name()?;
-            (cat == Category::LocalBranch).then(|| short_name.to_string())
-        })
-        .flatten();
-
     let repo_url = remote.repo_url_relative();
     let stack_pr_numbers =
         commit_pr_states.iter().map(|(_, state)| state.number).collect::<Vec<_>>();
@@ -567,7 +571,7 @@ async fn sync_prs(
             let body = PrBody {
                 commit_body: &c.message_body,
                 repo_url: &repo_url,
-                public_branch: public_branch.as_deref(),
+                public_branch,
                 stack_pr_numbers: &stack_pr_numbers,
                 current_pr_number: pr_state.number,
                 latest_version,
@@ -611,12 +615,14 @@ async fn sync_prs(
     Ok(())
 }
 
-fn is_private_stack(repo: &util::Repo, branch: &str) -> bool {
-    // If pushRemote is set to ".", it is a private loopback stack.
-    // If it is unset or anything else (e.g. 'origin'), it is public.
-    repo.config_string(&format!("branch.{}.pushRemote", branch))
-        .map(|val| val.as_deref() == Some("."))
-        .unwrap_or(false)
+fn public_branch_name(repo: &util::Repo, branch: &str) -> Result<Option<String>> {
+    if repo.config_string(&format!("branch.{branch}.pushRemote"))?.as_deref() == Some(".") {
+        return Ok(None);
+    }
+    Ok(repo.head()?.try_into_referent().and_then(|head_ref| {
+        let (category, short_name) = head_ref.inner.name.category_and_short_name()?;
+        (category == Category::LocalBranch).then(|| short_name.to_string())
+    }))
 }
 
 struct Commit {

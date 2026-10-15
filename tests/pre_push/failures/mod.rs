@@ -1,5 +1,49 @@
 use predicates::prelude::*;
 
+#[cfg(unix)]
+#[test]
+fn failed_default_hint_after_publication_preserves_the_completed_git_batch() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: GlateDefault");
+    let bad_ref = ctx.repo_path.join(".git/refs/heads/master");
+    let output = ctx
+        .remote_git_cmd()
+        .args(["rev-parse", "--absolute-git-dir"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let bare = std::path::PathBuf::from(std::str::from_utf8(&output).unwrap().trim());
+    let hooks = bare.join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("post-receive");
+    let quoted_ref = format!("'{}'", bad_ref.to_str().unwrap().replace('\'', "'\\''"));
+    // Corrupt a later local observation only after the remote accepts Git's
+    // entire batch. The receive hook runs synchronously before push returns.
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\nset -eu\nprintf '%s\\n' 'not-an-object-id' > {quoted_ref}\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains("master"));
+    assert_eq!(std::fs::read(&bad_ref).unwrap(), b"not-an-object-id\n");
+    let oid = ctx.head_oid();
+    for reference in ["refs/heads/GlateDefault", "refs/tags/gherrit/GlateDefault/v1"] {
+        assert_eq!(ctx.remote_ref_oid(reference).as_deref(), Some(oid.as_str()));
+    }
+    ctx.git_cmd()
+        .args(["show-ref", "--verify", "--hash", "refs/tags/gherrit/GlateDefault/v1"])
+        .assert()
+        .success()
+        .stdout(format!("{oid}\n"));
+    assert_eq!(ctx.recorded_pushes().len(), 1);
+    assert!(ctx.recorded_pushes()[0].succeeded());
+    assert!(ctx.github().pull_requests().is_empty());
+    assert_eq!(ctx.github().requests(), vec![vec![testutil::GraphQlOperation::Query]]);
+}
+
 fn stack_with_raw_commit_message(message: &str) -> testutil::TestContext {
     let ctx = testutil::test_context!()
         .with_remote()
@@ -340,5 +384,24 @@ fn local_version_write_failure_reports_applied_remote_batch() {
             .success()
     );
     assert_eq!(ctx.recorded_pushes().iter().filter(|push| push.succeeded()).count(), 1);
+    assert!(ctx.github().pull_requests().is_empty());
+}
+
+#[test]
+fn invalid_visibility_config_fails_before_external_io() {
+    use std::io::Write as _;
+    let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: Gvisibility");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(ctx.repo_path.join(".git/config"))
+        .unwrap()
+        .write_all(b"\n[branch \"invalid-id\"]\n pushRemote = \xff\n")
+        .unwrap();
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Failed to read stack visibility"));
+    assert_eq!(ctx.github().http_arrivals(), 0);
+    assert!(ctx.recorded_pushes().is_empty());
     assert!(ctx.github().pull_requests().is_empty());
 }
