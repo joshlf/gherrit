@@ -196,8 +196,33 @@ fn apply_config_update(
     }
 }
 
-/// Configures the Git branch state for GHerrit management.
+const DRIFT_REFUSAL: &str =
+    "Branch configuration was not changed. Use --force to overwrite manual changes.";
+
+#[derive(PartialEq, Eq)]
+enum StateUpdate {
+    Completed,
+    Refused,
+}
+
+/// Explicit requests must report that drift blocked the requested transition.
 pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()> {
+    match try_set_state(repo, new_state, force)? {
+        StateUpdate::Completed => Ok(()),
+        StateUpdate::Refused => bail!(DRIFT_REFUSAL),
+    }
+}
+
+/// Automatic checkout management is advisory. Only a known drift refusal is
+/// nonfatal; failed observations or writes still propagate their errors.
+fn set_state_after_checkout(repo: &util::Repo, new_state: State) -> Result<()> {
+    if try_set_state(repo, new_state, false)? == StateUpdate::Refused {
+        log::warn!("{DRIFT_REFUSAL}");
+    }
+    Ok(())
+}
+
+fn try_set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<StateUpdate> {
     let (branch_name, old_state) = repo.read_current_branch_and_state()?;
     match transition_kind(old_state, new_state) {
         TransitionKind::NoChange => {
@@ -205,7 +230,7 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
                 "Branch {} is already in the desired state ({new_state:?}).",
                 branch_name.yellow(),
             );
-            return Ok(());
+            return Ok(StateUpdate::Completed);
         }
         TransitionKind::RecordUnmanaged => {}
         TransitionKind::ReconcileConfig => {
@@ -225,8 +250,7 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
                     // configuration so it can be restored during a subsequent
                     // `gherrit unmanage`.
                     log_configuration_drift(&branch_name, old_state, &current, &expected);
-                    log::warn!("Use --force to overwrite manual changes.");
-                    return Ok(());
+                    return Ok(StateUpdate::Refused);
                 }
                 DriftDecision::Overwrite => {
                     log_configuration_drift(&branch_name, old_state, &current, &expected);
@@ -262,7 +286,7 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
         }
     }
 
-    Ok(())
+    Ok(StateUpdate::Completed)
 }
 
 fn checked_out_branch<'a>(flag: &str, head: &'a HeadState) -> Option<&'a str> {
@@ -364,12 +388,12 @@ pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> 
         }
         PostCheckoutBranchKind::Shared => {
             log::info!("Detected {branch_name_yellow} as a shared branch.");
-            set_state(repo, State::Unmanaged, false)?;
+            set_state_after_checkout(repo, State::Unmanaged)?;
             log::info!("To have GHerrit manage this branch, run: gherrit manage");
         }
         PostCheckoutBranchKind::NewStack => {
             log::info!("Detected {branch_name_yellow} as a new branch.");
-            set_state(repo, State::Private, false)?;
+            set_state_after_checkout(repo, State::Private)?;
             log::info!("To opt-out, run: gherrit unmanage");
         }
     }
