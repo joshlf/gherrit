@@ -10,7 +10,7 @@ A formatter or a subprocess cap cannot replace a caller's aggregate budget.
 | `src/hosted_contracts.rs` | Explicit probe: 40 requests, 180 seconds per run; each child gets at most 30 seconds and 4 MiB stdout; polling fits the remaining run deadline |
 | `src/pre_push/inspection.rs` | Read-only refs: 64 MiB aggregate output, 100,000 selected refs; 16 KiB argv batches |
 | `src/inspect.rs` | At most 1,000 displayed commits; ancestry identity scan separately stops after 10,000 commits |
-| `src/pre_push/local.rs` | PR title: nonempty, at most 256 Unicode scalars; this is not a UTF-8 byte limit |
+| `src/message.rs` | Shared PR-title classification, admitted by publication and reported by inspection: nonempty, at most 256 Unicode scalars; this is not a UTF-8 byte limit |
 | `src/pre_push/publication_attempt/body.rs` | Generated body: at most 131,072 UTF-8 bytes, including rendered/escaped history |
 | `src/pre_push/publication_attempt/remote.rs` | Ref query: 16 KiB variable argv; an ID's patterns remain indivisible |
 | `src/pre_push/publication_attempt/refs.rs` | Atomic push: 16 KiB variable argv; tuple/public units remain indivisible |

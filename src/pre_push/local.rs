@@ -16,9 +16,10 @@ use gix::ObjectId;
 
 use super::{autosquash, destination::DefaultBranch};
 pub(super) use crate::identity::{GherritIdTrailer, GherritPrId, gherrit_id_trailers};
-use crate::util;
-
-const MAX_TITLE_SCALARS: usize = 256;
+use crate::{
+    message::{self, IdentityProblem, MAX_TITLE_SCALARS, TitleProblem},
+    util,
+};
 
 /// A nonempty title of at most 256 Unicode scalar values.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,13 +27,12 @@ pub(super) struct PullRequestTitle(String);
 
 impl PullRequestTitle {
     fn new(value: String) -> Result<Self> {
-        if value.is_empty() {
-            bail!("A pull request title must not be empty");
-        }
-        if value.chars().nth(MAX_TITLE_SCALARS).is_some() {
-            bail!(
+        match message::title_problem(&value) {
+            Some(TitleProblem::Empty) => bail!("A pull request title must not be empty"),
+            Some(TitleProblem::Oversized) => bail!(
                 "A pull request title must contain at most {MAX_TITLE_SCALARS} Unicode scalar values"
-            );
+            ),
+            None => {}
         }
         Ok(Self(value))
     }
@@ -78,15 +78,15 @@ impl LocalChange {
             .wrap_err_with(|| format!("Commit {} has a non-UTF-8 message body", commit.id))?
             .unwrap_or("");
         let raw_message = commit.message_raw()?;
-        let mut ids = gherrit_id_trailers(raw_message.as_ref());
-        let id = match ids.len() {
-            0 => bail!("Commit {} missing gherrit-pr-id trailer", commit.id),
-            1 => ids.pop().expect("length checked above"),
-            _ => bail!("Commit {} has multiple gherrit-pr-id trailers", commit.id),
-        };
-        let (value, line) = match id {
-            GherritIdTrailer::Exact { value, line } => (value, line),
-            GherritIdTrailer::Malformed => {
+        let message::RawIdentity { value, line } = match message::identity(raw_message.as_ref()) {
+            Ok(identity) => identity,
+            Err(IdentityProblem::Missing) => {
+                bail!("Commit {} missing gherrit-pr-id trailer", commit.id)
+            }
+            Err(IdentityProblem::Multiple) => {
+                bail!("Commit {} has multiple gherrit-pr-id trailers", commit.id)
+            }
+            Err(IdentityProblem::Malformed) => {
                 bail!("Commit {} has invalid gherrit-pr-id trailer syntax", commit.id)
             }
         };

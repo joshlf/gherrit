@@ -2,10 +2,11 @@ use std::{error::Error, fmt};
 
 use super::destination::DefaultBranch;
 
+#[cfg(test)]
 const RESERVED_PREFIXES: [&str; 3] = ["fixup!", "squash!", "amend!"];
 
 fn is_pending(subject: &str) -> bool {
-    RESERVED_PREFIXES.iter().any(|prefix| subject.starts_with(prefix))
+    crate::message::pending_autosquash(subject.as_bytes())
 }
 
 #[derive(Debug, Eq, PartialEq)]

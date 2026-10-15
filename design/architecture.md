@@ -12,7 +12,7 @@ tests without restating that contract.
 | --- | --- | --- |
 | Composition and loopback admission | `lib.rs`, `pre_push/mod.rs` | CLI/process entry and exact hook-input policy tests |
 | Repository layout, literal graph, local config, credentials | `util/{layout,repository,config,command,auth}.rs` | Real Git layout/config/promisor witnesses and utility unit contracts |
-| Identity recognition and message editing | `identity.rs`, `commit_msg.rs` | Raw grammar/byte generators; installed hook and independent Git cleanup matrix |
+| Identity recognition and message editing | `identity.rs`, `message.rs`, `commit_msg.rs` | Raw grammar/byte generators; installed hook and independent Git cleanup matrix |
 | Complete installer inspection and per-file replacement | `install.rs` | Literal shim bytes/modes, binary conflicts, interruption prefixes, rerun/symlink tests |
 | Management ownership and complete edits | `manage.rs` | Pure literal plans and real-Git partial-prefix drift/force recovery |
 | Exact push repository | `pre_push/destination.rs` | Real fetch/push URL, rewrite, environment, and destination-redaction fixtures |

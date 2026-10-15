@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use crate::{
     identity::{self, GherritIdTrailer, GherritPrId},
     manage,
+    message::{self, IdentityProblem, TitleProblem},
     util::{self, CommandExt as _},
 };
 
@@ -79,28 +80,21 @@ fn commit_fact(
     let message = commit.message_raw()?;
     let parsed = commit.message()?;
     let identity_source = parsed.body.map(AsRef::as_ref).unwrap_or(message.as_ref());
-    let occurrences = identity::gherrit_id_trailers(identity_source);
     let mut problems = Vec::new();
-    let id = match occurrences.as_slice() {
-        [] => {
-            problems.push("missing identity");
-            None
-        }
-        [GherritIdTrailer::Exact { value, .. }] => {
-            match GherritPrId::from_trailer(commit.id, value) {
-                Ok(id) => Some(id),
-                Err(_) => {
-                    problems.push("invalid identity");
-                    None
-                }
+    let id = match message::identity(identity_source) {
+        Ok(raw) => match GherritPrId::from_trailer(commit.id, &raw.value) {
+            Ok(id) => Some(id),
+            Err(_) => {
+                problems.push("invalid identity");
+                None
             }
-        }
-        [GherritIdTrailer::Malformed] => {
-            problems.push("malformed identity syntax");
-            None
-        }
-        _ => {
-            problems.push("multiple identities");
+        },
+        Err(problem) => {
+            problems.push(match problem {
+                IdentityProblem::Missing => "missing identity",
+                IdentityProblem::Malformed => "malformed identity syntax",
+                IdentityProblem::Multiple => "multiple identities",
+            });
             None
         }
     };
@@ -117,15 +111,15 @@ fn commit_fact(
         problems.push("non-UTF-8 message");
     }
     let title = message.split(|byte| *byte == b'\n').next().unwrap_or_default();
-    if [b"fixup!".as_slice(), b"squash!", b"amend!"].iter().any(|prefix| title.starts_with(prefix))
-    {
+    if message::pending_autosquash(title) {
         problems.push("pending autosquash");
     }
-    if title.is_empty() {
-        problems.push("empty title");
-    }
-    if std::str::from_utf8(title).is_ok_and(|title| title.chars().count() > 256) {
-        problems.push("oversized title");
+    if let Ok(title) = std::str::from_utf8(title) {
+        match message::title_problem(title) {
+            Some(TitleProblem::Empty) => problems.push("empty title"),
+            Some(TitleProblem::Oversized) => problems.push("oversized title"),
+            None => {}
+        }
     }
     Ok(
         json!({"oid": commit.id.to_string(), "id": id.as_ref().map(GherritPrId::as_str), "title": bytes(title), "problems": problems}),
