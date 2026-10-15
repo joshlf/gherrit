@@ -23,6 +23,42 @@ mod commit_message {
         serde_json::from_str(include_str!("../tests/fixtures/trailer-classification.json"))
             .expect("literal trailer-classification corpus")
     }
+    fn gherrit_pr_id_re() -> &'static regex::Regex {
+        crate::re!(r"(?m)^gherrit-pr-id[=:][ \t]*([a-zA-Z0-9]+)[ \t]*\r?$")
+    }
+
+    pub(crate) fn strip_gherrit_id(body: &str, id: &str) -> String {
+        let trailer_start = body
+            .rfind("\n\n")
+            .map(|position| position + 2)
+            .into_iter()
+            .chain(body.rfind("\r\n\r\n").map(|position| position + 4))
+            .max()
+            .unwrap_or(0);
+        let matching_trailer = gherrit_pr_id_re()
+            .captures_iter(&body[trailer_start..])
+            .filter(|captures| captures.get(1).is_some_and(|value| value.as_str() == id))
+            .filter_map(|captures| captures.get(0))
+            .last();
+        let Some(trailer) = matching_trailer else {
+            return body.to_string();
+        };
+
+        let mut body = body.to_string();
+        let range = trailer.range();
+        body.replace_range(trailer_start + range.start..trailer_start + range.end, "");
+        body
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn gherrit_id_trailers_require_a_nonempty_identifier() {
+            assert!(gherrit_pr_id_re().is_match("gherrit-pr-id: Gone"));
+            assert!(!gherrit_pr_id_re().is_match("gherrit-pr-id: "));
+        }
+    }
 }
 mod commit_msg;
 mod install;
