@@ -52,6 +52,9 @@ It achieves this by:
   teardown ordering; private `environment.rs`, `server.rs`, `git_fixture.rs`,
   `github.rs` and `normalization.rs` own environment discovery, server lifetime,
   repository setup, GitHub fixture access and snapshot text respectively.
+  `mock_server.rs` retains HTTP dispatch, lock scope and fault consumption;
+  `mock_server/codec.rs`, `queries.rs` and `mutations.rs` contain its existing
+  GraphQL validation, query projection and mutation handlers.
 - `hooks/`: Git hooks (`pre-push`, `commit-msg`, `post-checkout`) that shell out to the `gherrit` binary.
 
 ## Development Workflow
