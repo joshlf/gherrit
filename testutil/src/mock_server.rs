@@ -7,7 +7,6 @@ use std::{
 
 use apollo_compiler::{executable, validation::Valid, ExecutableDocument};
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
-use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::{git_interceptor, FailureKind, GraphQlOperation, TestEnvironment};
@@ -51,28 +50,16 @@ impl MockState {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct PrEntry {
-    pub id: u64,
     pub number: usize,
-    #[serde(rename = "html_url")]
     pub html_url: String,
-    #[serde(rename = "url")]
-    pub api_url: String,
-    #[serde(rename = "node_id")]
     pub node_id: String,
     pub state: String,
-    pub user: User,
-    #[serde(rename = "title")]
     pub title: Option<String>,
-    #[serde(rename = "body")]
     pub body: Option<String>,
-    #[serde(rename = "head")]
-    pub head: RefInfo,
-    #[serde(rename = "base")]
-    pub base: RefInfo,
-    pub created_at: String,
-    pub updated_at: String,
+    pub head: String,
+    pub base: String,
 }
 
 pub struct MockPrArgs<'a> {
@@ -92,74 +79,16 @@ impl PrEntry {
         let url_path = format!("repos/{}/{}/pulls/{}", repo_owner, repo_name, id);
         let html_url = format!("http://github.com/{url_path}");
         Self {
-            id,
             number: id as usize,
             html_url,
-            api_url: format!("http://api.github.com/{url_path}"),
             node_id,
             state: "OPEN".to_string(),
-            user: User {
-                login: "test-user".to_string(),
-                id: 123,
-                node_id: "MDQ6VXNlcjE=".to_string(),
-                avatar_url: "https://example.com/avatar".to_string(),
-                gravatar_id: "".to_string(),
-                url: "https://api.github.com/users/test-user".to_string(),
-                html_url: "https://github.com/test-user".to_string(),
-                followers_url: "https://api.github.com/users/test-user/followers".to_string(),
-                following_url: "https://api.github.com/users/test-user/following{/other_user}"
-                    .to_string(),
-                gists_url: "https://api.github.com/users/test-user/gists{/gist_id}".to_string(),
-                starred_url: "https://api.github.com/users/test-user/starred{/owner}{/repo}"
-                    .to_string(),
-                subscriptions_url: "https://api.github.com/users/test-user/subscriptions"
-                    .to_string(),
-                organizations_url: "https://api.github.com/users/test-user/orgs".to_string(),
-                repos_url: "https://api.github.com/users/test-user/repos".to_string(),
-                events_url: "https://api.github.com/users/test-user/events{/privacy}".to_string(),
-                received_events_url: "https://api.github.com/users/test-user/received_events"
-                    .to_string(),
-                type_field: "User".to_string(),
-                site_admin: false,
-            },
             title: Some(title),
             body: Some(body),
-            head: RefInfo { ref_field: head, sha: "".to_string() },
-            base: RefInfo { ref_field: base, sha: "".to_string() },
-            created_at: "2023-01-01T00:00:00Z".to_string(),
-            updated_at: "2023-01-01T00:00:00Z".to_string(),
+            head,
+            base,
         }
     }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct User {
-    pub login: String,
-    pub id: u64,
-    pub node_id: String,
-    pub avatar_url: String,
-    pub gravatar_id: String,
-    pub url: String,
-    pub html_url: String,
-    pub followers_url: String,
-    pub following_url: String,
-    pub gists_url: String,
-    pub starred_url: String,
-    pub subscriptions_url: String,
-    pub organizations_url: String,
-    pub repos_url: String,
-    pub events_url: String,
-    pub received_events_url: String,
-    #[serde(rename = "type")]
-    pub type_field: String,
-    pub site_admin: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct RefInfo {
-    #[serde(rename = "ref")]
-    pub ref_field: String,
-    pub sha: String,
 }
 
 #[derive(Clone)]
