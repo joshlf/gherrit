@@ -273,3 +273,56 @@ fn invalid_json_http_arrives_before_extractor_rejection() {
     assert_eq!(ctx.github().http_arrivals(), 1);
     assert!(ctx.github().requests().is_empty());
 }
+
+#[test]
+fn unreadable_version_ref_stops_before_publication() {
+    let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: GversionRead");
+    let path = ctx.repo_path.join(".git/refs/tags/gherrit/broken");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, "not an object ID\n").unwrap();
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
+        "Failed to read local version refs; no publication batch was pushed",
+    ));
+    assert!(ctx.recorded_pushes().is_empty());
+    assert!(ctx.github().pull_requests().is_empty());
+}
+
+#[test]
+fn exhausted_version_counter_stops_before_publication() {
+    let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: GversionMax");
+    ctx.run_git(&["update-ref", &format!("refs/tags/gherrit/GversionMax/v{}", usize::MAX), "HEAD"]);
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
+        "Local version counter exhausted for 'GversionMax'; no publication batch was pushed",
+    ));
+    assert!(ctx.recorded_pushes().is_empty());
+    assert!(ctx.github().pull_requests().is_empty());
+}
+
+#[test]
+fn local_version_write_failure_reports_applied_remote_batch() {
+    let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: GversionLock");
+    let path = ctx.repo_path.join(".git/refs/tags/gherrit/GversionLock/v1.lock");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, "fixture lock").unwrap();
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Remote publication batch succeeded"))
+        .stderr(predicate::str::contains("Remote changes are already applied"));
+    let tip = ctx.head_oid();
+    assert_eq!(ctx.remote_ref_oid("refs/heads/GversionLock").as_deref(), Some(tip.as_str()));
+    assert_eq!(
+        ctx.remote_ref_oid("refs/tags/gherrit/GversionLock/v1").as_deref(),
+        Some(tip.as_str())
+    );
+    assert!(
+        !ctx.git_cmd()
+            .args(["show-ref", "--verify", "refs/tags/gherrit/GversionLock/v1"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(ctx.recorded_pushes().iter().filter(|push| push.succeeded()).count(), 1);
+    assert!(ctx.github().pull_requests().is_empty());
+}
