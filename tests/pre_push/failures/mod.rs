@@ -207,3 +207,26 @@ fn test_pre_push_pr_create_failure() {
     assert!(ctx.github().pull_requests().is_empty());
     assert_eq!(ctx.recorded_pushes().iter().filter(|push| push.succeeded()).count(), 1);
 }
+
+#[test]
+fn non_utf8_committed_body_is_an_error_before_publication() {
+    let ctx = stack_with_raw_commit_message("Valid\n\ngherrit-pr-id: Gvalid");
+    let parent = ctx.head_oid();
+    let tree = ctx.git_cmd().args(["show", "-s", "--format=%T", "HEAD"]).output().unwrap();
+    let tree = String::from_utf8(tree.stdout).unwrap();
+    let mut raw = format!("tree {}\nparent {parent}\nauthor Fixture <fixture@example.com> 0 +0000\ncommitter Fixture <fixture@example.com> 0 +0000\n\n", tree.trim()).into_bytes();
+    raw.extend_from_slice(b"Subject\n\nInvalid body: \xff\n\ngherrit-pr-id: GinvalidBody\n");
+    let path = ctx.repo_path.join("raw-commit");
+    std::fs::write(&path, raw).unwrap();
+    let output =
+        ctx.git_cmd().args(["hash-object", "-w", "-t", "commit"]).arg(&path).output().unwrap();
+    assert!(output.status.success());
+    let oid = String::from_utf8(output.stdout).unwrap();
+    ctx.run_git(&["update-ref", "HEAD", oid.trim()]);
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(format!("Commit {} body is not UTF-8", oid.trim())));
+    assert!(ctx.github().requests().is_empty());
+    assert!(ctx.recorded_pushes().is_empty());
+}
