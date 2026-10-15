@@ -7,6 +7,52 @@ use serde_json::{Value, json};
 use super::destination::PushDestination;
 use crate::{hosted, identity::GherritPrId, util};
 
+/// Completion is a typed observation outcome, never a JSON state-string test.
+enum RemotePart<T> {
+    Observed(T),
+    Unavailable(String),
+}
+
+impl<T> RemotePart<T> {
+    fn from_result(result: Result<T>) -> Self {
+        match result {
+            Ok(value) => Self::Observed(value),
+            Err(error) => Self::Unavailable(error.to_string()),
+        }
+    }
+
+    fn is_observed(&self) -> bool {
+        matches!(self, Self::Observed(_))
+    }
+
+    fn into_value(self, observed: impl FnOnce(T) -> Value) -> Value {
+        match self {
+            Self::Observed(value) => observed(value),
+            Self::Unavailable(reason) => json!({"state":"unavailable","reason":reason}),
+        }
+    }
+}
+
+struct RemoteReport {
+    repository: String,
+    refs: RemotePart<Vec<Value>>,
+    github: RemotePart<Value>,
+}
+
+impl RemoteReport {
+    fn into_value(self) -> Value {
+        let complete = self.refs.is_observed() && self.github.is_observed();
+        let refs = self.refs.into_value(|refs| {
+            json!({"state":"observed","refs":refs,
+            "archive_objects":"not acquired or validated"})
+        });
+        let github = self.github.into_value(|value| value);
+        json!({"state":if complete {"observed"} else {"partial"},
+            "repository":self.repository,"refs":refs,"github":github,
+            "publication_authority":false})
+    }
+}
+
 fn visit_refs(
     bytes: &[u8],
     ids: &[GherritPrId],
@@ -142,25 +188,56 @@ pub(crate) async fn observe(repo: &util::Repo, ids: &[GherritPrId]) -> Result<Va
     }
     .await;
     let coordinates = destination.coordinates();
-    let hosted = match hosted::observe(coordinates.owner(), coordinates.repository(), ids) {
-        Ok(value) => value,
-        Err(error) => json!({"state":"unavailable","reason":error.to_string()}),
-    };
-    let refs = match refs {
-        Ok(refs) => {
-            json!({"state":"observed","refs":refs,"archive_objects":"not acquired or validated"})
-        }
-        Err(error) => json!({"state":"unavailable","reason":error.to_string()}),
-    };
-    let complete = refs["state"] == "observed" && hosted["state"] == "observed";
-    Ok(
-        json!({"state":if complete{"observed"}else{"partial"},"repository":format!("{}/{}",coordinates.owner(),coordinates.repository()),"refs":refs,"github":hosted,"publication_authority":false}),
-    )
+    Ok(RemoteReport {
+        repository: format!("{}/{}", coordinates.owner(), coordinates.repository()),
+        refs: RemotePart::from_result(refs),
+        github: RemotePart::from_result(hosted::observe(
+            coordinates.owner(),
+            coordinates.repository(),
+            ids,
+        )),
+    }
+    .into_value())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_envelopes_preserve_complete_and_partial_wire_shapes() {
+        for refs_ok in [false, true] {
+            for github_ok in [false, true] {
+                let github = json!({"state":"observed","heads":[],"native_stacks":[],
+                    "extra_provider_fact":{"retained":null},"publication_authority":false});
+                let unavailable = json!({"state":"unavailable","reason":"unavailable"});
+                let value = RemoteReport {
+                    repository: "owner/repo".into(),
+                    refs: if refs_ok {
+                        RemotePart::Observed(Vec::new())
+                    } else {
+                        RemotePart::Unavailable("unavailable".into())
+                    },
+                    github: if github_ok {
+                        RemotePart::Observed(github.clone())
+                    } else {
+                        RemotePart::Unavailable("unavailable".into())
+                    },
+                }
+                .into_value();
+                assert_eq!(
+                    value,
+                    json!({
+                        "state":if refs_ok && github_ok {"observed"} else {"partial"},
+                        "repository":"owner/repo", "publication_authority":false,
+                        "refs":if refs_ok {json!({"state":"observed","refs":[],
+                            "archive_objects":"not acquired or validated"})} else {unavailable.clone()},
+                        "github":if github_ok {github} else {unavailable}
+                    })
+                );
+            }
+        }
+    }
+
     fn decode_refs(bytes: &[u8], ids: &[GherritPrId]) -> Result<Vec<Value>> {
         let mut refs = Vec::new();
         visit_refs(bytes, ids, |name, oid| {

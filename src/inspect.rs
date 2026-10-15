@@ -14,6 +14,71 @@ use crate::{
 
 const MAX_INSPECT_COMMITS: usize = 1000;
 
+#[derive(serde::Serialize)]
+struct CommitFact {
+    oid: String,
+    #[serde(serialize_with = "serialize_id")]
+    id: Option<GherritPrId>,
+    title: Value,
+    problems: Vec<Problem>,
+}
+
+fn serialize_id<S: serde::Serializer>(
+    id: &Option<GherritPrId>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&id.as_ref().map(GherritPrId::as_str), serializer)
+}
+
+#[derive(Eq, PartialEq, serde::Serialize)]
+enum Problem {
+    #[serde(rename = "missing identity")]
+    MissingIdentity,
+    #[serde(rename = "invalid identity")]
+    InvalidIdentity,
+    #[serde(rename = "malformed identity syntax")]
+    MalformedIdentity,
+    #[serde(rename = "multiple identities")]
+    MultipleIdentities,
+    #[serde(rename = "repeated identity")]
+    RepeatedIdentity,
+    #[serde(rename = "identity conflicts with default branch")]
+    DefaultConflict,
+    #[serde(rename = "non-UTF-8 message")]
+    NonUtf8Message,
+    #[serde(rename = "pending autosquash")]
+    PendingAutosquash,
+    #[serde(rename = "empty title")]
+    EmptyTitle,
+    #[serde(rename = "oversized title")]
+    OversizedTitle,
+}
+
+struct StackFacts {
+    envelope: Value,
+    commits: Vec<CommitFact>,
+}
+
+impl StackFacts {
+    fn into_report(self) -> (Value, Vec<GherritPrId>) {
+        let Self { mut envelope, commits } = self;
+        let mut seen = HashSet::new();
+        let ids = commits
+            .iter()
+            .filter_map(|commit| commit.id.as_ref())
+            .filter(|id| seen.insert((*id).clone()))
+            .cloned()
+            .collect();
+        envelope["commits"] = json!(commits);
+        (envelope, ids)
+    }
+}
+
+struct LocalReport {
+    value: Value,
+    remote_ids: Option<Vec<GherritPrId>>,
+}
+
 /// Lossless byte representation, including non-UTF-8 paths and names.
 fn bytes(value: &[u8]) -> Value {
     json!({"utf8": std::str::from_utf8(value).ok(), "hex": value.iter().map(|byte| format!("{byte:02x}")).collect::<String>()})
@@ -76,7 +141,7 @@ fn commit_fact(
     commit: gix::Commit<'_>,
     seen: &mut HashSet<GherritPrId>,
     default: Option<&str>,
-) -> Result<Value> {
+) -> Result<CommitFact> {
     let message = commit.message_raw()?;
     let parsed = commit.message()?;
     let identity_source = parsed.body.map(AsRef::as_ref).unwrap_or(message.as_ref());
@@ -85,45 +150,43 @@ fn commit_fact(
         Ok(raw) => match GherritPrId::from_trailer(commit.id, &raw.value) {
             Ok(id) => Some(id),
             Err(_) => {
-                problems.push("invalid identity");
+                problems.push(Problem::InvalidIdentity);
                 None
             }
         },
         Err(problem) => {
             problems.push(match problem {
-                IdentityProblem::Missing => "missing identity",
-                IdentityProblem::Malformed => "malformed identity syntax",
-                IdentityProblem::Multiple => "multiple identities",
+                IdentityProblem::Missing => Problem::MissingIdentity,
+                IdentityProblem::Malformed => Problem::MalformedIdentity,
+                IdentityProblem::Multiple => Problem::MultipleIdentities,
             });
             None
         }
     };
     if id.as_ref().is_some_and(|id| !seen.insert(id.clone())) {
-        problems.push("repeated identity");
+        problems.push(Problem::RepeatedIdentity);
     }
     if id
         .as_ref()
         .is_some_and(|id| default.is_some_and(|default| id.head_conflicts_with_branch(default)))
     {
-        problems.push("identity conflicts with default branch");
+        problems.push(Problem::DefaultConflict);
     }
     if std::str::from_utf8(message.as_ref()).is_err() {
-        problems.push("non-UTF-8 message");
+        problems.push(Problem::NonUtf8Message);
     }
     let title = message.split(|byte| *byte == b'\n').next().unwrap_or_default();
     if message::pending_autosquash(title) {
-        problems.push("pending autosquash");
+        problems.push(Problem::PendingAutosquash);
     }
     if let Ok(title) = std::str::from_utf8(title) {
         match message::title_problem(title) {
-            Some(TitleProblem::Empty) => problems.push("empty title"),
-            Some(TitleProblem::Oversized) => problems.push("oversized title"),
+            Some(TitleProblem::Empty) => problems.push(Problem::EmptyTitle),
+            Some(TitleProblem::Oversized) => problems.push(Problem::OversizedTitle),
             None => {}
         }
     }
-    Ok(
-        json!({"oid": commit.id.to_string(), "id": id.as_ref().map(GherritPrId::as_str), "title": bytes(title), "problems": problems}),
-    )
+    Ok(CommitFact { oid: commit.id.to_string(), id, title: bytes(title), problems })
 }
 
 /// Match publication's complete-HEAD identity rule while bounding diagnostic
@@ -131,14 +194,12 @@ fn commit_fact(
 fn inspect_identity_ancestry(
     repo: &util::Repo,
     head: gix::ObjectId,
-    commits: &mut [Value],
+    commits: &mut [CommitFact],
 ) -> Value {
     const MAX_ANCESTRY_COMMITS: usize = 10_000;
     let expected = commits
         .iter()
-        .filter_map(|commit| {
-            Some((commit["id"].as_str()?.to_owned(), commit["oid"].as_str()?.to_owned()))
-        })
+        .filter_map(|commit| Some((commit.id.as_ref()?.as_str().to_owned(), commit.oid.clone())))
         .collect::<std::collections::HashMap<_, _>>();
     if expected.is_empty() {
         return json!({"state":"not_needed"});
@@ -176,18 +237,16 @@ fn inspect_identity_ancestry(
         }
     })();
     for commit in commits {
-        if commit["id"].as_str().is_some_and(|id| repeated.contains(id)) {
-            let problems =
-                commit["problems"].as_array_mut().expect("commit facts have problem arrays");
-            if !problems.iter().any(|problem| problem == "repeated identity") {
-                problems.push(json!("repeated identity"));
-            }
+        if commit.id.as_ref().is_some_and(|id| repeated.contains(id.as_str()))
+            && !commit.problems.contains(&Problem::RepeatedIdentity)
+        {
+            commit.problems.push(Problem::RepeatedIdentity);
         }
     }
     scan.unwrap_or_else(|error| json!({"state":"unavailable","reason":error.to_string()}))
 }
 
-fn stack(repo: &util::Repo, base: &str) -> Result<Value> {
+fn stack(repo: &util::Repo, base: &str) -> Result<StackFacts> {
     let base_oid = repo.rev_parse_single(base)?.object()?.peel_to_commit()?.id;
     let head = repo.head_id()?.detach();
     // Traverse lazily with an inspection budget. Missing objects stay errors;
@@ -223,13 +282,14 @@ fn stack(repo: &util::Repo, base: &str) -> Result<Value> {
             json!({"state":"unavailable","reason":"No exact cached publication-default name; remote HEAD may be absent or malformed"})
         }
     };
-    Ok(
-        json!({"problems":[],"identity_ancestry":identity_ancestry,"identity_namespace":identity_namespace,"state": "observed", "base_ref": base, "base_oid": base_oid.to_string(), "head_oid": head.to_string(),
-        "basis": "local refs only; may be stale", "commits": commits, "publication_authority": false}),
-    )
+    Ok(StackFacts {
+        commits,
+        envelope: json!({"problems":[],"identity_ancestry":identity_ancestry,"identity_namespace":identity_namespace,"state": "observed", "base_ref": base, "base_oid": base_oid.to_string(), "head_oid": head.to_string(),
+        "basis": "local refs only; may be stale", "publication_authority": false}),
+    })
 }
 
-pub(crate) fn report(base: Option<&str>) -> Result<Value> {
+fn report(base: Option<&str>) -> Result<LocalReport> {
     // A real Git discovery makes status useful even when gix cannot open the
     // ref backend. Ordinary commands still require gix's supported format.
     git(&["rev-parse", "--git-dir"])?.ok_or_else(|| eyre::eyre!("No repository"))?;
@@ -252,6 +312,7 @@ pub(crate) fn report(base: Option<&str>) -> Result<Value> {
         report["capabilities"]["ref_backend"] =
             json!({"state": "unavailable", "reason": "Git does not report its ref backend"});
     }
+    let mut remote_ids = None;
     match util::Repo::open(".") {
         Ok(repo) => {
             report["capabilities"]["gix"] = json!({"state": "supported"});
@@ -277,7 +338,11 @@ pub(crate) fn report(base: Option<&str>) -> Result<Value> {
             let base = base.or(inferred.as_deref());
             if let Some(base) = base {
                 report["stack"] = match stack(&repo, base) {
-                    Ok(value) => value,
+                    Ok(facts) => {
+                        let (value, ids) = facts.into_report();
+                        remote_ids = Some(ids);
+                        value
+                    }
                     Err(_) => {
                         json!({"state": "unavailable", "base_ref": base, "reason": "Base or literal first-parent objects are unavailable; specify --base with a local ref"})
                     }
@@ -297,26 +362,18 @@ pub(crate) fn report(base: Option<&str>) -> Result<Value> {
     {
         report["stack"]["problems"] = json!(["managed branch is the cached default branch"]);
     }
-    Ok(report)
+    Ok(LocalReport { value: report, remote_ids })
 }
 
 pub(crate) async fn run(json_output: bool, base: Option<&str>, remote: bool) -> Result<()> {
-    let mut report = report(base).wrap_err("Failed to inspect repository")?;
+    let LocalReport { value: mut report, remote_ids } =
+        report(base).wrap_err("Failed to inspect repository")?;
     if remote {
         report["mode"] = json!("remote");
         let observed = async {
-            let commits = report["stack"]["commits"].as_array().ok_or_else(|| {
+            let ids = remote_ids.ok_or_else(|| {
                 eyre::eyre!("A complete local stack basis is required for remote inspection")
             })?;
-            let mut ids = Vec::new();
-            let mut seen = HashSet::new();
-            for commit in commits {
-                if let Some(id) = commit["id"].as_str()
-                    && seen.insert(id.to_owned())
-                {
-                    ids.push(GherritPrId::from_ref_component(id.as_bytes())?);
-                }
-            }
             crate::pre_push::inspect_remote(&util::Repo::open(".")?, &ids).await
         }
         .await;
@@ -339,4 +396,39 @@ pub(crate) async fn run(json_output: bool, base: Option<&str>, remote: bool) -> 
         println!("Remote: {}", terminal_json(&report["remote"])?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_commit_records_preserve_complete_wire_fields_and_problem_order() {
+        let fact = CommitFact {
+            oid: "1111111111111111111111111111111111111111".into(),
+            id: None,
+            title: bytes(&[0xff]),
+            problems: vec![Problem::MissingIdentity, Problem::NonUtf8Message],
+        };
+        assert_eq!(
+            json!(fact),
+            json!({
+                "oid":"1111111111111111111111111111111111111111", "id":null,
+                "title":{"utf8":null,"hex":"ff"},
+                "problems":["missing identity","non-UTF-8 message"]
+            })
+        );
+        let fact = CommitFact {
+            id: Some(GherritPrId::from_ref_component(b"Gone").unwrap()),
+            problems: Vec::new(),
+            ..fact
+        };
+        assert_eq!(
+            json!(fact),
+            json!({
+                "oid":"1111111111111111111111111111111111111111", "id":"Gone",
+                "title":{"utf8":null,"hex":"ff"}, "problems":[]
+            })
+        );
+    }
 }

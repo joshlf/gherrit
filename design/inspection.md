@@ -58,3 +58,11 @@ leaving object and commit inspection available.
 Shallow walks retain problems visible in the available history but mark identity
 ancestry incomplete. A successful truncated walk does not establish that older
 active-ID occurrences are absent.
+
+## Internal report construction
+
+Private commit/problem records retain validated identities through ancestry
+checks and remote-ID selection. JSON serialization preserves the existing
+schema at the report boundary. The remote envelope computes completion from
+observed/unavailable variants and retains the factual provider resource in
+full. These records do not construct publication authority.
