@@ -285,10 +285,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
                     return;
                 }
                 let block = buf.join("\n");
-                let re = re!(
-                    r"(?m)\n?^remote:\s*\nremote: Create a pull request for '.*' on GitHub by visiting:\s*\nremote:\s*https://github\.com/.*\nremote:\s*$"
-                );
-                let cleaned = re.replace(&block, "");
+                let cleaned = without_pr_invitation(&block);
                 if !cleaned.is_empty() {
                     eprintln!("{}", cleaned);
                 }
@@ -329,6 +326,10 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
     }
 
     Ok(next_versions)
+}
+
+fn without_pr_invitation(block: &str) -> std::borrow::Cow<'_, str> {
+    re!(r"(?m)\n?^remote:\s*\nremote: Create a pull request for '.*' on GitHub by visiting:\s*\nremote:\s*https://github\.com/.*\nremote:\s*$").replace(block, "")
 }
 
 fn get_local_version(repo: &util::Repo, gherrit_id: &str) -> Result<usize> {
@@ -749,6 +750,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_diagnostics_only_remove_the_complete_github_invitation() {
+        let invitation = "remote: \nremote: Create a pull request for 'G1' on GitHub by visiting:\nremote: https://github.com/owner/repo/pull/new/G1\nremote: ";
+        assert_eq!(without_pr_invitation(invitation), "");
+        assert_eq!(
+            without_pr_invitation(&format!("remote: warning\n{invitation}")),
+            "remote: warning"
+        );
+        for ordinary in
+            ["remote: warning", "fatal: push failed", "remote: https://example.com/path"]
+        {
+            assert_eq!(without_pr_invitation(ordinary), ordinary);
+        }
+    }
 
     #[test]
     fn committed_identity_corpus_preserves_admission_and_error_order() {
