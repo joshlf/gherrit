@@ -342,3 +342,22 @@ fn local_version_write_failure_reports_applied_remote_batch() {
     assert_eq!(ctx.recorded_pushes().iter().filter(|push| push.succeeded()).count(), 1);
     assert!(ctx.github().pull_requests().is_empty());
 }
+
+#[test]
+fn invalid_visibility_config_fails_before_external_io() {
+    use std::io::Write as _;
+    let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: Gvisibility");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(ctx.repo_path.join(".git/config"))
+        .unwrap()
+        .write_all(b"\n[branch \"invalid-id\"]\n pushRemote = \xff\n")
+        .unwrap();
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Failed to read stack visibility"));
+    assert_eq!(ctx.github().http_arrivals(), 0);
+    assert!(ctx.recorded_pushes().is_empty());
+    assert!(ctx.github().pull_requests().is_empty());
+}
