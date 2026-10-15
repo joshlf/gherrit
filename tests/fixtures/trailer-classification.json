@@ -1,0 +1,110 @@
+[
+  {
+    "name": "absent",
+    "trailers": "",
+    "hook_preserves": false,
+    "publication": "error:missing gherrit-pr-id trailer"
+  },
+  {
+    "name": "unrelated",
+    "trailers": "other-trailer: value",
+    "hook_preserves": false,
+    "publication": "error:missing gherrit-pr-id trailer"
+  },
+  {
+    "name": "one ID",
+    "trailers": "gherrit-pr-id: Gabc",
+    "hook_preserves": true,
+    "publication": "ok:Gabc"
+  },
+  {
+    "name": "empty ID",
+    "trailers": "gherrit-pr-id: ",
+    "hook_preserves": true,
+    "publication": "error:missing gherrit-pr-id trailer"
+  },
+  {
+    "name": "after another trailer",
+    "trailers": "other-trailer: value\ngherrit-pr-id: Gabc",
+    "hook_preserves": true,
+    "publication": "ok:Gabc"
+  },
+  {
+    "name": "no separator space",
+    "trailers": "gherrit-pr-id:Gabc",
+    "hook_preserves": false,
+    "publication": "error:missing gherrit-pr-id trailer"
+  },
+  {
+    "name": "different key case",
+    "trailers": "Gherrit-pr-id: Gabc",
+    "hook_preserves": false,
+    "publication": "error:missing gherrit-pr-id trailer"
+  },
+  {
+    "name": "indented key",
+    "trailers": " gherrit-pr-id: Gabc",
+    "hook_preserves": false,
+    "publication": "error:missing gherrit-pr-id trailer"
+  },
+  {
+    "name": "suffix key",
+    "trailers": "not-gherrit-pr-id: Gabc",
+    "hook_preserves": false,
+    "publication": "error:missing gherrit-pr-id trailer"
+  },
+  {
+    "name": "equals alias before normalization",
+    "trailers": "gherrit-pr-id=Gabc",
+    "hook_preserves": false,
+    "publication": "error:missing gherrit-pr-id trailer"
+  },
+  {
+    "name": "blank lines",
+    "trailers": "\n\ngherrit-pr-id: Gabc\n\n",
+    "hook_preserves": true,
+    "publication": "ok:Gabc"
+  },
+  {
+    "name": "CRLF before normalization",
+    "trailers": "gherrit-pr-id: Gabc\r\n",
+    "hook_preserves": true,
+    "publication": "error:has invalid gherrit-pr-id trailer"
+  },
+  {
+    "name": "trailing space",
+    "trailers": "gherrit-pr-id: Gabc ",
+    "hook_preserves": true,
+    "publication": "error:has invalid gherrit-pr-id trailer"
+  },
+  {
+    "name": "non ASCII value",
+    "trailers": "gherrit-pr-id: Gé",
+    "hook_preserves": true,
+    "publication": "error:has invalid gherrit-pr-id trailer"
+  },
+  {
+    "name": "punctuation",
+    "trailers": "gherrit-pr-id: G-a",
+    "hook_preserves": true,
+    "publication": "error:has invalid gherrit-pr-id trailer"
+  },
+  {
+    "name": "two IDs",
+    "trailers": "gherrit-pr-id: Gabc\ngherrit-pr-id: Gdef",
+    "hook_preserves": true,
+    "publication": "error:has multiple gherrit-pr-id trailers"
+  },
+  {
+    "name": "identical IDs",
+    "trailers": "gherrit-pr-id: Gabc\ngherrit-pr-id: Gabc",
+    "hook_preserves": true,
+    "publication": "error:has multiple gherrit-pr-id trailers"
+  },
+  {
+    "name": "empty plus valid ID",
+    "trailers": "gherrit-pr-id: \ngherrit-pr-id: Gabc",
+    "hook_preserves": true,
+    "publication": "error:has multiple gherrit-pr-id trailers"
+  }
+]
