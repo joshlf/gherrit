@@ -2,6 +2,7 @@ use std::fmt::{self, Write};
 
 use serde::Serialize;
 
+use super::refs;
 use crate::re;
 
 // Per https://github.com/orgs/community/discussions/27190#discussioncomment-3254953,
@@ -167,12 +168,13 @@ impl PrBody<'_> {
         // the full `refs/heads/` syntax to avoid ambiguity with tags of the
         // same name.
         let id = self.gherrit_id;
-        let fetch = format!("git fetch origin refs/heads/{id}");
+        let reference = refs::head(id);
+        let fetch = format!("git fetch origin {reference}");
         let commands = [
             ("Branch", format!("{fetch} && git checkout -b pr-{id} FETCH_HEAD")),
             ("Checkout", format!("{fetch} && git checkout FETCH_HEAD")),
             ("Cherry Pick", format!("{fetch} && git cherry-pick FETCH_HEAD")),
-            ("Pull", format!("git pull origin refs/heads/{id}")),
+            ("Pull", format!("git pull origin {reference}")),
         ];
 
         commands.into_iter().try_for_each(|(title, command)| {
