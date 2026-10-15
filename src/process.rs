@@ -49,9 +49,6 @@ pub fn run(runtime: gherrit::Runtime) -> ExitCode {
 }
 
 fn execute(runtime: gherrit::Runtime) -> Result<()> {
-    // Limit concurrency to avoid hitting GitHub's abuse limits.
-    rayon::ThreadPoolBuilder::new().num_threads(6).build_global()?;
-
     let cli = gherrit::Cli::parse();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
