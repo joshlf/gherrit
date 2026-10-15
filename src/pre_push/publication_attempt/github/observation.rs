@@ -16,10 +16,12 @@ use super::{
     CreatePreparation, PullRequestIdentity, PullRequestNumber, Repository, RepositoryNodeId,
     pull_request::PullRequestIdentityRegistry,
 };
-use crate::pre_push::{
-    destination::{DefaultBranch, PushDestination, RepositoryCoordinates},
+use crate::{
     json::UniqueJson,
-    local::{GherritPrId, LocalStack},
+    pre_push::{
+        destination::{DefaultBranch, PushDestination, RepositoryCoordinates},
+        local::{GherritPrId, LocalStack},
+    },
 };
 
 const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 80;

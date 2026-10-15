@@ -171,7 +171,7 @@ impl CommandExt for Command {
 /// Local commands never consult a remote: one minute and four MiB of stdout.
 /// Stderr retains the supervisor's final 16 KiB.
 pub(crate) fn local_output(command: &mut Command) -> Result<std::process::Output> {
-    Ok(crate::pre_push::subprocess::local_output(
+    Ok(crate::subprocess::local_output(
         command,
         None,
         std::time::Duration::from_secs(60),

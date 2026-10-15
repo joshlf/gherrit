@@ -17,10 +17,10 @@ use super::{
 };
 use crate::{
     github_http::{GraphqlBodyError, collect_body_with_limit, diagnostic_detail},
+    json::UniqueJson,
     pre_push::{
         GithubEndpoint,
         destination::{PublicationTarget, PushDestination},
-        json::UniqueJson,
         local::LocalStack,
     },
     util,

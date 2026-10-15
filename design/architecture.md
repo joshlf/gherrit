@@ -23,6 +23,7 @@ tests without restating that contract.
 | Exact atomic Git acknowledgements | `publication_attempt/refs.rs` | Literal porcelain receipts, atomic rollback, exact leases and malformed/lost output |
 | Single-send GitHub effects | `publication_attempt/github/{mutation,transport}.rs` | Literal provider receipts, null/missing/partial effects, no mutation replay |
 | Failure classification and safe context | `publication_attempt/failure.rs` | Typed known/indeterminate outcomes, stage/target escaping and bounded display |
+| Duplicate-key-safe JSON | `json.rs` | Generated duplicate-key and trailing-input cases |
 | Shared bounded HTTP body and diagnostic primitives | `github_http.rs` | Body-limit and safe-text transport contracts |
 | Child ownership | `subprocess/{mod,unix,windows}.rs` | Platform process-group/job lifetime, terminal, cancellation, bounded cleanup fixtures |
 | Factual lifecycle/native reads and inspection | `hosted.rs`, `inspect.rs`, `pre_push/inspection.rs` | Wrong-scope and incomplete-page cases, terminal facts, local read-only CLI/reftable witnesses |

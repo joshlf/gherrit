@@ -9,6 +9,7 @@ pub use hosted_contracts::main as hosted_contracts_main;
 mod identity;
 mod inspect;
 mod install;
+mod json;
 mod manage;
 mod pre_push;
 mod subprocess;

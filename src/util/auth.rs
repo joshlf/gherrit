@@ -12,7 +12,7 @@ pub fn get_github_token() -> Result<String> {
 
     // The API destination is github.com regardless of GH_HOST.
     // Priority 2: gh auth token --hostname github.com
-    let output = crate::pre_push::subprocess::local_output(
+    let output = crate::subprocess::local_output(
         &mut cmd!("gh auth token --hostname github.com"),
         None,
         std::time::Duration::from_secs(30),

@@ -11,7 +11,7 @@ use clap::{Parser, ValueEnum};
 use eyre::{Result, bail, eyre};
 use serde_json::{Value, json};
 
-use crate::{pre_push::json::UniqueJson, subprocess, util};
+use crate::{json::UniqueJson, subprocess, util};
 
 const MAX_REQUESTS: usize = 40;
 #[derive(Clone, Copy, Debug, ValueEnum)]

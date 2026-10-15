@@ -18,10 +18,12 @@ use super::{
     pull_request::{PullRequestIdentity, PullRequestIdentityRegistry},
     transport::{Github, indeterminate_mutation},
 };
-use crate::pre_push::{
-    destination::DefaultBranch,
+use crate::{
     json::UniqueJson,
-    local::{GherritPrId, PullRequestTitle},
+    pre_push::{
+        destination::DefaultBranch,
+        local::{GherritPrId, PullRequestTitle},
+    },
 };
 
 fn owned_base_name(id: &GherritPrId) -> String {

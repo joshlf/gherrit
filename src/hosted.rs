@@ -11,11 +11,7 @@ use eyre::{Result, WrapErr, bail, eyre};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{
-    identity::GherritPrId,
-    pre_push::{json::UniqueJson, subprocess},
-    util,
-};
+use crate::{identity::GherritPrId, json::UniqueJson, subprocess, util};
 
 const MAX_PAGES: usize = 32;
 const MAX_ROWS: usize = 1000;
