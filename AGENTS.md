@@ -48,6 +48,10 @@ It achieves this by:
       pushing, and PR syncing.
     - `manage.rs`: Handles the state of branches (Managed vs Unmanaged) via `git config`.
     - `commit_msg.rs`: Ensures commits have `gherrit-pr-id` trailers.
+- `testutil/src/`: System fixtures. `lib.rs` owns context construction and
+  teardown ordering; private `environment.rs`, `server.rs`, `git_fixture.rs`,
+  `github.rs` and `normalization.rs` own environment discovery, server lifetime,
+  repository setup, GitHub fixture access and snapshot text respectively.
 - `hooks/`: Git hooks (`pre-push`, `commit-msg`, `post-checkout`) that shell out to the `gherrit` binary.
 
 ## Development Workflow
