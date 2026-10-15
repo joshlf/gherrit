@@ -542,8 +542,13 @@ impl Commit {
     fn from_git(c: gix::Commit<'_>, trailers: &[u8]) -> Result<Self> {
         let message = c.message()?;
         let message_title = core::str::from_utf8(message.title)?.to_string();
-        let message_body =
-            message.body.map(|body| core::str::from_utf8(body).unwrap()).unwrap_or("").to_string();
+        let message_body = message
+            .body
+            .map(|body| core::str::from_utf8(body))
+            .transpose()
+            .wrap_err_with(|| format!("Commit {} body is not UTF-8", c.id))?
+            .unwrap_or("")
+            .to_string();
         let gherrit_id = committed_gherrit_id(trailers, c.id)?;
         let message_body = strip_gherrit_id(&message_body, &gherrit_id);
 
