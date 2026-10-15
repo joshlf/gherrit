@@ -7,6 +7,8 @@
 //! durable-effect barrier without the exact acknowledgement required by the
 //! preceding stage.
 
+mod execution;
+
 use color_eyre::eyre::{Result, bail};
 
 #[cfg(test)]
@@ -30,16 +32,13 @@ use super::{
     history::{Revision, ValidatedChangeHistory},
     marker::MarkerTemplate,
     refs::{
-        MarkerTransition, PreparedPushes, PublicBranchTransition, PublicationRevision,
-        TupleTransition, prepare_initial_pushes, prepare_marker_pushes,
+        PreparedPushes, PublicBranchTransition, PublicationRevision, TupleTransition,
+        prepare_initial_pushes,
     },
 };
-use crate::{
-    pre_push::{
-        destination::{DefaultBranch, PushDestination, RemoteBranchState},
-        local::{GherritPrId, LocalChange, LocalStack, PullRequestTitle},
-    },
-    util,
+use crate::pre_push::{
+    destination::{DefaultBranch, PushDestination, RemoteBranchState},
+    local::{GherritPrId, LocalChange, LocalStack, PullRequestTitle},
 };
 
 enum PlannedPublicBranch {
@@ -139,25 +138,6 @@ pub(super) struct PublicationPlan {
     effects: PlannedPublication,
 }
 
-impl PublicationPlan {
-    /// Executes the one fixed publication sequence without reobservation or
-    /// retry. Every later effect remains inaccessible until its preceding
-    /// durable acknowledgement has completed.
-    pub(super) async fn execute(self, repository: &util::Repo) -> Result<()> {
-        let Self { destination, github, effects } = self;
-        if !destination.belongs_to(repository)? {
-            bail!("Publication plan belongs to a different local repository");
-        }
-        effects
-            .execute_with(&mut RemoteEffectDriver {
-                repository,
-                destination: &destination,
-                github: &github,
-            })
-            .await
-    }
-}
-
 /// Performs the externally durable effect kinds for one bound attempt.
 ///
 /// The staged plan, rather than the driver, owns their order and every
@@ -182,55 +162,6 @@ pub(super) trait EffectDriver {
         &mut self,
         projection: PreparedPullRequestProjection,
     ) -> Result<()>;
-}
-
-/// The sole production effect driver, bound to the destination and GitHub
-/// client retained by the complete publication plan.
-struct RemoteEffectDriver<'attempt> {
-    repository: &'attempt util::Repo,
-    destination: &'attempt PushDestination,
-    github: &'attempt Github,
-}
-
-impl EffectDriver for RemoteEffectDriver<'_> {
-    async fn convert_pull_requests_to_draft(
-        &mut self,
-        conversions: PreparedDraftConversions,
-    ) -> Result<()> {
-        self.github.convert_pull_requests_to_draft(conversions).await
-    }
-
-    async fn publish_initial_refs(&mut self, pushes: PreparedPushes) -> Result<()> {
-        pushes.execute(self.destination).await
-    }
-
-    async fn create_pull_requests(
-        &mut self,
-        creates: PreparedCreates,
-    ) -> Result<CompleteCreateReceipts> {
-        self.github.create_pull_requests(creates).await
-    }
-
-    async fn publish_markers(&mut self, markers: Box<[MarkerTemplate]>) -> Result<()> {
-        let markers = markers
-            .into_vec()
-            .into_iter()
-            .map(MarkerTemplate::prepare)
-            .collect::<Result<Vec<_>>>()?;
-        let transitions = markers.iter().map(MarkerTransition::from_prepared).collect::<Vec<_>>();
-        let pushes = prepare_marker_pushes(self.destination, &transitions)?;
-        for marker in markers {
-            marker.materialize(self.repository)?;
-        }
-        pushes.execute(self.destination).await
-    }
-
-    async fn project_pull_requests(
-        &mut self,
-        projection: PreparedPullRequestProjection,
-    ) -> Result<()> {
-        self.github.project_pull_requests(projection).await
-    }
 }
 
 /// One complete staged publication plan before it receives execution
