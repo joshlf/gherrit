@@ -1,0 +1,104 @@
+[
+  {
+    "name": "canonical",
+    "message": "Subject\n\nBody\n\ngherrit-pr-id: Gcase\n",
+    "config": {},
+    "cleanup": "verbatim",
+    "hook_preserves": true,
+    "publication": "ok",
+    "committed": "Subject\n\nBody\n\ngherrit-pr-id: Gcase\n"
+  },
+  {
+    "name": "crlf",
+    "message": "Subject\r\n\r\nBody\r\n\r\ngherrit-pr-id: Gcase\r\n",
+    "config": {},
+    "cleanup": "verbatim",
+    "hook_preserves": true,
+    "publication": "ok",
+    "committed": "Subject\r\n\r\nBody\r\n\r\ngherrit-pr-id: Gcase\r\n"
+  },
+  {
+    "name": "body_lookalike",
+    "message": "Subject\n\ngherrit-pr-id: Gexample\n\nFinal prose paragraph.\n",
+    "config": {},
+    "cleanup": "verbatim",
+    "hook_preserves": false,
+    "publication": "missing",
+    "committed": "Subject\n\ngherrit-pr-id: Gexample\n\nFinal prose paragraph.\n"
+  },
+  {
+    "name": "alias",
+    "message": "Subject\n\ngherrit: Gcase\n",
+    "config": {
+      "trailer.gherrit.key": "gherrit-pr-id"
+    },
+    "cleanup": "verbatim",
+    "hook_preserves": true,
+    "publication": "ok",
+    "committed": "Subject\n\ngherrit: Gcase\n"
+  },
+  {
+    "name": "case_variant",
+    "message": "Subject\n\nGhErRiT-Pr-Id: Gcase\n",
+    "config": {},
+    "cleanup": "verbatim",
+    "hook_preserves": true,
+    "publication": "missing",
+    "committed": "Subject\n\nGhErRiT-Pr-Id: Gcase\n"
+  },
+  {
+    "name": "continuation",
+    "message": "Subject\n\ngherrit-pr-id: Gcase\n continued\n",
+    "config": {},
+    "cleanup": "verbatim",
+    "hook_preserves": true,
+    "publication": "invalid",
+    "committed": "Subject\n\ngherrit-pr-id: Gcase\n continued\n"
+  },
+  {
+    "name": "comment_cleanup",
+    "message": "Subject\n\n; hidden comment\n\ngherrit-pr-id: Gcase\n",
+    "config": {
+      "core.commentChar": ";",
+      "commit.cleanup": "strip"
+    },
+    "cleanup": null,
+    "hook_preserves": true,
+    "publication": "ok",
+    "committed": "Subject\n\ngherrit-pr-id: Gcase\n"
+  },
+  {
+    "name": "whitespace_cleanup",
+    "message": "Subject  \n\nBody  \n\ngherrit-pr-id: Gcase  \n",
+    "config": {
+      "commit.cleanup": "strip"
+    },
+    "cleanup": null,
+    "hook_preserves": true,
+    "publication": "ok",
+    "committed": "Subject\n\nBody\n\ngherrit-pr-id: Gcase\n"
+  },
+  {
+    "name": "duplicate",
+    "message": "Subject\n\ngherrit-pr-id: Gcase\ngherrit-pr-id: Gother\n",
+    "config": {},
+    "cleanup": "verbatim",
+    "hook_preserves": true,
+    "publication": "multiple",
+    "committed": "Subject\n\ngherrit-pr-id: Gcase\ngherrit-pr-id: Gother\n"
+  },
+  {
+    "name": "equals_separator",
+    "message": "Subject\n\ngherrit-pr-id=Gcase\n",
+    "config": {
+      "trailer.separators": "="
+    },
+    "cleanup": "verbatim",
+    "hook_preserves": false,
+    "publication": {
+      "gherrit-pr-id: Gcase\n\n": "ok",
+      "gherrit-pr-id= Gcase\n\n": "missing"
+    },
+    "committed": "Subject\n\ngherrit-pr-id=Gcase\n"
+  }
+]
