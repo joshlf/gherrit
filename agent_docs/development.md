@@ -19,6 +19,9 @@ for the ongoing migration away from broad system fixtures.
 The integration tests use local Git repositories and a local GitHub API stub.
 They do not require GitHub credentials or an authenticated GitHub CLI.
 
+The [resource-policy inventory](resource-policies.md) records existing limits,
+their units and their owning operations. It does not change their values.
+
 ## Rust Version
 
 This project uses the stable Rust toolchain and the 2024 edition. Ensure your
