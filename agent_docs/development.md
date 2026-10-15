@@ -109,3 +109,15 @@ adds a canonical key while preserving ordinary abbreviated trailer keys. If
 configured aliases rewrite those keys into competing identities, the hook
 refuses
 before replacing the original message; remove that alias or use the full key.
+
+## Tokio feature ownership
+
+The runtime uses a current-thread executor. Shipping code directly needs
+`rt`, `time` and `macros`; the test transport server adds `io-util` through a
+dev-dependency. The fixture crate requests its listener, synchronization and
+clock features explicitly. An October 2026 source/resolved-feature audit found
+no Tokio filesystem, standard-I/O, process, signal or multithread-runtime use.
+Those feature edges were removed without changing locked package versions.
+Recheck the executable profiles and all-target suite when adding a new use;
+all-feature compilation alone can hide optional-feature coupling. No build-time
+speedup is claimed by the feature audit.
