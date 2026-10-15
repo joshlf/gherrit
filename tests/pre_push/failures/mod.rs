@@ -79,7 +79,11 @@ fn test_duplicate_stack_ids_fail_before_external_io() {
 
 #[test]
 fn test_unavailable_remote_observation_failure() {
-    let ctx = testutil::test_context!().repository("missing", "repo").with_mock_github().build();
+    let ctx = testutil::test_context!()
+        .repository("missing", "repo")
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
     ctx.commit("Init");
 
     ctx.checkout_managed_private("feature-fail");
@@ -89,11 +93,15 @@ fn test_unavailable_remote_observation_failure() {
     ctx.run_git(&["remote", "add", "broken-remote", "missing/repo.git"]);
     ctx.run_git(&["config", "gherrit.remote", "broken-remote"]);
 
-    testutil::assert_failure_snapshot!(
-        ctx,
-        ctx.hook_cmd("pre-push"),
-        "pre_push_failure_broken_remote"
-    );
+    // Native shell diagnostics vary by platform. Keep the error context and
+    // verify that failed observation cannot lead to publication effects.
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains("[ERROR]").and(predicate::str::contains("broken-remote")));
+    assert!(ctx.recorded_pushes().is_empty());
+    assert!(ctx.github().pull_requests().is_empty());
 }
 
 #[test]
