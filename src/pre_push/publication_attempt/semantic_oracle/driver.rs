@@ -158,6 +158,9 @@ impl<'world> WorldDriver<'world> {
                 return Ok(());
             }
         };
+        if matches!(boundary, CompetitionBoundary::BetweenAliases { .. }) {
+            self.trace.alias_competitions.push(boundary);
+        }
         let mut driver = WorldDriver::new(self.world, interruption);
         let result = Box::pin(plan.execute_with(&mut driver)).await;
         let report = driver.finish(result)?.into_solo();
@@ -244,6 +247,14 @@ impl EffectDriver for WorldDriver<'_> {
                 }
                 exact &= self.apply_effect(ExternalEffect::Draft(operation.clone()))
                     == EffectOutcome::Acknowledged;
+                if alias + 1 < batch.len() {
+                    self.run_competition_at(CompetitionBoundary::BetweenAliases {
+                        stage: EffectStage::Draft,
+                        batch: index,
+                        completed_alias: alias,
+                    })
+                    .await?;
+                }
             }
             for operation in &batch {
                 self.assert_target_draft_safety(ExternalEffect::Draft(operation.clone()).target());
@@ -341,6 +352,14 @@ impl EffectDriver for WorldDriver<'_> {
                 exact &= outcome == EffectOutcome::Acknowledged;
                 if outcome == EffectOutcome::Acknowledged {
                     receipts.push((create.id.clone(), self.world.latest_identity(&create.id)));
+                }
+                if alias + 1 < batch.len() {
+                    self.run_competition_at(CompetitionBoundary::BetweenAliases {
+                        stage: EffectStage::Create,
+                        batch: index,
+                        completed_alias: alias,
+                    })
+                    .await?;
                 }
             }
             for create in &batch {
@@ -467,6 +486,14 @@ impl EffectDriver for WorldDriver<'_> {
                 }
                 exact &= self.apply_effect(ExternalEffect::Projection(operation.clone()))
                     == EffectOutcome::Acknowledged;
+                if alias + 1 < batch.len() {
+                    self.run_competition_at(CompetitionBoundary::BetweenAliases {
+                        stage: EffectStage::Projection,
+                        batch: index,
+                        completed_alias: alias,
+                    })
+                    .await?;
+                }
             }
             for operation in &batch {
                 self.assert_target_draft_safety(

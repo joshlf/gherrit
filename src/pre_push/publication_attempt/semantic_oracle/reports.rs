@@ -65,6 +65,7 @@ pub(super) struct AttemptTrace {
     pub(super) creates: EffectBatches<TestCreate>,
     pub(super) markers: EffectBatches<MarkerEffect>,
     pub(super) projections: EffectBatches<ProjectionEffect>,
+    pub(super) alias_competitions: Vec<CompetitionBoundary>,
 }
 
 impl AttemptTrace {
@@ -74,6 +75,7 @@ impl AttemptTrace {
             && self.creates.is_empty()
             && self.markers.is_empty()
             && self.projections.is_empty()
+            && self.alias_competitions.is_empty()
     }
 }
 
@@ -137,6 +139,8 @@ pub(super) enum CompetitionBoundary {
     AfterCreates,
     AfterMarkers,
     BetweenBatches { stage: EffectStage, completed_batch: usize },
+    // Reached after one indivisible GraphQL alias, before its later sibling.
+    BetweenAliases { stage: EffectStage, batch: usize, completed_alias: usize },
 }
 
 pub(super) enum Competition {

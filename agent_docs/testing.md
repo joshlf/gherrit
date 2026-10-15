@@ -157,9 +157,13 @@ separate: model schedules do not establish provider or OS behavior.
 - Commit cancellation and retention: native Git cleanup matrix,
   `tests/cli/commit_msg.rs::test_commit_msg_hook` plus its neighboring cases.
 
-Between-alias competing requests and non-orphaned shell-job stop/continue need
-additional witnesses. Existing whole-request schedules and isolated PTY tests
-must not be cited as those missing witnesses.
+Between-alias competition now has create, draft-conversion and projection
+witnesses in
+`src/pre_push/publication_attempt/semantic_oracle/scenarios/competition.rs`.
+They retain the primary request while another real consuming plan runs between
+its sibling aliases. The trace records the actual reached alias boundary.
+Non-orphaned shell-job stop/continue still needs a dedicated lifecycle witness;
+isolated PTY tests must not be cited as that missing evidence.
 
 ## Hosted probes
 

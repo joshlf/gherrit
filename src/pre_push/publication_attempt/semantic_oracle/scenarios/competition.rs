@@ -877,3 +877,117 @@ async fn three_retained_publishers_cannot_overwrite_after_revision_aba() {
     );
     assert_quiescent(&mut world, &intent_a, "ABA loser").await;
 }
+
+#[tokio::test]
+async fn competing_create_runs_between_sibling_aliases_before_marker_arbitration() {
+    let intent = two_change_intent();
+    let mut world = DurableWorld::for_intents(oid(10), &[&intent]);
+    for change in intent.iter() {
+        world.publish_for_setup(&change.id, change.desired);
+    }
+    let primary = world.plan(&intent, &QueryVisibility::default()).unwrap();
+    let competing = world.plan(&intent, &QueryVisibility::default()).unwrap();
+    let boundary = CompetitionBoundary::BetweenAliases {
+        stage: EffectStage::Create,
+        batch: 0,
+        completed_alias: 0,
+    };
+    let (primary, competing) =
+        execute_with_competition(&mut world, primary, competing, boundary, None).await.unwrap();
+    assert_eq!(primary.trace.alias_competitions, [boundary]);
+    assert_eq!(primary.trace.creates[0].len(), 2);
+    assert_attempt_outcome!(competing, AttemptOutcome::Acknowledged);
+    assert_attempt_outcome!(primary, AttemptOutcome::Stopped(StopReason::Rejected));
+    assert!(primary.trace.projections.is_empty());
+    assert_eq!(world.published(&intent.first.id).unwrap().marker.unwrap().number().get(), 101);
+    assert_eq!(world.published(&intent.later[0].id).unwrap().marker.unwrap().number().get(), 102);
+    for change in intent.iter() {
+        assert_eq!(world.open_pull_requests(&change.id).count(), 2);
+    }
+    assert_restart_converges(world, &intent, "between-create-aliases").await;
+}
+
+#[tokio::test]
+async fn competing_revision_runs_between_projection_aliases_and_stale_receipt_stops() {
+    let old = two_change_intent();
+    let mut new = old.clone();
+    new.first.desired.head = oid(70);
+    new.first.title = "New root".into();
+    new.later[0].desired = LiteralRevision { head: oid(71), first_parent: oid(70) };
+    new.later[0].title = "New child".into();
+    let mut world = DurableWorld::for_intents(oid(10), &[&old, &new]);
+    for (index, change) in old.iter().enumerate() {
+        world.publish_for_setup(&change.id, change.desired);
+        world.open_for_setup(&change.id, &change.title, "unprojected");
+        world.mark_for_setup(
+            &change.id,
+            change.desired.head,
+            if index == 0 { BaseKind::Default } else { BaseKind::Owned },
+        );
+    }
+    let primary = world.plan(&old, &QueryVisibility::default()).unwrap();
+    let competing = world.plan(&new, &QueryVisibility::default()).unwrap();
+    let boundary = CompetitionBoundary::BetweenAliases {
+        stage: EffectStage::Projection,
+        batch: 0,
+        completed_alias: 0,
+    };
+    let (primary, competing) =
+        execute_with_competition(&mut world, primary, competing, boundary, None).await.unwrap();
+    assert_eq!(primary.trace.alias_competitions, [boundary]);
+    assert_eq!(primary.trace.projections[0].len(), 2);
+    assert_attempt_outcome!(competing, AttemptOutcome::Acknowledged);
+    assert_attempt_outcome!(primary, AttemptOutcome::Stopped(StopReason::Indeterminate));
+    // Receipts detect the stale revision after the second alias applies. The
+    // service does not roll it back: these fields have different last writers.
+    assert_eq!(
+        world.selected_open_pull_request(&old.first.id).unwrap().open_fields().unwrap().title,
+        new.first.title
+    );
+    assert_eq!(
+        world.selected_open_pull_request(&old.later[0].id).unwrap().open_fields().unwrap().title,
+        old.later[0].title
+    );
+    assert_restart_converges(world, &new, "between-projection-aliases").await;
+}
+
+#[tokio::test]
+async fn competing_publication_runs_between_draft_aliases_before_primary_git() {
+    let intent = many_bounded_ids_intent(3, 8);
+    let prior = intent
+        .later
+        .iter()
+        .enumerate()
+        .map(|(index, change)| {
+            root_intent(
+                oid(1),
+                change.id.as_str(),
+                LiteralRevision { head: oid(90 + index as u16), first_parent: oid(1) },
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut intents = vec![&intent];
+    intents.extend(prior.iter());
+    let mut world = DurableWorld::for_intents(oid(1), &intents);
+    for old in &prior {
+        world.publish_for_setup(&old.first.id, old.first.desired);
+        world.open_for_setup(&old.first.id, &old.first.title, "old root");
+        world.mark_ready_on_default_for_setup(&old.first.id, old.first.desired.head);
+    }
+    let primary = world.plan(&intent, &QueryVisibility::default()).unwrap();
+    let competing = world.plan(&intent, &QueryVisibility::default()).unwrap();
+    let boundary = CompetitionBoundary::BetweenAliases {
+        stage: EffectStage::Draft,
+        batch: 0,
+        completed_alias: 0,
+    };
+    let (primary, competing) =
+        execute_with_competition(&mut world, primary, competing, boundary, None).await.unwrap();
+    assert_eq!(primary.trace.alias_competitions, [boundary]);
+    assert_eq!(primary.trace.draft_conversions[0].len(), 2);
+    assert_attempt_outcome!(competing, AttemptOutcome::Acknowledged);
+    assert_attempt_outcome!(primary, AttemptOutcome::Stopped(StopReason::Indeterminate));
+    assert!(primary.trace.initial_refs.is_empty());
+    assert!(primary.trace.creates.is_empty() && primary.trace.markers.is_empty());
+    assert_restart_converges(world, &intent, "between-draft-aliases").await;
+}
