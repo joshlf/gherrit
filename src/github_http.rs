@@ -2,6 +2,8 @@
 use std::fmt;
 
 use http_body_util::{BodyExt, LengthLimitError, Limited};
+
+pub(crate) use crate::diagnostic::detail as diagnostic_detail;
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum GraphqlBodyError {
     ExceededLimit,
@@ -34,21 +36,6 @@ where
             GraphqlBodyError::Read(diagnostic_detail(&error.to_string()))
         }
     })
-}
-
-pub(crate) fn diagnostic_detail(value: &str) -> String {
-    const MAX_BYTES: usize = 160;
-
-    let mut rendered = String::new();
-    for character in value.chars() {
-        let escaped = character.escape_default().to_string();
-        if rendered.len() + escaped.len() > MAX_BYTES {
-            rendered.push('…');
-            break;
-        }
-        rendered.push_str(&escaped);
-    }
-    rendered
 }
 
 /// A successful HTTP envelope can still carry GraphQL errors. A successful

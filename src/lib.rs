@@ -1,4 +1,5 @@
 mod commit_msg;
+mod diagnostic;
 mod github_http;
 mod hosted;
 #[cfg(feature = "hosted-contracts")]

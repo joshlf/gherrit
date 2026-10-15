@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::diagnostic::detail as safe;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Outcome {
     BeforeSend,
@@ -64,19 +66,6 @@ pub(super) fn contextualize(
         failure.targets = targets.to_vec();
     }
     error
-}
-
-fn safe(value: &str) -> String {
-    let mut output = String::new();
-    for character in value.chars() {
-        let escaped = character.escape_default().to_string();
-        if output.len() + escaped.len() > 160 {
-            output.push('…');
-            break;
-        }
-        output.push_str(&escaped);
-    }
-    output
 }
 
 #[cfg(test)]
