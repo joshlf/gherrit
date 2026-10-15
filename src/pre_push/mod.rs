@@ -43,7 +43,7 @@ use batching::{
     BatchPlan, INITIAL_GRAPHQL_BATCH_LEN, MAX_GRAPHQL_QUERY_BYTES, ResponseDisposition,
     classify_response, query_exceeds_limit,
 };
-use body::{PrBody, gherrit_pr_id_re};
+use body::PrBody;
 use github::{
     BatchedOperation, CreatePullRequest, CreatedPullRequest, FindPullRequest,
     PullRequest as PrState, RepositoryIdQuery, UpdatePullRequest, batch_document,
@@ -55,6 +55,8 @@ use reconcile::{
     plan_update,
 };
 use remote::observe_managed_branches;
+
+use crate::commit_message::strip_gherrit_id;
 
 #[derive(Eq, PartialEq)]
 pub(crate) enum GithubEndpoint {
@@ -563,29 +565,6 @@ fn committed_gherrit_id(trailers: &[u8], object_id: ObjectId) -> Result<String> 
         bail!("Commit {} has invalid gherrit-pr-id trailer", object_id);
     }
     Ok(str::from_utf8(gherrit_id)?.to_string())
-}
-
-fn strip_gherrit_id(body: &str, id: &str) -> String {
-    let trailer_start = body
-        .rfind("\n\n")
-        .map(|position| position + 2)
-        .into_iter()
-        .chain(body.rfind("\r\n\r\n").map(|position| position + 4))
-        .max()
-        .unwrap_or(0);
-    let matching_trailer = gherrit_pr_id_re()
-        .captures_iter(&body[trailer_start..])
-        .filter(|captures| captures.get(1).is_some_and(|value| value.as_str() == id))
-        .filter_map(|captures| captures.get(0))
-        .last();
-    let Some(trailer) = matching_trailer else {
-        return body.to_string();
-    };
-
-    let mut body = body.to_string();
-    let range = trailer.range();
-    body.replace_range(trailer_start + range.start..trailer_start + range.end, "");
-    body
 }
 
 /// A request to create a new PR in a batch.
