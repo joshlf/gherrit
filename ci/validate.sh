@@ -7,7 +7,15 @@ cd "$(dirname "$0")/.."
 
 check() {
   case "$1" in
-    production) cargo check --workspace --all-targets --locked ;;
+    production)
+      check profiles
+      cargo check --workspace --all-targets --locked
+      ;;
+    profiles)
+      cargo check -p gherrit --lib --bin gherrit --no-default-features --locked
+      cargo check -p gherrit --bin gherrit-test-driver --no-default-features --features test-driver --locked
+      cargo check -p gherrit --bin gherrit-hosted-contracts --no-default-features --features hosted-contracts --locked
+      ;;
     fmt) cargo +nightly fmt --all -- --check ;;
     lint) cargo clippy --workspace --all-targets --all-features --locked -- -D warnings ;;
     tests) cargo test --workspace --all-targets --all-features --locked ;;
@@ -22,7 +30,7 @@ check() {
       for step in production fmt lint tests doc markers; do check "$step"; done
       ;;
     *)
-      echo "Usage: ci/validate.sh [all|production|fmt|lint|tests|doc|markers|unit|semantic|adapters|hooks|cli]" >&2
+      echo "Usage: ci/validate.sh [all|production|profiles|fmt|lint|tests|doc|markers|unit|semantic|adapters|hooks|cli]" >&2
       return 2
       ;;
   esac

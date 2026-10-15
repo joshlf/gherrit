@@ -25,12 +25,17 @@ Ubuntu CI job. Set `RUSTUP_TOOLCHAIN=1.89.0` to reproduce its declared version.
 The formatter still uses nightly. The Windows job retains its native test
 invocation.
 
-For focused feedback, select `production`, `fmt`, `lint`, `unit`, `semantic`,
+For focused feedback, select `production`, `profiles`, `fmt`, `lint`, `unit`, `semantic`,
 `adapters`, `hooks`, `cli`, `doc`, or `markers`. `unit` includes all library
 tests; `semantic` selects the durable recovery model; `adapters` selects the
 pre-push integration target; `hooks` and `cli` select complete process tests.
 These commands do not replace the full validation required for submission.
 
+
+The `profiles` check compiles shipping lib/binary, test-driver-only binary and
+hosted-contracts-only binary independently. `production` includes these checks
+before the existing workspace/all-target check. Runtime tests still use all
+features; this does not multiply the runtime suite across profiles.
 
 The `test-driver` feature builds a separate, non-shipping process adapter for
 system tests. The production `gherrit` binary never reads test endpoints,
