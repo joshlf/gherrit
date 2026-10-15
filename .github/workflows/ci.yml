@@ -55,6 +55,9 @@ jobs:
           ci/validate.sh tests
           ci/validate.sh doc
 
+      - name: Check documentation navigation
+        run: ci/validate.sh navigation
+
       - name: Check task markers
         run: ci/validate.sh markers
 
