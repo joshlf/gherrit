@@ -20,6 +20,7 @@ mod body;
 mod github;
 mod publication;
 mod reconcile;
+mod refs;
 mod remote;
 
 use batching::{
@@ -301,7 +302,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
         // Persist the local tags now that the push succeeded.
         for tag in plan.persisted_tags {
             let _ = repo.reference(
-                format!("refs/tags/gherrit/{}/v{}", tag.gherrit_id, tag.version),
+                refs::version_tag(&tag.gherrit_id, tag.version),
                 tag.object_id,
                 PreviousValue::Any,
                 "gherrit: persist local version state",
@@ -313,7 +314,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
 }
 
 fn get_local_version(repo: &util::Repo, gherrit_id: &str) -> Result<usize> {
-    let prefix = format!("refs/tags/gherrit/{}/v", gherrit_id);
+    let prefix = refs::version_tag_prefix(gherrit_id);
     let mut max_ver = 0;
 
     // Use .all() and manual filtering to avoid `prefixed` API type issues.

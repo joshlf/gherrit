@@ -3,7 +3,7 @@ use std::collections::{HashMap, hash_map::Entry};
 use color_eyre::eyre::{Context as _, Result, bail};
 use gix::ObjectId;
 
-use super::publication::remote_query_batches;
+use super::{publication::remote_query_batches, refs};
 use crate::util::{self, CommandExt as _};
 
 /// Observes the managed branches relevant to the current stack.
@@ -13,7 +13,7 @@ pub(super) fn observe_managed_branches(
 ) -> Result<HashMap<String, String>> {
     remote_query_batches(gherrit_ids).try_fold(HashMap::new(), |mut states, chunk| {
         let mut arguments = vec!["ls-remote".to_string(), repo.default_remote_name()];
-        arguments.extend(chunk.iter().map(|id| format!("refs/heads/{id}")));
+        arguments.extend(chunk.iter().map(|id| refs::head(id)));
 
         let output = util::cmd("git", arguments).checked_output()?;
 
@@ -44,10 +44,8 @@ fn parse_managed_branches(
     output: &[u8],
     requested_ids: &[String],
 ) -> Result<HashMap<String, String>> {
-    let requested_refs = requested_ids
-        .iter()
-        .map(|id| (format!("refs/heads/{id}").into_bytes(), id))
-        .collect::<HashMap<_, _>>();
+    let requested_refs =
+        requested_ids.iter().map(|id| (refs::head(id).into_bytes(), id)).collect::<HashMap<_, _>>();
     if output.is_empty() {
         return Ok(HashMap::new());
     }
