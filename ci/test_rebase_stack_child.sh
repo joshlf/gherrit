@@ -18,7 +18,14 @@ printf 'gh' >>"$TRACE"
 printf '\t%s' "$@" >>"$TRACE"
 printf '\n' >>"$TRACE"
 if [[ $1 == pr && $2 == list ]]; then
-  printf '%s\n' "${FAKE_PR_NUMBER-17}"
+  if [[ -n ${FAKE_PR_JSON-} ]]; then
+    printf '%s\n' "$FAKE_PR_JSON"
+  elif [[ -n ${FAKE_PR_NUMBER-17} ]]; then
+    jq -n --arg head "$6" --argjson number "${FAKE_PR_NUMBER-17}" \
+      '[{number:$number, headRefName:$head, isCrossRepository:false, headRepository:{nameWithOwner:"owner/repo"}}]'
+  else
+    echo '[]'
+  fi
 fi
 EOF
 
@@ -47,6 +54,8 @@ run_action() {
   env -i \
     "PATH=$fake_bin:$PATH" \
     "ACTION_PATH=$root" \
+    "GITHUB_REPOSITORY=owner/repo" \
+    "FAKE_PR_JSON=${4-}" \
     "MERGED_PR_BODY=$body" \
     "TRACE=$trace" \
     "FAKE_PR_NUMBER=$pr_number" \
@@ -71,11 +80,11 @@ assert_trace ''
 
 : >"$trace"
 run_action "$(metadata '"Gchild"')"
-expected=$'gh\tpr\tlist\t--head\tGchild\t--json\tnumber\t--jq\t.[0].number\n'
+expected=$'gh\tpr\tlist\t--repo\towner/repo\t--head\tGchild\t--limit\t100\t--json\tnumber,headRefName,isCrossRepository,headRepository\n'
 expected+=$'git\tconfig\tuser.name\tgithub-actions[bot]\n'
 expected+=$'git\tconfig\tuser.email\t41898282+github-actions[bot]@users.noreply.github.com\n'
-expected+=$'gh\tpr\tcheckout\t17\n'
-expected+=$'gh\tpr\tedit\t17\t--base\tmain\n'
+expected+=$'gh\tpr\tcheckout\t17\t--repo\towner/repo\n'
+expected+=$'gh\tpr\tedit\t17\t--repo\towner/repo\t--base\tmain\n'
 expected+=$'git\trebase\torigin/main\n'
 expected+=$'git\tpush\t--force-with-lease'
 assert_trace "$expected"
@@ -85,17 +94,31 @@ if run_action "$(metadata '"Gmissing"')" ''; then
   echo "expected a missing child PR to fail" >&2
   exit 1
 fi
-assert_trace $'gh\tpr\tlist\t--head\tGmissing\t--json\tnumber\t--jq\t.[0].number'
+assert_trace $'gh\tpr\tlist\t--repo\towner/repo\t--head\tGmissing\t--limit\t100\t--json\tnumber,headRefName,isCrossRepository,headRepository'
 
 : >"$trace"
 if run_action "$(metadata '"Gconflict"')" 42 1; then
   echo "expected a rebase conflict to fail" >&2
   exit 1
 fi
-expected=$'gh\tpr\tlist\t--head\tGconflict\t--json\tnumber\t--jq\t.[0].number\n'
+expected=$'gh\tpr\tlist\t--repo\towner/repo\t--head\tGconflict\t--limit\t100\t--json\tnumber,headRefName,isCrossRepository,headRepository\n'
 expected+=$'git\tconfig\tuser.name\tgithub-actions[bot]\n'
 expected+=$'git\tconfig\tuser.email\t41898282+github-actions[bot]@users.noreply.github.com\n'
-expected+=$'gh\tpr\tcheckout\t42\n'
-expected+=$'gh\tpr\tedit\t42\t--base\tmain\n'
+expected+=$'gh\tpr\tcheckout\t42\t--repo\towner/repo\n'
+expected+=$'gh\tpr\tedit\t42\t--repo\towner/repo\t--base\tmain\n'
 expected+=$'git\trebase\torigin/main'
 assert_trace "$expected"
+
+# Ambiguity and wrong-repository observations must stop before Git or PR edits.
+for rows in \
+  '[{"number":17},{"number":18}]' \
+  '[{"number":17,"headRefName":"Gchild","isCrossRepository":true,"headRepository":{"nameWithOwner":"fork/repo"}}]' \
+  '[{"number":17,"headRefName":"Gother","isCrossRepository":false,"headRepository":{"nameWithOwner":"owner/repo"}}]' \
+  '[{"number":17,"headRefName":"Gchild","isCrossRepository":false,"headRepository":{"nameWithOwner":"other/repo"}}]'; do
+  : >"$trace"
+  if run_action "$(metadata '"Gchild"')" 17 0 "$rows"; then
+    echo "expected invalid child observation to fail" >&2
+    exit 1
+  fi
+  assert_trace $'gh\tpr\tlist\t--repo\towner/repo\t--head\tGchild\t--limit\t100\t--json\tnumber,headRefName,isCrossRepository,headRepository'
+done

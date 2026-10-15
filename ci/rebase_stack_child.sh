@@ -17,21 +17,30 @@ fi
 
 echo "Merged PR indicates next child is ID: $child_id"
 
-# GHerrit branches use the stable ID as their exact name.
-child_pr=$(gh pr list --head "$child_id" --json number --jq '.[0].number')
-if [[ -z $child_pr ]]; then
-  echo "Error: Metadata says child is $child_id, but no open PR exists for branch '$child_id'."
-  echo "The chain might be broken or the child was deleted."
-  exit 1
-fi
+# Bind lookup and subsequent PR operations to the workflow repository.
+repository=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required for stack advancement}
+child_prs=$(gh pr list --repo "$repository" --head "$child_id" --limit 100 \
+  --json number,headRefName,isCrossRepository,headRepository)
+child_pr=$(jq -er --arg repository "$repository" --arg child "$child_id" '
+  if type != "array" or length != 1 then
+    error("Expected exactly one open child PR")
+  elif (.[0] | .isCrossRepository == false
+      and .headRefName == $child
+      and ((.headRepository.nameWithOwner | ascii_downcase) == ($repository | ascii_downcase))
+      and (.number | type == "number") and .number > 0
+      and .number == (.number | floor)) then
+    .[0].number
+  else error("Child PR does not match the repository and managed head")
+  end
+' <<<"$child_prs")
 
 echo "Identified Child PR: #$child_pr"
 
 git config user.name "github-actions[bot]"
 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-gh pr checkout "$child_pr"
-gh pr edit "$child_pr" --base main
+gh pr checkout "$child_pr" --repo "$repository"
+gh pr edit "$child_pr" --repo "$repository" --base main
 
 if ! git rebase origin/main; then
   echo "::error::Rebase conflict for PR #$child_pr. Manual intervention required."
