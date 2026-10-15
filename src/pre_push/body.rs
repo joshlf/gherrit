@@ -30,7 +30,7 @@ enum HistoryTableFormat {
 
 impl PrBody<'_> {
     pub fn render(&self) -> String {
-        let format = if self.rendered_len(HistoryTableFormat::Full) > MAX_BODY_SIZE_BYTES {
+        let format = if self.exceeds_body_limit() {
             HistoryTableFormat::Sparse
         } else {
             HistoryTableFormat::Full
@@ -39,10 +39,16 @@ impl PrBody<'_> {
         self.render_with_history(format)
     }
 
+    fn exceeds_body_limit(&self) -> bool {
+        let mut size = ByteCounter { bytes: 0, limit: MAX_BODY_SIZE_BYTES };
+        self.write(&mut size, HistoryTableFormat::Full).is_err()
+    }
+
+    #[cfg(test)]
     fn rendered_len(&self, format: HistoryTableFormat) -> usize {
-        let mut size = ByteCounter(0);
+        let mut size = ByteCounter { bytes: 0, limit: usize::MAX };
         self.write(&mut size, format).expect("counting rendered PR body bytes cannot fail");
-        size.0
+        size.bytes
     }
 
     fn render_with_history(&self, format: HistoryTableFormat) -> String {
@@ -197,11 +203,17 @@ fn metadata_comment(id: &str, parent: Option<&str>, child: Option<&str>) -> Stri
     format!("<!-- gherrit-meta: {metadata} -->")
 }
 
-struct ByteCounter(usize);
+struct ByteCounter {
+    bytes: usize,
+    limit: usize,
+}
 
 impl Write for ByteCounter {
     fn write_str(&mut self, value: &str) -> fmt::Result {
-        self.0 += value.len();
+        if value.len() > self.limit.saturating_sub(self.bytes) {
+            return Err(fmt::Error);
+        }
+        self.bytes += value.len();
         Ok(())
     }
 }
@@ -233,6 +245,14 @@ mod tests {
             parent_id,
             child_id,
         }
+    }
+
+    #[test]
+    fn counting_stops_at_the_byte_threshold() {
+        let mut counter = ByteCounter { bytes: 0, limit: 4 };
+        counter.write_str("éé").unwrap();
+        assert!(counter.write_str("x").is_err());
+        assert_eq!(counter.bytes, 4);
     }
 
     #[test]
