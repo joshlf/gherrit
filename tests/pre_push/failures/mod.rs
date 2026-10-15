@@ -15,6 +15,7 @@ fn stack_with_raw_commit_message(message: &str) -> testutil::TestContext {
 fn assert_identity_failure_before_external_io(ctx: testutil::TestContext, diagnostic: &str) {
     ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(diagnostic));
 
+    assert_eq!(ctx.github().http_arrivals(), 0);
     assert!(ctx.github().requests().is_empty());
     assert!(ctx.recorded_pushes().is_empty());
 }
@@ -73,6 +74,7 @@ fn test_duplicate_stack_ids_fail_before_external_io() {
         .failure()
         .stderr(predicate::str::contains("multiple commits with gherrit-pr-id 'Gduplicate'"));
 
+    assert_eq!(ctx.github().http_arrivals(), 0);
     assert!(ctx.github().requests().is_empty());
     assert!(ctx.recorded_pushes().is_empty());
 }
@@ -227,6 +229,47 @@ fn non_utf8_committed_body_is_an_error_before_publication() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains(format!("Commit {} body is not UTF-8", oid.trim())));
+    assert_eq!(ctx.github().http_arrivals(), 0);
     assert!(ctx.github().requests().is_empty());
     assert!(ctx.recorded_pushes().is_empty());
+}
+
+#[test]
+fn malformed_graphql_is_recorded_before_schema_decoding() {
+    let ctx = testutil::test_context!().with_mock_github().build();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let _entered = runtime.enter();
+    let client = octocrab::Octocrab::builder()
+        .personal_token("fixture-token".to_string())
+        .base_uri(ctx.mock_server_url())
+        .unwrap()
+        .build()
+        .unwrap();
+    let response: Result<serde_json::Value, _> =
+        runtime.block_on(client.graphql(&serde_json::json!({
+            "query": "query { fieldThatDoesNotExist }"
+        })));
+    assert!(response.is_err());
+    assert_eq!(ctx.github().http_arrivals(), 1);
+    assert!(ctx.github().requests().is_empty());
+}
+
+#[test]
+fn invalid_json_http_arrives_before_extractor_rejection() {
+    use std::{
+        io::{Read as _, Write as _},
+        time::Duration,
+    };
+    let ctx = testutil::test_context!().with_mock_github().build();
+    let address = ctx.mock_server_url().strip_prefix("http://").unwrap().parse().unwrap();
+    let mut socket =
+        std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    socket.write_all(b"POST /graphql HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{").unwrap();
+    let mut response = String::new();
+    socket.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert_eq!(ctx.github().http_arrivals(), 1);
+    assert!(ctx.github().requests().is_empty());
 }
