@@ -2,6 +2,8 @@ use std::slice;
 
 use gix::ObjectId;
 
+use super::refs;
+
 // Windows command lines are limited to roughly 32 KiB. Each target contributes
 // about 200 characters of branch and tag refspecs, so 80 targets leave ample
 // headroom.
@@ -39,8 +41,8 @@ pub(super) fn remote_query_batches<T>(items: &[T]) -> slice::Chunks<'_, T> {
 pub(super) fn plan_push(remote: &str, targets: &[PushTarget<'_>]) -> PushPlan {
     assert!(!targets.is_empty(), "cannot plan an empty push");
     let refspecs = targets.iter().flat_map(|target| {
-        let branch = format!("refs/heads/{}", target.gherrit_id);
-        let tag = format!("refs/tags/gherrit/{}/v{}", target.gherrit_id, target.version);
+        let branch = refs::head(target.gherrit_id);
+        let tag = refs::version_tag(target.gherrit_id, target.version);
         // Branch updates are leased against the observed remote value. A tag
         // lease with an empty expected value requires that the version tag not
         // exist, making it a lock rather than an overwrite.
