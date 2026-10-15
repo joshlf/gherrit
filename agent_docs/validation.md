@@ -26,7 +26,7 @@ The formatter still uses nightly. The Windows job retains its native test
 invocation.
 
 For focused feedback, select `production`, `profiles`, `fmt`, `lint`, `unit`,
-`adapters`, `hooks`, `cli`, `doc`, `markers`, `navigation`, or `action`.
+`adapters`, `hooks`, `cli`, `doc`, `markers`, `navigation`, `action`, or `devtools`.
 `unit` includes all library tests; `adapters` selects the pre-push integration
 target; `hooks` and `cli` select complete process tests.
 These commands do not replace the full validation required for submission.
