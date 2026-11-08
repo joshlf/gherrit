@@ -72,8 +72,7 @@ use github::{
 use identity::ChangeId;
 use publication::{PushTarget, Version, plan_push, push_batches};
 use reconcile::{
-    CurrentPr, DesiredPr, PrUpdate, PullRequestState, ensure_pull_requests_open, link_stack,
-    plan_update,
+    CurrentPr, DesiredPr, PrUpdate, ensure_pull_requests_open, link_stack, plan_update,
 };
 use remote::observe_managed_branches;
 
@@ -516,93 +515,82 @@ async fn sync_prs(
 
     let commits = link_stack(base_branch, commits, |entry| entry.commit.gherrit_id.to_string());
 
-    enum PrResolution {
-        Existing(PrState),
-        ToCreate(BatchCreate),
-    }
-
     let prs_by_head = pull_requests_by_head(&prs);
 
-    // 1. Identify existing PRs or queue for creation
+    // Keep one slot per commit. Request a new PR only for an empty slot. For
+    // existing PRs, keep using the first match in the index.
     let resolutions: Vec<_> = commits
         .iter()
         .map(|entry| {
             let c = &entry.item.commit;
-
             if let Some(&pr) = prs_by_head.get(c.gherrit_id.as_str()) {
                 log::debug!("Found existing PR #{} for {}", pr.number.green().bold(), c.gherrit_id);
-                PrResolution::Existing(pr.clone())
+                Some(pr.clone())
             } else {
                 log::debug!("No GitHub PR exists for {}; queuing creation...", c.gherrit_id);
-                PrResolution::ToCreate(BatchCreate {
-                    title: c.message_title.clone(),
-                    body: c.message_body.clone(),
-                    base_branch: entry.base_branch.clone(),
-                    head_branch: c.gherrit_id.to_string(),
-                })
+                None
             }
         })
         .collect();
 
-    // Create PRs with the plain commit body first. Full descriptions need all
-    // the returned PR numbers, including those of other PRs in the stack. If a
-    // later update fails, new PRs may keep their initial descriptions. Creating
-    // PRs and writing their full descriptions are separate operations.
-    let creations = resolutions
-        .iter()
-        .filter_map(|resolution| match resolution {
-            PrResolution::ToCreate(create) => Some(create),
-            PrResolution::Existing(_) => None,
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let num_creations = creations.len();
-    let new_prs = if !creations.is_empty() {
+    // Create PRs with the plain commit body first. Full descriptions need every
+    // PR number, so writing them remains a separate step.
+    let num_creations = resolutions.iter().filter(|state| state.is_none()).count();
+    let created = if num_creations != 0 {
         log::info!("Creating {num_creations} PRs...");
         let repo_id = fetch_repo_id(octocrab, &remote).await?;
-        let created = batch_create_prs(octocrab, &repo_id, creations).await?;
-        assert_eq!(created.len(), num_creations);
+        let requests = commits.iter().zip(&resolutions).filter(|(_, state)| state.is_none()).map(
+            |(entry, _)| {
+                let c = &entry.item.commit;
+                CreatePullRequest::new(
+                    repo_id.clone(),
+                    entry.base_branch.clone(),
+                    c.gherrit_id.to_string(),
+                    c.message_title.clone(),
+                    c.message_body.clone(),
+                )
+            },
+        );
+        let created = run_batched_graphql(octocrab, requests).await?;
+        if created.len() != num_creations {
+            bail!(
+                "GitHub creation results did not match the requested PR count; PRs may have been created"
+            );
+        }
         log::info!("Created {num_creations} PRs.");
         created
     } else {
-        HashMap::new()
+        Vec::new()
     };
 
-    // 3. Resolve final PR states
-    //
-    // We zip commits with resolutions. Since resolutions were built in order,
-    // they match perfectly.
-    let commit_pr_states = commits
-        .iter()
-        .zip(resolutions)
-        .map(|(entry, resolution)| {
-            let pr_state = match resolution {
-                PrResolution::Existing(state) => state,
-                PrResolution::ToCreate(create) => {
-                    let created = new_prs.get(&create.head_branch).ok_or_else(|| {
-                        eyre::eyre!("Failed to resolve created PR for {}", create.head_branch)
-                    })?;
-                    log::info!(
-                        "Created PR #{}: {}",
-                        created.number.green().bold(),
-                        created.url.blue().underline()
+    // The decoder matches aliases to requests and returns results in request
+    // order. Use each new PR once, in the order of the empty slots. Its decoded
+    // result already has the request details, so we need neither a head-keyed
+    // map nor another copy of those details to fill the slot.
+    let mut created = created.into_iter();
+    let mut commit_pr_states = Vec::with_capacity(commits.len());
+    for (entry, existing) in commits.iter().zip(resolutions) {
+        let state = match existing {
+            Some(state) => state,
+            None => {
+                let id = &entry.item.commit.gherrit_id;
+                let CreatedPullRequest { pull_request, url } =
+                    created.next().ok_or_else(|| eyre!("Failed to resolve created PR for {id}"))?;
+                if pull_request.head_branch != id.as_str() {
+                    bail!(
+                        "Created PR response did not match requested head '{id}'; PRs may have been created"
                     );
-                    PrState {
-                        number: created.number,
-                        node_id: created.node_id.clone(),
-                        title: Some(create.title),
-                        body: Some(create.body),
-                        base_branch: create.base_branch,
-                        head_branch: create.head_branch,
-                        // NOTE: We assume that newly-created PRs are in the
-                        // OPEN state.
-                        state: PullRequestState::Open,
-                    }
                 }
-            };
-            Ok((entry, pr_state))
-        })
-        .collect::<Result<Vec<_>>>()?;
+                log::info!(
+                    "Created PR #{}: {}",
+                    pull_request.number.green().bold(),
+                    url.blue().underline()
+                );
+                pull_request
+            }
+        };
+        commit_pr_states.push((entry, state));
+    }
 
     let repo_url = remote.repo_url_relative();
     let stack_pr_numbers =
@@ -726,15 +714,6 @@ fn committed_gherrit_id(trailers: &[u8], object_id: ObjectId) -> Result<ChangeId
         .ok_or_else(|| eyre!("Commit {} has invalid gherrit-pr-id trailer", object_id))
 }
 
-/// A request to create a new PR in a batch.
-#[derive(Clone)]
-struct BatchCreate {
-    title: String,
-    body: String,
-    base_branch: String,
-    head_branch: String,
-}
-
 /// Fetches the repository's global node ID.
 ///
 /// GraphQL `createPullRequest` needs this ID, such as `R_kgDOL...`, in its
@@ -767,38 +746,6 @@ async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<PrUpdate>) -> Result
     });
     run_batched_graphql(octocrab, updates).await?;
     Ok(())
-}
-
-/// Creates PRs in batches through GitHub's GraphQL API.
-///
-/// Creations are grouped to reduce requests, with batches shrinking on the
-/// recognized resource-limit responses. The returned map is keyed by head
-/// branch.
-///
-/// # Errors
-///
-/// Returns an error if a request or response decoding fails, or a single
-/// operation still exceeds the limits. PRs created by earlier batches still
-/// exist if a later request fails.
-async fn batch_create_prs(
-    octocrab: &Octocrab,
-    repo_id: &str,
-    creations: impl IntoIterator<Item = BatchCreate>,
-) -> Result<HashMap<String, CreatedPullRequest>> {
-    let creations = creations.into_iter().map(|create| {
-        CreatePullRequest::new(
-            repo_id.to_string(),
-            create.base_branch,
-            create.head_branch,
-            create.title,
-            create.body,
-        )
-    });
-    Ok(run_batched_graphql(octocrab, creations)
-        .await?
-        .into_iter()
-        .map(|created| (created.head_branch.clone(), created))
-        .collect())
 }
 
 async fn batch_fetch_prs(
