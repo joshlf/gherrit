@@ -10,6 +10,8 @@ mod tests {
     fn private_api_contracts() {
         let cases = trybuild::TestCases::new();
         cases.pass("tests/ui/batch-valid.rs");
+        cases.pass("tests/ui/identity-valid.rs");
+        cases.compile_fail("tests/ui/identity-forged-invalid.rs");
         cases.compile_fail("tests/ui/batch-overlap-invalid.rs");
         cases.compile_fail("tests/ui/batch-forged-invalid.rs");
         cases.compile_fail("tests/ui/batch-reuse-accept-invalid.rs");
