@@ -1,3 +1,9 @@
+//! GraphQL documents and the response shapes needed by the publisher.
+//!
+//! Each operation carries the context needed to interpret its own response.
+//! The orchestrator owns authentication, transport, batching, and effect order;
+//! decoding an acknowledgement here does not re-read the resulting PR state.
+
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -53,6 +59,9 @@ pub(super) trait BatchedOperation {
 
 /// Builds the exact GraphQL document sent for one adaptive batch.
 pub(super) fn batch_document<O: BatchedOperation>(operations: &[O]) -> String {
+    // Aliases identify positions within this request, not global PR identity.
+    // The decoder uses the same operation slice to bind each result back to
+    // the operation that supplied its branch name and other request context.
     let body = operations
         .iter()
         .enumerate()
@@ -156,6 +165,9 @@ impl BatchedOperation for FindPullRequest {
 
     fn document(&self) -> String {
         let connection = |alias: &str, states: &str| {
+            // Separate connections keep old closed PRs from crowding a live
+            // PR out of one bounded result page. Values are JSON-escaped
+            // GraphQL strings, never interpolated as unquoted query syntax.
             format!(
                 "{alias}: pullRequests(headRefName: {}, first: {MAX_PULL_REQUEST_CANDIDATES}, states: {states}) {{ nodes {{ number, id, title, body, baseRefName, state, isCrossRepository }} pageInfo {{ hasNextPage }} }}",
                 json!(self.head_branch),
@@ -206,6 +218,9 @@ impl BatchedOperation for FindPullRequest {
         let response: Response = serde_json::from_value(response)
             .wrap_err("Failed to decode pull request query response")?;
         let select = |kind: &str, pull_requests: PullRequests| -> Result<Option<Node>> {
+            // A fork can use the same head name. Only same-repository PRs
+            // identify our managed branch, and a truncated or ambiguous set
+            // cannot establish that no matching PR exists.
             let mut candidates = pull_requests
                 .nodes
                 .into_iter()
@@ -349,6 +364,8 @@ impl BatchedOperation for UpdatePullRequest {
 
     fn document(&self) -> String {
         let fields = std::iter::once(("pullRequestId", &self.node_id))
+            // None means omit the input field, not send null or clear it.
+            // In particular, a no-op base edit is not safe for merge-queue PRs.
             .chain(self.base_branch.as_ref().map(|value| ("baseRefName", value)))
             .chain(self.title.as_ref().map(|value| ("title", value)))
             .chain(self.body.as_ref().map(|value| ("body", value)))
@@ -365,6 +382,9 @@ impl BatchedOperation for UpdatePullRequest {
                 self.node_id
             );
         }
+        // No clientMutationId was sent, so null is a valid returned value.
+        // Require the selected field to be present with its expected shape;
+        // that checks the acknowledgement, not the PR's final metadata.
         let acknowledgement = response.as_object().ok_or_else(|| eyre!(
             "Unusable update acknowledgement for PR '{}': expected an object; the mutation may have applied", self.node_id))?;
         let mutation_id = acknowledgement.get("clientMutationId").ok_or_else(|| eyre!(

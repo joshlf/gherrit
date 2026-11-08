@@ -1,3 +1,9 @@
+//! Pure PR policy: lifecycle admission, stack adjacency, and changed fields.
+//!
+//! Inputs are observations and local intent. These functions make no network
+//! requests and do not prevent a PR from changing after it was observed. The
+//! caller owns the order and failure handling of the resulting API operations.
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -75,6 +81,10 @@ pub(super) struct StackEntry<T> {
 }
 
 /// Derives stack topology from items ordered from base to head.
+///
+/// The bottom PR targets the default branch; each later PR targets its
+/// predecessor's managed branch. Parent/child metadata comes from this same
+/// order. This does not check ancestry or discover a GitHub-native stack.
 pub(super) fn link_stack<T>(
     base_branch: &str,
     items: impl IntoIterator<Item = T>,
@@ -146,6 +156,9 @@ pub(super) fn plan_update(current: CurrentPr<'_>, desired: DesiredPr<'_>) -> Opt
 }
 
 fn normalize_body(body: &str) -> String {
+    // GitHub and local messages can differ in line endings and whitespace.
+    // Ignore those differences when deciding whether to write, but retain the
+    // original desired bytes when an actual update is needed.
     body.replace("\r\n", "\n").trim().to_string()
 }
 

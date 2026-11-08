@@ -1,3 +1,10 @@
+//! Render the generated PR description from resolved stack facts.
+//!
+//! User prose comes first, followed by navigation, version comparisons,
+//! download commands, and machine-readable parent/child metadata. Rendering
+//! does not query Git or GitHub: callers supply PR numbers, version numbers,
+//! and branch names after their publication steps have resolved them.
+
 use std::fmt::{self, Write};
 
 use serde::Serialize;
@@ -40,6 +47,9 @@ impl PrBody<'_> {
     }
 
     fn exceeds_body_limit(&self) -> bool {
+        // Run the same writer against a bounded byte counter before allocating
+        // a potentially large comparison table. The sparse fallback reduces
+        // link text; it is not a hard bound on arbitrary commit-body size.
         let mut size = ByteCounter { bytes: 0, limit: MAX_BODY_SIZE_BYTES };
         self.write(&mut size, HistoryTableFormat::Full).is_err()
     }
@@ -139,6 +149,9 @@ impl PrBody<'_> {
 
                 let show_link = match format {
                     HistoryTableFormat::Full => true,
+                    // Keep comparisons against the latest revision and each
+                    // adjacent pair. The grid still includes every version;
+                    // sparse mode removes links rather than old revisions.
                     HistoryTableFormat::Sparse => row == self.latest_version || row == column + 1,
                 };
 
@@ -153,6 +166,8 @@ impl PrBody<'_> {
                 }
             }
 
+            // Base is the current comparison branch, which can itself move.
+            // This link does not freeze the base used by an older revision.
             writeln!(
                 output,
                 "[{prefix}Base]({}/compare/{}..gherrit/{}/v{row})|",
@@ -191,6 +206,9 @@ impl PrBody<'_> {
 }
 
 fn metadata_comment(id: &str, parent: Option<&str>, child: Option<&str>) -> String {
+    // The post-merge action reads this exact marker to locate the next child.
+    // Serialize the values as JSON so the prose renderer and action share a
+    // structured contract rather than relying on Markdown layout.
     #[derive(Serialize)]
     struct Metadata<'a> {
         id: &'a str,
@@ -210,6 +228,8 @@ struct ByteCounter {
 
 impl Write for ByteCounter {
     fn write_str(&mut self, value: &str) -> fmt::Result {
+        // Count UTF-8 bytes, not characters. Refuse the next write before the
+        // sum can exceed the limit or overflow; fmt::Error ends this probe.
         if value.len() > self.limit.saturating_sub(self.bytes) {
             return Err(fmt::Error);
         }
