@@ -72,8 +72,7 @@ use github::{
 use identity::ChangeId;
 use publication::{PushTarget, Version, plan_push, push_batches};
 use reconcile::{
-    CurrentPr, DesiredPr, PrUpdate, PullRequestState, ensure_pull_requests_open, link_stack,
-    plan_update,
+    CurrentPr, DesiredPr, PrUpdate, ensure_pull_requests_open, link_stack, plan_update,
 };
 use remote::observe_managed_branches;
 
@@ -518,6 +517,49 @@ fn pull_requests_by_head(prs: &[PrState]) -> HashMap<&str, &PrState> {
     by_head
 }
 
+// The codec returns creations in request order. Fill only empty slots in that
+// order and keep existing states intact. Validate the whole count before using
+// any result; a rejection cannot undo PRs already created by GitHub.
+fn resolve_pr_slots(
+    slots: Vec<(&ChangeId, Option<PrState>)>,
+    created: Vec<CreatedPullRequest>,
+) -> Result<Vec<PrState>> {
+    let expected = slots.iter().filter(|(_, state)| state.is_none()).count();
+    if created.len() != expected {
+        bail!(
+            "GitHub creation results did not match the requested PR count; PRs may have been created"
+        );
+    }
+    if expected != 0 {
+        log::info!("Created {expected} PRs.");
+    }
+    let mut created = created.into_iter();
+    let mut states = Vec::with_capacity(slots.len());
+    for (id, existing) in slots {
+        let state = match existing {
+            Some(state) => state,
+            None => {
+                // The count check provides one result for each empty slot.
+                let CreatedPullRequest { pull_request, url } =
+                    created.next().expect("one creation result per empty slot");
+                if pull_request.head_branch != id.as_str() {
+                    bail!(
+                        "Created PR response did not match requested head '{id}'; PRs may have been created"
+                    );
+                }
+                log::info!(
+                    "Created PR #{}: {}",
+                    pull_request.number.green().bold(),
+                    url.blue().underline()
+                );
+                pull_request
+            }
+        };
+        states.push(state);
+    }
+    Ok(states)
+}
+
 /// Syncs the local commit stack with GitHub PRs.
 ///
 /// The function finds existing PRs and creates any missing ones. It then queues
@@ -540,102 +582,58 @@ async fn sync_prs(
 
     let commits = link_stack(base_branch, commits, |entry| entry.commit.gherrit_id.to_string());
 
-    enum PrResolution {
-        Existing(PrState),
-        ToCreate(BatchCreate),
-    }
-
     let prs_by_head = pull_requests_by_head(&prs);
 
-    // 1. Identify existing PRs or queue for creation
+    // Keep one slot per commit. Request a new PR only for an empty slot. For
+    // existing PRs, keep using the first match in the index.
     let resolutions: Vec<_> = commits
         .iter()
         .map(|entry| {
             let c = &entry.item.commit;
-
-            if let Some(&pr) = prs_by_head.get(c.gherrit_id.as_str()) {
+            let state = if let Some(&pr) = prs_by_head.get(c.gherrit_id.as_str()) {
                 log::debug!("Found existing PR #{} for {}", pr.number.green().bold(), c.gherrit_id);
-                PrResolution::Existing(pr.clone())
+                Some(pr.clone())
             } else {
                 log::debug!("No GitHub PR exists for {}; queuing creation...", c.gherrit_id);
-                PrResolution::ToCreate(BatchCreate {
-                    title: c.message_title.clone(),
-                    body: c.message_body.clone(),
-                    base_branch: entry.base_branch.clone(),
-                    head_branch: c.gherrit_id.to_string(),
-                })
-            }
+                None
+            };
+            (&c.gherrit_id, state)
         })
         .collect();
 
-    // Create PRs with the plain commit body first. Full descriptions need all
-    // the returned PR numbers, including those of other PRs in the stack. If a
-    // later update fails, new PRs may keep their initial descriptions. Creating
-    // PRs and writing their full descriptions are separate operations.
-    let creations = resolutions
-        .iter()
-        .filter_map(|resolution| match resolution {
-            PrResolution::ToCreate(create) => Some(create),
-            PrResolution::Existing(_) => None,
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let num_creations = creations.len();
-    let new_prs = if !creations.is_empty() {
+    // Create PRs with the plain commit body first. Full descriptions need every
+    // PR number, so writing them remains a separate step.
+    let num_creations = resolutions.iter().filter(|(_, state)| state.is_none()).count();
+    let created = if num_creations != 0 {
         log::info!("Creating {num_creations} PRs...");
         let repo_id = fetch_repo_id(octocrab, &remote).await?;
-        let created = batch_create_prs(octocrab, &repo_id, creations).await?;
-        assert_eq!(created.len(), num_creations);
-        log::info!("Created {num_creations} PRs.");
-        created
+        let requests =
+            commits.iter().zip(&resolutions).filter(|(_, (_, state))| state.is_none()).map(
+                |(entry, _)| {
+                    let c = &entry.item.commit;
+                    CreatePullRequest::new(
+                        repo_id.clone(),
+                        entry.base_branch.clone(),
+                        c.gherrit_id.to_string(),
+                        c.message_title.clone(),
+                        c.message_body.clone(),
+                    )
+                },
+            );
+        run_batched_graphql(octocrab, requests).await?
     } else {
-        HashMap::new()
+        Vec::new()
     };
 
-    // 3. Resolve final PR states
-    //
-    // We zip commits with resolutions. Since resolutions were built in order,
-    // they match perfectly.
-    let commit_pr_states = commits
-        .iter()
-        .zip(resolutions)
-        .map(|(entry, resolution)| {
-            let pr_state = match resolution {
-                PrResolution::Existing(state) => state,
-                PrResolution::ToCreate(create) => {
-                    let created = new_prs.get(&create.head_branch).ok_or_else(|| {
-                        eyre::eyre!("Failed to resolve created PR for {}", create.head_branch)
-                    })?;
-                    log::info!(
-                        "Created PR #{}: {}",
-                        created.number.green().bold(),
-                        created.url.blue().underline()
-                    );
-                    PrState {
-                        number: created.number,
-                        node_id: created.node_id.clone(),
-                        title: Some(create.title),
-                        body: Some(create.body),
-                        base_branch: create.base_branch,
-                        head_branch: create.head_branch,
-                        // NOTE: We assume that newly-created PRs are in the
-                        // OPEN state.
-                        state: PullRequestState::Open,
-                    }
-                }
-            };
-            Ok((entry, pr_state))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
+    let states = resolve_pr_slots(resolutions, created)?;
     let repo_url = remote.repo_url_relative();
-    let stack_pr_numbers =
-        commit_pr_states.iter().map(|(_, state)| state.number).collect::<Vec<_>>();
+    let stack_pr_numbers = states.iter().map(|state| state.number).collect::<Vec<_>>();
     // Use the same bottom-to-top order for navigation and parent/child links.
     // plan_update leaves out unchanged fields, especially the base: GitHub may
     // reject an unchanged base edit for a PR in the merge queue.
-    let updates: Vec<PrUpdate> = commit_pr_states
+    let updates: Vec<PrUpdate> = commits
         .iter()
+        .zip(&states)
         .filter_map(|(entry, pr_state)| {
             let c = &entry.item.commit;
             let latest_version = entry.item.version.get();
@@ -750,15 +748,6 @@ fn committed_gherrit_id(trailers: &[u8], object_id: ObjectId) -> Result<ChangeId
         .ok_or_else(|| eyre!("Commit {} has invalid gherrit-pr-id trailer", object_id))
 }
 
-/// A request to create a new PR in a batch.
-#[derive(Clone)]
-struct BatchCreate {
-    title: String,
-    body: String,
-    base_branch: String,
-    head_branch: String,
-}
-
 /// Fetches the repository's global node ID.
 ///
 /// GraphQL `createPullRequest` needs this ID, such as `R_kgDOL...`, in its
@@ -791,38 +780,6 @@ async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<PrUpdate>) -> Result
     });
     run_batched_graphql(octocrab, updates).await?;
     Ok(())
-}
-
-/// Creates PRs in batches through GitHub's GraphQL API.
-///
-/// Creations are grouped to reduce requests, with batches shrinking on the
-/// recognized resource-limit responses. The returned map is keyed by head
-/// branch.
-///
-/// # Errors
-///
-/// Returns an error if a request or response decoding fails, or a single
-/// operation still exceeds the limits. PRs created by earlier batches still
-/// exist if a later request fails.
-async fn batch_create_prs(
-    octocrab: &Octocrab,
-    repo_id: &str,
-    creations: impl IntoIterator<Item = BatchCreate>,
-) -> Result<HashMap<String, CreatedPullRequest>> {
-    let creations = creations.into_iter().map(|create| {
-        CreatePullRequest::new(
-            repo_id.to_string(),
-            create.base_branch,
-            create.head_branch,
-            create.title,
-            create.body,
-        )
-    });
-    Ok(run_batched_graphql(octocrab, creations)
-        .await?
-        .into_iter()
-        .map(|created| (created.head_branch.clone(), created))
-        .collect())
 }
 
 async fn batch_fetch_prs(
@@ -1213,6 +1170,74 @@ mod tests {
                 1,
                 "a malformed acknowledgement must not be replayed"
             );
+        }
+    }
+
+    #[test]
+    fn resolves_every_mixture_of_existing_and_created_prs_in_slot_order() {
+        let ids = ["Gzeta", "Galpha", "Gmiddle"].map(|id| ChangeId::parse(id.as_bytes()).unwrap());
+        let expected = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut state = observed_pr(10 + index as u64, id.as_str());
+                state.title = Some(format!("Title {index}"));
+                state.body = Some(format!("Body {index}"));
+                state.base_branch = format!("base{index}");
+                state
+            })
+            .collect::<Vec<_>>();
+        for mask in 0..8 {
+            let slots = ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    (id, (mask & (1 << index) != 0).then(|| expected[index].clone()))
+                })
+                .collect();
+            let created = expected
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1 << index) == 0)
+                .map(|(_, state)| CreatedPullRequest {
+                    pull_request: state.clone(),
+                    url: format!("https://github.test/pull/{}", state.number),
+                })
+                .collect();
+            assert_eq!(resolve_pr_slots(slots, created).unwrap(), expected, "mask {mask}");
+        }
+        assert!(resolve_pr_slots(Vec::new(), Vec::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_creation_count_and_head_mismatches_before_rendering() {
+        let ids = ["Gone", "Gtwo"].map(|id| ChangeId::parse(id.as_bytes()).unwrap());
+        let creation = |head: &str| CreatedPullRequest {
+            pull_request: observed_pr(10, head),
+            url: "https://github.test/pull/10".to_string(),
+        };
+        for count in [0, 1, 3] {
+            let error = resolve_pr_slots(
+                ids.iter().map(|id| (id, None)).collect(),
+                (0..count).map(|_| creation("Gone")).collect(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("requested PR count; PRs may have been created"));
+        }
+        for wrong_index in 0..2 {
+            let created = ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    creation(if index == wrong_index { "Gother" } else { id.as_str() })
+                })
+                .collect();
+            let error =
+                resolve_pr_slots(ids.iter().map(|id| (id, None)).collect(), created).unwrap_err();
+            assert!(error.to_string().contains(&format!(
+                "requested head '{}'; PRs may have been created",
+                ids[wrong_index]
+            )));
         }
     }
 
