@@ -1,3 +1,9 @@
+//! Read the requested managed branch tips without fetching their objects.
+//!
+//! Each successful ls-remote response gives exact branch/OID pairs for later
+//! leases. Several requests may be needed, so the results are not a snapshot of
+//! all remote refs. A tip may still change before the push.
+
 use std::collections::{HashMap, hash_map::Entry};
 
 use color_eyre::eyre::{Context as _, Result, bail};
@@ -64,6 +70,8 @@ fn parse_managed_branches(
             .wrap_err_with(|| format!("invalid object ID in `git ls-remote` line: {line:?}"))?;
 
         let Some(id) = requested_refs.get(ref_name) else {
+            // Git's patterns may match refs we did not request. Use only exact
+            // requested names when choosing a managed branch's lease.
             return Ok(states);
         };
 

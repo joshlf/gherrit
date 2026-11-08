@@ -1,3 +1,9 @@
+//! Choose allowed PR states, parent/child links, and fields to update.
+//!
+//! Use the observed PR state and requested local changes without making network
+//! requests. A PR may change after it was read. The caller controls the
+//! resulting API requests, their order, and how failures are handled.
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -74,7 +80,12 @@ pub(super) struct StackEntry<T> {
     pub(super) child_id: Option<String>,
 }
 
-/// Derives stack topology from items ordered from base to head.
+/// Build PR links from items ordered from the bottom to the top of the stack.
+///
+/// The bottom PR targets the default branch. Each later PR targets the managed
+/// branch of the PR below it. Use this same order for parent/child IDs. This
+/// does not check ancestry or discover a stack managed by GitHub's native stack
+/// feature.
 pub(super) fn link_stack<T>(
     base_branch: &str,
     items: impl IntoIterator<Item = T>,
@@ -146,6 +157,9 @@ pub(super) fn plan_update(current: CurrentPr<'_>, desired: DesiredPr<'_>) -> Opt
 }
 
 fn normalize_body(body: &str) -> String {
+    // Ignore differences in line endings and whitespace when comparing GitHub
+    // with local messages. If an update is needed, send the original desired
+    // bytes rather than the normalized text used for comparison.
     body.replace("\r\n", "\n").trim().to_string()
 }
 

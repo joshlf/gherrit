@@ -1,3 +1,7 @@
+//! Reject temporary commits before creating a separate PR for each change.
+//! Local autosquash must decide which commits survive before each change can
+//! have a meaningful PR.
+
 use std::{error::Error, fmt};
 
 const RESERVED_PREFIXES: [&str; 3] = ["fixup!", "squash!", "amend!"];

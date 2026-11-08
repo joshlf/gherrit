@@ -1,3 +1,10 @@
+//! Render the PR description from the stack details supplied by the caller.
+//!
+//! Put the user's prose first, then navigation, version comparisons, download
+//! commands, and machine-readable parent/child IDs. Rendering does not query
+//! Git or GitHub. The caller supplies PR numbers, version numbers, and branch
+//! names after the earlier publication steps have determined them.
+
 use std::fmt::{self, Write};
 
 use serde::Serialize;
@@ -40,6 +47,9 @@ impl PrBody<'_> {
     }
 
     fn exceeds_body_limit(&self) -> bool {
+        // Use the same writer to count bytes up to a limit before allocating a
+        // large comparison table. The sparse fallback shortens link text; it
+        // does not impose a hard limit on arbitrary commit-body size.
         let mut size = ByteCounter { bytes: 0, limit: MAX_BODY_SIZE_BYTES };
         self.write(&mut size, HistoryTableFormat::Full).is_err()
     }
@@ -139,6 +149,9 @@ impl PrBody<'_> {
 
                 let show_link = match format {
                     HistoryTableFormat::Full => true,
+                    // Keep comparisons with the latest revision and between
+                    // adjacent revisions. The grid still shows every version;
+                    // sparse mode removes links, not old revisions.
                     HistoryTableFormat::Sparse => row == self.latest_version || row == column + 1,
                 };
 
@@ -153,6 +166,8 @@ impl PrBody<'_> {
                 }
             }
 
+            // Base is the current comparison branch and may move. This link
+            // does not preserve the base used by an older revision.
             writeln!(
                 output,
                 "[{prefix}Base]({}/compare/{}..gherrit/{}/v{row})|",
@@ -191,6 +206,9 @@ impl PrBody<'_> {
 }
 
 fn metadata_comment(id: &str, parent: Option<&str>, child: Option<&str>) -> String {
+    // The post-merge action uses this exact marker to find the next child.
+    // Write the values as JSON so the renderer and action agree on their format
+    // without depending on Markdown layout.
     #[derive(Serialize)]
     struct Metadata<'a> {
         id: &'a str,
@@ -210,6 +228,8 @@ struct ByteCounter {
 
 impl Write for ByteCounter {
     fn write_str(&mut self, value: &str) -> fmt::Result {
+        // Count UTF-8 bytes, not characters. Stop before a write would exceed
+        // the limit or overflow the sum. fmt::Error ends this counting pass.
         if value.len() > self.limit.saturating_sub(self.bytes) {
             return Err(fmt::Error);
         }
