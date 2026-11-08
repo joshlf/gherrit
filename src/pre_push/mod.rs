@@ -851,8 +851,8 @@ where
     // [1] https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit
     // [2] https://github.blog/changelog/2025-09-01-graphql-api-resource-limits/
     let mut batches = BatchPlan::new(operations.len(), INITIAL_GRAPHQL_BATCH_LEN);
-    while let Some(range) = batches.current() {
-        let chunk = &operations[range];
+    while let Some(attempt) = batches.current() {
+        let chunk = &operations[attempt.range()];
         let query = batch_document(chunk);
 
         // Try the query and return:
@@ -904,7 +904,7 @@ where
         .await?;
 
         let Some(response) = response else {
-            match batches.reject() {
+            match attempt.reject() {
                 Ok(backoff) => log::warn!(
                     "Backing off GraphQL batch size from {} to {}.",
                     backoff.attempted,
@@ -923,7 +923,7 @@ where
         // mean GitHub left the remote state unchanged.
         outputs.extend(decode_batch_response(chunk, response)?);
 
-        batches.accept();
+        attempt.accept();
     }
     Ok(outputs)
 }
