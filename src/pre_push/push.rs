@@ -1,0 +1,350 @@
+//! Publish Git batches and persist the selected local version refs.
+//!
+//! Keep child-process/diagnostic ownership with the operation that starts Git.
+//! The pure command plan lives in publication; this adapter owns observation,
+//! execution, acknowledgement by exit status, and local persistence. Earlier
+//! successful batches can remain after any later failure.
+
+use std::{collections::HashMap, process::Stdio};
+
+use color_eyre::eyre::{Context as _, Result, bail, eyre};
+use gix::refs::transaction::PreviousValue;
+
+use super::{
+    collect::Commit,
+    identity::ChangeId,
+    publication::{PushTarget, Version, plan_push, push_batches},
+    refs,
+    remote::observe_managed_branches,
+};
+use crate::{re, util};
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn push_to_origin(
+    repo: &util::Repo,
+    commits: Vec<Commit>,
+) -> Result<Vec<VersionedCommit>> {
+    let gherrit_ids: Vec<ChangeId> = commits.iter().map(|c| c.gherrit_id().clone()).collect();
+
+    // Read branch tips for explicit lease expectations. ls-remote does not
+    // fetch objects or version tags, and these observations can become stale;
+    // Git must check each branch's expected value when applying its update.
+    let remote_branch_states = observe_managed_branches(repo, &gherrit_ids)?;
+
+    // One local observation for the entire attempt. Failed reads and counter
+    // exhaustion must be discovered before any publication batch is pushed.
+    let local_versions = get_local_versions(repo, &gherrit_ids)
+        .wrap_err("Failed to read local version refs; no publication batch was pushed")?;
+    let commits = commits
+        .into_iter()
+        .map(|commit| {
+            let id = commit.gherrit_id();
+            let version = Version::next_after(local_versions[id]).ok_or_else(|| {
+                eyre!("Local version counter exhausted for '{id}'; no publication batch was pushed")
+            })?;
+            Ok(VersionedCommit { commit, version })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Each chunk is a separate Git transaction. Local version refs are saved
+    // after its success, so a later chunk failure can leave a published prefix.
+    // Version numbers come from local tags; stale/missing local history is not
+    // repaired by the remote branch-tip observation above.
+    for chunk in push_batches(&commits) {
+        let mut targets = Vec::with_capacity(chunk.len());
+
+        for entry in chunk {
+            let c = &entry.commit;
+
+            // Absence remains distinct from a parsed object ID until the
+            // command builder spells Git's empty creation-lease expectation.
+            let expected_remote_tip = remote_branch_states.get(c.gherrit_id()).copied();
+
+            targets.push(PushTarget {
+                object_id: c.id(),
+                gherrit_id: c.gherrit_id(),
+                version: entry.version,
+                expected_remote_tip,
+            });
+        }
+
+        let plan = plan_push(&repo.default_remote_name()?, &targets);
+
+        log::info!("Pushing chunk to remote...");
+        let mut child = util::cmd("git", plan.arguments)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .spawn()
+            .wrap_err("Failed to run `git push`")?;
+
+        // Preserve Git's diagnostics except the generated "create a PR" invite,
+        // since this command creates the PR itself. Buffer consecutive remote:
+        // lines so the invitation can be recognized as a multiline block.
+        let status = finish_push(&mut child, std::io::stderr().lock())?;
+        if !status.success() {
+            // If the push failed, it's likely due to a lease failure
+            // (concurrent modification). If failed, it might be due to the tag
+            // lock or branch lease.
+            let r = repo.default_remote_name()?;
+            bail!(
+                "`git push` failed. The remote might be ahead or changed. Run `git fetch {r}` to sync."
+            );
+        }
+
+        // The remote batch has already committed. Try every local ref and
+        // distinguish local persistence failure from an unapplied push.
+        let mut persistence_errors = Vec::new();
+        for tag in plan.persisted_tags {
+            let name = refs::version_tag(tag.gherrit_id.as_str(), tag.version.get());
+            if let Err(error) = repo.reference(
+                name.clone(),
+                tag.object_id,
+                PreviousValue::Any,
+                "gherrit: persist local version state",
+            ) {
+                persistence_errors.push(format!("{name}: {error}"));
+            }
+        }
+        if !persistence_errors.is_empty() {
+            bail!(
+                "Remote publication batch succeeded, but local version refs were not all persisted: {}. Remote changes are already applied; inspect and fetch version refs before retrying.",
+                persistence_errors.join("; ")
+            );
+        }
+    }
+
+    Ok(commits)
+}
+
+fn without_pr_invitation(block: &str) -> std::borrow::Cow<'_, str> {
+    re!(r"(?m)\n?^remote:\s*\nremote: Create a pull request for '.*' on GitHub by visiting:\s*\nremote:\s*https://github\.com/.*\nremote:\s*$").replace(block, "")
+}
+
+/// Own the pipe until it is consumed or dropped, then reap even if relaying
+/// diagnostics failed. Once dispatched, an I/O error cannot prove no effect.
+fn finish_push(
+    child: &mut std::process::Child,
+    output: impl std::io::Write,
+) -> Result<std::process::ExitStatus> {
+    let diagnostics = match child.stderr.take() {
+        Some(stderr) => relay_push_diagnostics(std::io::BufReader::new(stderr), output),
+        None => Err(std::io::Error::other("Git push stderr pipe is unavailable")),
+    };
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            // Best-effort cleanup after wait itself failed. The remote outcome
+            // is unknown even if termination and the second wait succeed.
+            let termination = child.kill();
+            let reaping = child.wait();
+            bail!(
+                "Failed to wait for git push: {error}; termination: {termination:?}; reaping: {reaping:?}. Remote changes may have applied; inspect remote refs before retrying."
+            );
+        }
+    };
+    diagnostics.wrap_err_with(|| format!("Failed to relay git push diagnostics (child status {status}). Remote changes may have applied; inspect remote refs before retrying."))?;
+    Ok(status)
+}
+
+fn relay_push_diagnostics(
+    mut reader: impl std::io::BufRead,
+    mut output: impl std::io::Write,
+) -> std::io::Result<()> {
+    fn flush(buffer: &mut Vec<String>, output: &mut impl std::io::Write) -> std::io::Result<()> {
+        if !buffer.is_empty() {
+            let block = buffer.join("\n");
+            let cleaned = without_pr_invitation(&block);
+            if !cleaned.is_empty() {
+                writeln!(output, "{cleaned}")?;
+            }
+            buffer.clear();
+        }
+        Ok(())
+    }
+    let result = (|| {
+        let mut buffer = Vec::new();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            // Match BufRead::lines for valid text, including CRLF and a final
+            // unterminated line. Non-UTF-8 diagnostics are relayed as bytes.
+            if line.last() == Some(&b'\n') {
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+            }
+            match std::str::from_utf8(&line) {
+                Ok(text) if text.trim_start().starts_with("remote:") => {
+                    buffer.push(text.to_owned())
+                }
+                _ => {
+                    flush(&mut buffer, &mut output)?;
+                    output.write_all(&line)?;
+                    output.write_all(b"\n")?;
+                }
+            }
+        }
+        flush(&mut buffer, &mut output)
+    })();
+    if result.is_err() {
+        // A broken output stream must not leave Git blocked on its stderr
+        // pipe. If reading also fails, dropping the owned pipe closes it.
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    }
+    result
+}
+
+fn local_version_entry(name: &str) -> Option<(&str, usize)> {
+    let tail = name.strip_prefix("refs/tags/gherrit/")?;
+    let (id, version) = tail.split_once("/v")?;
+    // Preserve the legacy last-'v' numeric suffix, including noncanonical
+    // spellings. Changing archive admission is a separate policy decision.
+    let version = version.rsplit('v').next()?.parse().ok()?;
+    Some((id, version))
+}
+
+fn get_local_versions(repo: &util::Repo, ids: &[ChangeId]) -> Result<HashMap<ChangeId, usize>> {
+    // An ID with no recognized local tag starts at zero. Scan all refs once
+    // for the whole stack; decoding/iteration errors must stop publication
+    // rather than turn incomplete history into a lower version number.
+    let mut versions = ids.iter().map(|id| (id.clone(), 0)).collect::<HashMap<_, _>>();
+    let references = repo.references().map_err(|error| eyre!(error))?;
+    for reference in references.all().map_err(|error| eyre!(error))? {
+        let reference = reference.map_err(|error| eyre!(error))?;
+        let name = reference.name().as_bstr().to_string();
+        if let Some((id, version)) = local_version_entry(&name)
+            && let Some(current) = versions.get_mut(id)
+        {
+            *current = (*current).max(version);
+        }
+    }
+    Ok(versions)
+}
+
+/// One revision paired with the version selected for it. Keep that relationship
+/// through publication and PR rendering rather than joining again by ID.
+pub(super) struct VersionedCommit {
+    commit: Commit,
+    version: Version,
+}
+
+impl VersionedCommit {
+    // Outside this adapter, the pair is read-only and has no constructor. A
+    // caller obtains it after the requested Git batches and local persistence
+    // succeed, without treating that status as a stronger remote receipt.
+    pub(super) fn commit(&self) -> &Commit {
+        &self.commit
+    }
+
+    pub(super) fn version(&self) -> Version {
+        self.version
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailedOutput;
+
+    impl std::io::Write for FailedOutput {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn push_relay_preserves_text_and_non_utf8_diagnostics() {
+        let input = b"remote: server warning\r\nlocal diagnostic\r\nremote: \xff\nlast";
+        let mut output = Vec::new();
+        relay_push_diagnostics(std::io::Cursor::new(input), &mut output).unwrap();
+        assert_eq!(output, b"remote: server warning\nlocal diagnostic\nremote: \xff\nlast\n");
+    }
+
+    #[test]
+    fn push_relay_drains_after_output_or_read_failure() {
+        let mut reader = std::io::Cursor::new(b"first\nsecond\nlast\n");
+        assert!(relay_push_diagnostics(&mut reader, FailedOutput).is_err());
+        assert_eq!(reader.position(), reader.get_ref().len() as u64);
+
+        struct ReadFailure {
+            reader: std::io::Cursor<Vec<u8>>,
+            fail: bool,
+        }
+        impl std::io::Read for ReadFailure {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.reader.read(bytes)
+            }
+        }
+        impl std::io::BufRead for ReadFailure {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                if std::mem::take(&mut self.fail) {
+                    return Err(std::io::Error::other("fixture read failure"));
+                }
+                self.reader.fill_buf()
+            }
+            fn consume(&mut self, n: usize) {
+                self.reader.consume(n);
+            }
+        }
+        let mut reader =
+            ReadFailure { reader: std::io::Cursor::new(b"remaining bytes".to_vec()), fail: true };
+        let error = relay_push_diagnostics(&mut reader, Vec::new()).unwrap_err();
+        assert_eq!(error.to_string(), "fixture read failure");
+        assert_eq!(reader.reader.position(), reader.reader.get_ref().len() as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_child_is_drained_and_reaped_after_output_failure() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "i=0; while [ $i -lt 10000 ]; do echo diagnostic >&2; i=$((i+1)); done"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let error = finish_push(&mut child, FailedOutput).unwrap_err();
+        assert!(format!("{error:#}").contains("Remote changes may have applied"));
+        assert!(child.try_wait().unwrap().unwrap().success());
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert_eq!(finish_push(&mut child, Vec::new()).unwrap().code(), Some(3));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn local_version_index_retains_legacy_numeric_suffixes() {
+        for (name, version) in [("v2", 2), ("v0002", 2), ("v+2", 2), ("vjunkv3", 3)] {
+            let full = format!("refs/tags/gherrit/Gcase/{name}");
+            assert_eq!(local_version_entry(&full), Some(("Gcase", version)));
+        }
+        for name in ["refs/heads/Gcase", "refs/tags/gherrit/Gcase/vno", "refs/tags/other/v2"] {
+            assert!(local_version_entry(name).is_none());
+        }
+    }
+
+    #[test]
+    fn push_diagnostics_only_remove_the_complete_github_invitation() {
+        let invitation = "remote: \nremote: Create a pull request for 'G1' on GitHub by visiting:\nremote: https://github.com/owner/repo/pull/new/G1\nremote: ";
+        assert_eq!(without_pr_invitation(invitation), "");
+        assert_eq!(
+            without_pr_invitation(&format!("remote: warning\n{invitation}")),
+            "remote: warning"
+        );
+        for ordinary in
+            ["remote: warning", "fatal: push failed", "remote: https://example.com/path"]
+        {
+            assert_eq!(without_pr_invitation(ordinary), ordinary);
+        }
+    }
+}
