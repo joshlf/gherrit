@@ -28,7 +28,6 @@ gherrit hook {} "$@"
 "#;
 
 struct HookReplacement {
-    name: &'static str,
     path: PathBuf,
     content: String,
 }
@@ -42,6 +41,10 @@ struct PreparedHook {
 }
 
 impl HookReplacement {
+    fn new(directory: &std::path::Path, name: &'static str) -> Self {
+        Self { path: directory.join(name), content: SHIM_TEMPLATE.replace("{}", name) }
+    }
+
     fn prepare(self) -> Result<PreparedHook> {
         // Write a temporary file in the same directory, then rename it so
         // readers never see a partly written hook. The temporary file is also
@@ -77,7 +80,6 @@ impl PreparedHook {
 
 struct InstallPlan {
     directory: PathBuf,
-    hooks: Vec<HookReplacement>,
 }
 
 fn is_managed_hook(content: &[u8]) -> bool {
@@ -98,7 +100,6 @@ impl InstallPlan {
     /// unless `force` is true.
     fn inspect(directory: PathBuf, force: bool) -> Result<Self> {
         let mut conflicts = Vec::new();
-        let mut hooks = Vec::new();
         for &name in REQUIRED_HOOKS {
             let path = directory.join(name);
             match fs::symlink_metadata(&path) {
@@ -126,7 +127,6 @@ impl InstallPlan {
                         .wrap_err_with(|| format!("Failed to inspect hook entry: {path:?}"));
                 }
             }
-            hooks.push(HookReplacement { name, path, content: SHIM_TEMPLATE.replace("{}", name) });
         }
         if !conflicts.is_empty() && !force {
             let mut message = String::from("Refusing to overwrite unmanaged hooks:\n");
@@ -136,7 +136,7 @@ impl InstallPlan {
             message.push_str("\nUse --force to overwrite them.");
             bail!(message);
         }
-        Ok(Self { directory, hooks })
+        Ok(Self { directory })
     }
 
     fn apply(self) -> Result<()> {
@@ -146,8 +146,11 @@ impl InstallPlan {
     fn apply_using(self, mut replace: impl FnMut(HookReplacement) -> Result<()>) -> Result<()> {
         fs::create_dir_all(&self.directory)
             .wrap_err_with(|| format!("Failed to create hooks directory: {:?}", self.directory))?;
-        for hook in self.hooks {
-            let name = hook.name;
+        // The hook set is fixed. Build each path and script from the checked
+        // directory and hook name instead of storing another mutable list of
+        // those same values in the plan.
+        for &name in REQUIRED_HOOKS {
+            let hook = HookReplacement::new(&self.directory, name);
             replace(hook)?;
             log::info!("Installed {}", name.green());
         }
@@ -212,8 +215,10 @@ mod tests {
                     let plan = InstallPlan::inspect(directory.path().to_owned(), false).unwrap();
                     // This executor test owns payload delivery; integration
                     // tests independently own complete shim encoding and mode.
-                    let expected: Vec<_> =
-                        plan.hooks.iter().map(|hook| hook.content.clone()).collect();
+                    let expected: Vec<_> = REQUIRED_HOOKS
+                        .iter()
+                        .map(|name| SHIM_TEMPLATE.replace("{}", name))
+                        .collect();
                     let mut index = 0;
                     let result = plan.apply_using(|hook| {
                         let current = index;
