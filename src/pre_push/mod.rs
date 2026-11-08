@@ -70,7 +70,7 @@ use github::{
     decode_batch_response,
 };
 use identity::ChangeId;
-use publication::{PushTarget, plan_push, push_batches};
+use publication::{PushTarget, Version, plan_push, push_batches};
 use reconcile::{
     CurrentPr, DesiredPr, PrUpdate, PullRequestState, ensure_pull_requests_open, link_stack,
     plan_update,
@@ -159,20 +159,11 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
     ensure_pull_requests_open(prs.iter().map(|pr| (pr.number, pr.state)))?;
 
-    let latest_versions = push_to_origin(repo, &commits)?;
+    let commits = push_to_origin(repo, commits)?;
     let default_branch = repo.find_default_branch_on_default_remote()?;
 
     let num_commits = commits.len();
-    sync_prs(
-        repo,
-        &octocrab,
-        public_branch.as_deref(),
-        &default_branch,
-        commits,
-        latest_versions,
-        prs,
-    )
-    .await?;
+    sync_prs(repo, &octocrab, public_branch.as_deref(), &default_branch, commits, prs).await?;
 
     log::info!("Successfully synced {num_commits} commits.");
     Ok(())
@@ -285,7 +276,7 @@ fn ensure_unique_gherrit_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Resu
 }
 
 #[allow(clippy::too_many_lines)]
-fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<ChangeId, usize>> {
+fn push_to_origin(repo: &util::Repo, commits: Vec<Commit>) -> Result<Vec<VersionedCommit>> {
     let gherrit_ids: Vec<ChangeId> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
 
     // Read branch tips for the leases. ls-remote fetches neither objects nor
@@ -297,25 +288,26 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Chang
     // exhausted version numbers before pushing any batch.
     let local_versions = get_local_versions(repo, &gherrit_ids)
         .wrap_err("Failed to read local version refs; no publication batch was pushed")?;
-    let next_versions = gherrit_ids
-        .iter()
-        .map(|id| {
-            let next = local_versions[id].checked_add(1).ok_or_else(|| {
+    let commits = commits
+        .into_iter()
+        .map(|commit| {
+            let id = &commit.gherrit_id;
+            let version = Version::next_after(local_versions[id]).ok_or_else(|| {
                 eyre!("Local version counter exhausted for '{id}'; no publication batch was pushed")
             })?;
-            Ok((id.clone(), next))
+            Ok(VersionedCommit { commit, version })
         })
-        .collect::<Result<HashMap<_, _>>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
     // Each chunk is a separate Git transaction. Save local version refs after
     // it succeeds. A later chunk may fail while earlier chunks stay published.
     // Version numbers come from local tags; reading remote branch tips above
     // does not repair missing or stale local history.
-    for chunk in push_batches(commits) {
+    for chunk in push_batches(&commits) {
         let mut targets = Vec::with_capacity(chunk.len());
 
-        for c in chunk {
-            let next_ver = next_versions[&c.gherrit_id];
+        for entry in chunk {
+            let c = &entry.commit;
 
             // Keep a missing tip distinct from a parsed object ID until
             // building the command, where Git uses an empty lease value for a
@@ -325,7 +317,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Chang
             targets.push(PushTarget {
                 object_id: c.id,
                 gherrit_id: &c.gherrit_id,
-                version: next_ver,
+                version: entry.version,
                 expected_remote_tip,
             });
         }
@@ -357,7 +349,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Chang
         // effect.
         let mut persistence_errors = Vec::new();
         for tag in plan.persisted_tags {
-            let name = refs::version_tag(tag.gherrit_id.as_str(), tag.version);
+            let name = refs::version_tag(tag.gherrit_id.as_str(), tag.version.get());
             if let Err(error) = repo.reference(
                 name.clone(),
                 tag.object_id,
@@ -375,7 +367,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Chang
         }
     }
 
-    Ok(next_versions)
+    Ok(commits)
 }
 
 fn without_pr_invitation(block: &str) -> std::borrow::Cow<'_, str> {
@@ -543,13 +535,12 @@ async fn sync_prs(
     octocrab: &Octocrab,
     public_branch: Option<&str>,
     base_branch: &str,
-    commits: Vec<Commit>,
-    latest_versions: HashMap<ChangeId, usize>,
+    commits: Vec<VersionedCommit>,
     prs: Vec<PrState>,
 ) -> Result<()> {
     let remote = repo.default_remote()?;
 
-    let commits = link_stack(base_branch, commits, |commit| commit.gherrit_id.to_string());
+    let commits = link_stack(base_branch, commits, |entry| entry.commit.gherrit_id.to_string());
 
     enum PrResolution {
         Existing(PrState),
@@ -562,7 +553,7 @@ async fn sync_prs(
     let resolutions: Vec<_> = commits
         .iter()
         .map(|entry| {
-            let c = &entry.item;
+            let c = &entry.item.commit;
 
             if let Some(&pr) = prs_by_head.get(c.gherrit_id.as_str()) {
                 log::debug!("Found existing PR #{} for {}", pr.number.green().bold(), c.gherrit_id);
@@ -648,8 +639,8 @@ async fn sync_prs(
     let updates: Vec<PrUpdate> = commit_pr_states
         .iter()
         .filter_map(|(entry, pr_state)| {
-            let c = &entry.item;
-            let latest_version = latest_versions.get(&c.gherrit_id).copied().unwrap_or(1);
+            let c = &entry.item.commit;
+            let latest_version = entry.item.version.get();
 
             let body = PrBody {
                 commit_body: &c.message_body,
@@ -706,6 +697,15 @@ fn public_branch_name(repo: &util::Repo, branch: &str) -> Result<Option<String>>
         let (category, short_name) = head_ref.inner.name.category_and_short_name()?;
         (category == Category::LocalBranch).then(|| short_name.to_string())
     }))
+}
+
+/// A commit paired with its selected version.
+///
+/// The pair stays together through the push and PR rendering, so the version
+/// does not need to be looked up again by ID.
+struct VersionedCommit {
+    commit: Commit,
+    version: Version,
 }
 
 struct Commit {
