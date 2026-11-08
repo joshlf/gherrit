@@ -1,3 +1,22 @@
+//! Publishes the local stack as Git refs and GitHub pull requests.
+//!
+//! The command reads and checks commits, looks up PRs and rejects closed or
+//! merged ones, pushes Git refs, then creates missing PRs and updates their
+//! details. Git is pushed first so branches exist before PR creation. All PR
+//! numbers are known before navigation links for the whole stack are rendered.
+//!
+//! These steps are not one transaction. Each Git batch is atomic, but later Git
+//! or GraphQL batches may fail after earlier ones succeed. Errors stop the
+//! command without undoing remote changes. Publishing a nonempty managed stack
+//! creates version tags even when its commit objects have not changed.
+//!
+//! Small modules handle local decisions and formats: [`autosquash`] checks
+//! whether history is ready, [`remote`] reads branch tips, [`publication`]
+//! builds Git updates, [`github`] encodes API requests, [`batching`] chooses
+//! request sizes, [`reconcile`] links PRs and chooses changed fields, and
+//! [`body`] renders descriptions. This module controls write order and shared
+//! inputs.
+
 use std::{
     collections::{HashMap, HashSet},
     process::Stdio,
@@ -20,9 +39,10 @@ mod body;
 mod github;
 mod publication;
 mod reconcile;
-/// Managed ref names shared by publication, observation and local
-/// persistence. Parsing and admission stay with the caller; these functions
-/// only spell names.
+/// Names for managed branches and version tags.
+///
+/// These helpers construct names shared by publication, remote reads, and
+/// local tag writes. Callers handle parsing and validation.
 mod refs {
 
     pub(super) fn head(id: &str) -> String {
@@ -130,6 +150,8 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
     let octocrab = builder.build()?;
 
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
+    // Reject a PR known to be closed or merged before pushing Git refs. This
+    // read does not lock the PR; another actor may change its state later.
     let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
     ensure_pull_requests_open(prs.iter().map(|pr| (pr.number, pr.state)))?;
 
@@ -144,6 +166,9 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
 }
 
 fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
+    // Choose stack members from the local default-branch ref, without fetching
+    // the remote tip. The user must update or rebase local history when that
+    // ref no longer names the intended publication base.
     let head = repo.rev_parse_single("HEAD")?;
     let default_branch = repo.find_default_branch_on_default_remote();
     let default_ref = repo.rev_parse_single(format!("refs/heads/{}", default_branch).as_str())?;
@@ -185,6 +210,9 @@ fn collect_commits(repo: &util::Repo) -> Result<Vec<Commit>> {
 }
 
 fn read_commit_trailers(commits: &[(gix::Commit<'_>, String)]) -> Result<Vec<Vec<u8>>> {
+    // Let Git find trailers in each complete commit message. Query several
+    // commits per child process, keeping the requested order so trailers cannot
+    // be assigned to the wrong commit.
     const QUERY_BATCH_LEN: usize = 120;
     const FORMAT: &str = "--format=tformat:%H%x00%(trailers:only,unfold)";
 
@@ -206,6 +234,9 @@ fn read_commit_trailers(commits: &[(gix::Commit<'_>, String)]) -> Result<Vec<Vec
 }
 
 fn decode_commit_trailers(output: &[u8], object_ids: &[ObjectId]) -> Result<Vec<Vec<u8>>> {
+    // Each record is OID NUL trailers NUL. Splitting the whole response leaves
+    // one final empty field. Newlines are trailer content; NUL separates
+    // records. Check record counts and OIDs before checking the trailer IDs.
     let mut parsed = Vec::with_capacity(object_ids.len());
     let mut fields = output.split(|byte| *byte == 0);
     for object_id in object_ids {
@@ -227,6 +258,8 @@ fn decode_commit_trailers(output: &[u8], object_ids: &[ObjectId]) -> Result<Vec<
 }
 
 fn ensure_unique_gherrit_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    // Two commits with the same change ID would target the same branch and PR.
+    // Reject the whole stack before making any remote changes.
     ids.into_iter().try_fold(HashSet::new(), |mut seen, id| {
         if !seen.insert(id) {
             bail!("Stack contains multiple commits with gherrit-pr-id '{id}'");
@@ -240,11 +273,13 @@ fn ensure_unique_gherrit_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Resu
 fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<String, usize>> {
     let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
 
-    // Fetch remote branch states to ensure we don't act on stale information.
+    // Read branch tips for the leases. ls-remote fetches neither objects nor
+    // version tags, and its results may become stale. Git must check each
+    // branch's expected value when applying the update.
     let remote_branch_states = observe_managed_branches(repo, &gherrit_ids)?;
 
-    // One local observation for the entire attempt. Failed reads and counter
-    // exhaustion must be discovered before any publication batch is pushed.
+    // Read local versions once for this attempt. Detect read failures or
+    // exhausted version numbers before pushing any batch.
     let local_versions = get_local_versions(repo, &gherrit_ids)
         .wrap_err("Failed to read local version refs; no publication batch was pushed")?;
     let next_versions = gherrit_ids
@@ -257,6 +292,10 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
         })
         .collect::<Result<HashMap<_, _>>>()?;
 
+    // Each chunk is a separate Git transaction. Save local version refs after
+    // it succeeds. A later chunk may fail while earlier chunks stay published.
+    // Version numbers come from local tags; reading remote branch tips above
+    // does not repair missing or stale local history.
     for chunk in push_batches(commits) {
         let mut targets = Vec::with_capacity(chunk.len());
 
@@ -286,7 +325,9 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
             .spawn()
             .wrap_err("Failed to run `git push`")?;
 
-        // Filter output logic (elided for brevity, same as before)
+        // Keep Git's diagnostics except the invitation to create a PR, since
+        // this command creates the PR itself. Buffer consecutive remote: lines
+        // so the filter can recognize an invitation that spans several lines.
         {
             use std::io::{BufRead, BufReader};
             let stderr = child.stderr.take().unwrap();
@@ -317,17 +358,17 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
 
         let status = child.wait().unwrap();
         if !status.success() {
-            // If the push failed, it's likely due to a lease failure
-            // (concurrent modification). If failed, it might be due to the tag
-            // lock or branch lease.
+            // A lease failure is a likely cause: another writer may have
+            // changed the branch or version tag.
             let r = repo.default_remote_name();
             bail!(
                 "`git push` failed. The remote might be ahead or changed. Run `git fetch {r}` to sync."
             );
         }
 
-        // The remote batch has already committed. Try every local ref and
-        // distinguish local persistence failure from an unapplied push.
+        // The remote batch has already succeeded. Try every local ref and
+        // report failed local writes separately from a push that never took
+        // effect.
         let mut persistence_errors = Vec::new();
         for tag in plan.persisted_tags {
             let name = refs::version_tag(&tag.gherrit_id, tag.version);
@@ -358,13 +399,17 @@ fn without_pr_invitation(block: &str) -> std::borrow::Cow<'_, str> {
 fn local_version_entry(name: &str) -> Option<(&str, usize)> {
     let tail = name.strip_prefix("refs/tags/gherrit/")?;
     let (id, version) = tail.split_once("/v")?;
-    // Preserve the legacy last-'v' numeric suffix, including noncanonical
-    // spellings. Changing archive admission is a separate policy decision.
+    // Keep parsing the number after the last 'v', including unusual existing
+    // spellings. Changing which archive names are accepted is a separate
+    // decision.
     let version = version.rsplit('v').next()?.parse().ok()?;
     Some((id, version))
 }
 
 fn get_local_versions(repo: &util::Repo, ids: &[String]) -> Result<HashMap<String, usize>> {
+    // An ID with no recognized local tag starts at zero. Scan refs once for the
+    // whole stack. Stop on decoding or iteration errors so incomplete history
+    // cannot silently produce a lower version number.
     let mut versions = ids.iter().map(|id| (id.clone(), 0)).collect::<HashMap<_, _>>();
     let references = repo.references().map_err(|error| eyre!(error))?;
     for reference in references.all().map_err(|error| eyre!(error))? {
@@ -382,18 +427,22 @@ fn get_local_versions(repo: &util::Repo, ids: &[String]) -> Result<HashMap<Strin
 fn pull_requests_by_head(prs: &[PrState]) -> HashMap<&str, &PrState> {
     let mut by_head = HashMap::with_capacity(prs.len());
     for pr in prs {
-        // Preserve the previous linear search's first-match behavior.
+        // Use the first PR found for each head, as a linear search would.
         by_head.entry(pr.head_branch.as_str()).or_insert(pr);
     }
     by_head
 }
 
-/// Syncs the local stack of commits with GitHub Pull Requests.
+/// Syncs the local commit stack with GitHub PRs.
 ///
-/// This function:
-/// 1. Finds existing PRs or creates new ones for new commits.
-/// 2. Updates PR metadata (title, body, base branch) to match the local stack.
-/// 3. Updates are queued and executed in batches to optimize performance.
+/// The function finds existing PRs and creates any missing ones. It then queues
+/// changes to titles, descriptions, and base branches to match the local stack.
+/// Updates are sent in batches to reduce the number of requests.
+///
+/// # Errors
+///
+/// Returns an error if a GitHub request or response decoding fails, or a new PR
+/// cannot be matched to its commit. Completed remote writes are not undone.
 async fn sync_prs(
     repo: &util::Repo,
     octocrab: &Octocrab,
@@ -435,7 +484,10 @@ async fn sync_prs(
         })
         .collect();
 
-    // 2. Batch create missing PRs
+    // Create PRs with the plain commit body first. Full descriptions need all
+    // the returned PR numbers, including those of other PRs in the stack. If a
+    // later update fails, new PRs may keep their initial descriptions. Creating
+    // PRs and writing their full descriptions are separate operations.
     let creations = resolutions
         .iter()
         .filter_map(|resolution| match resolution {
@@ -503,6 +555,9 @@ async fn sync_prs(
     let repo_url = remote.repo_url_relative();
     let stack_pr_numbers =
         commit_pr_states.iter().map(|(_, state)| state.number).collect::<Vec<_>>();
+    // Use the same bottom-to-top order for navigation and parent/child links.
+    // plan_update leaves out unchanged fields, especially the base: GitHub may
+    // reject an unchanged base edit for a PR in the merge queue.
     let updates: Vec<PrUpdate> = commit_pr_states
         .iter()
         .filter_map(|(entry, pr_state)| {
@@ -565,6 +620,8 @@ fn is_private_stack(repo: &util::Repo, branch: &str) -> bool {
 }
 
 struct Commit {
+    // id changes when a commit is rewritten. Keep gherrit_id unchanged so the
+    // rewritten change updates the same PR.
     id: ObjectId,
     gherrit_id: String,
     message_title: String,
@@ -590,6 +647,8 @@ impl Commit {
 }
 
 fn committed_gherrit_id(trailers: &[u8], object_id: ObjectId) -> Result<String> {
+    // The commit hook only keeps or adds an ID. Check it here before
+    // publishing, so ambiguous or unsafe IDs never become ref names.
     let mut gherrit_ids = crate::commit_message::gherrit_id_values(trailers);
     let gherrit_id = gherrit_ids
         .next()
@@ -615,11 +674,15 @@ struct BatchCreate {
     head_branch: String,
 }
 
-/// Fetches the global Repository Node ID for the given owner and repo.
+/// Fetches the repository's global node ID.
 ///
-/// This ID (e.g., "R_kgDOL...") is required for creating PRs via the GraphQL
-/// API, as the `createPullRequest` mutation accepts a `repositoryId` argument,
-/// not owner/name.
+/// GraphQL `createPullRequest` needs this ID, such as `R_kgDOL...`, in its
+/// `repositoryId` argument. It does not accept an owner/name pair instead.
+///
+/// # Errors
+///
+/// Returns an error if the request fails, GitHub reports an error, or the reply
+/// does not contain the expected repository ID.
 async fn fetch_repo_id(octocrab: &Octocrab, remote: &util::Remote) -> Result<String> {
     let query = RepositoryIdQuery::new(remote.owner.clone(), remote.repo_name.clone());
     let request = query.request();
@@ -628,10 +691,15 @@ async fn fetch_repo_id(octocrab: &Octocrab, remote: &util::Remote) -> Result<Str
     query.decode(response)
 }
 
-/// Performs batched updates of PRs using GitHub's GraphQL API.
+/// Updates PRs in batches through GitHub's GraphQL API.
 ///
-/// This avoids rate limits and network latency by grouping updates into
-/// adaptive batches and sending each batch as one GraphQL operation.
+/// Updates are grouped to reduce requests. Batches shrink on the resource-limit
+/// responses recognized here; this does not retry rate-limit errors in general.
+///
+/// # Errors
+///
+/// Returns an error if a request or response decoding fails, or a single
+/// operation still exceeds the limits. Earlier batches may have taken effect.
 async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<PrUpdate>) -> Result<()> {
     let updates = updates.into_iter().map(|update| {
         UpdatePullRequest::new(update.node_id, update.title, update.body, update.base_branch)
@@ -640,12 +708,17 @@ async fn batch_update_prs(octocrab: &Octocrab, updates: Vec<PrUpdate>) -> Result
     Ok(())
 }
 
-/// Performs batched creation of PRs using GitHub's GraphQL API.
+/// Creates PRs in batches through GitHub's GraphQL API.
 ///
-/// This avoids rate limits and network latency by grouping creations into
-/// adaptive batches and sending each batch as one GraphQL operation.
+/// Creations are grouped to reduce requests, with batches shrinking on the
+/// recognized resource-limit responses. The returned map is keyed by head
+/// branch.
 ///
-/// Returns the newly-created PRs keyed by their head branches.
+/// # Errors
+///
+/// Returns an error if a request or response decoding fails, or a single
+/// operation still exceeds the limits. PRs created by earlier batches still
+/// exist if a later request fails.
 async fn batch_create_prs(
     octocrab: &Octocrab,
     repo_id: &str,
@@ -683,10 +756,16 @@ async fn batch_fetch_prs(
     Ok(run_batched_graphql(octocrab, queries).await?.into_iter().flatten().collect())
 }
 
-/// Executes batched GraphQL operations (queries or mutations).
+/// Runs GraphQL queries or mutations in batches.
 ///
-/// Builds a combined query for each adaptive batch and decodes each operation
-/// in a successful response.
+/// A combined request is built for each batch, with its size adjusted as
+/// needed. Each operation in a successful reply is decoded in request order.
+///
+/// # Errors
+///
+/// Returns an error on transport failures, unexpected API errors or response
+/// shapes, decoding failures, or when a single operation still exceeds the
+/// limits. Earlier mutation batches may already have taken effect.
 async fn run_batched_graphql<O>(
     octocrab: &Octocrab,
     operations: impl IntoIterator<Item = O>,
@@ -701,14 +780,10 @@ where
 
     let mut outputs = Vec::with_capacity(operations.len());
 
-    // GitHub imposes a limit on the number of nodes that can be processed in a
-    // single GraphQL query (500,000 as of this writing [1]), and also imposes
-    // limits on the amount of computation resources required to process the
-    // query [2]. In order to avoid hitting these limits while still processing
-    // large batches in the optimistic case, we start with a large batch size
-    // and perform exponential backoff if we hit the limits. This also ensures
-    // that we are resilient in the face of GitHub changing these limits in the
-    // future.
+    // GraphQL resource use depends on both item count and document size. Start
+    // with a fixed batch cap, then shrink the pending range on resource
+    // responses recognized by classify_response. Change the batch size, not the
+    // timing. HTTP transport failures do not use this retry path.
     //
     // [1] https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit
     // [2] https://github.blog/changelog/2025-09-01-graphql-api-resource-limits/
@@ -717,16 +792,18 @@ where
         let chunk = &operations[range];
         let query = batch_document(chunk);
 
-        // Attempt to perform the query. Returns:
-        // - Ok(Some(response)): Success
-        // - Ok(None): Heuristic or API limit hit (needs backoff)
-        // - Err(e): Fatal error (bail)
+        // Try the query and return:
+        //
+        // - Ok(Some(response)) on success.
+        // - Ok(None) when the size check or an API resource limit calls for
+        //   backoff.
+        // - Err(e) for an error that stops the operation.
         let response = async {
-            // HEURISTIC: Check query size before sending. GitHub's WAF/load
-            // balancer/some other middleware seems to silently drop or truncate
-            // requests larger than ~600KB, leading to confusing "missing query
-            // attribute" errors. We preemptively backoff if we exceed a
-            // conservative limit (256KB).
+            // Check query size before sending. A firewall, load balancer, or
+            // other intermediary may be dropping or truncating requests above
+            // about 600KB, causing confusing "missing query attribute" errors.
+            // Use the conservative 256KiB limit below to shrink the batch
+            // before sending it.
             if query_exceeds_limit(&query) {
                 log::warn!(
                     "GraphQL query size ({} bytes) exceeds heuristic limit ({} bytes).",
@@ -778,6 +855,9 @@ where
             continue;
         };
 
+        // Advance only after decoding every alias. A malformed reply may follow
+        // a mutation that already took effect. Returning an error here does not
+        // mean GitHub left the remote state unchanged.
         outputs.extend(decode_batch_response(chunk, response)?);
 
         batches.accept();
