@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# Match the marker written by src/pre_push/body.rs. The last matching line is
+# authoritative; other PR prose can contain examples of the same marker. The
+# JSON decoder below validates the child field before the caller uses it.
 metadata=$(
   sed -n 's/^.*<!-- gherrit-meta: \(.*\) -->[[:space:]]*$/\1/p' |
     tail -n 1
@@ -19,6 +22,8 @@ if [[ ${metadata: -1} == '"' ]]; then
   metadata=${metadata%\"}
 fi
 
+# A null child marks the top of the stack. Missing or malformed metadata is an
+# error; the action cannot confuse a failed read with a finished stack.
 if ! child=$(
   jq -Rer '
     fromjson |

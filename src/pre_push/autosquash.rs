@@ -1,3 +1,7 @@
+//! Reject temporary history before it becomes a set of independently reviewed
+//! PRs. Local autosquash must settle which commits survive before publication
+//! can assign a meaningful PR to each logical change.
+
 use std::{error::Error, fmt};
 
 const RESERVED_PREFIXES: [&str; 3] = ["fixup!", "squash!", "amend!"];
