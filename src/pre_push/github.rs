@@ -25,10 +25,11 @@ pub(super) struct PullRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CreatedPullRequest {
-    pub(super) head_branch: String,
-    pub(super) number: u64,
+    /// The returned identity with the metadata sent by this exact request.
+    /// This retains the existing assumption that a new PR starts open; it is
+    /// not a second observation of its state after creation.
+    pub(super) pull_request: PullRequest,
     pub(super) url: String,
-    pub(super) node_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,10 +330,16 @@ impl BatchedOperation for CreatePullRequest {
         })?;
 
         Ok(CreatedPullRequest {
-            head_branch: self.head_branch.clone(),
-            number: created.number,
+            pull_request: PullRequest {
+                number: created.number,
+                node_id: created.id,
+                title: Some(self.title.clone()),
+                body: Some(self.body.clone()),
+                base_branch: self.base_branch.clone(),
+                head_branch: self.head_branch.clone(),
+                state: PullRequestState::Open,
+            },
             url: created.url,
-            node_id: created.id,
         })
     }
 }
@@ -802,11 +809,56 @@ mod tests {
                 }))
                 .unwrap(),
             CreatedPullRequest {
-                head_branch: "G123".to_string(),
-                number: 42,
+                pull_request: PullRequest {
+                    number: 42,
+                    node_id: "PR_42".to_string(),
+                    title: Some("Title".to_string()),
+                    body: Some("Body".to_string()),
+                    base_branch: "main".to_string(),
+                    head_branch: "G123".to_string(),
+                    state: PullRequestState::Open,
+                },
                 url: "https://github.test/pull/42".to_string(),
-                node_id: "PR_42".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn creation_aliases_bind_returned_identities_to_request_metadata() {
+        // With twelve operations, lexical alias order differs from request
+        // order (op10 sorts before op2). Results must follow the requests.
+        let requests = (0..12)
+            .map(|index| {
+                CreatePullRequest::new(
+                    "R_1".to_string(),
+                    "main".to_string(),
+                    format!("G{index}"),
+                    format!("Title {index}"),
+                    format!("Body {index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let data = (0..12)
+            .rev()
+            .map(|index| {
+                (
+                    format!("op{index}"),
+                    json!({"pullRequest": {
+                        "number": 100 + index,
+                        "url": format!("https://github.test/pull/{}", 100 + index),
+                        "id": format!("PR_{index}"),
+                    }}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+
+        let created = decode_batch_response(&requests, json!({"data": data})).unwrap();
+        for (index, created) in created.into_iter().enumerate() {
+            assert_eq!(created.pull_request.number, 100 + index as u64);
+            assert_eq!(created.pull_request.node_id, format!("PR_{index}"));
+            assert_eq!(created.pull_request.head_branch, format!("G{index}"));
+            assert_eq!(created.pull_request.title, Some(format!("Title {index}")));
+            assert_eq!(created.pull_request.body, Some(format!("Body {index}")));
+        }
     }
 }
