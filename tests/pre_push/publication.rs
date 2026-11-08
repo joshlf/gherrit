@@ -225,3 +225,28 @@ fn test_graphql_batch_backoff() {
         .count();
     assert_eq!(v1_refs, 4, "Expected every v1 tag on the remote");
 }
+
+#[test]
+fn stack_visibility_reaches_the_pr_body() {
+    let ctx =
+        testutil::test_context!().with_remote().with_initial_commit().with_mock_github().build();
+    ctx.checkout_managed_private("visibility-topic");
+    ctx.commit_with_explicit_gherrit_id("Visible work", "Gvisibility");
+    for push_remote in [Some("."), Some("origin"), None] {
+        match push_remote {
+            Some(remote) => ctx.run_git(&["config", "branch.visibility-topic.pushRemote", remote]),
+            None => ctx.run_git(&["config", "--unset", "branch.visibility-topic.pushRemote"]),
+        }
+        ctx.hook_cmd("pre-push").assert().success();
+        let prs = ctx.github().pull_requests();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(
+            prs[0]
+                .body
+                .as_deref()
+                .unwrap()
+                .contains("This PR is on branch [visibility-topic](../tree/visibility-topic)."),
+            push_remote != Some(".")
+        );
+    }
+}
