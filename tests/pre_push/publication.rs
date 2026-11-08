@@ -250,3 +250,46 @@ fn stack_visibility_reaches_the_pr_body() {
         );
     }
 }
+
+#[test]
+fn each_selected_version_reaches_its_refs_and_pr_body() {
+    let ctx = testutil::test_context!()
+        .repository("owner", "repo")
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("different-versions");
+    let mut expected = Vec::new();
+    for (id, previous, version) in [("Gzeta", 3, 4), ("Galpha", 0, 1), ("Gmiddle", 7, 8)] {
+        ctx.commit_with_explicit_gherrit_id(&format!("Work for {id}"), id);
+        let oid = ctx.head_oid();
+        if previous != 0 {
+            ctx.run_git(&["update-ref", &format!("refs/tags/gherrit/{id}/v{previous}"), &oid]);
+        }
+        expected.push((id, oid, version));
+    }
+    ctx.hook_cmd("pre-push").assert().success();
+    let prs = ctx.github().pull_requests();
+    assert_eq!(prs.len(), 3);
+    for (id, oid, version) in expected {
+        let tag = format!("refs/tags/gherrit/{id}/v{version}");
+        assert_eq!(ctx.remote_ref_oid(&tag).as_deref(), Some(oid.as_str()));
+        assert_eq!(ctx.remote_ref_oid(&format!("refs/heads/{id}")).as_deref(), Some(oid.as_str()));
+        ctx.git_cmd()
+            .args(["show-ref", "--verify", "--hash", &tag])
+            .assert()
+            .success()
+            .stdout(format!("{oid}\n"));
+        let pr = prs.iter().find(|pr| pr.head == id).unwrap();
+        let body = pr.body.as_deref().unwrap();
+        if version == 1 {
+            assert!(!body.contains("**Latest Update:**"));
+        } else {
+            let previous = version - 1;
+            assert!(body.contains(&format!("**Latest Update:** v{version} — [Compare vs v{previous}](/owner/repo/compare/gherrit/{id}/v{previous}..gherrit/{id}/v{version})")), "{id}: {body}");
+        }
+    }
+    assert_eq!(ctx.recorded_pushes().len(), 1);
+}

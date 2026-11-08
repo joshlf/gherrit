@@ -348,17 +348,6 @@ fn unreadable_version_ref_stops_before_publication() {
 }
 
 #[test]
-fn exhausted_version_counter_stops_before_publication() {
-    let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: GversionMax");
-    ctx.run_git(&["update-ref", &format!("refs/tags/gherrit/GversionMax/v{}", usize::MAX), "HEAD"]);
-    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
-        "Local version counter exhausted for 'GversionMax'; no publication batch was pushed",
-    ));
-    assert!(ctx.recorded_pushes().is_empty());
-    assert!(ctx.github().pull_requests().is_empty());
-}
-
-#[test]
 fn local_version_write_failure_reports_applied_remote_batch() {
     let ctx = stack_with_raw_commit_message("Work\n\ngherrit-pr-id: GversionLock");
     let path = ctx.repo_path.join(".git/refs/tags/gherrit/GversionLock/v1.lock");
@@ -402,6 +391,32 @@ fn invalid_visibility_config_fails_before_external_io() {
         .failure()
         .stderr(predicate::str::contains("Failed to read stack visibility"));
     assert_eq!(ctx.github().http_arrivals(), 0);
+    assert!(ctx.recorded_pushes().is_empty());
+    assert!(ctx.github().pull_requests().is_empty());
+}
+
+#[test]
+fn every_version_is_checked_before_the_first_publication_batch() {
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("late-exhaustion");
+    // The exhausted entry follows a complete 80-target publication batch.
+    // Checking versions inside the push loop would publish that first batch.
+    for index in 0..81 {
+        ctx.commit_with_explicit_gherrit_id("Work", &format!("Gpreflight{index}"));
+    }
+    ctx.run_git(&[
+        "update-ref",
+        &format!("refs/tags/gherrit/Gpreflight80/v{}", usize::MAX),
+        "HEAD",
+    ]);
+    ctx.hook_cmd("pre-push").assert().failure().stderr(predicate::str::contains(
+        "Local version counter exhausted for 'Gpreflight80'; no publication batch was pushed",
+    ));
     assert!(ctx.recorded_pushes().is_empty());
     assert!(ctx.github().pull_requests().is_empty());
 }
