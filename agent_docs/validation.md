@@ -21,7 +21,7 @@ ci/validate.sh
 ```
 
 The helper uses the caller's stable toolchain and runs the same checks as the
-Ubuntu CI job. Set `RUSTUP_TOOLCHAIN=1.89.0` to reproduce its declared version.
+Ubuntu CI job. Set `RUSTUP_TOOLCHAIN=1.99.1` to reproduce its declared version.
 The formatter still uses nightly. The Windows job retains its native test
 invocation.
 

@@ -78,7 +78,7 @@ use remote::observe_managed_branches;
 
 use crate::commit_message::strip_gherrit_id;
 
-#[derive(Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum GithubEndpoint {
     Production,
     #[cfg(feature = "test-driver")]
@@ -853,10 +853,12 @@ where
                     backoff.attempted,
                     backoff.retry
                 ),
-                Err(item) => bail!(
-                    "GraphQL operation at item {} exceeds GitHub resource limits. Cannot sync.",
-                    item.index
-                ),
+                Err(item) => {
+                    bail!(
+                        "GraphQL operation at item {} exceeds GitHub resource limits. Cannot sync.",
+                        item.index
+                    );
+                }
             }
             continue;
         };

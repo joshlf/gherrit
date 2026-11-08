@@ -287,16 +287,19 @@ mod tests {
 
     #[test]
     fn production_runtime_uses_only_the_production_endpoint() {
-        assert!(matches!(
+        std::assert_matches!(
             Runtime::production().github_endpoint,
             pre_push::GithubEndpoint::Production
-        ));
+        );
     }
 
     #[cfg(feature = "test-driver")]
     #[test]
     fn test_runtime_uses_only_an_explicit_endpoint() {
-        assert!(matches!(Runtime::test(None).github_endpoint, pre_push::GithubEndpoint::Disabled));
+        std::assert_matches!(
+            Runtime::test(None).github_endpoint,
+            pre_push::GithubEndpoint::Disabled
+        );
 
         let runtime = Runtime::test(Some("http://127.0.0.1:1234".to_string()));
         let pre_push::GithubEndpoint::Custom(endpoint) = runtime.github_endpoint else {
