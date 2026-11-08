@@ -1,9 +1,30 @@
+//! GHerrit keeps one GitHub pull request for each commit in a local stack.
+//!
+//! The `gherrit-pr-id` trailer identifies a change across rebases and amends.
+//! The Git object ID identifies one revision of that change. `commit_msg` adds
+//! change IDs, `manage` chooses which branches use GHerrit, and `pre_push`
+//! pushes revisions and updates the PR chain. Git still handles local history
+//! edits. `install` connects these commands to Git hooks.
+//!
+//! The executable chooses runtime inputs and process-wide settings. Command
+//! handlers read repository state through `util::Repo`. This library returns
+//! errors so the executable can report a failed hook.
+//!
+//! See [`Runtime::production`] for runtime setup and [`dispatch`] for an
+//! example of parsing and running a command.
+
 use std::path::PathBuf;
+/// Helpers for IDs in trailers recognized by Git.
+///
+/// Callers choose which part of the message to inspect, how to normalize
+/// it, and which ID values to accept.
 mod commit_message {
-    //! Facts about the trailer bytes supplied by native Git. Callers still
-    //! choose their own source region, normalization and admission policy.
 
     pub(crate) fn gherrit_id_values(trailers: &[u8]) -> impl Iterator<Item = &[u8]> {
+        // Git has already found the trailers and joined folded lines. This
+        // helper only matches the trailer key. The commit hook keeps any
+        // existing value; the publisher separately requires exactly one
+        // nonempty alphanumeric ID.
         trailers
             .split(|byte| *byte == b'\n')
             .filter_map(|line| line.strip_prefix(b"gherrit-pr-id: "))
@@ -28,6 +49,9 @@ mod commit_message {
     }
 
     pub(crate) fn strip_gherrit_id(body: &str, id: &str) -> String {
+        // Remove the chosen ID only from the final paragraph. An ID mentioned
+        // earlier is part of the user's explanation, so leave it in the PR
+        // description. Keep other trailers and whitespace.
         let trailer_start = body
             .rfind("\n\n")
             .map(|position| position + 2)
@@ -71,15 +95,24 @@ use eyre::{Result, WrapErr};
 use manage::State;
 pub(crate) use util::{cmd_macro as cmd, re_macro as re};
 
+/// Runtime inputs for the normal binary or the system-test driver.
+///
+/// The normal binary chooses its endpoint and random-data source directly. Only
+/// the test executable reads test environment variables, even when Cargo
+/// enables the test-driver feature for this library.
+///
+/// See [`Runtime::production`] for an example.
 pub struct Runtime {
     github_endpoint: pre_push::GithubEndpoint,
     id_entropy: fn() -> commit_msg::IdEntropy,
 }
 
 impl Runtime {
-    /// Constructs the dependencies used by the production CLI.
+    /// Constructs the runtime inputs used by the production CLI.
     ///
-    /// ```
+    /// # Examples
+    ///
+    /// ```rust
     /// let _runtime = gherrit::Runtime::production();
     /// ```
     pub fn production() -> Self {
@@ -160,18 +193,44 @@ enum HookCommands {
     },
 }
 
-/// Executes one parsed GHerrit command using explicitly constructed runtime
-/// dependencies.
+/// Runs a parsed GHerrit command with the supplied runtime inputs.
 ///
-/// This boundary is asynchronous and fallible: it does not install process
-/// hooks, parse process arguments, terminate the process, or create a nested
-/// async runtime. Standalone binaries own those policies.
+/// The caller owns argument parsing, global process handlers, and the async
+/// runtime. This function does not install those handlers, parse process
+/// arguments, terminate the process, or create a nested runtime.
+///
+/// # Errors
+///
+/// Returns an error if the current repository cannot be opened or the selected
+/// command fails. A failed command may have already changed Git configuration,
+/// hook files, remote refs, or PRs; those changes are not rolled back.
+///
+/// # Examples
+///
+/// The following example runs in an existing Git worktree and changes its
+/// branch settings. It is compiled but not run as a documentation test.
+///
+/// ```no_run
+/// use clap::Parser;
+/// # fn main() -> eyre::Result<()> {
+/// let cli = gherrit::Cli::try_parse_from(["gherrit", "manage", "--private"])?;
+/// let executor = tokio::runtime::Builder::new_current_thread()
+///     .enable_all()
+///     .build()?;
+/// executor.block_on(gherrit::dispatch(cli, gherrit::Runtime::production()))?;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
     let repo = util::Repo::open(".").wrap_err("Failed to open repo")?;
 
     match cli.command {
         Commands::Hook(cmd) => match cmd {
             HookCommands::PrePush { .. } => {
+                // Accept Git's hook arguments, but publish the current branch's
+                // stack using gherrit.remote. Neither the proposed ref updates
+                // on stdin nor the remote named by Git's hook arguments chooses
+                // what this publisher sends.
                 pre_push::run(&repo, &runtime.github_endpoint).await?;
             }
             HookCommands::PostCheckout { prev, new, flag } => {
@@ -185,7 +244,9 @@ pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
             } else if private {
                 State::Private
             } else {
-                // If no flag provided, preserve current state (enforcing config) or default to private.
+                // Running manage again repairs the current managed mode's
+                // settings. An unset or explicitly unmanaged branch starts in
+                // private mode unless the caller chooses a visibility flag.
                 let (_, state) = repo.read_current_branch_and_state()?;
                 match state {
                     Some(State::Public) => State::Public,

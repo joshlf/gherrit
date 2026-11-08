@@ -1,3 +1,9 @@
+//! Finds a GitHub token for the HTTP client.
+//!
+//! A nonempty `GITHUB_TOKEN` takes priority over the account selected by `gh`.
+//! The caller chooses the endpoint and must keep the returned token out of
+//! diagnostics and requests to unintended destinations.
+
 use eyre::{Result, WrapErr, eyre};
 
 use crate::cmd;

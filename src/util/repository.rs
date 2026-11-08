@@ -1,3 +1,10 @@
+//! Reads repository state for branch management and stack collection.
+//!
+//! [`Repo`] saves the branch name when it opens, including the branch being
+//! rebased while HEAD is detached. Other methods read Git objects, refs,
+//! reflogs, and settings. These reads do not lock the repository, so a later
+//! external operation may see different state.
+
 use std::path::PathBuf;
 
 use eyre::{OptionExt, Result, bail, eyre};
@@ -8,18 +15,21 @@ use crate::{manage::State, re};
 /// Represents the state of the HEAD reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadState {
-    /// HEAD points to a local branch (e.g., `refs/heads/main`). We are fully
-    /// "on" this branch.
+    /// HEAD points to a local branch, such as `refs/heads/main`.
     Attached(String),
-    /// HEAD is detached (e.g. during a rebase), but we know which branch we are
-    /// conceptually working on.
+    /// HEAD is detached, but the branch being worked on is known.
+    ///
+    /// A rebase is one example of this state.
     Pending(String),
-    /// HEAD is detached and we don't know of any associated branch.
+    /// HEAD is detached with no known associated branch.
     Detached,
 }
 
 impl HeadState {
-    /// Returns the logical branch name if one exists (Attached or Pending).
+    /// Returns the branch name when one is known.
+    ///
+    /// [`Self::Attached`] and [`Self::Pending`] return a name;
+    /// [`Self::Detached`] returns `None`.
     pub fn name(&self) -> Option<&str> {
         match self {
             HeadState::Attached(name) | HeadState::Pending(name) => Some(name),
@@ -84,6 +94,9 @@ impl Repo {
         Ok(Remote { owner, repo_name })
     }
 
+    // These are ordered local hints, not a fresh GitHub query. Collection uses
+    // the first as the stack's base. Post-checkout uses the whole list to
+    // recognize branches tracking any possible default branch.
     fn find_default_branches(&self, remote_name: &str) -> Vec<String> {
         let mut branches = Vec::new();
 
@@ -129,7 +142,8 @@ impl Repo {
         branches.iter().any(|b| b == branch_name)
     }
 
-    // Check whether the branch is managed by GHerrit.
+    // A missing setting means the user has not chosen a mode. Only an explicit
+    // Unmanaged value allows a push without syncing PRs.
     pub fn is_managed(&self, branch_name: &str) -> Result<bool> {
         match State::read_from(self, branch_name)? {
             Some(State::Unmanaged) => Ok(false),
@@ -164,7 +178,16 @@ pub enum CommitsBetweenError {
 }
 
 impl Repo {
-    /// Returns the commits from `ancestor` to `descendant` (in that order).
+    /// Returns commits from `ancestor` to `descendant`, excluding `ancestor`.
+    ///
+    /// The commits are ordered from ancestor to descendant. The walk includes
+    /// all reachable history, not just first parents. This function does not
+    /// reject merge commits or side histories.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `ancestor` is not an ancestor of `descendant`, or if
+    /// the histories cannot be read.
     pub fn commits_between(
         &self,
         ancestor: Id<'_>,
@@ -251,12 +274,18 @@ fn get_current_branch(repo: &gix::Repository) -> Result<HeadState> {
 
 /// Parses the owner and repository name from a remote URL.
 ///
-/// Supports the following formats:
-/// - https://github.com/owner/repo(.git)
-/// - git@github.com:owner/repo(.git)
-/// - http://localhost:port/owner/repo(.git)
-/// - /absolute/path/to/owner/repo(.git) (for tests)
-/// - owner/repo (for tests)
+/// Supported forms include:
+///
+/// - `https://github.com/owner/repo(.git)`
+/// - `git@github.com:owner/repo(.git)`
+/// - `http://localhost:port/owner/repo(.git)`
+/// - `/absolute/path/to/owner/repo(.git)` (for tests)
+/// - `owner/repo` (for tests)
+///
+/// # Errors
+///
+/// Returns an error if `remote_url` does not match a supported owner/repository
+/// form.
 pub(super) fn get_repo_owner_name(remote_url: &str) -> Result<(String, String)> {
     let re = re!(r"^(?:.*[/:])?(?P<owner>[^/:]+)/(?P<repo>[^/]+?)(?:\.git)?$");
 

@@ -18,6 +18,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Adds a stable change ID when a managed commit has none.
+//!
+//! Amending or rebasing keeps the existing trailer, so the rewritten commit
+//! updates the same PR. Git finds and writes the trailers; this hook does not
+//! define its own rules for parsing trailers from a complete message. Before
+//! using the ID in a remote ref name, the publisher checks it more strictly.
+
 use std::{fs, path::Path};
 
 use eyre::{Result, WrapErr, bail};
@@ -59,7 +66,9 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
         bail!("File does not exist: {}", msg_path.display().red().bold());
     }
 
-    // Get current branch (supporting rebase)
+    // A rebase detaches HEAD, but the commits still belong to a branch. Repo
+    // keeps that branch name from Git's rebase state so rewritten commits still
+    // get the branch's usual hook behavior.
     let Some(branch_name) = repo.current_branch().name() else {
         log::debug!("Could not determine branch name (detached head?). Skipping.");
         return Ok(());
@@ -79,7 +88,9 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
         return Ok(());
     }
 
-    // Check if trailer exists
+    // Keep any ID Git recognizes here, even one the publisher would reject.
+    // Silently replacing an invalid or duplicate ID could create a new PR
+    // instead of letting the user repair the original commit.
     let output = cmd!("git interpret-trailers --parse").arg(msg_file).checked_output()?;
     let trailers = String::from_utf8_lossy(&output.stdout);
 
@@ -87,8 +98,9 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
         return Ok(());
     }
 
-    // Calculate Change-ID
-    // Construct the input: "Ident\nRefHash\nMsgContent"
+    // Use both commit details and fresh random data to generate the ID. This is
+    // not the final commit hash: adding the ID changes the message. Later
+    // rewrites must keep this ID.
     let input_data = {
         let committer_ident = cmd!("git var GIT_COMMITTER_IDENT").checked_output()?;
         let committer_ident =
@@ -113,9 +125,9 @@ pub fn run(repo: &util::Repo, msg_file: &Path, acquire_entropy: fn() -> IdEntrop
     .wrap_err("Failed to compute hash")?;
     let gherrit_id = derive_gherrit_id(acquire_entropy(), object_id.as_bytes());
 
-    // Insert trailer
-    // --where start: puts it at the top of the trailer block
-    // --if-exists doNothing: prevents duplicates
+    // Let Git add the ID at the start of the trailers using its own formatting
+    // rules. doNothing adds another check against duplicates; it does not
+    // guarantee that every byte of the existing trailers stays the same.
     cmd!(
         "git interpret-trailers --in-place --where start --if-exists doNothing --trailer",
         "gherrit-pr-id: {gherrit_id}"

@@ -1,3 +1,11 @@
+//! Configures which branches use GHerrit.
+//!
+//! Both managed modes track the local branch through the remote `.`. Private
+//! mode also pushes to `.`, so pre-push can publish the PR stack without
+//! pushing the user's branch. Public mode also pushes that branch to the
+//! configured remote. The pre-push command sends the PR branches itself; these
+//! settings control the outer Git push.
+
 use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
 
@@ -6,6 +14,11 @@ use crate::{
     util::{self, CommandExt as _, HeadState},
 };
 
+/// The user's branch-management choice.
+///
+/// The choice is stored in `branch.<name>.gherritManaged`. `None` means the
+/// user has not chosen and differs from [`State::Unmanaged`]. A push requires
+/// an explicit choice rather than guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Unmanaged,
@@ -44,6 +57,11 @@ impl State {
     }
 }
 
+/// The branch settings GHerrit updates when the management mode changes.
+///
+/// The old mode's expected values determine whether the user changed these
+/// settings manually. Unrelated branch settings are excluded from that
+/// comparison.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BranchConfig {
     push_remote: Option<String>,
@@ -92,6 +110,8 @@ impl BranchConfig {
         &'a self,
         desired: &'a BranchConfig,
     ) -> impl Iterator<Item = (BranchConfigKey, Option<&'a str>, Option<&'a str>)> + 'a {
+        // Use the same key list for drift reports and writes so they have the
+        // same order. Write only settings whose values changed.
         BranchConfigKey::ALL.into_iter().filter_map(move |key| {
             let current = self.value(key).as_deref();
             let desired = desired.value(key).as_deref();
@@ -124,9 +144,9 @@ impl BranchConfigKey {
 enum TransitionKind {
     /// The branch is already explicitly unmanaged.
     NoChange,
-    /// Record unmanaged intent without claiming ownership of branch config.
+    /// Records unmanaged intent without taking over branch settings.
     RecordUnmanaged,
-    /// Reconcile branch config before recording the requested state.
+    /// Updates branch settings before recording the requested state.
     ReconcileConfig,
 }
 
@@ -205,7 +225,12 @@ enum StateUpdate {
     Refused,
 }
 
-/// Explicit requests must report that drift blocked the requested transition.
+/// Changes the branch's management mode for an explicit request.
+///
+/// # Errors
+///
+/// Returns an error if reading or updating branch state fails, or if manual
+/// configuration changes block the requested transition.
 pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()> {
     match try_set_state(repo, new_state, force)? {
         StateUpdate::Completed => Ok(()),
@@ -213,8 +238,13 @@ pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()>
     }
 }
 
-/// Automatic checkout management is advisory. Only a known drift refusal is
-/// nonfatal; failed observations or writes still propagate their errors.
+/// Changes the management mode after a checkout, warning on drift.
+///
+/// A known drift refusal is advisory and does not fail the checkout.
+///
+/// # Errors
+///
+/// Returns errors from failed repository observations or configuration writes.
 fn set_state_after_checkout(repo: &util::Repo, new_state: State) -> Result<()> {
     if try_set_state(repo, new_state, false)? == StateUpdate::Refused {
         log::warn!("{DRIFT_REFUSAL}");
@@ -265,6 +295,9 @@ fn try_set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<Sta
     }
 
     let state_key = format!("branch.{branch_name}.gherritManaged");
+    // Record the chosen mode after changing its settings. These Git config
+    // writes are separate: a failure may leave some settings changed. A later
+    // command may report that partial update as drift.
     cmd!("git config", state_key, new_state.config_value()).success()?;
 
     let branch_name_y = branch_name.yellow();
@@ -290,6 +323,9 @@ fn try_set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<Sta
 }
 
 fn checked_out_branch<'a>(flag: &str, head: &'a HeadState) -> Option<&'a str> {
+    // Checking out a file or a detached commit does not create a managed
+    // branch. This hook needs HEAD to name a branch, unlike commit-msg during a
+    // rebase.
     match (flag, head) {
         ("1", HeadState::Attached(branch_name)) => Some(branch_name),
         _ => None,
@@ -329,6 +365,10 @@ enum PostCheckoutBranchKind {
 fn classify_post_checkout_branch(
     observation: PostCheckoutBranchObservation,
 ) -> PostCheckoutBranchKind {
+    // Treat a new branch that tracks a non-default branch as shared. Tracking a
+    // default branch is the usual way to start a local stack. This decision
+    // does not allow overwriting custom settings; changing the mode still
+    // requires the usual drift check.
     match observation {
         PostCheckoutBranchObservation::Existing => PostCheckoutBranchKind::Existing,
         PostCheckoutBranchObservation::NewlyCreated {
@@ -340,6 +380,8 @@ fn classify_post_checkout_branch(
 }
 
 pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> Result<()> {
+    // An object ID cannot tell whether we created a branch or switched to an
+    // existing branch at the same commit. Check the branch's reflog below.
     let Some(branch_name) = checked_out_branch(flag, repo.current_branch()) else {
         return Ok(());
     };

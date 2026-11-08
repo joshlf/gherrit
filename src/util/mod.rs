@@ -1,9 +1,16 @@
+//! Shared helpers for Git repositories, configuration, and child commands.
+//!
+//! The helpers return repository facts, command results, and the paths callers
+//! need. The command using them decides what may be published.
+
 mod auth;
 mod command;
 mod config;
+/// Paths used by a linked worktree.
+///
+/// Child processes receive paths with their original spelling. Determining
+/// a canonical repository identity is a separate contract.
 mod layout {
-    //! Path roles are distinct in a linked worktree. Keep the original spelling
-    //! for child processes; canonical identity is a separate repository contract.
 
     use std::path::Path;
 
