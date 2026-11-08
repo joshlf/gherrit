@@ -1,3 +1,8 @@
+//! Shared adapters for Git repositories, configuration, and child commands.
+//!
+//! Keep policy in the owning command: these helpers expose repository facts,
+//! command results, and path roles without deciding what may be published.
+
 mod auth;
 mod command;
 mod config;

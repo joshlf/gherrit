@@ -1,3 +1,10 @@
+//! Repository observations used by management and stack collection.
+//!
+//! The branch identity is captured when Repo opens, including the branch being
+//! rebased while HEAD is detached. Other methods consult Git objects, refs,
+//! reflogs, and configuration; these observations do not lock the repository
+//! or guarantee that a later external operation sees the same state.
+
 use std::path::PathBuf;
 
 use eyre::{OptionExt, Result, bail, eyre};
@@ -84,6 +91,9 @@ impl Repo {
         Ok(Remote { owner, repo_name })
     }
 
+    // This is an ordered list of local hints, not a fresh query to GitHub.
+    // Collection uses its first entry as the stack's base; post-checkout uses
+    // membership to recognize branches tracking any default-branch candidate.
     fn find_default_branches(&self, remote_name: &str) -> Vec<String> {
         let mut branches = Vec::new();
 
@@ -129,7 +139,8 @@ impl Repo {
         branches.iter().any(|b| b == branch_name)
     }
 
-    // Check whether the branch is managed by GHerrit.
+    // An absent setting is an unanswered management question. Only an explicit
+    // Unmanaged value authorizes the ordinary-push path without syncing PRs.
     pub fn is_managed(&self, branch_name: &str) -> Result<bool> {
         match State::read_from(self, branch_name)? {
             Some(State::Unmanaged) => Ok(false),
@@ -165,6 +176,10 @@ pub enum CommitsBetweenError {
 
 impl Repo {
     /// Returns the commits from `ancestor` to `descendant` (in that order).
+    ///
+    /// The ancestor itself is excluded. This walks reachable history rather
+    /// than a first-parent-only chain; callers must not infer that merge
+    /// commits or side histories were rejected here.
     pub fn commits_between(
         &self,
         ancestor: Id<'_>,
