@@ -4,9 +4,11 @@
 //! The orchestrator owns authentication, transport, batching, and effect order;
 //! decoding an acknowledgement here does not re-read the resulting PR state.
 
+mod transport;
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use serde::Deserialize;
 use serde_json::{Value, json};
+pub(super) use transport::run_batched_graphql;
 
 use super::reconcile::PullRequestState;
 

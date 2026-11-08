@@ -7,7 +7,7 @@ outstanding work.
 
 | Owner | Unit and current value | Meaning |
 | --- | --- | --- |
-| `src/pre_push/mod.rs::read_commit_trailers` | 120 commit arguments per Git invocation | Bounds each trailer-query argument list; output is collected by the command adapter |
+| `src/pre_push/collect.rs::read_commit_trailers` | 120 commit arguments per Git invocation | Bounds each trailer-query argument list; output is collected by the command adapter |
 | `src/pre_push/publication.rs` | 80 publication targets per push | Leaves command-line headroom for branch and tag refspecs and leases |
 | `src/pre_push/publication.rs` | 250 branch arguments per remote query | Separately bounds each `ls-remote` invocation |
 | `src/pre_push/batching.rs` | 64 initial GraphQL operations per batch | Rejected batches halve down to a single operation |
