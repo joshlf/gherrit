@@ -32,8 +32,9 @@ represented as a chain of Pull Requests on GitHub.
 
 It achieves this by:
 1.  Intercepting `git push` via the `pre-push` hook.
-2.  Pushing unique `refs/gherrit/<id>` refs for every commit to the remote.
-3.  Using the `gh` CLI tool to create/update PRs and chain them together
+2.  Publishing `refs/heads/<id>` branches and numbered
+    `refs/tags/gherrit/<id>/v<n>` revision tags.
+3.  Using GitHub's GraphQL API to create/update PRs and chain them together
     (setting the base of one PR to the head of the previous one).
 
 ### Project Structure
@@ -44,8 +45,12 @@ It achieves this by:
     - `process.rs`: Process setup shared by the two executable targets.
     - `test_git.rs`: Git interceptor compiled only into the test driver.
     - `lib.rs`: Fallible asynchronous command dispatch and runtime inputs.
-    - `pre_push/mod.rs`: **CORE LOGIC**. Handles commit analysis, ref creation,
-      pushing, and PR syncing.
+    - `pre_push/mod.rs`: Command admission and the order of publication phases.
+    - `pre_push/collect.rs`: Local history and committed-identity admission.
+    - `pre_push/push.rs`: Git execution, diagnostics and local version state.
+    - `pre_push/sync.rs`: PR identity resolution and metadata projection.
+    - `pre_push/github.rs`: GraphQL request/response codecs.
+    - `pre_push/github/transport.rs`: Adaptive GraphQL request execution.
     - `manage.rs`: Handles the state of branches (Managed vs Unmanaged) via `git config`.
     - `commit_msg.rs`: Ensures commits have `gherrit-pr-id` trailers.
 - `testutil/src/`: System fixtures. `lib.rs` owns context construction and
