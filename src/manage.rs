@@ -69,21 +69,18 @@ struct BranchConfig {
 
 impl BranchConfig {
     fn expected(state: Option<State>, branch_name: &str, default_remote: &str) -> BranchConfig {
-        let self_merge_ref = format!("refs/heads/{branch_name}");
+        // Both managed modes track the local branch. Only their push
+        // destination differs. Build all the settings from one state match so
+        // those choices have one place to update.
+        let push_remote = match state {
+            Some(State::Unmanaged) | None => return BranchConfig::default(),
+            Some(State::Private) => ".",
+            Some(State::Public) => default_remote,
+        };
         BranchConfig {
-            push_remote: match state {
-                Some(State::Unmanaged) | None => None,
-                Some(State::Private) => Some(".".to_string()),
-                Some(State::Public) => Some(default_remote.to_string()),
-            },
-            remote: match state {
-                Some(State::Unmanaged) | None => None,
-                Some(State::Private | State::Public) => Some(".".to_string()),
-            },
-            merge: match state {
-                Some(State::Unmanaged) | None => None,
-                Some(State::Private | State::Public) => Some(self_merge_ref),
-            },
+            push_remote: Some(push_remote.to_string()),
+            remote: Some(".".to_string()),
+            merge: Some(format!("refs/heads/{branch_name}")),
         }
     }
 
