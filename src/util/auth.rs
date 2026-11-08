@@ -1,3 +1,9 @@
+//! Resolve a GitHub credential for the HTTP client.
+//!
+//! A nonempty GITHUB_TOKEN takes precedence over the gh CLI's selected account.
+//! Return only the token; the caller owns endpoint selection and must keep it
+//! away from diagnostics and unintended destinations.
+
 use eyre::{Result, WrapErr, eyre};
 
 use crate::cmd;

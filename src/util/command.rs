@@ -1,3 +1,9 @@
+//! Child-command construction and checked exit statuses.
+//!
+//! Commands execute directly, without a shell. Callers choose arguments, I/O
+//! capture, and any lifetime policy. These helpers do not impose a timeout,
+//! retry a failed command, or undo effects it performed before failing.
+
 use std::{ffi::OsStr, process::Command};
 
 use eyre::{Result, bail};
@@ -82,7 +88,10 @@ pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Co
 }
 
 pub trait CommandExt {
+    /// Run with the command's configured I/O and reject a nonzero exit status.
     fn success(&mut self) -> Result<()>;
+    /// Return captured output only after checking the exit status.
+    /// Failure diagnostics include stderr; callers own its sensitivity.
     fn checked_output(&mut self) -> Result<std::process::Output>;
 }
 

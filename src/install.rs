@@ -1,3 +1,10 @@
+//! Install small hook shims while respecting existing hook ownership.
+//!
+//! Inspect all three destinations before changing any of them. Each hook is
+//! then prepared completely and renamed into place. Replacement is atomic for
+//! one directory entry, not for the whole set of hooks; a later failure can
+//! leave an installed prefix. Rerunning installation repairs that prefix.
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{fs, io::Write as _, path::PathBuf};
@@ -8,6 +15,8 @@ use owo_colors::OwoColorize;
 use crate::util::Repo;
 
 const REQUIRED_HOOKS: &[&str] = &["pre-push", "commit-msg", "post-checkout"];
+// This marker, rather than a byte-for-byte template match, grants permission
+// to replace an existing hook without --force. Keep it in generated shims.
 const PROLOGUE: &str = "# gherrit-installer: managed";
 const SHIM_TEMPLATE: &str = r#"#!/bin/sh
 # gherrit-installer: managed
@@ -31,6 +40,9 @@ struct PreparedHook {
 
 impl HookReplacement {
     fn prepare(self) -> Result<PreparedHook> {
+        // A sibling temporary file permits rename over the destination without
+        // exposing a partly written hook. Its lifetime also handles cleanup if
+        // writing or setting executable permissions fails.
         let parent = self.path.parent().expect("hook destination has a parent");
         let mut temporary = tempfile::Builder::new()
             .prefix(".gherrit-hook-")
@@ -49,6 +61,9 @@ impl HookReplacement {
 
 impl PreparedHook {
     fn replace(self) -> Result<()> {
+        // Rename replaces a symlink entry instead of writing through it. The
+        // new file has its own metadata; this does not preserve the old file's
+        // owner/ACLs or establish durability of the directory after power loss.
         self.temporary
             .persist(&self.destination)
             .map_err(|error| error.error)
@@ -134,12 +149,16 @@ pub fn install(repo: &Repo, force: bool, allow_global: bool) -> Result<()> {
 
 fn resolve_hooks_dir(repo: &Repo, allow_global: bool) -> Result<PathBuf> {
     if let Some(path_buf) = repo.config_path("core.hooksPath")? {
-        // Security check: ensure the hooks directory is within the repository.
+        // External hook paths can affect repositories beyond this one, so
+        // require the separate --allow-global opt-in. --force only authorizes
+        // replacing hooks; it does not authorize using an external path.
         let layout = repo.layout();
         let root = layout.workdir.unwrap_or(layout.worktree_git_dir);
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
-        // Best effort canonicalization
+        // Existing paths can be compared after resolving symlinks. Missing
+        // paths retain their spelling. This is a best-effort location check,
+        // not a filesystem capability or protection from concurrent changes.
         let abs_hooks =
             if path_buf.exists() { path_buf.canonicalize().unwrap_or(path_buf) } else { path_buf };
 

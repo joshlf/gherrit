@@ -1,9 +1,25 @@
+//! GHerrit keeps one GitHub pull request for each commit in a local stack.
+//!
+//! A `gherrit-pr-id` trailer names a logical change across rebases and amends;
+//! the Git object ID names one particular revision. `commit_msg` supplies new
+//! logical IDs, `manage` configures which branches participate, and `pre_push`
+//! publishes revisions and the corresponding PR chain. Git still owns local
+//! history editing. `install` connects these commands to Git through hooks.
+//!
+//! The executable chooses runtime dependencies and process-wide policies.
+//! Command handlers share repository observations through `util::Repo`; this
+//! library returns errors so the executable can turn them into a failed hook.
+
 use std::path::PathBuf;
 mod commit_message {
     //! Facts about the trailer bytes supplied by native Git. Callers still
     //! choose their own source region, normalization and admission policy.
 
     pub(crate) fn gherrit_id_values(trailers: &[u8]) -> impl Iterator<Item = &[u8]> {
+        // Git has already decided which lines are trailers and unfolded them.
+        // Keep this shared operation limited to recognizing its key spelling:
+        // the commit hook preserves an existing value, whereas publication
+        // separately requires exactly one nonempty, alphanumeric value.
         trailers
             .split(|byte| *byte == b'\n')
             .filter_map(|line| line.strip_prefix(b"gherrit-pr-id: "))
@@ -28,6 +44,9 @@ mod commit_message {
     }
 
     pub(crate) fn strip_gherrit_id(body: &str, id: &str) -> String {
+        // Remove the selected identity only from the final paragraph. An ID
+        // mentioned earlier in an explanation is user prose, not metadata to
+        // hide from the PR description. Keep other trailers and whitespace.
         let trailer_start = body
             .rfind("\n\n")
             .map(|position| position + 2)
@@ -71,6 +90,11 @@ use eyre::{Result, WrapErr};
 use manage::State;
 pub(crate) use util::{cmd_macro as cmd, re_macro as re};
 
+/// Inputs that differ between the shipping binary and the system-test driver.
+///
+/// Production constructs its endpoint and entropy source directly. Test-only
+/// environment handling stays in the separate executable, including when
+/// Cargo enables the test-driver feature for the library.
 pub struct Runtime {
     github_endpoint: pre_push::GithubEndpoint,
     id_entropy: fn() -> commit_msg::IdEntropy,
@@ -172,6 +196,10 @@ pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
     match cli.command {
         Commands::Hook(cmd) => match cmd {
             HookCommands::PrePush { .. } => {
+                // Accept Git's hook arguments for interface compatibility.
+                // This publisher discovers the current branch's stack and
+                // uses gherrit.remote; it does not select work from Git's
+                // proposed ref updates on stdin or bind to the hook's remote.
                 pre_push::run(&repo, &runtime.github_endpoint).await?;
             }
             HookCommands::PostCheckout { prev, new, flag } => {
@@ -185,7 +213,9 @@ pub async fn dispatch(cli: Cli, runtime: Runtime) -> Result<()> {
             } else if private {
                 State::Private
             } else {
-                // If no flag provided, preserve current state (enforcing config) or default to private.
+                // Re-running manage repairs/enforces the current managed mode.
+                // An unset or explicitly unmanaged branch starts in private
+                // mode unless the caller selected a visibility flag.
                 let (_, state) = repo.read_current_branch_and_state()?;
                 match state {
                     Some(State::Public) => State::Public,

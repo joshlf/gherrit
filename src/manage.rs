@@ -1,3 +1,11 @@
+//! Branch participation and the Git configuration that implements it.
+//!
+//! Both managed modes track the local branch through the loopback remote `.`.
+//! Private mode also pushes to `.`, allowing pre-push to publish the PR stack
+//! without exporting the user's branch. Public mode pushes that branch to the
+//! configured remote as well. The pre-push command publishes synthesized PR
+//! branches itself; these settings govern the enclosing Git operation.
+
 use eyre::{Result, WrapErr, bail};
 use owo_colors::OwoColorize;
 
@@ -6,6 +14,10 @@ use crate::{
     util::{self, CommandExt as _, HeadState},
 };
 
+/// Explicit intent stored in `branch.<name>.gherritManaged`.
+///
+/// Absence is represented by `Option<State>` and differs from `Unmanaged`:
+/// push requires an explicit choice rather than guessing the user's intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Unmanaged,
@@ -44,6 +56,10 @@ impl State {
     }
 }
 
+/// Only the settings GHerrit reconciles when changing management mode.
+///
+/// The expected values for the old mode determine whether these settings have
+/// drifted. Unrelated branch settings remain outside this comparison.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BranchConfig {
     push_remote: Option<String>,
@@ -92,6 +108,8 @@ impl BranchConfig {
         &'a self,
         desired: &'a BranchConfig,
     ) -> impl Iterator<Item = (BranchConfigKey, Option<&'a str>, Option<&'a str>)> + 'a {
+        // Enumerating one shared key list keeps drift reports and actual
+        // updates in the same order, and avoids rewriting unchanged settings.
         BranchConfigKey::ALL.into_iter().filter_map(move |key| {
             let current = self.value(key).as_deref();
             let desired = desired.value(key).as_deref();
@@ -265,6 +283,9 @@ fn try_set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<Sta
     }
 
     let state_key = format!("branch.{branch_name}.gherritManaged");
+    // Record intent after changing the related settings. These separate Git
+    // config writes are not a transaction: a failure can leave a partial
+    // update, which a later command may report as drift.
     cmd!("git config", state_key, new_state.config_value()).success()?;
 
     let branch_name_y = branch_name.yellow();
@@ -290,6 +311,8 @@ fn try_set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<Sta
 }
 
 fn checked_out_branch<'a>(flag: &str, head: &'a HeadState) -> Option<&'a str> {
+    // File checkout and detached checkout do not create a managed branch.
+    // Unlike commit-msg during a rebase, this hook needs an attached HEAD.
     match (flag, head) {
         ("1", HeadState::Attached(branch_name)) => Some(branch_name),
         _ => None,
@@ -329,6 +352,10 @@ enum PostCheckoutBranchKind {
 fn classify_post_checkout_branch(
     observation: PostCheckoutBranchObservation,
 ) -> PostCheckoutBranchKind {
+    // A new branch tracking another non-default branch is treated as shared.
+    // Tracking a default branch is instead the usual start of a local stack.
+    // Classification does not authorize overwriting custom branch settings;
+    // the state transition still performs its own drift check.
     match observation {
         PostCheckoutBranchObservation::Existing => PostCheckoutBranchKind::Existing,
         PostCheckoutBranchObservation::NewlyCreated {
@@ -340,6 +367,8 @@ fn classify_post_checkout_branch(
 }
 
 pub fn post_checkout(repo: &util::Repo, _prev: &str, _new: &str, flag: &str) -> Result<()> {
+    // Object IDs alone cannot distinguish branch creation from switching to
+    // an existing branch at the same commit. Use the branch's reflog below.
     let Some(branch_name) = checked_out_branch(flag, repo.current_branch()) else {
         return Ok(());
     };
