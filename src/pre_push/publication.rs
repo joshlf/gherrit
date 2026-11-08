@@ -1,3 +1,11 @@
+//! Builds the arguments and local tag writes for one Git push batch.
+//!
+//! Each change has a mutable branch and a numbered version tag pointing to the
+//! submitted commit. The caller supplies observed branch tips and version
+//! numbers chosen from local history, runs the command, and saves local tags
+//! only after Git reports success. This module neither reads remote state nor
+//! checks a push receipt or recovers from a failed attempt.
+
 use std::slice;
 
 use gix::ObjectId;
@@ -16,6 +24,7 @@ pub(super) struct PushTarget<'a> {
     pub object_id: ObjectId,
     pub gherrit_id: &'a str,
     pub version: usize,
+    /// An empty value means the branch was absent in the caller's observation.
     pub expected_remote_sha: &'a str,
 }
 
@@ -27,6 +36,10 @@ pub(super) struct PersistedTag {
 
 pub(super) struct PushPlan {
     pub arguments: Vec<String>,
+    /// Local writes to make after a successful push.
+    ///
+    /// These values do not prove that the remote push took effect. The caller
+    /// runs the push and checks its result.
     pub persisted_tags: Vec<PersistedTag>,
 }
 
@@ -43,9 +56,10 @@ pub(super) fn plan_push(remote: &str, targets: &[PushTarget<'_>]) -> PushPlan {
     let refspecs = targets.iter().flat_map(|target| {
         let branch = refs::head(target.gherrit_id);
         let tag = refs::version_tag(target.gherrit_id, target.version);
-        // Branch updates are leased against the observed remote value. A tag
-        // lease with an empty expected value requires that the version tag not
-        // exist, making it a lock rather than an overwrite.
+        // Require the observed branch value and a missing version tag. These
+        // lightweight refs store commit IDs, not unique attempt IDs. Git may
+        // consider a ref with the requested value already up to date, so these
+        // checks are not an exclusive lock that only one push can use.
         [
             format!("{}:{branch}", target.object_id),
             format!("--force-with-lease={branch}:{}", target.expected_remote_sha),
@@ -53,6 +67,9 @@ pub(super) fn plan_push(remote: &str, targets: &[PushTarget<'_>]) -> PushPlan {
             format!("--force-with-lease={tag}:"),
         ]
     });
+    // The outer pre-push hook is already sending these generated refs.
+    // --no-verify avoids running the hook recursively. --atomic covers this
+    // batch of branches and tags, not other batches or GitHub PR changes.
     let arguments = ["push", "--quiet", "--no-verify", "--atomic", remote]
         .into_iter()
         .map(ToString::to_string)

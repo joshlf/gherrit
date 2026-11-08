@@ -1,3 +1,9 @@
+//! Reads managed branch tips without fetching their objects.
+//!
+//! Each successful `ls-remote` response gives exact branch/OID pairs for later
+//! leases. Several requests may be needed, so the results are not a snapshot of
+//! all remote refs. A tip may still change before the push.
+
 use std::collections::{HashMap, hash_map::Entry};
 
 use color_eyre::eyre::{Context as _, Result, bail};
@@ -6,7 +12,12 @@ use gix::ObjectId;
 use super::{publication::remote_query_batches, refs};
 use crate::util::{self, CommandExt as _};
 
-/// Observes the managed branches relevant to the current stack.
+/// Reads the managed branch tips for the current stack.
+///
+/// # Errors
+///
+/// Returns an error if a Git request fails or its output is malformed, contains
+/// invalid object IDs, or repeats a requested branch.
 pub(super) fn observe_managed_branches(
     repo: &util::Repo,
     gherrit_ids: &[String],
@@ -33,13 +44,19 @@ pub(super) fn observe_managed_branches(
     })
 }
 
-/// Parses `git ls-remote` standard output.
+/// Parses the standard output of `git ls-remote`.
 ///
-/// The output is zero or more `<object ID>\t<fully qualified ref name>`
-/// records separated by line feeds; a requested ref that is absent produces no
-/// record. The final line feed is optional here. Ref names need not be UTF-8,
-/// so parsing stays byte-oriented and retains only exact requested refs after
+/// Each record is `<object ID>\t<fully qualified ref name>`, where `\t` is a
+/// literal tab. Records are separated by line feeds, and the final line feed is
+/// optional. An absent requested ref produces no record. Ref names need not be
+/// UTF-8, so parsing uses bytes and keeps only exact requested refs after
 /// validating every complete record and object ID.
+///
+/// # Errors
+///
+/// Returns an error for malformed records, invalid object IDs, or duplicate
+/// requested refs, including malformed records for refs that were not
+/// requested.
 fn parse_managed_branches(
     output: &[u8],
     requested_ids: &[String],
@@ -64,6 +81,8 @@ fn parse_managed_branches(
             .wrap_err_with(|| format!("invalid object ID in `git ls-remote` line: {line:?}"))?;
 
         let Some(id) = requested_refs.get(ref_name) else {
+            // Git's patterns may match refs we did not request. Use only exact
+            // requested names when choosing a managed branch's lease.
             return Ok(states);
         };
 

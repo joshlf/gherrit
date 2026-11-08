@@ -1,3 +1,9 @@
+//! Chooses request sizes without encoding GraphQL or using the network.
+//!
+//! [`BatchPlan`] tracks a position in the original item order. Accepting a
+//! batch advances it. Rejecting a batch shrinks the range without advancing.
+//! The smaller size remains the cap for the rest of the invocation.
+
 use std::{num::NonZeroUsize, ops::Range};
 
 use serde_json::Value;
@@ -38,6 +44,8 @@ impl BatchPlan {
     }
 
     pub fn reject(&mut self) -> Result<Backoff, ItemTooLarge> {
+        // Retrying one item cannot make its document smaller. Report its
+        // original position instead of retrying forever at the smallest size.
         let range = self.current().expect("cannot reject a completed batch plan");
         let attempted = range.len();
         if attempted == 1 {
@@ -62,6 +70,10 @@ pub(super) fn query_exceeds_limit(query: &str) -> bool {
 }
 
 pub(super) fn classify_response(response: &Value) -> ResponseDisposition {
+    // Partial data or mixed errors may follow mutations that already took
+    // effect. Do not retry them in smaller batches. Retry only the narrow error
+    // shape checked here, with no data. This heuristic does not prove that a
+    // failed mutation made no remote changes.
     let Some(errors) = response.get("errors") else {
         return ResponseDisposition::Success;
     };

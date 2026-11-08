@@ -1,3 +1,8 @@
+//! Rejects temporary commits before they become separate PRs.
+//!
+//! Local autosquash must decide which commits survive before each change can
+//! have a meaningful PR.
+
 use std::{error::Error, fmt};
 
 const RESERVED_PREFIXES: [&str; 3] = ["fixup!", "squash!", "amend!"];
@@ -30,10 +35,13 @@ impl Error for PendingAutosquash {}
 
 /// Ensures that a stack contains no commits reserved for autosquashing.
 ///
-/// This policy runs over the entire stack before commit metadata is validated.
-/// A temporary commit therefore takes precedence over errors that are only
-/// meaningful once the stack is ready to publish, such as a missing GHerrit
-/// ID.
+/// This check runs over the entire stack before commit metadata is validated. A
+/// temporary commit therefore takes precedence over errors meaningful only once
+/// the stack is ready to publish, such as a missing GHerrit ID.
+///
+/// # Errors
+///
+/// Returns [`PendingAutosquash`] if a subject starts with a reserved prefix.
 pub(super) fn ensure_publishable<'a>(
     subjects: impl IntoIterator<Item = &'a str>,
     remote: &str,
