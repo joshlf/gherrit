@@ -4,9 +4,11 @@
 //! handles authentication, HTTP requests, batches, and write order. Decoding a
 //! reply here does not read the resulting PR state again.
 
+mod transport;
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use serde::Deserialize;
 use serde_json::{Value, json};
+pub(super) use transport::run_batched_graphql;
 
 use super::reconcile::PullRequestState;
 
