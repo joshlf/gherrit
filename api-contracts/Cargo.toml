@@ -1,0 +1,10 @@
+[package]
+name = "gherrit-api-contracts"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.89.0"
+publish = false
+
+[dev-dependencies]
+serde_json = "1.0"
+trybuild = "=1.0.122"

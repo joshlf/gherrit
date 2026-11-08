@@ -1,0 +1,15 @@
+error[E0382]: use of moved value: `attempt`
+  --> tests/ui/batch-reuse-accept-invalid.rs:13:5
+   |
+11 |     let attempt = plan.current().unwrap();
+   |         ------- move occurs because `attempt` has type `BatchAttempt<'_>`, which does not implement the `Copy` trait
+12 |     attempt.accept();
+   |             -------- `attempt` moved due to this method call
+13 |     attempt.reject().unwrap();
+   |     ^^^^^^^ value used here after move
+   |
+note: `BatchAttempt::<'_>::accept` takes ownership of the receiver `self`, which moves `attempt`
+  --> tests/ui/../../../src/pre_push/batching.rs
+   |
+   |     pub fn accept(self) {
+   |                   ^^^^

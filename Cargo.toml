@@ -75,4 +75,4 @@ path = "tests/pre_push/main.rs"
 required-features = ["test-driver"]
 
 [workspace]
-members = ["testutil"]
+members = ["testutil", "api-contracts"]
