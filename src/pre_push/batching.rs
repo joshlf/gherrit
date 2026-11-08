@@ -18,6 +18,15 @@ pub(super) struct BatchPlan {
     batch_len: NonZeroUsize,
 }
 
+/// One nonempty range borrowed from a plan. Resolving it consumes the attempt,
+/// so the caller cannot advance it twice or accept a different current range.
+/// Dropping it leaves the plan unchanged, as when request decoding fails.
+#[must_use]
+pub(super) struct BatchAttempt<'plan> {
+    plan: &'plan mut BatchPlan,
+    range: Range<usize>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Backoff {
     pub attempted: usize,
@@ -34,26 +43,37 @@ impl BatchPlan {
         Self { item_count, cursor: 0, batch_len: max_batch_len }
     }
 
-    pub fn current(&self) -> Option<Range<usize>> {
-        (self.cursor < self.item_count)
-            .then(|| self.cursor..self.item_count.min(self.cursor + self.batch_len.get()))
+    pub fn current(&mut self) -> Option<BatchAttempt<'_>> {
+        if self.cursor == self.item_count {
+            return None;
+        }
+        // Bound the increment before adding it: cursor + batch_len can
+        // overflow even though a smaller final range fits within item_count.
+        let start = self.cursor;
+        let length = self.batch_len.get().min(self.item_count - start);
+        Some(BatchAttempt { plan: self, range: start..start + length })
+    }
+}
+
+impl BatchAttempt<'_> {
+    pub fn range(&self) -> Range<usize> {
+        self.range.clone()
     }
 
-    pub fn accept(&mut self) {
-        self.cursor = self.current().expect("cannot accept a completed batch plan").end;
+    pub fn accept(self) {
+        self.plan.cursor = self.range.end;
     }
 
-    pub fn reject(&mut self) -> Result<Backoff, ItemTooLarge> {
+    pub fn reject(self) -> Result<Backoff, ItemTooLarge> {
         // Retrying a single item cannot make its document smaller. Report its
         // original position rather than looping forever at the minimum size.
-        let range = self.current().expect("cannot reject a completed batch plan");
-        let attempted = range.len();
+        let attempted = self.range.len();
         if attempted == 1 {
-            return Err(ItemTooLarge { index: range.start });
+            return Err(ItemTooLarge { index: self.range.start });
         }
 
         let retry = NonZeroUsize::new(attempted / 2).expect("rejected batch has multiple items");
-        self.batch_len = retry;
+        self.plan.batch_len = retry;
         Ok(Backoff { attempted, retry: retry.get() })
     }
 }
@@ -110,12 +130,16 @@ mod tests {
 
     use super::*;
 
+    fn current_range(plan: &mut BatchPlan) -> Option<Range<usize>> {
+        plan.current().map(|attempt| attempt.range())
+    }
+
     fn ranges(item_count: usize) -> Vec<Range<usize>> {
         let mut plan = BatchPlan::new(item_count, INITIAL_GRAPHQL_BATCH_LEN);
         let mut ranges = Vec::new();
-        while let Some(range) = plan.current() {
-            ranges.push(range);
-            plan.accept();
+        while let Some(attempt) = plan.current() {
+            ranges.push(attempt.range());
+            attempt.accept();
         }
         ranges
     }
@@ -135,47 +159,70 @@ mod tests {
         let mut plan = BatchPlan::new(64, INITIAL_GRAPHQL_BATCH_LEN);
 
         for (attempted, retry) in [(64, 32), (32, 16), (16, 8), (8, 4), (4, 2), (2, 1)] {
-            assert_eq!(plan.current(), Some(0..attempted));
-            assert_eq!(plan.reject(), Ok(Backoff { attempted, retry }));
-            assert_eq!(plan.current(), Some(0..retry));
+            assert_eq!(current_range(&mut plan), Some(0..attempted));
+            assert_eq!(plan.current().unwrap().reject(), Ok(Backoff { attempted, retry }));
+            assert_eq!(current_range(&mut plan), Some(0..retry));
         }
-        assert_eq!(plan.reject(), Err(ItemTooLarge { index: 0 }));
+        assert_eq!(plan.current().unwrap().reject(), Err(ItemTooLarge { index: 0 }));
     }
 
     #[test]
     fn halves_the_actual_tail_attempt() {
         let mut plan = BatchPlan::new(100, INITIAL_GRAPHQL_BATCH_LEN);
-        assert_eq!(plan.current(), Some(0..64));
-        plan.accept();
+        assert_eq!(current_range(&mut plan), Some(0..64));
+        plan.current().unwrap().accept();
 
-        assert_eq!(plan.current(), Some(64..100));
-        assert_eq!(plan.reject(), Ok(Backoff { attempted: 36, retry: 18 }));
-        assert_eq!(plan.current(), Some(64..82));
+        assert_eq!(current_range(&mut plan), Some(64..100));
+        assert_eq!(plan.current().unwrap().reject(), Ok(Backoff { attempted: 36, retry: 18 }));
+        assert_eq!(current_range(&mut plan), Some(64..82));
     }
 
     #[test]
     fn rejects_a_single_tail_item_immediately() {
         let mut plan = BatchPlan::new(65, INITIAL_GRAPHQL_BATCH_LEN);
-        plan.accept();
+        plan.current().unwrap().accept();
 
-        assert_eq!(plan.current(), Some(64..65));
-        assert_eq!(plan.reject(), Err(ItemTooLarge { index: 64 }));
+        assert_eq!(current_range(&mut plan), Some(64..65));
+        assert_eq!(plan.current().unwrap().reject(), Err(ItemTooLarge { index: 64 }));
     }
 
     #[test]
     fn preserves_a_reduced_batch_length_after_success() {
         let mut plan = BatchPlan::new(100, INITIAL_GRAPHQL_BATCH_LEN);
-        plan.reject().unwrap();
-        assert_eq!(plan.current(), Some(0..32));
-        plan.accept();
-        assert_eq!(plan.current(), Some(32..64));
+        plan.current().unwrap().reject().unwrap();
+        assert_eq!(current_range(&mut plan), Some(0..32));
+        plan.current().unwrap().accept();
+        assert_eq!(current_range(&mut plan), Some(32..64));
     }
 
     #[test]
     fn floors_odd_backoff_lengths() {
         let mut plan = BatchPlan::new(3, NonZeroUsize::new(3).unwrap());
-        assert_eq!(plan.reject(), Ok(Backoff { attempted: 3, retry: 1 }));
-        assert_eq!(plan.current(), Some(0..1));
+        assert_eq!(plan.current().unwrap().reject(), Ok(Backoff { attempted: 3, retry: 1 }));
+        assert_eq!(current_range(&mut plan), Some(0..1));
+    }
+
+    #[test]
+    fn dropping_an_attempt_does_not_skip_items() {
+        let mut plan = BatchPlan::new(65, INITIAL_GRAPHQL_BATCH_LEN);
+        {
+            let attempt = plan.current().unwrap();
+            assert_eq!(attempt.range(), 0..64);
+        }
+        assert_eq!(current_range(&mut plan), Some(0..64));
+        plan.current().unwrap().accept();
+        assert_eq!(current_range(&mut plan), Some(64..65));
+    }
+
+    #[test]
+    fn extreme_counts_bound_the_increment_before_adding() {
+        let mut plan = BatchPlan::new(usize::MAX, NonZeroUsize::new(usize::MAX - 1).unwrap());
+        assert_eq!(current_range(&mut plan), Some(0..usize::MAX - 1));
+        plan.current().unwrap().accept();
+        assert_eq!(current_range(&mut plan), Some(usize::MAX - 1..usize::MAX));
+        assert_eq!(plan.current().unwrap().reject(), Err(ItemTooLarge { index: usize::MAX - 1 }));
+        plan.current().unwrap().accept();
+        assert!(plan.current().is_none());
     }
 
     #[test]
