@@ -1,0 +1,16 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui/identity-forged-invalid.rs:8:13
+  |
+8 |     let _ = ChangeId("invalid/id".to_owned());
+  |             ^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> tests/ui/../../../src/pre_push/identity.rs
+  |
+  | pub(super) struct ChangeId(String);
+  |                            ^^^^^^ private field
+help: consider making the field publicly accessible
+ --> tests/ui/../../../src/pre_push/identity.rs
+  |
+  | pub(super) struct ChangeId(pub String);
+  |                            +++
