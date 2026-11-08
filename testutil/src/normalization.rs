@@ -84,17 +84,13 @@ pub(super) fn expand_literal_redactions<'a>(
         .flat_map(|(target, replacement)| {
             let mut targets = vec![target.to_string()];
             let debug = format!("{target:?}");
-            let debug =
-                debug.strip_prefix('"').and_then(|debug| debug.strip_suffix('"')).unwrap_or(&debug);
+            let debug = debug.strip_circumfix('"', '"').unwrap_or(&debug);
             targets.push(debug.to_string());
             if let Ok(canonical) = fs::canonicalize(target) {
                 targets.push(canonical.to_string_lossy().into_owned());
 
                 let debug = format!("{canonical:?}");
-                let debug = debug
-                    .strip_prefix('"')
-                    .and_then(|debug| debug.strip_suffix('"'))
-                    .unwrap_or(&debug);
+                let debug = debug.strip_circumfix('"', '"').unwrap_or(&debug);
                 targets.push(debug.to_string());
             }
             let forward_slash_targets = targets

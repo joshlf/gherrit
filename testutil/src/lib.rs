@@ -1066,7 +1066,7 @@ mod tests {
 
         let error = wait_for_server_completion(&completion_rx, timeout).unwrap_err();
 
-        assert!(matches!(error, MockServerStopError::TimedOut(value) if value == timeout));
+        std::assert_matches!(error, MockServerStopError::TimedOut(value) if value == timeout);
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 

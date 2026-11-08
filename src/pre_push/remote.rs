@@ -35,7 +35,7 @@ pub(super) fn observe_managed_branches(
                     Ok(())
                 }
                 Entry::Occupied(entry) => {
-                    bail!("`git ls-remote` reported managed branch {} more than once", entry.key())
+                    bail!("`git ls-remote` reported managed branch {} more than once", entry.key());
                 }
             },
         )?;
