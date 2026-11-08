@@ -293,3 +293,65 @@ fn each_selected_version_reaches_its_refs_and_pr_body() {
     }
     assert_eq!(ctx.recorded_pushes().len(), 1);
 }
+
+#[test]
+fn mixed_pr_slots_keep_created_metadata_after_update_failure_and_retry() {
+    use predicates::prelude::*;
+    let ctx = testutil::test_context!()
+        .with_remote()
+        .with_initial_commit()
+        .with_mock_github()
+        .with_git_interceptor()
+        .build();
+    ctx.checkout_managed_private("mixed-slots");
+    for id in ["Gzeta", "Galpha", "Gmiddle"] {
+        ctx.commit_with_explicit_gherrit_id(&format!("Work {id}\n\nBody {id}"), id);
+    }
+    ctx.github().seed_pull_request(testutil::PullRequestSeed {
+        number: 7,
+        title: "Previous title".to_owned(),
+        body: "Retained body".to_owned(),
+        head: "Galpha".to_owned(),
+        base: "main".to_owned(),
+    });
+    let existing = ctx.github().pull_requests().pop().unwrap();
+    ctx.inject_failure(testutil::FailureKind::UpdatePr);
+    ctx.hook_cmd("pre-push")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Injected UpdatePr failure"));
+    ctx.assert_failure_consumed();
+    let initial = ctx.github().pull_requests();
+    assert_eq!(initial.len(), 3);
+    assert_eq!(initial.iter().find(|pr| pr.head == "Galpha").unwrap(), &existing);
+    for (id, base) in [("Gzeta", "main"), ("Gmiddle", "Galpha")] {
+        let pr = initial.iter().find(|pr| pr.head == id).unwrap();
+        assert_eq!(pr.title.as_deref(), Some(format!("Work {id}").as_str()));
+        assert_eq!(pr.body.as_deref(), Some(format!("Body {id}\n\n\n").as_str()));
+        assert_eq!(pr.base, base);
+        assert_eq!(pr.state, testutil::PullRequestState::Open);
+    }
+    assert_eq!(
+        ctx.github().requests().last(),
+        Some(&vec![testutil::GraphQlOperation::UpdatePr; 3])
+    );
+    ctx.hook_cmd("pre-push").assert().success();
+    let final_prs = ctx.github().pull_requests();
+    assert_eq!(final_prs.len(), 3);
+    for (id, base) in [("Gzeta", "main"), ("Galpha", "Gzeta"), ("Gmiddle", "Galpha")] {
+        let pr = final_prs.iter().find(|pr| pr.head == id).unwrap();
+        assert_eq!(pr.number, initial.iter().find(|pr| pr.head == id).unwrap().number);
+        assert_eq!(pr.title.as_deref(), Some(format!("Work {id}").as_str()));
+        assert_eq!(pr.base, base);
+        assert!(pr.body.as_deref().unwrap().contains(&format!("Body {id}")));
+    }
+    assert_eq!(
+        ctx.github()
+            .requests()
+            .into_iter()
+            .flatten()
+            .filter(|operation| *operation == testutil::GraphQlOperation::CreatePr)
+            .count(),
+        2
+    );
+}
