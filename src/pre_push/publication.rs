@@ -6,7 +6,7 @@
 //! only after Git reports success. This module neither reads remote state nor
 //! checks a push receipt or recovers from a failed attempt.
 
-use std::slice;
+use std::{num::NonZeroUsize, slice};
 
 use gix::ObjectId;
 
@@ -20,10 +20,26 @@ const PUSH_BATCH_LEN: usize = 80;
 // 15.5 KiB.
 const REMOTE_QUERY_BATCH_LEN: usize = 250;
 
+/// A positive version number chosen from local history. The number alone does
+/// not prove that anything was published remotely. A local scan may still
+/// return zero when it found no positive version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Version(NonZeroUsize);
+
+impl Version {
+    pub fn next_after(previous: usize) -> Option<Self> {
+        previous.checked_add(1).and_then(NonZeroUsize::new).map(Self)
+    }
+
+    pub fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
 pub(super) struct PushTarget<'a> {
     pub object_id: ObjectId,
     pub gherrit_id: &'a ChangeId,
-    pub version: usize,
+    pub version: Version,
     /// None means the branch was absent when the caller read the remote refs.
     pub expected_remote_tip: Option<ObjectId>,
 }
@@ -31,7 +47,7 @@ pub(super) struct PushTarget<'a> {
 pub(super) struct PersistedTag {
     pub object_id: ObjectId,
     pub gherrit_id: ChangeId,
-    pub version: usize,
+    pub version: Version,
 }
 
 pub(super) struct PushPlan {
@@ -53,7 +69,7 @@ pub(super) fn plan_push(remote: &str, targets: &[PushTarget<'_>]) -> PushPlan {
     assert!(!targets.is_empty(), "cannot plan an empty push");
     let refspecs = targets.iter().flat_map(|target| {
         let branch = refs::head(target.gherrit_id.as_str());
-        let tag = refs::version_tag(target.gherrit_id.as_str(), target.version);
+        let tag = refs::version_tag(target.gherrit_id.as_str(), target.version.get());
         let expected = target.expected_remote_tip.map(|id| id.to_string()).unwrap_or_default();
         // Require the observed branch value and a missing version tag. These
         // lightweight refs store commit IDs, not unique attempt IDs. Git may
@@ -130,13 +146,13 @@ mod tests {
             PushTarget {
                 object_id: object_id(0x11),
                 gherrit_id: &ChangeId::parse(b"Gone").unwrap(),
-                version: 2,
+                version: Version::next_after(1).unwrap(),
                 expected_remote_tip: Some(object_id(0x33)),
             },
             PushTarget {
                 object_id: object_id(0x22),
                 gherrit_id: &ChangeId::parse(b"Gtwo").unwrap(),
-                version: 1,
+                version: Version::next_after(0).unwrap(),
                 expected_remote_tip: None,
             },
         ];
@@ -164,9 +180,17 @@ mod tests {
         assert_eq!(plan.persisted_tags.len(), 2);
         assert_eq!(plan.persisted_tags[0].object_id, object_id(0x11));
         assert_eq!(plan.persisted_tags[0].gherrit_id.as_str(), "Gone");
-        assert_eq!(plan.persisted_tags[0].version, 2);
+        assert_eq!(plan.persisted_tags[0].version.get(), 2);
         assert_eq!(plan.persisted_tags[1].object_id, object_id(0x22));
         assert_eq!(plan.persisted_tags[1].gherrit_id.as_str(), "Gtwo");
-        assert_eq!(plan.persisted_tags[1].version, 1);
+        assert_eq!(plan.persisted_tags[1].version.get(), 1);
+    }
+
+    #[test]
+    fn next_version_is_positive_and_rejects_counter_exhaustion() {
+        assert_eq!(Version::next_after(0).unwrap().get(), 1);
+        assert_eq!(Version::next_after(1).unwrap().get(), 2);
+        assert_eq!(Version::next_after(usize::MAX - 1).unwrap().get(), usize::MAX);
+        assert_eq!(Version::next_after(usize::MAX), None);
     }
 }
