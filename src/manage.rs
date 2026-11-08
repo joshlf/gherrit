@@ -73,21 +73,18 @@ struct BranchConfig {
 
 impl BranchConfig {
     fn expected(state: Option<State>, branch_name: &str, default_remote: &str) -> BranchConfig {
-        let self_merge_ref = format!("refs/heads/{branch_name}");
+        // Both managed modes track the local branch. Only their push
+        // destination differs. Build all the settings from one state match so
+        // those choices have one place to update.
+        let push_remote = match state {
+            Some(State::Unmanaged) | None => return BranchConfig::default(),
+            Some(State::Private) => ".",
+            Some(State::Public) => default_remote,
+        };
         BranchConfig {
-            push_remote: match state {
-                Some(State::Unmanaged) | None => None,
-                Some(State::Private) => Some(".".to_string()),
-                Some(State::Public) => Some(default_remote.to_string()),
-            },
-            remote: match state {
-                Some(State::Unmanaged) | None => None,
-                Some(State::Private | State::Public) => Some(".".to_string()),
-            },
-            merge: match state {
-                Some(State::Unmanaged) | None => None,
-                Some(State::Private | State::Public) => Some(self_merge_ref),
-            },
+            push_remote: Some(push_remote.to_string()),
+            remote: Some(".".to_string()),
+            merge: Some(format!("refs/heads/{branch_name}")),
         }
     }
 
@@ -569,24 +566,24 @@ mod tests {
 
     #[test]
     fn expected_branch_configuration_is_owned_and_state_specific() {
-        assert_eq!(BranchConfig::expected(None, BRANCH, DEFAULT_REMOTE), BranchConfig::default());
-        assert_eq!(
-            BranchConfig::expected(Some(State::Unmanaged), BRANCH, DEFAULT_REMOTE),
-            BranchConfig::default()
-        );
-        assert_eq!(
-            BranchConfig::expected(Some(State::Private), BRANCH, DEFAULT_REMOTE),
-            branch_config(Some("."), Some("."), Some("refs/heads/feature"))
-        );
-        assert_eq!(
-            BranchConfig::expected(Some(State::Public), BRANCH, DEFAULT_REMOTE),
-            branch_config(Some("origin"), Some("."), Some("refs/heads/feature"))
-        );
-        assert_eq!(
-            BranchConfig::expected(Some(State::Private), BRANCH, "."),
-            BranchConfig::expected(Some(State::Public), BRANCH, "."),
-            "private and public config may coincide for an unusual remote name"
-        );
+        for (branch, merge) in
+            [("feature", "refs/heads/feature"), ("topic/nested", "refs/heads/topic/nested")]
+        {
+            for remote in ["origin", "upstream", "."] {
+                for (state, expected) in [
+                    (None, branch_config(None, None, None)),
+                    (Some(State::Unmanaged), branch_config(None, None, None)),
+                    (Some(State::Private), branch_config(Some("."), Some("."), Some(merge))),
+                    (Some(State::Public), branch_config(Some(remote), Some("."), Some(merge))),
+                ] {
+                    assert_eq!(
+                        BranchConfig::expected(state, branch, remote),
+                        expected,
+                        "{state:?}, {branch}, {remote}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
