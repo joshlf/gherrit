@@ -48,6 +48,20 @@ system tests. The production `gherrit` binary never reads test endpoints,
 generates deterministic IDs, or dispatches the Git interceptor, even when
 Cargo unifies features across the package.
 
+## Private API contracts
+
+`cargo test -p gherrit-api-contracts --locked` checks ownership contracts with
+[trybuild](https://docs.rs/trybuild/1.0.122/trybuild/). The small workspace member
+imports the real private source files. Its positive fixtures must compile and
+run; negative fixtures must fail with the checked-in diagnostics. This prevents
+an inaccessible import from passing as evidence of a forbidden operation.
+Explicit fixture paths also make a missing fixture fail the test.
+
+The full workspace tests include these checks. Inspect compiler diagnostics when
+a toolchain or API changes; update expected output only after confirming that the
+intended restriction still causes the error. Keep runtime boundary cases in the
+owning module tests rather than repeating them in compiler fixtures.
+
 ## Testing Strategy
 
 See [testing.md](./testing.md) for the product-risk model, test layers, snapshot
