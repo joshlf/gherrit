@@ -22,6 +22,7 @@ pub struct MockServerInfo {
     completion_rx: Option<Receiver<thread::Result<()>>>,
 }
 
+#[derive(Debug)]
 pub(super) enum MockServerStopError {
     Panicked(Box<dyn Any + Send + 'static>),
     TimedOut(Duration),

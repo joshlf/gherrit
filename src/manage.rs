@@ -38,13 +38,15 @@ impl State {
             Some(State::PRIVATE) => Ok(Some(State::Private)),
             Some(State::UNMANAGED) => Ok(Some(State::Unmanaged)),
             None => Ok(None),
-            Some(unknown) => bail!(
-                "Invalid gherritManaged value: {}. Expected {}, {}, or {}.",
-                unknown.yellow(),
-                State::PUBLIC.yellow(),
-                State::PRIVATE.yellow(),
-                State::UNMANAGED.yellow()
-            ),
+            Some(unknown) => {
+                bail!(
+                    "Invalid gherritManaged value: {}. Expected {}, {}, or {}.",
+                    unknown.yellow(),
+                    State::PUBLIC.yellow(),
+                    State::PRIVATE.yellow(),
+                    State::UNMANAGED.yellow()
+                );
+            }
         }
     }
 
@@ -234,7 +236,9 @@ enum StateUpdate {
 pub fn set_state(repo: &util::Repo, new_state: State, force: bool) -> Result<()> {
     match try_set_state(repo, new_state, force)? {
         StateUpdate::Completed => Ok(()),
-        StateUpdate::Refused => bail!(DRIFT_REFUSAL),
+        StateUpdate::Refused => {
+            bail!(DRIFT_REFUSAL);
+        }
     }
 }
 
