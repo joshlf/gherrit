@@ -95,6 +95,56 @@ def latest(rows, group):
     return list(result.values())
 
 
+def select_workflow_runs(runs, number, expected, runs_complete):
+    """Select this PR/base without treating an unbound run as complete evidence."""
+    target_runs = []
+    for row in runs:
+        if row.get("event") == "pull_request":
+            bindings = row.get("pull_requests")
+            if not isinstance(bindings, list) or not bindings:
+                runs_complete = False
+                continue
+            if not any(item.get("number") == number and identity(item) == expected for item in bindings):
+                continue
+        target_runs.append(row)
+    return target_runs, runs_complete
+
+
+def approve_observed_workflows(prefix, number, expected, current_runs):
+    """Own deliberate POSTs and report any completed prefix on failure.
+
+    The caller checks observation completeness. This executor still rechecks
+    each live PR/run binding immediately before acting; it claims no fence.
+    """
+    pr_path = f"{prefix}/pulls/{number}"
+    head, _ = expected
+    approved = []
+    try:
+        for row in current_runs:
+            if workflow_state(row) != "approval_required":
+                continue
+            if identity(api(pr_path)) != expected:
+                raise ObservationError(f"PR changed; stopped after approvals {approved}")
+            run_id = row.get("id")
+            if type(run_id) is not int or run_id <= 0:
+                raise ObservationError("Unusable workflow run ID")
+            run = api(f"{prefix}/actions/runs/{run_id}")
+            linked = any(item.get("number") == number and identity(item) == expected for item in run.get("pull_requests", []))
+            if run.get("head_sha") != head or run.get("event") != "pull_request" or workflow_state(run) != "approval_required" or not linked:
+                raise ObservationError(f"Workflow identity/state changed or is not bound to this PR/base; stopped after approvals {approved}")
+            # No claim of a compare-and-swap fence: the PR can still change
+            # between the final observation and this provider operation.
+            try:
+                api(f"{prefix}/actions/runs/{run_id}/approve", "POST")
+            except ObservationError as error:
+                raise ObservationError(f"Approval of run {run_id} has uncertain outcome; prior completed approvals {approved}: {error}") from error
+            approved.append(run_id)
+        consistent = identity(api(pr_path)) == expected
+    except (ObservationError, KeyError, TypeError, ValueError) as error:
+        raise ObservationError(f"Approval incomplete; completed approvals {approved}: {error}") from error
+    return approved, consistent
+
+
 def observe(repo, number, approve=False, expected=None):
     prefix = f"repos/{repo}"
     pr_path = f"{prefix}/pulls/{number}"
@@ -111,16 +161,7 @@ def observe(repo, number, approve=False, expected=None):
     runs = [row for row in runs if row.get("head_sha") == head]
     # Head SHA is shared by PRs with different bases. Retain every run in the
     # evidence, but select this PR/base before choosing its latest attempt.
-    target_runs = []
-    for row in runs:
-        if row.get("event") == "pull_request":
-            bindings = row.get("pull_requests")
-            if not isinstance(bindings, list) or not bindings:
-                runs_complete = False
-                continue
-            if not any(item.get("number") == number and identity(item) == (head, base) for item in bindings):
-                continue
-        target_runs.append(row)
+    target_runs, runs_complete = select_workflow_runs(runs, number, (head, base), runs_complete)
     current_checks = latest(checks, check_key)
     current_runs = latest(target_runs, lambda row: (row.get("workflow_id"), row.get("event"),
         (number, head, base) if row.get("event") == "pull_request" else None))
@@ -133,29 +174,7 @@ def observe(repo, number, approve=False, expected=None):
             raise ObservationError("Approval requires expected head and base commits")
         if not consistent or not runs_complete:
             raise ObservationError("Changed or incomplete workflow observation; no approval sent")
-        try:
-            for row in current_runs:
-                if workflow_state(row) != "approval_required":
-                    continue
-                if identity(api(pr_path)) != expected:
-                    raise ObservationError(f"PR changed; stopped after approvals {approved}")
-                run_id = row.get("id")
-                if type(run_id) is not int or run_id <= 0:
-                    raise ObservationError("Unusable workflow run ID")
-                run = api(f"{prefix}/actions/runs/{run_id}")
-                linked = any(item.get("number") == number and identity(item) == expected for item in run.get("pull_requests", []))
-                if run.get("head_sha") != head or run.get("event") != "pull_request" or workflow_state(run) != "approval_required" or not linked:
-                    raise ObservationError(f"Workflow identity/state changed or is not bound to this PR/base; stopped after approvals {approved}")
-                # No claim of a compare-and-swap fence: the PR can still change
-                # between the final observation and this provider operation.
-                try:
-                    api(f"{prefix}/actions/runs/{run_id}/approve", "POST")
-                except ObservationError as error:
-                    raise ObservationError(f"Approval of run {run_id} has uncertain outcome; prior completed approvals {approved}: {error}") from error
-                approved.append(run_id)
-            consistent = identity(api(pr_path)) == (head, base)
-        except (ObservationError, KeyError, TypeError, ValueError) as error:
-            raise ObservationError(f"Approval incomplete; completed approvals {approved}: {error}") from error
+        approved, consistent = approve_observed_workflows(prefix, number, expected, current_runs)
 
     return {
         "repository": repo, "pull_request": number, "head": head, "base": base,
