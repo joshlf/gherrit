@@ -82,4 +82,51 @@ This is a developer diagnostic, not a stable product status or admission API.
 `ci/validate.sh devtools` exercises redaction and a native linked-worktree
 contract, including relative hooks and unchanged configuration and refs.
 
+## Current-head PR observations
+
+Run `python3 ci/pr_readiness.py --repo owner/repository 123` for a read-only
+report of head and base commits, head-commit checks, workflow runs, and formal
+review decisions. It distinguishes no run, approval required, running, failed,
+successful and unknown. It summarizes the latest check/app and workflow/event
+for the observed PR and base, excluding other PRs or old bases that share its
+head. Non-PR workflow runs are grouped by branch; runs without a branch identity
+remain separate. Unbound PR runs leave the workflow observation incomplete.
+Checks from unknown apps remain separate because their shared provider cannot
+be established. A check's requested action is distinct from workflow approval.
+
+The report retains the returned check and workflow run records as evidence.
+GitHub lists a workflow run's latest rerun attempt; earlier attempts are not
+fetched. Each formal decision indicates whether it names the current head.
+Reviews from deleted accounts keep a null login and remain separate because
+their shared authorship cannot be established. Ordinary review comments, bot
+messages and emoji reactions do not become formal approvals. It reads the PR
+again after observation; a changed head or base makes the check/workflow
+summaries unknown and prevents any review from being marked as a current-head
+match.
+
+The report is not permission to merge. It omits rulesets, required-check
+selection, merge-commit checks, commit status contexts and comment/reaction
+approvals. Head checks alone do not prove validation against the recorded base.
+Missing API access fails rather than indicating green CI. Each request has a
+30-second timeout. Reviews/checks are bounded at 100 pages of 100 records;
+filtered workflow searches are bounded at ten pages because GitHub caps them
+at 1,000 results. A full bound is explicitly incomplete and summarizes unknown.
+GitHub's commit check-run endpoint covers only the most recent 1,000 check
+suites. The helper reads the suite count after listing runs and marks check
+coverage incomplete above that limit, even if every returned page was read.
+An unusable suite count fails observation.
+See GitHub's [workflow run API](https://docs.github.com/en/rest/actions/workflow-runs),
+[check API](https://docs.github.com/en/rest/checks/runs), and
+[review API](https://docs.github.com/en/rest/pulls/reviews).
+
+To approve existing workflow runs deliberately, add `--approve-workflows
+--expect-head FULL_OID --expect-base FULL_OID`. The helper rechecks the PR and
+each run before the POST, requiring an approval-required pull-request run
+whose PR record names both expected commits. An absent binding refuses the
+operation. A later failure may leave earlier approvals applied; errors report
+that prefix. A failed POST has an uncertain outcome. These observations cannot
+fence a concurrent edit. Approval starts execution; run the read-only helper
+again for fresh results. The helper never dispatches a new workflow or changes
+credentials. Its scripted API contracts run with `ci/validate.sh devtools`.
+
 *Updated by an AI agent acting on joshlf's behalf.*
