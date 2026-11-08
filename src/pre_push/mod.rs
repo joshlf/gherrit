@@ -20,7 +20,6 @@
 use std::{
     collections::{HashMap, HashSet},
     process::Stdio,
-    str,
 };
 
 use color_eyre::eyre::{Context, Result, bail, eyre};
@@ -37,6 +36,7 @@ mod autosquash;
 mod batching;
 mod body;
 mod github;
+mod identity;
 mod publication;
 mod reconcile;
 /// Names for managed branches and version tags.
@@ -69,6 +69,7 @@ use github::{
     PullRequest as PrState, RepositoryIdQuery, UpdatePullRequest, batch_document,
     decode_batch_response,
 };
+use identity::ChangeId;
 use publication::{PushTarget, plan_push, push_batches};
 use reconcile::{
     CurrentPr, DesiredPr, PrUpdate, PullRequestState, ensure_pull_requests_open, link_stack,
@@ -152,7 +153,7 @@ pub async fn run(repo: &util::Repo, github_endpoint: &GithubEndpoint) -> Result<
 
     let octocrab = builder.build()?;
 
-    let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
+    let gherrit_ids: Vec<ChangeId> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
     // Reject a PR known to be closed or merged before pushing Git refs. This
     // read does not lock the PR; another actor may change its state later.
     let prs = batch_fetch_prs(repo, &octocrab, &gherrit_ids).await?;
@@ -282,8 +283,8 @@ fn ensure_unique_gherrit_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Resu
 }
 
 #[allow(clippy::too_many_lines)]
-fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<String, usize>> {
-    let gherrit_ids: Vec<String> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
+fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<ChangeId, usize>> {
+    let gherrit_ids: Vec<ChangeId> = commits.iter().map(|c| c.gherrit_id.clone()).collect();
 
     // Read branch tips for the leases. ls-remote fetches neither objects nor
     // version tags, and its results may become stale. Git must check each
@@ -314,17 +315,16 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
         for c in chunk {
             let next_ver = next_versions[&c.gherrit_id];
 
-            // Lease the branch to ensure it hasn't changed since our fetch.
-            // If we know the remote SHA, we expect it. If we don't (None), we
-            // expect "" (creation).
-            let expected_sha =
-                remote_branch_states.get(&c.gherrit_id).map(String::as_str).unwrap_or("");
+            // Keep a missing tip distinct from a parsed object ID until
+            // building the command, where Git uses an empty lease value for a
+            // new branch.
+            let expected_remote_tip = remote_branch_states.get(&c.gherrit_id).copied();
 
             targets.push(PushTarget {
                 object_id: c.id,
                 gherrit_id: &c.gherrit_id,
                 version: next_ver,
-                expected_remote_sha: expected_sha,
+                expected_remote_tip,
             });
         }
 
@@ -355,7 +355,7 @@ fn push_to_origin(repo: &util::Repo, commits: &[Commit]) -> Result<HashMap<Strin
         // effect.
         let mut persistence_errors = Vec::new();
         for tag in plan.persisted_tags {
-            let name = refs::version_tag(&tag.gherrit_id, tag.version);
+            let name = refs::version_tag(tag.gherrit_id.as_str(), tag.version);
             if let Err(error) = repo.reference(
                 name.clone(),
                 tag.object_id,
@@ -475,7 +475,7 @@ fn local_version_entry(name: &str) -> Option<(&str, usize)> {
     Some((id, version))
 }
 
-fn get_local_versions(repo: &util::Repo, ids: &[String]) -> Result<HashMap<String, usize>> {
+fn get_local_versions(repo: &util::Repo, ids: &[ChangeId]) -> Result<HashMap<ChangeId, usize>> {
     // An ID with no recognized local tag starts at zero. Scan refs once for the
     // whole stack. Stop on decoding or iteration errors so incomplete history
     // cannot silently produce a lower version number.
@@ -518,12 +518,12 @@ async fn sync_prs(
     public_branch: Option<&str>,
     base_branch: &str,
     commits: Vec<Commit>,
-    latest_versions: HashMap<String, usize>,
+    latest_versions: HashMap<ChangeId, usize>,
     prs: Vec<PrState>,
 ) -> Result<()> {
     let remote = repo.default_remote()?;
 
-    let commits = link_stack(base_branch, commits, |commit| commit.gherrit_id.clone());
+    let commits = link_stack(base_branch, commits, |commit| commit.gherrit_id.to_string());
 
     enum PrResolution {
         Existing(PrState),
@@ -547,7 +547,7 @@ async fn sync_prs(
                     title: c.message_title.clone(),
                     body: c.message_body.clone(),
                     base_branch: entry.base_branch.clone(),
-                    head_branch: c.gherrit_id.clone(),
+                    head_branch: c.gherrit_id.to_string(),
                 })
             }
         })
@@ -633,7 +633,7 @@ async fn sync_prs(
                 current_pr_number: pr_state.number,
                 latest_version,
                 base_branch: &entry.base_branch,
-                gherrit_id: &c.gherrit_id,
+                gherrit_id: c.gherrit_id.as_str(),
                 parent_id: entry.parent_id.as_deref(),
                 child_id: entry.child_id.as_deref(),
             }
@@ -686,7 +686,7 @@ struct Commit {
     // id changes when a commit is rewritten. Keep gherrit_id unchanged so the
     // rewritten change updates the same PR.
     id: ObjectId,
-    gherrit_id: String,
+    gherrit_id: ChangeId,
     message_title: String,
     message_body: String,
 }
@@ -703,13 +703,13 @@ impl Commit {
             .unwrap_or("")
             .to_string();
         let gherrit_id = committed_gherrit_id(trailers, c.id)?;
-        let message_body = strip_gherrit_id(&message_body, &gherrit_id);
+        let message_body = strip_gherrit_id(&message_body, gherrit_id.as_str());
 
         Ok(Commit { id: c.id, gherrit_id, message_title, message_body })
     }
 }
 
-fn committed_gherrit_id(trailers: &[u8], object_id: ObjectId) -> Result<String> {
+fn committed_gherrit_id(trailers: &[u8], object_id: ObjectId) -> Result<ChangeId> {
     // The commit hook only keeps or adds an ID. Check it here before
     // publishing, so ambiguous or unsafe IDs never become ref names.
     let mut gherrit_ids = crate::commit_message::gherrit_id_values(trailers);
@@ -722,10 +722,8 @@ fn committed_gherrit_id(trailers: &[u8], object_id: ObjectId) -> Result<String> 
     if gherrit_id.is_empty() {
         bail!("Commit {} missing gherrit-pr-id trailer", object_id);
     }
-    if !gherrit_id.iter().all(u8::is_ascii_alphanumeric) {
-        bail!("Commit {} has invalid gherrit-pr-id trailer", object_id);
-    }
-    Ok(str::from_utf8(gherrit_id)?.to_string())
+    ChangeId::parse(gherrit_id)
+        .ok_or_else(|| eyre!("Commit {} has invalid gherrit-pr-id trailer", object_id))
 }
 
 /// A request to create a new PR in a batch.
@@ -806,15 +804,14 @@ async fn batch_create_prs(
 async fn batch_fetch_prs(
     repo: &util::Repo,
     octocrab: &Octocrab,
-    head_refs: &[String],
+    head_refs: &[ChangeId],
 ) -> Result<Vec<PrState>> {
     let remote = repo.default_remote()?;
     let owner = remote.owner;
     let repo_name = remote.repo_name;
-    let queries = head_refs
-        .iter()
-        .cloned()
-        .map(|head_ref| FindPullRequest::new(owner.clone(), repo_name.clone(), head_ref));
+    let queries = head_refs.iter().cloned().map(|head_ref| {
+        FindPullRequest::new(owner.clone(), repo_name.clone(), head_ref.to_string())
+    });
 
     Ok(run_batched_graphql(octocrab, queries).await?.into_iter().flatten().collect())
 }
@@ -1097,7 +1094,7 @@ mod tests {
         for case in crate::commit_message::trailer_cases() {
             let actual = committed_gherrit_id(case.trailers.as_bytes(), object_id);
             if let Some(expected_id) = case.publication.strip_prefix("ok:") {
-                assert_eq!(actual.unwrap(), expected_id, "{}", case.name);
+                assert_eq!(actual.unwrap().as_str(), expected_id, "{}", case.name);
             } else {
                 let expected = case.publication.strip_prefix("error:").unwrap();
                 assert_eq!(
