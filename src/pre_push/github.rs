@@ -47,7 +47,13 @@ pub(super) trait BatchedOperation {
 
     const TYPE: OperationType;
 
+    /// Returns this operation's GraphQL document.
     fn document(&self) -> String;
+    /// Decodes this operation's reply.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required data is missing, malformed, or ambiguous.
     fn decode(&self, response: Value) -> Result<Self::Output>;
 }
 

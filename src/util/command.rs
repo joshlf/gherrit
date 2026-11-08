@@ -1,25 +1,34 @@
+//! Builds child commands and checks their exit status.
+//!
+//! Commands run directly, without a shell. Callers choose arguments, captured
+//! input/output, and how to manage the child process. These helpers do not add
+//! timeouts, retry failures, or undo changes made before a command fails.
+
 use std::{ffi::OsStr, process::Command};
 
 use eyre::{Result, bail};
 
-/// Constructs a `std::process::Command`.
+/// Constructs a [`std::process::Command`].
 ///
 /// # Usage
 ///
-/// The first argument must be a string literal representing the command and any initial arguments.
-/// This string is split by whitespace to determine the command name and initial arguments.
+/// The first argument is a string literal containing the command and any
+/// initial arguments. It is split on whitespace. Each subsequent argument
+/// remains a single argument, even if it contains spaces.
 ///
-/// Subsequent arguments are treated as individual arguments to the command. They are NOT split
-/// by whitespace, allowing for safe passing of arguments that contain spaces.
+/// # Panics
 ///
-/// # Example
+/// Panics if the first string contains no non-whitespace characters.
+///
+/// # Examples
 ///
 /// ```text
-/// // - "git" is the command; "config" is an argument.
-/// // - "branch.{branch_name}.gherritManaged" is a single argument (even if it contains spaces when formatted).
-/// // - `state` is a single argument (even if it contains spaces when formatted).
 /// cmd!("git config", "branch.{branch_name}.gherritManaged", state)
 /// ```
+///
+/// Here `git` is the command and `config` is its first argument. The formatted
+/// branch key and `state` are each passed as one argument, including any spaces
+/// in their values.
 macro_rules! cmd {
     ($bin:literal $(, $($rest:tt)*)?) => {{
         // The first argument is a literal, so we can safely split it by whitespace.
@@ -82,7 +91,22 @@ pub fn cmd<I: AsRef<OsStr>>(name: &str, args: impl IntoIterator<Item = I>) -> Co
 }
 
 pub trait CommandExt {
+    /// Runs the command with its configured input and output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the child cannot be started or waited for, or exits
+    /// with a nonzero status.
     fn success(&mut self) -> Result<()>;
+    /// Returns captured output after checking the command's exit status.
+    ///
+    /// Error messages include stderr, so callers must check whether it contains
+    /// sensitive data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if starting the child or collecting its output fails,
+    /// or if the child exits with a nonzero status.
     fn checked_output(&mut self) -> Result<std::process::Output>;
 }
 

@@ -20,10 +20,10 @@ mod body;
 mod github;
 mod publication;
 mod reconcile;
+/// Managed ref names shared by publication, observation and local
+/// persistence. Parsing and admission stay with the caller; these functions
+/// only spell names.
 mod refs {
-    //! Managed ref names shared by publication, observation and local
-    //! persistence. Parsing and admission stay with the caller; these functions
-    //! only spell names.
 
     pub(super) fn head(id: &str) -> String {
         format!("refs/heads/{id}")

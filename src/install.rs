@@ -1,3 +1,11 @@
+//! Installs hook scripts after checking existing hook ownership.
+//!
+//! The installer checks all three destinations before changing any of them. It
+//! writes each new hook completely, then renames it into place. Each rename is
+//! atomic, but the three replacements are not one transaction: if a later one
+//! fails, earlier hooks stay installed. Rerunning can repair that partial
+//! result.
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{fs, io::Write as _, path::PathBuf};
@@ -8,6 +16,8 @@ use owo_colors::OwoColorize;
 use crate::util::Repo;
 
 const REQUIRED_HOOKS: &[&str] = &["pre-push", "commit-msg", "post-checkout"];
+// This marker lets us replace a hook without --force. The rest of the file need
+// not match the template exactly. Keep the marker in generated hooks.
 const PROLOGUE: &str = "# gherrit-installer: managed";
 const SHIM_TEMPLATE: &str = r#"#!/bin/sh
 # gherrit-installer: managed
@@ -23,7 +33,9 @@ struct HookReplacement {
     content: String,
 }
 
-/// A complete executable sibling; failure or drop leaves the old hook intact.
+/// A complete executable hook awaiting replacement.
+///
+/// Failure or dropping this value leaves the old hook intact.
 struct PreparedHook {
     destination: PathBuf,
     temporary: tempfile::NamedTempFile,
@@ -31,6 +43,9 @@ struct PreparedHook {
 
 impl HookReplacement {
     fn prepare(self) -> Result<PreparedHook> {
+        // Write a temporary file in the same directory, then rename it so
+        // readers never see a partly written hook. The temporary file is also
+        // cleaned up if writing it or making it executable fails.
         let parent = self.path.parent().expect("hook destination has a parent");
         let mut temporary = tempfile::Builder::new()
             .prefix(".gherrit-hook-")
@@ -49,6 +64,9 @@ impl HookReplacement {
 
 impl PreparedHook {
     fn replace(self) -> Result<()> {
+        // Rename replaces the symlink itself without writing to its target. The
+        // new file does not keep the old owner or ACLs. This also does not
+        // ensure that the directory change survives a power loss.
         self.temporary
             .persist(&self.destination)
             .map_err(|error| error.error)
@@ -67,8 +85,17 @@ fn is_managed_hook(content: &[u8]) -> bool {
 }
 
 impl InstallPlan {
-    /// Inspect every destination before creating directories or writing hooks.
-    /// This retains sentinel ownership; it does not lock out concurrent writers.
+    /// Inspects hook destinations without changing them.
+    ///
+    /// The installer checks every destination before creating directories or
+    /// writing hooks. Ownership is based on the marker in each file; inspection
+    /// does not lock out concurrent writers.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from inspecting entries or reading hooks. A dangling
+    /// symlink is treated as an unowned entry. Unowned hooks are rejected
+    /// unless `force` is true.
     fn inspect(directory: PathBuf, force: bool) -> Result<Self> {
         let mut conflicts = Vec::new();
         let mut hooks = Vec::new();
@@ -134,12 +161,16 @@ pub fn install(repo: &Repo, force: bool, allow_global: bool) -> Result<()> {
 
 fn resolve_hooks_dir(repo: &Repo, allow_global: bool) -> Result<PathBuf> {
     if let Some(path_buf) = repo.config_path("core.hooksPath")? {
-        // Security check: ensure the hooks directory is within the repository.
+        // An external hooks directory may affect other repositories, so require
+        // --allow-global separately. --force allows replacing hooks; it does
+        // not allow using an external directory.
         let layout = repo.layout();
         let root = layout.workdir.unwrap_or(layout.worktree_git_dir);
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
-        // Best effort canonicalization
+        // Resolve symlinks before comparing existing paths. Keep missing paths
+        // as written. This check helps locate the directory; it neither grants
+        // access to it nor prevents another process from changing it.
         let abs_hooks =
             if path_buf.exists() { path_buf.canonicalize().unwrap_or(path_buf) } else { path_buf };
 
