@@ -10,7 +10,7 @@ use std::{
 
 use command_group::{CommandGroup, GroupChild};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_TIMEOUT: Duration = Duration::from_mins(1);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
