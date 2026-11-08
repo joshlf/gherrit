@@ -1,3 +1,8 @@
+//! Shared helpers for Git repositories, configuration, and child commands.
+//!
+//! Return repository facts, command results, and the paths callers need. The
+//! command using these helpers decides what may be published.
+
 mod auth;
 mod command;
 mod config;

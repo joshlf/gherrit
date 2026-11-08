@@ -1,3 +1,9 @@
+//! Read Git settings while keeping strings and paths distinct.
+//!
+//! Trim whitespace around string settings. Keep paths as written and resolve
+//! relative paths from this worktree, or the Git directory for a bare repo.
+//! Distinguish a missing setting from a value that cannot be decoded.
+
 use std::path::PathBuf;
 
 use eyre::Result;
@@ -13,6 +19,8 @@ impl Repo {
         Ok(Some(s.trim().to_string()))
     }
     pub fn config_path(&self, key: &str) -> Result<Option<PathBuf>> {
+        // Do not read paths with config_string: whitespace may be part of a
+        // filename, and Git paths need the platform's native path conversion.
         let snapshot = self.inner.config_snapshot();
         let Some(path_val) = snapshot.path(key) else {
             return Ok(None);

@@ -1,3 +1,9 @@
+//! Process setup shared by the normal binary and the system-test driver.
+//!
+//! Set up logging, panic reports, argument parsing, and the async runtime here.
+//! Library callers can run commands without installing global handlers or
+//! having their process terminated.
+
 use std::process::ExitCode;
 
 use clap::Parser as _;
@@ -41,6 +47,8 @@ pub fn run(runtime: gherrit::Runtime) -> ExitCode {
     }
 
     if let Err(error) = execute(runtime) {
+        // If pre-push fails, the outer Git push must fail too. Log the full
+        // error chain and let main return a failure status.
         format!("{error:#}").lines().for_each(|line| log::error!("{line}"));
         return ExitCode::FAILURE;
     }
@@ -49,6 +57,8 @@ pub fn run(runtime: gherrit::Runtime) -> ExitCode {
 }
 
 fn execute(runtime: gherrit::Runtime) -> Result<()> {
+    // Each invocation runs one command. Async HTTP work can use this thread, so
+    // command handlers do not need to create another runtime.
     let cli = gherrit::Cli::parse();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
