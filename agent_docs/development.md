@@ -38,9 +38,10 @@ its successful checkout with a failing explicit management request.
 
 ## Hook installation
 
-The installer inspects all destination bytes and constructs the complete plan
-before creating directories or replacing hooks. Binary hooks follow the same
-sentinel ownership and `--force` rules as text hooks. Each replacement is
+The installer checks ownership at every destination before creating directories
+or replacing hooks. Once inspection succeeds, it creates the hooks directory
+and builds each path and script as its replacement begins. Binary hooks follow
+the same sentinel ownership and `--force` rules as text hooks. Each replacement is
 written and made executable in a temporary sibling, then renamed over its
 destination. A failed preparation leaves that hook untouched. Replacement
 replaces a symlink entry rather than modifying its target. Existing file
