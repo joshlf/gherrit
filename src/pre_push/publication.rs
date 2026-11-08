@@ -10,7 +10,7 @@ use std::slice;
 
 use gix::ObjectId;
 
-use super::refs;
+use super::{identity::ChangeId, refs};
 
 // Windows command lines are limited to roughly 32 KiB. Each target contributes
 // about 200 characters of branch and tag refspecs, so 80 targets leave ample
@@ -22,15 +22,15 @@ const REMOTE_QUERY_BATCH_LEN: usize = 250;
 
 pub(super) struct PushTarget<'a> {
     pub object_id: ObjectId,
-    pub gherrit_id: &'a str,
+    pub gherrit_id: &'a ChangeId,
     pub version: usize,
-    /// Empty means the branch was absent in the caller's observation.
-    pub expected_remote_sha: &'a str,
+    /// None means the branch was absent in the caller's observation.
+    pub expected_remote_tip: Option<ObjectId>,
 }
 
 pub(super) struct PersistedTag {
     pub object_id: ObjectId,
-    pub gherrit_id: String,
+    pub gherrit_id: ChangeId,
     pub version: usize,
 }
 
@@ -52,15 +52,16 @@ pub(super) fn remote_query_batches<T>(items: &[T]) -> slice::Chunks<'_, T> {
 pub(super) fn plan_push(remote: &str, targets: &[PushTarget<'_>]) -> PushPlan {
     assert!(!targets.is_empty(), "cannot plan an empty push");
     let refspecs = targets.iter().flat_map(|target| {
-        let branch = refs::head(target.gherrit_id);
-        let tag = refs::version_tag(target.gherrit_id, target.version);
+        let branch = refs::head(target.gherrit_id.as_str());
+        let tag = refs::version_tag(target.gherrit_id.as_str(), target.version);
+        let expected = target.expected_remote_tip.map(|id| id.to_string()).unwrap_or_default();
         // Request the observed branch value and an absent version tag. These
         // lightweight refs store commit IDs, not unique attempt IDs. Git can
         // treat an already identical ref as up to date, so these expectations
         // must not be mistaken for an exclusive, single-use publication lock.
         [
             format!("{}:{branch}", target.object_id),
-            format!("--force-with-lease={branch}:{}", target.expected_remote_sha),
+            format!("--force-with-lease={branch}:{expected}"),
             format!("{}:{tag}", target.object_id),
             format!("--force-with-lease={tag}:"),
         ]
@@ -77,7 +78,7 @@ pub(super) fn plan_push(remote: &str, targets: &[PushTarget<'_>]) -> PushPlan {
         .iter()
         .map(|target| PersistedTag {
             object_id: target.object_id,
-            gherrit_id: target.gherrit_id.to_string(),
+            gherrit_id: target.gherrit_id.clone(),
             version: target.version,
         })
         .collect();
@@ -128,15 +129,15 @@ mod tests {
         let targets = [
             PushTarget {
                 object_id: object_id(0x11),
-                gherrit_id: "Gone",
+                gherrit_id: &ChangeId::parse(b"Gone").unwrap(),
                 version: 2,
-                expected_remote_sha: "abc123",
+                expected_remote_tip: Some(object_id(0x33)),
             },
             PushTarget {
                 object_id: object_id(0x22),
-                gherrit_id: "Gtwo",
+                gherrit_id: &ChangeId::parse(b"Gtwo").unwrap(),
                 version: 1,
-                expected_remote_sha: "",
+                expected_remote_tip: None,
             },
         ];
 
@@ -151,7 +152,7 @@ mod tests {
                 "--atomic".to_string(),
                 "origin".to_string(),
                 format!("{}:refs/heads/Gone", object_id(0x11)),
-                "--force-with-lease=refs/heads/Gone:abc123".to_string(),
+                format!("--force-with-lease=refs/heads/Gone:{}", object_id(0x33)),
                 format!("{}:refs/tags/gherrit/Gone/v2", object_id(0x11)),
                 "--force-with-lease=refs/tags/gherrit/Gone/v2:".to_string(),
                 format!("{}:refs/heads/Gtwo", object_id(0x22)),
@@ -162,10 +163,10 @@ mod tests {
         );
         assert_eq!(plan.persisted_tags.len(), 2);
         assert_eq!(plan.persisted_tags[0].object_id, object_id(0x11));
-        assert_eq!(plan.persisted_tags[0].gherrit_id, "Gone");
+        assert_eq!(plan.persisted_tags[0].gherrit_id.as_str(), "Gone");
         assert_eq!(plan.persisted_tags[0].version, 2);
         assert_eq!(plan.persisted_tags[1].object_id, object_id(0x22));
-        assert_eq!(plan.persisted_tags[1].gherrit_id, "Gtwo");
+        assert_eq!(plan.persisted_tags[1].gherrit_id.as_str(), "Gtwo");
         assert_eq!(plan.persisted_tags[1].version, 1);
     }
 }

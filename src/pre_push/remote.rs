@@ -9,17 +9,17 @@ use std::collections::{HashMap, hash_map::Entry};
 use color_eyre::eyre::{Context as _, Result, bail};
 use gix::ObjectId;
 
-use super::{publication::remote_query_batches, refs};
+use super::{identity::ChangeId, publication::remote_query_batches, refs};
 use crate::util::{self, CommandExt as _};
 
 /// Observes the managed branches relevant to the current stack.
 pub(super) fn observe_managed_branches(
     repo: &util::Repo,
-    gherrit_ids: &[String],
-) -> Result<HashMap<String, String>> {
+    gherrit_ids: &[ChangeId],
+) -> Result<HashMap<ChangeId, ObjectId>> {
     remote_query_batches(gherrit_ids).try_fold(HashMap::new(), |mut states, chunk| {
         let mut arguments = vec!["ls-remote".to_string(), repo.default_remote_name()?];
-        arguments.extend(chunk.iter().map(|id| refs::head(id)));
+        arguments.extend(chunk.iter().map(|id| refs::head(id.as_str())));
 
         let output = util::cmd("git", arguments).checked_output()?;
 
@@ -48,10 +48,12 @@ pub(super) fn observe_managed_branches(
 /// validating every complete record and object ID.
 fn parse_managed_branches(
     output: &[u8],
-    requested_ids: &[String],
-) -> Result<HashMap<String, String>> {
-    let requested_refs =
-        requested_ids.iter().map(|id| (refs::head(id).into_bytes(), id)).collect::<HashMap<_, _>>();
+    requested_ids: &[ChangeId],
+) -> Result<HashMap<ChangeId, ObjectId>> {
+    let requested_refs = requested_ids
+        .iter()
+        .map(|id| (refs::head(id.as_str()).into_bytes(), id))
+        .collect::<HashMap<_, _>>();
     if output.is_empty() {
         return Ok(HashMap::new());
     }
@@ -77,7 +79,7 @@ fn parse_managed_branches(
 
         match states.entry((*id).clone()) {
             Entry::Vacant(entry) => {
-                entry.insert(object_id.to_string());
+                entry.insert(object_id);
             }
             Entry::Occupied(_) => {
                 bail!("`git ls-remote` reported refs/heads/{id} more than once");
@@ -94,8 +96,8 @@ mod tests {
     const OBJECT_A: &str = "1111111111111111111111111111111111111111";
     const OBJECT_B: &str = "2222222222222222222222222222222222222222";
 
-    fn ids(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_string()).collect()
+    fn ids(values: &[&str]) -> Vec<ChangeId> {
+        values.iter().map(|value| ChangeId::parse(value.as_bytes()).unwrap()).collect()
     }
 
     #[test]
@@ -112,8 +114,14 @@ mod tests {
         assert_eq!(
             parse_managed_branches(output.as_bytes(), &requested).unwrap(),
             HashMap::from([
-                ("Gone".to_string(), OBJECT_A.to_string()),
-                ("Gtwo".to_string(), OBJECT_B.to_string()),
+                (
+                    ChangeId::parse(b"Gone").unwrap(),
+                    ObjectId::from_hex(OBJECT_A.as_bytes()).unwrap()
+                ),
+                (
+                    ChangeId::parse(b"Gtwo").unwrap(),
+                    ObjectId::from_hex(OBJECT_B.as_bytes()).unwrap()
+                ),
             ])
         );
         assert!(parse_managed_branches(b"", &requested).unwrap().is_empty());
@@ -128,7 +136,10 @@ mod tests {
 
         assert_eq!(
             parse_managed_branches(&output, &requested).unwrap(),
-            HashMap::from([("Gone".to_string(), OBJECT_B.to_string())])
+            HashMap::from([(
+                ChangeId::parse(b"Gone").unwrap(),
+                ObjectId::from_hex(OBJECT_B.as_bytes()).unwrap(),
+            )])
         );
     }
 
