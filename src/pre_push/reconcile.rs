@@ -1,3 +1,10 @@
+//! Chooses allowed PR states, parent/child links, and fields to update.
+//!
+//! These functions use the observed PR state and requested local changes
+//! without making network requests. A PR may change after it was read. The
+//! caller controls the resulting API requests, their order, and how failures
+//! are handled.
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -8,9 +15,10 @@ pub(super) enum PullRequestState {
     Merged,
 }
 
-/// A PR lifecycle observation that forbids mutation.
+/// A closed or merged PR that must not be changed.
 ///
-/// `Open` is unrepresentable, so consumers do not rely on a field invariant.
+/// [`PullRequestState::Open`] cannot be represented here, so callers need not
+/// check a field to rule it out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NonOpenPullRequest {
     Closed { number: u64 },
@@ -18,9 +26,7 @@ enum NonOpenPullRequest {
 }
 
 impl NonOpenPullRequest {
-    /// Converts a lifecycle observation into rejection evidence.
-    ///
-    /// Returns `None` exactly when the pull request is open.
+    /// Returns a closed or merged PR, or `None` if it is open.
     fn from_state(number: u64, state: PullRequestState) -> Option<Self> {
         match state {
             PullRequestState::Open => None,
@@ -54,6 +60,10 @@ impl std::fmt::Display for NonOpenPullRequests {
 impl std::error::Error for NonOpenPullRequests {}
 
 /// Rejects a stack containing any closed or merged pull request.
+///
+/// # Errors
+///
+/// Returns [`NonOpenPullRequests`] containing all closed or merged PRs found.
 pub(super) fn ensure_pull_requests_open(
     pull_requests: impl IntoIterator<Item = (u64, PullRequestState)>,
 ) -> Result<(), NonOpenPullRequests> {
@@ -65,7 +75,7 @@ pub(super) fn ensure_pull_requests_open(
     if pull_requests.is_empty() { Ok(()) } else { Err(NonOpenPullRequests { pull_requests }) }
 }
 
-/// A stack item annotated with the relationships needed to project it as a PR.
+/// A stack item with the branch and parent/child links needed for its PR.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct StackEntry<T> {
     pub(super) item: T,
@@ -74,7 +84,12 @@ pub(super) struct StackEntry<T> {
     pub(super) child_id: Option<String>,
 }
 
-/// Derives stack topology from items ordered from base to head.
+/// Builds PR links from items ordered from the bottom to the top.
+///
+/// The bottom PR targets the default branch. Each later PR targets the managed
+/// branch of the PR below it. The same order determines parent/child IDs. This
+/// does not check ancestry or discover a stack managed by GitHub's native stack
+/// feature.
 pub(super) fn link_stack<T>(
     base_branch: &str,
     items: impl IntoIterator<Item = T>,
@@ -115,7 +130,7 @@ pub(super) struct DesiredPr<'a> {
     pub(super) base_branch: &'a str,
 }
 
-/// The fields that must be changed to reconcile a PR.
+/// The fields needed to update an existing PR.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct PrUpdate {
     /// The global node ID of the PR to update.
@@ -146,6 +161,9 @@ pub(super) fn plan_update(current: CurrentPr<'_>, desired: DesiredPr<'_>) -> Opt
 }
 
 fn normalize_body(body: &str) -> String {
+    // Normalize CRLF line endings and trim whitespace at the start and end.
+    // Other whitespace differences still require an update. Send the original
+    // desired bytes when an update is needed.
     body.replace("\r\n", "\n").trim().to_string()
 }
 

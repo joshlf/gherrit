@@ -1,3 +1,9 @@
+//! Builds GraphQL documents and decodes the replies the publisher needs.
+//!
+//! Each operation keeps the details needed to read its own reply. The caller
+//! handles authentication, HTTP requests, batches, and write order. Decoding a
+//! reply here does not read the resulting PR state again.
+
 use color_eyre::eyre::{Context as _, Result, bail, eyre};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -40,8 +46,7 @@ impl OperationType {
     }
 }
 
-/// A self-contained GraphQL operation that can be batched with operations of
-/// the same type.
+/// A GraphQL operation batched with others of the same type.
 pub(super) trait BatchedOperation {
     type Output;
 
@@ -59,6 +64,9 @@ pub(super) trait BatchedOperation {
 
 /// Builds the exact GraphQL document sent for one adaptive batch.
 pub(super) fn batch_document<O: BatchedOperation>(operations: &[O]) -> String {
+    // Aliases name positions in this request, not PRs across requests. Decode
+    // with the same operation slice so each result stays with the branch name
+    // and other details from the request that produced it.
     let body = operations
         .iter()
         .enumerate()
@@ -67,7 +75,12 @@ pub(super) fn batch_document<O: BatchedOperation>(operations: &[O]) -> String {
     format!("{} {{ {body} }}", O::TYPE.keyword())
 }
 
-/// Decodes every aliased operation in a successful adaptive batch response.
+/// Decodes a batch reply in the order of its requested operations.
+///
+/// # Errors
+///
+/// Returns an error if `data` is missing or is not an object, a requested alias
+/// is missing, or an operation cannot decode its reply.
 pub(super) fn decode_batch_response<O: BatchedOperation>(
     operations: &[O],
     response: Value,
@@ -141,7 +154,7 @@ impl RepositoryIdQuery {
     }
 }
 
-/// Looks up the PR whose head branch is a GHerrit ID.
+/// A query for the PR whose head branch is a GHerrit ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FindPullRequest {
     owner: String,
@@ -162,6 +175,9 @@ impl BatchedOperation for FindPullRequest {
 
     fn document(&self) -> String {
         let connection = |alias: &str, states: &str| {
+            // Query open and closed PRs separately so old closed PRs cannot
+            // fill the page and hide an open one. Encode values as JSON-escaped
+            // GraphQL strings; never insert them as unquoted query syntax.
             format!(
                 "{alias}: pullRequests(headRefName: {}, first: {MAX_PULL_REQUEST_CANDIDATES}, states: {states}) {{ nodes {{ number, id, title, body, baseRefName, state, isCrossRepository }} pageInfo {{ hasNextPage }} }}",
                 json!(self.head_branch),
@@ -212,6 +228,9 @@ impl BatchedOperation for FindPullRequest {
         let response: Response = serde_json::from_value(response)
             .wrap_err("Failed to decode pull request query response")?;
         let select = |kind: &str, pull_requests: PullRequests| -> Result<Option<Node>> {
+            // A fork may use the same head name. Only a PR whose head is in
+            // this repository can identify our managed branch. Incomplete or
+            // ambiguous results cannot establish that no matching PR exists.
             let mut candidates = pull_requests
                 .nodes
                 .into_iter()
@@ -355,6 +374,8 @@ impl BatchedOperation for UpdatePullRequest {
 
     fn document(&self) -> String {
         let fields = std::iter::once(("pullRequestId", &self.node_id))
+            // None means leave the field out, not send null or clear it. Even
+            // setting an unchanged base can fail for a PR in the merge queue.
             .chain(self.base_branch.as_ref().map(|value| ("baseRefName", value)))
             .chain(self.title.as_ref().map(|value| ("title", value)))
             .chain(self.body.as_ref().map(|value| ("body", value)))
@@ -371,6 +392,9 @@ impl BatchedOperation for UpdatePullRequest {
                 self.node_id
             );
         }
+        // We sent no clientMutationId, so the returned value may be null.
+        // Require the field and its expected shape. This checks the reply, not
+        // the PR's final metadata.
         let acknowledgement = response.as_object().ok_or_else(|| eyre!(
             "Unusable update acknowledgement for PR '{}': expected an object; the mutation may have applied", self.node_id))?;
         let mutation_id = acknowledgement.get("clientMutationId").ok_or_else(|| eyre!(

@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# This action writes separately from pre-push. A merged PR's saved metadata
+# names the next change; it does not tell us that child's current Git history or
+# PR state.
 action_path=${ACTION_PATH:-$(cd "$(dirname "$0")/.." && pwd)}
 merged_pr_body=${MERGED_PR_BODY-}
 
@@ -39,6 +42,9 @@ echo "Identified Child PR: #$child_pr"
 git config user.name "github-actions[bot]"
 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+# These operations are separate: the base edit stays applied if the local rebase
+# fails. Advance only the immediate child here, not the rest of the stack in one
+# run.
 gh pr checkout "$child_pr" --repo "$repository"
 gh pr edit "$child_pr" --repo "$repository" --base main
 
@@ -47,4 +53,6 @@ if ! git rebase origin/main; then
   exit 1
 fi
 
+# The tracking ref gives this push its default lease. That lease does not
+# protect the earlier PR base edit or stop other writers changing stack refs.
 git push --force-with-lease
